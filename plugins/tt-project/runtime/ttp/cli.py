@@ -4699,6 +4699,7 @@ def cmd_schedules(a) -> None:
                                                   "description", "payload")}
         print(json.dumps({**e, "state": state}, indent=2, default=str))
         return
+    from . import heal
     print(f"schedules from {path}" if path.exists() else
           f"schedules from the database only (`ttp schedules {p.name} --export` moves them into {path})")
     home = timefmt.home(p)
@@ -4707,6 +4708,10 @@ def cmd_schedules(a) -> None:
         t = e["payload"].get("timeout_s") if isinstance(e["payload"], dict) else None
         pre = str(e["payload"].get("precheck") or "").strip() if isinstance(e["payload"], dict) else ""
         at = sched.at_text(r, home)
+        spec = heal.of(e["payload"]) if r["kind"] == "command" and isinstance(e["payload"], dict) else None
+        slow = heal.interval(p.db, r, spec) if spec else 0
+        if slow > int(r["every_s"]):   # a heal check backing off while healthy
+            at = (at + " " if at else "") + f"(now {heal._secs(slow)}: healthy)"
         print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' ' + at if at else ''}"
               f"{f' timeout {t}s' if t else ''}{f' precheck: {pre[:60]}' if pre else ''}"
               f"{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")

@@ -186,6 +186,90 @@ def test_heal_grace_unknown_and_broken_check_never_fix(env):
     assert heal.run(d, "svc", spec, now + 600)[0] == "unhealthy (0 s, grace 300 s)"   # a new stint
 
 
+def test_heal_backs_off_to_healthy_every_after_healthy_runs_and_shows_it(env, capsys, monkeypatch):
+    from ttp import cli, heal
+    p, d, up = _heal_setup(env, healthy_every="1h")
+    up.touch()
+    for n in (1, 2, 3):
+        p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+        d.run_schedules()
+        row = p.db.one("SELECT * FROM schedules WHERE name='svc'")
+        assert row["last_status"] == "ok (healthy)" and heal.state(p.db, "svc")[heal.STREAK_KEY] == n
+        assert row["next_run"] - row["last_run"] == pytest.approx(3600 if n == heal.HEALTHY_RUNS else 300), n
+    r = p.db.one("SELECT * FROM schedules WHERE name='svc'")
+    assert "; every 1h (3 healthy in a row)" in heal.describe(r, _heal_spec(p), p.db)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    cli.main(["schedules", p.name])
+    assert "every 5m (now 1h: healthy)" in capsys.readouterr().out
+    up.unlink()   # the first unhealthy run goes straight back to `every`
+    p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+    d.run_schedules()
+    row = p.db.one("SELECT * FROM schedules WHERE name='svc'")
+    assert heal.STREAK_KEY not in heal.state(p.db, "svc") and row["next_run"] - row["last_run"] <= 300
+    assert "; every 5m, 1h after 3 healthy in a row (0 so far)" in heal.describe(row, _heal_spec(p), p.db)
+    # Without `healthy_every` a healthy streak changes nothing.
+    p2, d2, up2 = _heal_setup(env)
+    up2.touch()
+    for _ in range(4):
+        p2.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+        d2.run_schedules()
+    row = p2.db.one("SELECT * FROM schedules WHERE name='svc'")
+    assert row["next_run"] - row["last_run"] == pytest.approx(300)
+
+
+@pytest.mark.parametrize("result", ["unhealthy", "unknown", "error", "known", "fixed"])
+def test_heal_any_result_but_plain_healthy_drops_back_to_every(env, result):
+    from ttp import heal
+    p, d, up = _heal_setup(env, healthy_every="1h", healthy_runs=2)
+    spec, now, row = _heal_spec(p), time.time(), dict(p.db.one("SELECT * FROM schedules WHERE name='svc'"))
+    up.touch()
+    for i in range(2):
+        assert heal.run(d, "svc", spec, now + i)[0] == "ok (healthy)"
+    assert heal.interval(p.db, row, spec) == 3600
+    if result == "unhealthy":
+        up.unlink()
+        run = dict(spec, grace_s=300)
+    else:
+        run = dict(spec, check={"unknown": "exit 75", "error": "exit 2",
+                                "known": "echo 'ttp-heal: known ops: planned work'; exit 75",
+                                "fixed": f"test -e {up} && test -e {up}.fixed"}.get(result, spec["check"]),
+                   fix=f"touch {up}.fixed")
+    status = heal.run(d, "svc", run, now + 10)[0]
+    assert status != "ok (healthy)" and heal.interval(p.db, row, spec) == 300, status
+    if result == "fixed":   # the fix ran and its recheck is healthy: still not a plain healthy run
+        assert heal.run(d, "svc", run, now + 20)[0].startswith("fixed")
+        assert heal.interval(p.db, row, spec) == 300
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 30)[0] == "ok (healthy)"   # a new streak starts at one
+    assert heal.state(p.db, "svc")[heal.STREAK_KEY] == 1 and heal.interval(p.db, row, spec) == 300
+
+
+def test_heal_healthy_every_is_validated_against_every(env):
+    from ttp import coordinator as coord
+    from ttp import heal
+    from ttp import schedule as sched
+    assert heal.validate({"check": "true", "healthy_every": "1h"})["healthy_runs"] == heal.HEALTHY_RUNS
+    assert heal.validate({"check": "true", "healthy_every": 3600, "healthy_runs": 5}, every_s=3600)
+    for bad, why in (({"healthy_every": "soon"}, "is an interval"), ({"healthy_every": 0}, "is an interval"),
+                     ({"healthy_every": True}, "is an interval"), ({"healthy_runs": 2}, "goes with"),
+                     ({"healthy_every": "1h", "healthy_runs": 0}, "`healthy_runs` is an integer"),
+                     ({"healthy_every": "1m"}, "must be at least")):
+        with pytest.raises(ValueError, match=why):
+            heal.validate({"check": "true", **bad}, every_s=300)
+    entry = {"name": "svc", "kind": "command", "every": "5m", "payload": {"heal": {"check": "true", "healthy_every": "1h"}}}
+    assert sched.parse_file(json.dumps([entry]))
+    with pytest.raises(ValueError, match="must be at least"):
+        sched.parse_file(json.dumps([dict(entry, every="2h")]))
+    p = make(env)
+    assert coord.apply(p, [{"type": "schedule_set", "name": "svc", "kind": "command", "every": "5m",
+                            "heal": {"check": "true", "healthy_every": "1h"}}]) == []
+    for act in ({"heal": {"check": "true", "healthy_every": "1m"}}, {"every": "2h"}):   # a kept block too
+        coord.apply(p, [{"type": "schedule_set", "name": "svc", "kind": "command", **act}])
+        row = p.db.one("SELECT every_s, payload FROM schedules WHERE name='svc'")
+        assert row["every_s"] == 300 and json.loads(row["payload"])["heal"]["healthy_every"] == "1h", act
+    assert "healthy_every" in coord.HEAL_SCHEMA["properties"] and "healthy_runs" in coord.HEAL_SCHEMA["properties"]
+
+
 def test_heal_cap_then_one_self_fix_task_then_outage_alert_that_clears(env):
     from ttp import alerts, heal
     p, d, up = _heal_setup(env, max_fixes=2, window_h=1)
@@ -2054,7 +2138,8 @@ def test_heal_field_types_are_what_validate_takes():
     passes validate() for its preset, and no key has two types."""
     from ttp import heal
     sample = {'string': 'x', 'integer': 2, 'number': 1.5, 'boolean': True}
-    fixed = {'escalate': 'coordinator', 'condition': 'down', 'url': 'http://example.invalid'}
+    fixed = {'escalate': 'coordinator', 'condition': 'down', 'url': 'http://example.invalid',
+             'healthy_every': '1h'}
     seen = {}
     for preset, fields in [(None, {}), *heal.PRESET_FIELDS.items()]:
         for k, t in [*heal.COMMON_FIELDS.items(), *fields.items()]:

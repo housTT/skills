@@ -126,6 +126,12 @@ fix, no task; it ends the current unknown stretch, and the status reads "known (
 says so for itself: the next run without the line starts or keeps the ordinary unknown stretch, or is
 handled as healthy or unhealthy as above.
 
+Backing off while healthy: `healthy_every` (an interval like the schedule's `every`, e.g. "1h", at least
+`every`) runs the check that often once it was healthy `healthy_runs` (HEALTHY_RUNS, 3) runs in a row. The
+first run that is anything else (unhealthy, unknown, a known state, an error or a fix that ran) goes straight
+back to `every`. The streak lives in the check's state (`healthy_streak`); `ttp heal list` and `ttp schedules`
+show the interval in force.
+
 Daemon time: `timeout_s` is capped at MAX_TIMEOUT_S (the daemon's command-watcher cap), a timeout
 kills the check's or fix's whole process group, and the daemon tells its watchdog it still moves
 between the check and the fix; after a fix the schedule's own command waits for the recheck, so one
@@ -219,6 +225,8 @@ FIX_POLL_S = 60                 # a detached fix's end is looked for this often
 FIX_DIR = "heal-fix"            # state/heal-fix/<check>/: a detached fix's job
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 NOTE_MAX = 2000                 # self_fix_note cap: a longer note is cut to this
+HEALTHY_RUNS = 3                # healthy_runs default: healthy runs in a row before `healthy_every` applies
+STREAK_KEY = "healthy_streak"   # a check's state: its plain healthy runs in a row
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120, "unknown_cap_s": 3600}
 OPEN = ("queued", "running", "waiting", "needs_review")
 # Every key a block takes, with its JSON type. validate() accepts exactly these keys, and the coordinator's
@@ -230,6 +238,7 @@ COMMON_FIELDS: dict[str, dict] = {
                      "ping_host", "ping_peer", "to", "self_fix_note"), _TEXT),
     "known_fault": {"anyOf": [_TEXT, {"type": "object", "properties": dict.fromkeys(KNOWN_FAULT_KEYS, _TEXT),
                                       "required": ["why"]}]},
+    "healthy_every": {"anyOf": [_TEXT, _COUNT]}, "healthy_runs": _COUNT,
     "outage": _FLAG, "fix_detached": _FLAG, "fix_timeout_s": {"type": "number"},
     **dict.fromkeys(DEFAULTS, {"type": "number"})}
 PRESET_FIELDS: dict[str, dict[str, dict]] = {
@@ -248,8 +257,9 @@ LEDGER_CONDITIONS = ("down", "held")   # machine_ledger.CONDITIONS
 
 
 # The block ----------------------------------------------------------------------------------------
-def validate(block: Any, where: str = "heal") -> dict:
-    """The heal block checked and with its defaults filled in. Raises ValueError saying what is wrong."""
+def validate(block: Any, where: str = "heal", every_s: int | None = None) -> dict:
+    """The heal block checked and with its defaults filled in. Raises ValueError saying what is wrong.
+    `every_s`, the schedule's period when known, is the floor of `healthy_every`."""
     if not isinstance(block, dict):
         raise ValueError(f"{where} is an object")
     preset = block.get("preset")
@@ -287,6 +297,18 @@ def validate(block: Any, where: str = "heal") -> dict:
         out["fix_timeout_s"] = min(v, FIX_MAX_TIMEOUT_S)
     elif "fix_timeout_s" in out:
         raise ValueError(f"{where}: `fix_timeout_s` is for a detached fix: set `fix_detached` true too")
+    if out.get("healthy_every") is not None:
+        v = healthy_every_s(out)
+        if v <= 0:
+            raise ValueError(f"{where}: `healthy_every` is an interval (e.g. 1h, 30m or seconds), above 0")
+        if every_s is not None and v < every_s:
+            raise ValueError(f"{where}: `healthy_every` ({out['healthy_every']}) must be at least the schedule's "
+                             f"`every` ({every_s} s)")
+        n = out.setdefault("healthy_runs", HEALTHY_RUNS)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError(f"{where}: `healthy_runs` is an integer, 1 or more")
+    elif "healthy_runs" in out:
+        raise ValueError(f"{where}: `healthy_runs` goes with `healthy_every`: set that too")
     for k in ("ping_host", "ping_peer"):
         v = out.get(k)
         if v is not None and not (isinstance(v, str) and HOST_RE.fullmatch(v)):
@@ -323,6 +345,16 @@ def validate(block: Any, where: str = "heal") -> dict:
         raise ValueError(f"{where} needs `check` (a shell probe: 0 healthy, 1 unhealthy, 75/255 unknown) "
                          f"or a `preset`")
     return out
+
+
+def healthy_every_s(spec: dict) -> int:
+    """`healthy_every` in seconds; 0 when unset or not an interval."""
+    from .schedule import parse_every
+    v = spec.get("healthy_every")
+    try:
+        return 0 if v is None or isinstance(v, bool) else parse_every(v)
+    except (ValueError, TypeError):
+        return 0
 
 
 def _validate_known(kf: Any, where: str) -> None:
@@ -756,12 +788,29 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
     the watchdog ping, called between the check and the fix). Returns (schedule status, when to run
     again if sooner than its period)."""
     now = time.time() if now is None else now
+    streak = int(state(host.p.db, name).get(STREAK_KEY) or 0)
     out = _run(host, name, spec, now)
+    st = state(host.p.db, name)   # only a plain healthy run keeps the streak going (module doc: backing off)
+    if out[0] == "ok (healthy)":
+        st[STREAK_KEY] = streak + 1
+    else:
+        st.pop(STREAK_KEY, None)
+    _save(host.p.db, name, st)
     try:
         _report_machine(host, name, spec, now)
     except Exception as e:   # the ledger is shared and best effort: the check's own result stands
         print(f"heal {name}: machine ledger report failed: {e}", file=sys.stderr)
     return out
+
+
+def interval(db: DB, row: dict, spec: dict) -> int:
+    """The schedule's period in force: `healthy_every` once the check was healthy `healthy_runs` times in a
+    row, else its `every` (module doc: backing off)."""
+    every = int(row["every_s"])
+    slow = healthy_every_s(spec)
+    if not slow or int(state(db, row["name"]).get(STREAK_KEY) or 0) < spec.get("healthy_runs", HEALTHY_RUNS):
+        return every
+    return max(slow, every)
 
 
 def machine_of(spec: dict, known: dict | None = None) -> str | None:
@@ -1551,6 +1600,13 @@ def holds(db: DB, name: str, now: float | None = None) -> bool:
 
 
 # Views --------------------------------------------------------------------------------------------
+def _secs(s: int) -> str:
+    """An interval as `every` reads it: 1h, 30m, or 90s."""
+    from .schedule import _every_text
+    t = _every_text(int(s))
+    return f"{t}s" if isinstance(t, int) else t
+
+
 def checks(db: DB) -> list[tuple[dict, dict]]:
     """Enabled schedules with a heal block: (schedule row, heal spec)."""
     out = []
@@ -1610,5 +1666,11 @@ def describe(r: dict, spec: dict, db: DB, now: float | None = None) -> str:
     elif status == "unhealthy" and s.get("since"):
         status += f" for {(now - float(s['since'])) / 60:.0f} min"
     extra = f"; self-fix task #{s['task']}" if s.get("task") else ""
+    slow = healthy_every_s(spec)
+    if slow:
+        iv, n = interval(db, r, spec), int(s.get(STREAK_KEY) or 0)
+        extra += (f"; every {_secs(iv)} ({n} healthy in a row)" if iv > int(r["every_s"])
+                  else f"; every {_secs(iv)}, {_secs(slow)} after {spec.get('healthy_runs', HEALTHY_RUNS)} "
+                       f"healthy in a row ({n} so far)")
     return (f"{r['name']}: {status}{extra}; {fixed_today(db, r['name'], now)} fixed today; check: {what}; "
             f"fix: {spec.get('fix') or '(none)'}" + (f" under lock {spec['resource']}" if spec.get("resource") else ""))

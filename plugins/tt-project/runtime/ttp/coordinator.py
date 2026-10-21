@@ -2001,6 +2001,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 else:
                     raise ValueError(f"schedule_set {a.get('name')!r} rejected: `kind` must be llm or command")
                 every_s = sched.parse_every(a.get("every") or (old["every_s"] if old else "1d"))
+                if kind == "command" and payload.get("heal"):   # a kept block too: `healthy_every` >= `every`
+                    heal.validate(payload["heal"], f"schedule_set {a.get('name')!r} rejected: `heal`", every_s)
                 if str(a.get("every") or "").strip().isdigit():   # bare seconds: echo what was understood
                     notes.append(f"schedule_set {a['name']!r}: every {every_s} s")
                 sched.upsert(db, a["name"], kind, every_s,

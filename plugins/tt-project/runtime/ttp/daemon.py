@@ -4456,6 +4456,10 @@ class Daemon:
         sched.mark_ran(db, row, status, home=timefmt.home(self.p))
         if again is not None:   # a heal check's grace end or settle recheck comes before its period
             db.x("UPDATE schedules SET next_run=MIN(next_run, ?) WHERE name=?", (again, row["name"]))
+        elif row["kind"] == "command" and (spec := heal.of(payload)):   # backing off while healthy
+            slow = heal.interval(db, row, spec)
+            if slow > int(row["every_s"]):
+                db.x("UPDATE schedules SET next_run=MAX(next_run, last_run + ?) WHERE name=?", (slow, row["name"]))
         if (sched.failing(status) and sched.failing(row["last_status"])
                 and not (row["kind"] == "command" and payload.get("heal") and heal.owns(db, row["name"]))):
             self._schedule_broken(row, status)

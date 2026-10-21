@@ -318,7 +318,7 @@ def parse_file(text: str | bytes, known: Any = ()) -> list[dict]:
             if e["kind"] != "command":
                 raise ValueError(f"{where}: only a command schedule takes `payload.heal`")
             from .heal import validate
-            validate(payload["heal"], f"{where}: payload.heal")
+            validate(payload["heal"], f"{where}: payload.heal", parse_every(e["every"]))
         if payload.get("precheck") is not None:
             if e["kind"] != "llm":
                 raise ValueError(f"{where}: only an llm schedule takes `payload.precheck`")
