@@ -4689,3 +4689,19 @@ def test_worker_prompt_keeps_idleness_evidence_and_shared_script_rules():
         out = prompts.feature_blocks(raw, on)
         assert "names its evidence" in out and "auth log" in out, on
     assert prompts.feature_blocks(raw, {"device", "remote", "clusters", "wait"}).count("names its evidence") == 1
+
+
+def test_docs_say_each_line_once():
+    """A setup-box page links to new-box.md instead of repeating its lines, and install.md's known
+    issues do not repeat the guide's limits."""
+    def lines(p):
+        return {re.sub(r"\W+", " ", ln).strip().lower() for ln in p.read_text(encoding="utf-8").splitlines()
+                if len(re.sub(r"\W+", " ", ln).strip()) > 40}
+    box = PLUGIN / "skills" / "setup-box"
+    new_box = lines(box / "new-box.md")
+    for page in sorted(box.glob("*.md")):
+        if page.name != "new-box.md":
+            assert not lines(page) & new_box, (page.name, lines(page) & new_box)
+    assert not lines(PLUGIN / "docs" / "install.md") & lines(PLUGIN / "docs" / "guide.md")
+    for prompt in sorted((PLUGIN / "template" / "prompts").glob("*.md")):   # no capital verb mid-sentence
+        assert not re.findall(r"[a-z,;)] (?:Set|Use|Run|Add|Keep) `", prompt.read_text(encoding="utf-8")), prompt.name

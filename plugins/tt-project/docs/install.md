@@ -138,4 +138,3 @@ history. If you ran `ttp notifier install`, also remove its `tt-project-notifier
 - Codex and Cursor spend is estimated from a price table (see [Limits](guide.md#limits)).
 - Not on Codex: worker plugins. Not yet on Cursor: worker plugins, worker isolation, mid-run coordinator updates.
 - Older Cursor builds print nothing until a run ends, so set `stall_s` above their longest run.
-- A laptop pauses while it sleeps; use an always-on machine for round-the-clock work.

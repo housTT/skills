@@ -2,8 +2,7 @@
 
 A box is set up in the user's own account, not in the shared admin or site account through which
 access was first given. The new-box questionnaire (`new-box.md`) asks for it first; `box.py setup
-plan` puts these steps before every other one. Every command below is
-`<plugin-root>/skills/setup-box/scripts/box.py`, shortened to `box.py`.
+plan` puts these steps before every other one. `box.py` below is the script named in `new-box.md`.
 
 ## 1. The login
 

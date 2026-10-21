@@ -5,7 +5,7 @@ the box lose the caches and backups they keep there. The new-box flow (`new-box.
 whether the box should mount shared storage at boot; on yes it makes the mount persistent and
 verifies it now and again after the next reboot.
 
-Every command below is `<plugin-root>/skills/setup-box/scripts/box.py`, shortened to `box.py`.
+`box.py` below is the script named in `new-box.md`.
 
 ## 1. Ask
 

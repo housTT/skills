@@ -78,7 +78,7 @@ broker where it has one.
     at the time of writing; check `build_metal.sh --help` in your checkout).
   - A prebuilt build tree or `python_env` copied from elsewhere is not portable (it embeds
     absolute paths): build in place.
-- If tt-buddy is not installed, name it in the hand-off as the plugin that holds these recipes.
+- If tt-buddy is not installed: as in `new-box.md`.
 
 ## Hand-off
 

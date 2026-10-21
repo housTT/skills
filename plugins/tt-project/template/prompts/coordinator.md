@@ -68,7 +68,7 @@ Each field's rules are in the section named; the table only lists them.
 - `tier`: `light` for lookups, triage, small edits; `standard` (default) otherwise; `deep` (max
   effort) only when the user asks (`user_deep`). The daemon retries a failed run a tier up itself.
   Respect the budget's `max_tier`. A `review` gets its tier from the diff it names (branch or commit
-  in the spec, or `depends_on` the code task); Set `deep` only to force it. A re-review `continues`
+  in the spec, or `depends_on` the code task); set `deep` only to force it. A re-review `continues`
   the failed one or depends on its fix, and its spec lists the earlier findings.
 - Pins: set `provider`, `model` or `effort` (e.g. `xhigh`, over its tier's) only when the user's
   verbatim words or the charter name them; reviews, fixes and `continues` follow-ups keep the pin.
