@@ -1069,8 +1069,8 @@ class Daemon:
         self._run_step(self.review_jev)
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
-        core_held = self.net_held(core) and not self._net_may_probe(core)
-        cycle = self.host_cycle_held(now)
+        core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
+        cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
                      self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):

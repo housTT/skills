@@ -3263,6 +3263,24 @@ def test_a_failing_call_between_the_tick_step_loops_does_not_stop_dispatch_or_de
     assert f"RuntimeError: {bare} broke" in logged
 
 
+@pytest.mark.parametrize("bare", ["net_held", "_net_may_probe", "host_cycle_held"])
+def test_a_failing_hold_check_does_not_stop_dispatch_or_delivery(env, bare):
+    """net_held, _net_may_probe and host_cycle_held run guarded with a False default: one that raises
+    is logged and dispatch and deliver_outbound still run in that tick."""
+    p = make(env)
+    calls: list[str] = []
+    d = _failing_step_daemon(p.base, calls)
+    if bare == "_net_may_probe":
+        d.net_held = lambda prov: True   # so that the probe check is reached
+
+    def broken(*a, **k):
+        raise RuntimeError(f"{bare} broke")
+    setattr(d, bare, broken)
+    d.tick()
+    assert "dispatch" in calls and "deliver" in calls
+    assert f"RuntimeError: {bare} broke" in (p.logs / "daemon.log").read_text()
+
+
 def test_a_failing_update_gates_still_lets_dispatch_and_delivery_run_and_is_alerted(env):
     """update_gates raising every tick: dispatch and deliver_outbound still run each tick, and after
     STEP_FAILS_ALERT ticks it is alerted as tick-step:update_gates like any step."""
