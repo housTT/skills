@@ -6853,7 +6853,7 @@ def main(argv: list[str] | None = None) -> None:
                            "about $0.55; a missing or logged-out CLI is reported, exit 0)")
             s.add_argument("--loop", choices=["claude", "codex", "cursor"], metavar="PROVIDER",
                            help="run one tiny code task end to end (dispatch, hand-off, review, push to a local "
-                           "bare remote) in a scratch project, each daemon tick in a fresh process (spends up to "
+                           "bare remote) in a scratch project, ticking one daemon of its own (spends up to "
                            "about $1, at most 15 minutes; a missing or logged-out CLI is reported, exit 0)")
             s.add_argument("--json", action="store_true", help="with --live or --loop: the result as JSON")
             s.add_argument("--scheduler", action="store_true",

@@ -5828,7 +5828,7 @@ fi
 
 def test_doctor_loop_lands_one_code_task_on_a_local_bare_remote_through_review(env, monkeypatch):
     """`ttp doctor --loop`: one code task goes through dispatch, hand-off, review, the push queue and
-    lands on the scratch project's bare remote, each tick in a fresh process; one line per step with
+    lands on the scratch project's bare remote, ticking one daemon process; one line per step with
     the spend so far. Nothing is registered and the scratch project is removed."""
     from ttp import loopcheck
     monkeypatch.setenv("TTP_FAKE_SHELL", LOOP_FAKE_SHELL)
@@ -5889,6 +5889,25 @@ def test_doctor_loop_stops_a_precheck_still_running_when_it_ends(env, monkeypatc
     assert not any(cli._checks_alive(i) for i in seen), "and was stopped"
     time.sleep(1)
     assert not list(pathlib.Path(os.environ["TTP_HOME"]).glob("loop-check-*")), "the scratch project stays removed"
+
+
+def test_doctor_loop_wakes_a_worker_that_hands_off_waiting_on_its_probe(env, monkeypatch, tmp_path):
+    """A real worker commits, then hands off `waiting` on its own detached checks. The daemon reads
+    that wait's background probe back on a later tick of the same process, so the loop's ticks share
+    one daemon process: fresh-process ticks lost every probe and the check ran into its time cap."""
+    from ttp import loopcheck
+    mark = tmp_path / "first-run-done"
+    monkeypatch.setenv("TTP_FAKE_SHELL", LOOP_FAKE_SHELL.replace(
+        'commit -qm "notes: $w"',
+        f'commit -qm "notes: $w" && touch {mark} && printf \'{{"status":"waiting","summary":"checks running",'
+        f'"retry_when":"true","retry_after_s":3600}}\' > "$TTP_RUN_DIR/result.json"').replace(
+        "else\n  w=", f"elif [ -e {mark} ]; then\n  echo '{{\"status\":\"done\",\"summary\":\"checks passed\"}}'"
+        f" > \"$TTP_RUN_DIR/result.json\"\nelse\n  w="))
+    monkeypatch.setenv("TTP_FAKE_COST", "0.01")
+    lines = []
+    r = loopcheck.run("fake", tick_s=0.05, cap_s=60, emit=lines.append)
+    assert r["outcome"] == "pass" and r["spend_usd"] == 0.03, (r, lines)
+    assert any("hand-off waiting" in l for l in lines) and any("hand-off done: checks passed" in l for l in lines), lines
 
 
 def test_doctor_loop_stops_at_its_spend_cap_and_reports_a_missing_cli_with_exit_0(env, monkeypatch, capsys):

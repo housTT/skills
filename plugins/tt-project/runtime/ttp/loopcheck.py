@@ -3,11 +3,11 @@
 """`ttp doctor --loop <provider>`: one tiny code task end to end on a real agent CLI. Opt-in, and it
 spends money (capped at CAP_USD), so the tests run it only with the fake provider.
 
-It makes a scratch project under the tt-project home (registered nowhere, no service installed, no
-daemon started; Jev, chat notices and schedules off) whose repository's only remote is a local bare
-repository: nothing reaches a real remote. It queues one light code task (add a line to NOTES.md and
-land it on the push branch) and runs daemon ticks, each in a fresh process, so only what the database
-and the disk keep carries over, as across a restart. The daemon dispatches the task, queues its review
+It makes a scratch project under the tt-project home (registered nowhere, no service installed; Jev,
+chat notices and schedules off) whose repository's only remote is a local bare repository: nothing
+reaches a real remote. It queues one light code task (add a line to NOTES.md and land it on the push
+branch) and ticks one daemon process of its own, as the service does: a waiting task's background
+probe is read back on a later tick of the same daemon. The daemon dispatches the task, queues its review
 itself (review.auto) and pushes the approved head through its push queue (no model). It stops once the
 line is on the bare remote's push branch and the review is closed, a step fails, the wall clock
 (CAP_S) runs out or the runs spent CAP_USD; then it stops any run still going and removes the project.
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -36,6 +37,7 @@ CAP_USD = 1.0             # all runs together; a run still going when it is pass
 TASK_USD = 0.5            # each task's budget (budget.task_default_usd for light)
 TICK_S = 5.0              # between ticks
 TICK_TIMEOUT_S = 180
+DONE = "ttp-loop-tick:"   # the tick process's answer line
 STOP_WAIT_S = 30          # for stopped runs to end before the project is removed
 STUBBED = ("maybe_coordinate", "run_schedules", "review_jev", "check_release", "poll_slack", "deliver_outbound",
            "read_upstream", "wake_upstream_fixes", "forward_upstream", "drain_note_outbox", "remind_logouts",
@@ -47,23 +49,62 @@ RUN_VARS = ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT
             "TTP_LOCKS_HELD", "TTP_DETACHED")
 
 
-def tick(base: str) -> None:
-    """One daemon tick in this process, with the STUBBED steps off."""
+def ticker(base: str) -> None:
+    """One daemon with the STUBBED steps off, ticking once per line read from stdin and answering with
+    a DONE line. One process, as in the service: a waiting task's background probe and an on_pass
+    check are read back on a later tick of the same daemon (fresh-process ticks lost them all)."""
     from .daemon import Daemon
     d = Daemon(base)
     for name in STUBBED:
         setattr(d, name, lambda *a, **k: None)
-    d.tick()
+    for _ in sys.stdin:
+        try:
+            d.tick()
+            print(f"{DONE} ok", flush=True)
+        except Exception as e:
+            print(f"{DONE} {type(e).__name__}: {e}".replace("\n", " ")[:400], flush=True)
 
 
-def _fresh_tick(base: Path) -> None:
-    code = ("import sys; sys.path.insert(0, sys.argv[1]); from ttp import loopcheck; "
-            "loopcheck.tick(sys.argv[2])")
-    env = {k: v for k, v in os.environ.items() if k not in RUN_VARS}
-    out = subprocess.run([sys.executable, "-c", code, str(Path(__file__).resolve().parent.parent), str(base)],
-                         capture_output=True, text=True, timeout=TICK_TIMEOUT_S, stdin=subprocess.DEVNULL, env=env)
-    if out.returncode:
-        raise RuntimeError(f"tick exited {out.returncode}: {(out.stderr or out.stdout).strip()[-400:]}")
+class Ticker:
+    """The check's one daemon process; tick() waits up to TICK_TIMEOUT_S for its answer."""
+
+    def __init__(self, base: Path):
+        code = "import sys; sys.path.insert(0, sys.argv[1]); from ttp import loopcheck; loopcheck.ticker(sys.argv[2])"
+        env = {k: v for k, v in os.environ.items() if k not in RUN_VARS}
+        self.proc = subprocess.Popen([sys.executable, "-c", code, str(Path(__file__).resolve().parent.parent),
+                                      str(base)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, env=env)
+        self.buf, self.tail = b"", []
+
+    def tick(self) -> None:
+        self.proc.stdin.write(b"tick\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + TICK_TIMEOUT_S
+        while True:
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                text = line.decode(errors="replace")
+                if text.startswith(DONE):
+                    if text[len(DONE):].strip() != "ok":
+                        raise RuntimeError(f"tick raised {text[len(DONE):].strip()}")
+                    return
+                self.tail = (self.tail + [text])[-10:]
+            left = deadline - time.time()
+            if left <= 0:
+                raise subprocess.TimeoutExpired("daemon tick", TICK_TIMEOUT_S)
+            if select.select([self.proc.stdout], [], [], left)[0]:
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+                if not chunk:
+                    raise RuntimeError(f"tick process exited {self.proc.wait()}: {' / '.join(self.tail)[-400:]}")
+                self.buf += chunk
+
+    def close(self) -> None:
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=STOP_WAIT_S)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+            self.proc.wait()
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
@@ -268,15 +309,16 @@ def run(provider: str, *, home: Path | None = None, cap_s: float = CAP_S, cap_us
     sweep(home)
     tmp = Path(tempfile.mkdtemp(prefix="loop-check-", dir=home))
     word = uuid.uuid4().hex[:8]
-    p = None
+    p = ticker = None
     try:
         p, remote, tid = setup(tmp, provider, word)
         w = Watch(p, remote, tid, word, emit)
         w.emit(f"    0s  queued   task #{tid}: add `loop check {word}` to NOTES.md, land it on {BRANCH}")
         outcome = None
+        ticker = Ticker(p.base)
         while outcome is None:
             try:
-                _fresh_tick(p.base)
+                ticker.tick()
             except (RuntimeError, subprocess.TimeoutExpired) as e:
                 outcome = f"tick failed: {str(e)[:300]}"
                 break
@@ -294,6 +336,8 @@ def run(provider: str, *, home: Path | None = None, cap_s: float = CAP_S, cap_us
              + ("the change landed after review" if outcome == "pass" else outcome)
              + f" · spent ${w.spent():.2f}")
     finally:
+        if ticker is not None:
+            ticker.close()
         if p is not None:
             stop_all(p)
         for _ in range(STOP_WAIT_S):   # a stopped run's runner may still write its last files
