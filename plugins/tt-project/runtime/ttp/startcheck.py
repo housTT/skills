@@ -197,9 +197,13 @@ def _check_base(p: Project, task: dict, now: float) -> list[str]:
                                       f"restore or clone it again, then requeue")
     else:
         return []   # never a git repository: tasks work in the root, as before
-    if os.environ.get(ALLOW_VOLATILE_ENV, "").strip() not in ("", "0"):
-        return []
     out = []
+    if (why := worktree.dangling_root(p)):
+        text = f"Task #{task['id']} cannot get a worktree: {why}."
+        _observe(p, f"dangling-root:{p.worktrees}", "high", text, task, now)
+        out.append(text)
+    if os.environ.get(ALLOW_VOLATILE_ENV, "").strip() not in ("", "0"):
+        return out
     for what, where in (("repository code worktrees are made from", root), ("worktrees folder", p.worktrees)):
         kind = volatile(where)
         if kind:

@@ -45770,3 +45770,18 @@ def test_project_name_is_optional_from_a_git_worktree_outside_the_project_folder
     monkeypatch.chdir(wt)
     cli.main(["task", "list"])
     assert f"#{tid}" in capsys.readouterr().out
+
+
+def test_startcheck_reports_a_dangling_worktrees_symlink(env, monkeypatch):
+    p = make(env)
+    from ttp import startcheck
+    monkeypatch.setenv(startcheck.ALLOW_VOLATILE_ENV, "1")
+    task = p.db.task(p.db.add_task("build", "s", kind="code", tier="light", origin="user"))
+    if p.worktrees.exists() or p.worktrees.is_symlink():
+        shutil.rmtree(p.worktrees) if not p.worktrees.is_symlink() else p.worktrees.unlink()
+    p.worktrees.symlink_to(p.root.parent / "gone-target")
+    found = startcheck.check(p, task)
+    assert len(found) == 1 and "symlink" in found[0] and "gone-target" in found[0]
+    startcheck.check(p, task)
+    obs = p.db.q("SELECT * FROM events WHERE kind='observation' AND fingerprint LIKE 'dangling-root:%'")
+    assert len(obs) == 1 and obs[0]["severity"] == "high"
