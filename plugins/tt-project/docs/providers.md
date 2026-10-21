@@ -9,6 +9,12 @@ the daemon does, resumes its session, and runs one read-only coordinator turn wi
 coordinator's structured-output schema. It costs a few tens of cents per provider. Each check is
 pass, fail, or unsupported (the adapter does not use that feature; the note says why).
 
+`ttp doctor --loop <provider> [--json]` runs the whole path once: one light code task (add a line
+to `NOTES.md`) in a scratch project whose only remote is a local bare repository, with daemon ticks
+in fresh processes until the task is dispatched, handed off, reviewed and pushed to that remote by
+the push queue. It prints one line per step with the spend so far and stops at $1 or 15 minutes.
+The coordinator does not run. A missing or logged-out CLI is reported with exit 0.
+
 Measured on 2026-10-09:
 
 | Check | Claude Code 2.1.285 | Codex CLI 0.160.0 | Cursor agent |
