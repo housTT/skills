@@ -31,7 +31,7 @@ Features:
 - Supports: Claude Code, Cursor and Codex.
 - Manage many projects at the same time from many chats.
 - It's a meta-harness that generates a custom harness for each of your projects.
-- Very flexible, so it can manage software- legal- or finance projects.
+- Very flexible, so it can manage software-, legal-, or finance projects.
 - Safe(ish?). It doesn't merge PRs or talk to humans in your name. It leaves sensitive operations to you, unless you tell it otherwise. 
 - Your brief and subsequent messages specify how it behaves; if you don't like how it behaves, you tell it to behave better.
 - Each project has its own memory and remembers your preferences and lessons learned.
