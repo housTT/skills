@@ -6851,10 +6851,33 @@ def test_remote_listen_exit_of_its_own_is_passed_through_not_retried(env, monkey
     assert "unknown chat c9" in err and "retrying" not in err and len(calls) == 1
 
 
+# A sitecustomize for a ttp that runs on "another machine": its sandbox.inside() answers False.
+_OUTSIDE_SANDBOX = """
+import importlib.abc, importlib.util, sys
+class _Hook(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name != "ttp.sandbox":
+            return None
+        sys.meta_path.remove(self)
+        spec = importlib.util.find_spec(name)
+        run = spec.loader.exec_module
+        def exec_module(module):
+            run(module)
+            module.inside = lambda: False
+        spec.loader.exec_module = exec_module
+        return spec
+sys.meta_path.insert(0, _Hook())
+"""
+
+
 def _flaky_ssh(monkeypatch, cwd, codes, calls):
     """ssh HOST CMD: 255 = unreachable (nothing runs); "drop" = CMD runs, then the connection drops
-    before its answer arrives (255); anything else, or no codes left = CMD runs here in `cwd`."""
+    before its answer arrives (255); anything else, or no codes left = CMD runs here in `cwd`, which
+    is another machine: outside the `ttp sandbox` the suite may run in, where `ttp say` is refused."""
     real = subprocess.run
+    site = cwd.parent / "far-site"
+    site.mkdir(exist_ok=True)
+    (site / "sitecustomize.py").write_text(_OUTSIDE_SANDBOX)
 
     def run(args, **kw):
         if args[0] != "ssh":
@@ -6864,7 +6887,9 @@ def _flaky_ssh(monkeypatch, cwd, codes, calls):
         if code == 255:
             return subprocess.CompletedProcess(args, 255, "" if kw.get("stdout") else None,
                                                "ssh: connect to host far port 22: Network is unreachable")
-        r = real(["bash", "-c", args[-1]], cwd=cwd, **kw)
+        env = dict(kw.pop("env", None) or os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(site), env.get("PYTHONPATH")]))
+        r = real(["bash", "-c", args[-1]], cwd=cwd, env=env, **kw)
         return subprocess.CompletedProcess(args, 255 if code == "drop" else r.returncode, r.stdout, r.stderr)
     monkeypatch.setattr(subprocess, "run", run)
 
