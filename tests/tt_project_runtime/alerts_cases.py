@@ -3872,7 +3872,7 @@ def test_macos_falls_back_to_osascript_and_names_the_setting_when_the_app_cannot
     (16 | 0x2000000, "alert style: persistent (stays until closed)", False),
     (8, "alert style: banners;", True),
     (0, "alert style: none;", True),
-    (None, "The tt-project app is not in System Settings > Notifications yet, so alerts come from osascript", False),
+    (None, "The tt-project app is not in System Settings > Notifications yet, so alerts come from osascript", True),
 ])
 def test_ttp_notifier_test_reads_the_macos_alert_style_and_hints_only_when_alerts_go_away(
         monkeypatch, tmp_path, capsys, flags, says, hint):
@@ -3926,15 +3926,18 @@ def test_setup_builds_the_macos_app_and_sends_its_first_test_even_on_a_tested_co
     monkeypatch.setattr(notifier, "_service_on", lambda: True)
     out = notifier.refresh(send_test=True)   # current macOS: no ncprefs file, `defaults` gives nothing either
     assert out[0].startswith("desktop notifier: notifier app ") and len(calls("open")) == 1, out
-    assert any("alerts come from the tt-project app from now on" in ln for ln in out), out
-    assert any("test notification sent (tt-project)" in ln for ln in out) and not calls("osascript"), \
-        "the test is the app's first post (the Allow prompt), and the only notification setup sends"
-    assert any(ln.startswith("alert style: macOS does not say here") and "> tt-project > alert style Persistent" in ln
-               for ln in out), "the one line naming what only the user can set"
+    assert any("the tt-project app posted its first notification" in ln for ln in out), "the Allow prompt"
+    assert any("test notification sent (osascript)" in ln for ln in out) and len(calls("osascript")) == 1, \
+        "unreadable settings never prove the app registered: the test keeps the sender"
+    step = [ln for ln in out if "System Settings > Notifications > tt-project > Allow notifications on, alert style "
+            "Persistent" in ln]
+    assert len(step) == 1 and step[0].startswith("alerts still come from Script Editor") and \
+        "macOS lets no program set another app's alert style" in step[0], "the one line naming what only the user can set"
     out = notifier.refresh(send_test=True)
     assert len(calls("open")) == 1 and len(calls("osacompile")) == 1 and "already went out" in out[-1], \
         "a rerun builds and sends nothing more"
-    assert notifier.show("t", "b")["backend"] == "tt-project" and not calls("osascript"), "alerts now use the app"
+    assert not [ln for ln in out if "alerts still come from" in ln], "the line prints once per setup run"
+    assert notifier.show("t", "b")["backend"] == "osascript" and len(calls("open")) == 1, "alerts keep the sender"
 
 
 def test_macos_notification_settings_are_read_through_defaults_when_the_plist_file_is_gone(monkeypatch, tmp_path):
@@ -3957,3 +3960,30 @@ def test_macos_notification_settings_are_read_through_defaults_when_the_plist_fi
     assert notifier.register_app()[0].startswith("the tt-project app posted its first notification")
     assert len(calls("open")) == 3 and notifier.show("t", "b")["backend"] == "osascript", \
         "readable settings that do not list the app keep the sender, even after its first post"
+    prefs.write_bytes(plistlib.dumps({}))   # an export with no apps key at all
+    assert notifier.alert_style() == "not registered" and notifier.show("t", "b")["backend"] == "osascript"
+    assert notifier.register_app()[0].startswith("the tt-project app posted its first notification")
+    assert len(calls("open")) == 4 and notifier.show("t", "b")["backend"] == "osascript", "never switches senders"
+
+
+@pytest.mark.parametrize("answer", ["fails", "times out", "empty"])
+def test_a_failed_timed_out_or_empty_defaults_export_never_switches_senders(monkeypatch, tmp_path, answer):
+    import subprocess
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)
+    assert notifier.ensure_app()[0]
+    stub = tmp_path / "bin" / "defaults"
+    stub.write_text(f"#!{sys.executable}\nimport sys\nsys.exit({1 if answer == 'fails' else 0})\n")
+    stub.chmod(0o755)
+    run = subprocess.run
+
+    def fake_run(args, *a, **kw):
+        if answer == "times out" and args[0] == "defaults":
+            raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+        return run(args, *a, **kw)
+    monkeypatch.setattr(notifier.subprocess, "run", fake_run)
+    for _ in range(2):   # before and after the app's first post
+        assert notifier.alert_style() == "unknown" and not notifier.app_registered()
+        assert notifier.show("t", "b")["backend"] == "osascript", answer
+        notifier.register_app()
+    assert len(calls("open")) == 2 and len(calls("osascript")) == 2 and "app_posted" not in notifier.delivery()

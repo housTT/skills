@@ -1097,11 +1097,14 @@ install it, to a desktop notifier on your workstation that covers all your proje
 - Desktop: alerts play a sound and are meant to stay until you close them. Linux: critical urgency with
   no expiry. macOS: `ttp setup`, `ttp upgrade` and `ttp notifier install` build a small `tt-project`
   app in `~/Applications` (no root) that asks for the Persistent style; alerts come from it once macOS
-  lists it under System Settings > Notifications (click Allow on its first notification), or, where
-  macOS's notification settings cannot be read, from setup's test notification on, and until then from
-  terminal-notifier or osascript as before. Whether the app keeps the Persistent style
-  without a change in System Settings is not yet checked on a Mac; `ttp notifier test` shows the
-  style macOS reports and the one setting to change if alerts still go away. `"app": false` in
+  lists it under System Settings > Notifications (click Allow on its first notification), and until
+  then, or while macOS's notification settings cannot be read, from terminal-notifier or osascript as
+  before. macOS lets no program set another app's alert style, so setup and `ttp notifier test` print
+  one line while the app is not listed: allow the tt-project app in System Settings > Notifications
+  and set its style to Persistent. Whether the app keeps the Persistent style without that change is
+  not yet checked on a Mac. tt-project reads the settings with `defaults export com.apple.ncprefs -`
+  where the plist file is gone; what that prints for a domain that does not exist is unverified, and
+  an empty answer reads as not listed. `"app": false` in
   `~/.tt-project/notifier.json` turns the app off.
 
 Workers can read Slack links you paste, using your Slack connector if you have one.

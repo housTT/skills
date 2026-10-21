@@ -6,7 +6,7 @@ One small agent per workstation watches every project in this machine's registry
 reading their database, remote ones with one ssh call per minute — and shows each new alert at
 or above the severity floor as a native notification with a sound, meant to stay until closed (macOS
 Notification Center through the tt-project app, which asks for the persistent style, once macOS lists it
-(or, where its settings cannot be read, once its first one went out: ensure_app, app_registered; notifier.json `app: false` skips it), else terminal-notifier or osascript; or
+(ensure_app, app_registered; notifier.json `app: false` skips it), else terminal-notifier or osascript; or
 notify-send, critical with no expiry, on a Linux desktop; notifier.json `persistent: false` lets them go). It never marks anything read; chats
 and the web app keep their own cursors. Every delivery is recorded (DELIVERY): a failure goes to the
 notifier log and raises one alert in this machine's projects until a later delivery succeeds
@@ -417,10 +417,9 @@ def alert_style() -> str:
 
 
 def app_registered() -> bool:
-    """Alerts go through the app (_command) once macOS lists it in its Notifications settings, or, where
-    those settings cannot be read, once its first notification went out (register_app)."""
-    style = alert_style()
-    return style in STYLES.values() or style == "unknown" and bool(delivery().get("app_posted"))
+    """macOS lists the app in its Notifications settings: only then do alerts go through it (_command).
+    A failed, timed-out, empty or unreadable read keeps the sender."""
+    return alert_style() in STYLES.values()
 
 
 def _app_args(app: Path, title: str, body: str) -> list[str]:
@@ -435,21 +434,10 @@ def app_pending() -> bool:
 
 def register_app() -> list[str]:
     """macOS: while the app is built but not yet listed in Notifications, post one notification through
-    it, so macOS lists it and asks once to allow it. Alerts keep their sender until it is listed; where
-    macOS's settings cannot be read, it is marked posted instead and the next alert (the test) goes
-    through it."""
+    it, so macOS lists it and asks once to allow it. Alerts keep their sender until it is listed."""
     app = app_ready() if sys.platform == "darwin" and app_wanted() and shutil.which("open") else None
     if not app or app_registered():
         return []
-    if alert_style() == "unknown":   # settings unreadable (current macOS): the test that follows is its first post
-        d = delivery()
-        d["app_posted"] = time.time()
-        try:
-            write_json(DELIVERY, d)
-        except OSError as e:
-            log(f"could not record the app's first notification: {e}")
-            return []
-        return [f"alerts come from the {APP_NAME} app from now on: allow its notifications if macOS asks"]
     try:
         r = subprocess.run(_app_args(app, APP_NAME, "tt-project alerts come from this app once you allow it."),
                            capture_output=True, text=True, errors="replace", timeout=TIMEOUT_S)
@@ -467,6 +455,10 @@ def style_lines(backend: str) -> list[str]:
         return []
     if backend != APP_NAME:
         entry = "Script Editor" if backend == "osascript" else backend
+        if app_pending():   # built, but macOS's settings do not show it listed (or cannot be read)
+            return [f"alerts still come from {entry} and may go away by themselves; to keep them on screen: "
+                    f"System Settings > Notifications > {APP_NAME} > Allow notifications on, alert style Persistent "
+                    "(older macOS: Alerts). macOS lets no program set another app's alert style"]
         return [f"alerts come from {entry} and may go away by themselves: System Settings > Notifications > "
                 f"{entry} > alert style Persistent (older macOS: Alerts)"]
     style = alert_style()
@@ -475,17 +467,13 @@ def style_lines(backend: str) -> list[str]:
     if style in ("banners", "none"):
         return [f"alert style: {style}; to keep alerts until closed: System Settings > Notifications > "
                 f"{APP_NAME} > Allow notifications on, alert style Persistent (older macOS: Alerts)"]
-    if style == "unknown":
-        return [f"alert style: macOS does not say here (the app asks for Persistent); if its alerts go away by "
-                f"themselves: System Settings > Notifications > {APP_NAME} > alert style Persistent (older macOS: Alerts)"]
     return [f"alert style: {style} (the app asks macOS for persistent alerts)"]
 
 
 def _command(title: str, body: str, url: str | None, severity: str = "high") -> tuple[str, list[str] | None, str]:
     """(the backend, its argv or None, why there is none) for this machine. Every one plays a sound."""
     if sys.platform == "darwin":
-        # the app only once macOS lists it, or its first post went out where that cannot be read
-        # (app_registered): until then, or opted out, the sender stays
+        # the app only once macOS lists it (app_registered): until then, or opted out, the sender stays
         app = app_ready() if shutil.which("open") and app_wanted() else None
         if app and app_registered():
             return APP_NAME, _app_args(app, title, body), ""
