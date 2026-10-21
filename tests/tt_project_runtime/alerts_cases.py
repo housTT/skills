@@ -3751,6 +3751,8 @@ def _mac_app_stubs(monkeypatch, tmp_path, tools=("osacompile", "codesign", "open
     from ttp import notifier
     _notifier_stubs(monkeypatch, tmp_path, [])
     monkeypatch.setattr(notifier.sys, "platform", "darwin")
+    monkeypatch.setattr(notifier, "LOG_SETTLE_S", 0.3)   # the usernoted poll after a first post
+    monkeypatch.setattr(notifier, "LOG_POLL_S", 0.05)
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
     monkeypatch.setattr(notifier, "CONF", tmp_path / "notifier.json")
     monkeypatch.setattr(notifier, "CLICK_URL", tmp_path / "notifier-click-url")
@@ -3990,16 +3992,22 @@ def test_a_failed_timed_out_or_empty_defaults_export_never_switches_senders(monk
     assert len(calls("open")) == 2 and len(calls("osascript")) == 2 and not notifier.delivery().get("app_allowed")
 
 
-def _usernoted_log(tmp_path, text=None, rc=0):
-    """A stub `log` that prints `text` (usernoted's lines) and logs its argv to log.calls; None: no `log`."""
+def _usernoted_log(tmp_path, text=None, rc=0, after=0):
+    """A stub `log` that prints `text` (usernoted's lines) from its read number `after` + 1 on (nothing before:
+    the record is not there yet) and logs its argv to log.calls; None: no `log`."""
     stub = tmp_path / "bin" / "log"
     if text is None:
         stub.unlink(missing_ok=True)
         return
+    calls = str(tmp_path / 'log.calls')
     stub.write_text(f"#!{sys.executable}\nimport json, sys\n"
-                    f"open({str(tmp_path / 'log.calls')!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                    f"sys.stdout.write({text!r})\nsys.exit({rc})\n")
+                    f"open({calls!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                    f"if len(open({calls!r}).read().splitlines()) > {after}:\n    sys.stdout.write({text!r})\n"
+                    f"sys.exit({rc})\n")
     stub.chmod(0o755)
+
+
+_TS = "2026-01-01 09:00:00.123 Df usernoted[512:1a2b] [com.apple.unc:application]"   # `log show --style compact`
 
 
 @pytest.mark.parametrize("text,rc,switches", [
@@ -4008,6 +4016,23 @@ def _usernoted_log(tmp_path, text=None, rc=0):
     ('usernoted: Delivering <NotificationRecord app:"com.tt-project.notifier">\n'
      'usernoted: com.tt-project.notifier: authorization denied\n', 0, False),
     ("", 0, False),   # nothing in the log
+    # real compact records, one spanning lines: the bundle is on a continuation line
+    (f'Timestamp               Ty Process[PID:TID]\n{_TS} Delivering <NotificationRecord app:"com.tt-project.notifier" '
+     'ident:"1" req:"A1" uuid:"B2" priority:2(high) interrupt:1 actions:0>\n', 0, True),
+    (f'Timestamp               Ty Process[PID:TID]\n{_TS} Presenting <NotificationRecord\n'
+     '    app:"com.tt-project.notifier" ident:"1" req:"A1" uuid:"B2"\n    priority:2(high) interrupt:1 actions:0>\n', 0, True),
+    # held back or off: never allowed, whatever else the log says
+    (f'{_TS} Not presenting <NotificationRecord app:"com.tt-project.notifier" ident:"1">: muted by display state\n',
+     0, False),
+    (f'{_TS} Not presenting <NotificationRecord app:"com.tt-project.notifier" ident:"1">: suppressed by Focus\n',
+     0, False),
+    (f'{_TS} Not delivering <NotificationRecord app:"com.tt-project.notifier" ident:"1">: notifications disabled\n',
+     0, False),
+    (f'{_TS} Not delivering <NotificationRecord\n    app:"com.tt-project.notifier" ident:"1">: notifications disabled\n',
+     0, False),
+    (f'{_TS} Delivering <NotificationRecord app:"com.tt-project.notifier" ident:"1">\n'
+     f'{_TS} Not presenting <NotificationRecord app:"com.tt-project.notifier" ident:"1">: suppressed by Focus\n', 0, False),
+    (f'{_TS} Withdrawing <NotificationRecord app:"com.tt-project.notifier" ident:"1">\n', 0, False),   # unknown
     ('usernoted: Delivering <NotificationRecord app:"com.tt-project.notifier">\n', 1, False),   # log show fails
     (None, 0, False),   # no `log` at all
 ])
@@ -4033,6 +4058,41 @@ def test_where_macos_settings_list_no_apps_usernoted_log_decides_the_app_is_allo
     notifier.show("t", "b")
     m = len((tmp_path / "log.calls").read_text().splitlines()) if text is not None else 0
     assert m == n, "an alert re-reads the log at most every LOG_CHECK_S, and never once it showed the app allowed"
+
+
+@pytest.mark.parametrize("text,switches", [
+    (f'{_TS} Delivering <NotificationRecord app:"com.tt-project.notifier" ident:"1">\n', True),
+    ("", False),
+])
+def test_setup_polls_usernoted_log_after_the_first_post_and_never_backs_off_on_an_early_read(monkeypatch, tmp_path,
+                                                                                            text, switches):
+    from ttp import notifier
+    _mac_app_stubs(monkeypatch, tmp_path)
+    monkeypatch.setattr(notifier, "LOG_SETTLE_S", 1.5)
+    _usernoted_log(tmp_path, text, after=2)   # the record shows only from the third read on (usernoted is slower)
+    t0 = time.time()
+    ok, lines = notifier.test()
+    reads = len((tmp_path / "log.calls").read_text().splitlines())
+    assert ok and "test notification sent (osascript); macOS does not say whether it was shown" in lines, lines
+    assert ("macOS shows the tt-project app allowed: alerts come from it from now on" in lines) == switches
+    d = notifier.delivery()
+    assert reads >= 3 and bool(d.get("app_allowed")) == switches
+    assert notifier.show("t", "b")["backend"] == ("tt-project" if switches else "osascript")
+    if switches:
+        assert time.time() - t0 < notifier.LOG_SETTLE_S, "a decisive record ends the poll early"
+    else:
+        assert d["app_log_checked"] >= d["app_posted"] + notifier.LOG_SETTLE_S, "only a read after the window backs off"
+
+
+def test_an_alert_read_of_usernoted_log_before_the_window_ends_sets_no_back_off(monkeypatch, tmp_path):
+    from ttp import notifier
+    _mac_app_stubs(monkeypatch, tmp_path)
+    monkeypatch.setattr(notifier, "LOG_SETTLE_S", 3600)
+    notifier.ensure_app()
+    _usernoted_log(tmp_path, f'{_TS} Delivering <NotificationRecord app:"com.tt-project.notifier" ident:"1">\n', after=1)
+    notifier.register_app()
+    assert notifier.show("t", "b")["backend"] == "osascript" and not notifier.delivery().get("app_log_checked")
+    assert notifier.show("t", "b")["backend"] == "tt-project", "the next alert reads again, no LOG_CHECK_S back-off"
 
 
 def test_the_app_allowance_in_the_log_is_looked_for_only_after_its_post_and_listed_apps_decide_first(

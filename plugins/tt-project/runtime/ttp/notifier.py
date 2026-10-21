@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -56,10 +57,14 @@ CLICK_URL = HOME_DIR / "notifier-click-url"   # the app opens it when an alert i
 STYLES = {0: "none", 8: "banners", 16: "persistent"}   # com.apple.ncprefs flags & 0x38, read only
 LOG_TIMEOUT_S = 20   # one read of macOS's unified log (usernoted)
 LOG_CHECK_S = 60   # while the app's allowance is unknown: how often an alert re-reads the log
+LOG_SETTLE_S = 15   # after the app's first post: how long usernoted may take to log it (setup polls, no back-off)
+LOG_POLL_S = 1   # how often setup re-reads the log in that window
 LOG_WINDOW_S = 24 * 3600   # how long after the app's first post its log entries are looked for
 SENDER_IDS = {APP_NAME: BUNDLE_ID, "osascript": "com.apple.ScriptEditor2",
               "terminal-notifier": "fr.julienxx.oss.terminal-notifier"}   # whose usernoted lines a test reads
 DENIED = ("denied", "not authorized", "unauthorized", "disallowed", "not allowed")
+SHOWN = re.compile(r"(?<![\w-])(not\s+)?(delivering|presenting)\b", re.I)   # usernoted: a record shown, or not
+LOG_RECORD = re.compile(r"\d{4}-\d\d-\d\d[ T]\d")   # `log show --style compact`: a line starting a record
 
 
 def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
@@ -445,22 +450,32 @@ def _usernoted(bundle: str, since: float) -> list[str] | None:
                            capture_output=True, text=True, errors="replace", timeout=LOG_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return [ln for ln in r.stdout.splitlines() if bundle in ln] if r.returncode == 0 else None
+    if r.returncode != 0:
+        return None
+    recs: list[str] = []   # one per log record: a message spanning lines joins its first line
+    for ln in r.stdout.splitlines():
+        if recs and not LOG_RECORD.match(ln) and LOG_RECORD.match(recs[-1]):
+            recs[-1] += " " + ln.strip()
+        else:
+            recs.append(ln)
+    return [rec for rec in recs if bundle in rec]
 
 
 def _log_verdict(lines: list[str]) -> str:
-    """'denied' (any denial), 'allowed' (a record delivered or presented) or 'none'."""
-    low = [ln.lower() for ln in lines]
-    if any(w in ln for ln in low for w in DENIED):
+    """'denied' (a denial, or a record not delivered or not presented: Focus, display state, turned off),
+    'allowed' (only a record that was delivered or presented, not negated) or 'none' (nothing decisive)."""
+    said = [m for ln in lines for m in SHOWN.finditer(ln)]
+    if any(w in ln.lower() for ln in lines for w in DENIED) or any(m.group(1) for m in said):
         return "denied"
-    return "allowed" if any("delivering" in ln or "presenting" in ln for ln in low) else "none"
+    return "allowed" if said else "none"
 
 
 def app_allowed(force: bool = False) -> bool:
     """Where macOS's settings list no apps: whether usernoted's log shows the app's notification delivered
-    or presented, with no denial, since its first post (register_app). Remembered once seen; until then
-    re-read at most every LOG_CHECK_S (`force`: now), only for LOG_WINDOW_S after that post. An unreadable
-    log, a denial or nothing: False, the sender stays."""
+    or presented, with no denial or negated record, since its first post (register_app). Remembered once
+    seen; until then re-read at most every LOG_CHECK_S (`force`: now, polling every LOG_POLL_S until a
+    decisive record or LOG_SETTLE_S after the post), only for LOG_WINDOW_S after that post. A read before
+    LOG_SETTLE_S sets no back-off. An unreadable log, a denial or nothing: False, the sender stays."""
     d, now = delivery(), time.time()
     if d.get("app_allowed"):
         return True
@@ -468,9 +483,17 @@ def app_allowed(force: bool = False) -> bool:
     if not isinstance(posted, (int, float)) or now - posted > LOG_WINDOW_S or \
             not force and now - float(d.get("app_log_checked") or 0) < LOG_CHECK_S:
         return False
-    lines = _usernoted(BUNDLE_ID, posted - 5)
-    verdict = "unreadable" if lines is None else _log_verdict(lines)
-    d = dict(delivery(), app_log_checked=now, app_log=verdict)
+    while True:
+        lines = _usernoted(BUNDLE_ID, posted - 5)
+        verdict = "unreadable" if lines is None else _log_verdict(lines)
+        early = now < posted + LOG_SETTLE_S   # usernoted may not have logged the post yet
+        if not force or not early or verdict in ("allowed", "denied"):
+            break
+        time.sleep(max(0.0, min(LOG_POLL_S, posted + LOG_SETTLE_S - time.time())))
+        now = time.time()
+    d = dict(delivery(), app_log=verdict)
+    if not early or verdict in ("allowed", "denied"):
+        d["app_log_checked"] = now
     if verdict == "allowed":
         d["app_allowed"] = now
     try:
