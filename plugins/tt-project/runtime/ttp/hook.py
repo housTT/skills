@@ -24,6 +24,9 @@ what runs: heredocs and echo/printf/cat text written to files that the command d
 argument, piped into a shell, through eval or after a move), and files that are only named, read
 or edited, are data.
 
+In a code task's run that may not push to the push branch (gitguard.py) it denies `git push` with
+git called by a path, which skips the run's bin/git.
+
 It also denies a Bash call that runs one of the project's configured pytest checks
 (`delivery.push_checks`) in full, and points at `ttp checks`, which reuses a pass recorded for the
 same tree (full_suite). Focused runs pass, and so does `TTP_ALLOW_FULL_SUITE=1`; each refusal is
@@ -362,6 +365,21 @@ def draft_bypass(text: str, path_changed: bool = False) -> str | None:
     return None
 
 
+def git_push_bypass(segments: list[list[str]]) -> str | None:
+    """Why a Bash call that pushes with git called by a path (around the run's bin/git, gitguard.py)
+    is refused while this run may not push to the push branch, else None."""
+    from . import gitguard
+    if not any(os.path.basename(s[0]) == "git" and "/" in s[0] and gitguard.split(s[1:])[1] == "push"
+               for s in segments):
+        return None
+    try:
+        branch, why = gitguard.guarded_branch(dict(os.environ))
+    except Exception:
+        return None
+    return (f"{why}. git called by its path skips the run's push guard: push with plain `git` from PATH"
+            if branch else None)
+
+
 def _segments(cmd: str) -> list[list[str]]:
     """The simple commands in `cmd`, each without its leading variable assignments and wrappers
     (env, nohup, timeout 60, `ttp lock res --` ...): what actually runs first in each."""
@@ -492,6 +510,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         # Whoever holds it acts as the user in the web app; the Read deny rule covers the file tools.
         why = ("the web token is the user's credential and a run must not read it; any command naming its "
                "path is refused, so write a commit message with `git commit -F <file>` or call it 'the web token file'")
+    if not why:
+        why = git_push_bypass(segments)
     if not why:
         path_changed = bool(PATH_CHANGE_RE.search(scan))
         for f in _scripts(segments, str(payload.get("cwd") or os.getcwd())):

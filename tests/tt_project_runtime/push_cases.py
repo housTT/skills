@@ -1265,6 +1265,7 @@ def test_a_detached_push_starts_promptly_when_the_base_detection_fetch_times_out
 def test_push_refuses_a_worktree_on_another_tasks_branch_at_once(env, monkeypatch, capsys):
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
     _git_out(repo, "checkout", "-q", "-b", "ttp/t149-fix")
     _commit(repo, "mine.txt", "mine\n")
     _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/ttp/t149-fix")   # published with --own
@@ -1292,6 +1293,7 @@ def test_push_from_a_tasks_own_branch_lands_only_when_its_spec_asks_or_land_says
     # branch, `ttp push --detach` targeted the push branch. It is refused at once, naming --own and --land.
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
     shared = _git_out(origin, "rev-parse", "proj")
     own_only = p.db.add_task("fix", kind="code", spec="Fix it. Push only your own ttp/* branch; never open PRs.")
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{own_only}-fix")
@@ -1364,6 +1366,7 @@ def test_a_code_workers_plain_push_lands_only_tested_work_unless_land_overrides_
     # land now needs `ttp checks` passed on HEAD; `--land` overrides it, explicitly and logged.
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
     shared = _git_out(origin, "rev-parse", "proj")
     tid = p.db.add_task("fix", kind="code", spec="Fix it, then land it with `ttp push`.")
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{tid}-fix")
@@ -5620,6 +5623,7 @@ def test_a_plain_push_refuses_a_head_whose_task_has_another_pr_branch_and_own_pu
     review publishes onto that pr_branch. A pr_branch that is the push branch pushes as before."""
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
     _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
 
     def task(labels, kind="code", **more):
@@ -9491,3 +9495,70 @@ def test_a_push_batch_with_changeset_file_adds_to_the_release_changeset(env, mon
     assert rc == 0 and _statuses(m) == ["pushed"] * 2, m
     text = _git_out(origin, "show", f"proj:{rel}")
     assert sets() == [rel] and "e4:" not in text and text.endswith("\n- written by hand\n- e5: edit plugins/p/f5.txt")
+
+
+def test_a_code_tasks_run_never_pushes_to_the_push_branch_while_code_tasks_may_push_is_off(env, monkeypatch, capsys):
+    # Replays `ttp doctor --loop claude`: with delivery.code_tasks_may_push off (push queue and review on),
+    # a light code worker whose spec said "land it on the push branch" pushed its commit there itself
+    # within seconds, before any review. Neither `ttp push` (even with --land) nor a raw `git push`
+    # through the run's git wrapper may land it; its own branch still publishes, and the repository's
+    # own pre-push hook still runs.
+    from ttp import push
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    tid = p.db.add_task("notes", kind="code",
+                        spec="Add a line to NOTES.md, commit it and land it on the push branch proj through the review.")
+    own = f"ttp/t{tid}-notes"
+    _git_out(repo, "checkout", "-q", "-b", own)
+    _commit(repo, "NOTES.md", "loop check\n")
+    _record_checks_pass(p, tid, repo)
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    for args in (["push"], ["push", "--detach"], ["push", "--land"], ["push", "--land", "--detach"]):
+        assert _ttp(*args) == 2, args
+        assert "delivery.code_tasks_may_push is off" in capsys.readouterr().err, args
+        monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push sets it in os.environ
+    assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
+    # A raw `git push` in the run goes through the harness's bin/git, first on the run's PATH.
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+    hooks = repo / _git_out(repo, "rev-parse", "--git-path", "hooks")
+    hooks.mkdir(parents=True, exist_ok=True)
+    (hooks / "pre-push").write_text(f"#!/bin/sh\ncat >/dev/null\necho \"$1\" >> {env['tmp'] / 'own-hook'}\n")
+    (hooks / "pre-push").chmod(0o755)
+    run_env = {**os.environ, "TTP_PYTHON": sys.executable}
+
+    def git_push(*args):
+        return subprocess.run([str(wrapper), "push", *args], cwd=repo, env=run_env, capture_output=True,
+                              text=True, timeout=60)
+
+    for args in (["origin", "HEAD:proj"], ["-q", "origin", "HEAD:refs/heads/proj"], ["--no-verify", "origin", "HEAD:proj"],
+                 ["origin", f"+{own}:proj"], ["origin", ":proj"], ["-u", "origin", f"{own}:proj", own]):
+        out = git_push(*args)
+        assert out.returncode != 0 and "delivery.code_tasks_may_push is off" in out.stderr, (args, out.stderr)
+    assert _git_out(origin, "rev-parse", "proj") == shared
+    assert not (env["tmp"] / "own-hook").exists() or "--no-verify" not in (env["tmp"] / "own-hook").read_text()
+    # Claude Code's PreToolUse hook denies git called by its path to push (it skips bin/git).
+    from ttp import hook
+    deny = lambda c: (hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": c}})[0] or {}).get(
+        "hookSpecificOutput", {}).get("permissionDecision")
+    assert deny("/usr/bin/git push origin HEAD:proj") == "deny"
+    assert deny("cd x && env /usr/bin/git -C . push") == "deny"
+    assert deny("git push origin HEAD:proj") is None and deny("/usr/bin/git log --oneline") is None
+    out = git_push("origin", own)
+    assert out.returncode == 0, out.stderr
+    assert _git_out(origin, "rev-parse", own) == _git_out(repo, "rev-parse", "HEAD")
+    assert "origin" in (env["tmp"] / "own-hook").read_text()   # the repository's own pre-push hook ran
+    # A review, or code_tasks_may_push on, lands as before.
+    review = p.db.add_task("review", kind="review")
+    monkeypatch.setenv("TTP_TASK", str(review))
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    run_env["TTP_TASK"] = str(tid)
+    p.set_config("delivery.code_tasks_may_push", True)
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    assert deny("/usr/bin/git push origin HEAD:proj") is None
+    out = git_push("origin", "HEAD:proj")
+    assert out.returncode == 0, out.stderr
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")

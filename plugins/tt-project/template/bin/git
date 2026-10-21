@@ -1,0 +1,35 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# git for tt-project runs: the real git further down PATH. Inside a run (TTP_TASK set), a call naming
+# `push` goes through ttp/gitguard.py first, which keeps a code task off the push branch while
+# delivery.code_tasks_may_push is off. Every other call execs the real git at once.
+set -f
+real=
+ifs=$IFS
+IFS=:
+for d in $PATH; do
+    if [ -n "$d" ] && [ -x "$d/git" ] && ! [ "$d/git" -ef "$0" ]; then
+        real=$d/git
+        break
+    fi
+done
+IFS=$ifs
+if [ -z "$real" ]; then
+    echo "git: not found on PATH" >&2
+    exit 127
+fi
+if [ -n "${TTP_TASK:-}" ]; then
+    case " $* " in
+    *" push "*)
+        [ -x "${TTP_PYTHON:-}" ] || TTP_PYTHON=python3
+        rt=${0%/*}/../runtime                                # a harness's bin/
+        [ -d "$rt/ttp" ] || rt=${0%/*}/../../runtime         # the plugin's template/bin/
+        # The guard never stops git by failing to load: the real git runs then.
+        "$TTP_PYTHON" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import ttp.gitguard' "$rt" 2>/dev/null &&
+            exec "$TTP_PYTHON" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from ttp.gitguard import main; sys.exit(main(sys.argv[2:]))' \
+                "$rt" "$real" "$@"
+        ;;
+    esac
+fi
+exec "$real" "$@"

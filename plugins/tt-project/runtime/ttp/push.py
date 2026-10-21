@@ -37,8 +37,8 @@ from . import (checkcap, checkdirs, envfault, landed, locks, machines, prguard, 
                timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
-from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_creates_pr_branch,
-                      own_push, push_queue_on, renice, write_json)
+from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, nice_level,
+                      own_creates_pr_branch, own_push, push_queue_on, renice, write_json)
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -1908,7 +1908,8 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
     on a branch outside the flow work lands by (foreign_base) is never rebased onto the push target:
     once on the remote as a fast-forward it is pushed there as with --own, else it is refused. Inside a
     run, the task's own ttp/t<id>-... branch lands on the push branch only when its spec asks it to
-    land (_told_to_land) or `--land` (LAND_ENV) says so; else it is refused, naming `--own`."""
+    land (_told_to_land) or `--land` (LAND_ENV) says so; else it is refused, naming `--own`. A code
+    task's run never lands on the push branch while delivery.code_tasks_may_push is off (code_run_landing)."""
     if own:
         return (*own_target(p, repo), True)
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
@@ -1949,6 +1950,8 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
                 return remote, branch, True
         raise ValueError(f"{why}. Publish it on its own branch with `ttp push --own`, or rebase only "
                          f"its own commits (`git rebase --onto {upstream} {base}`) and rerun")
+    if task and (why := code_run_landing(p, task, f"{remote}/{push_to}", d)):
+        raise ValueError(why)
     if m and task and m.group(1) == task:
         if os.environ.get(LAND_ENV):
             say = (f"ttp push: --land: task #{task} lands its own branch {branch} on {remote}/{push_to} "
@@ -1963,6 +1966,24 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
         elif why := untested_landing(p, repo, task, d):
             raise ValueError(why)
     return remote, push_to, False
+
+
+def code_run_landing(p: Project, task: str, upstream: str, d: dict) -> str:
+    """Why task `task`'s run must not push to the push branch `upstream`, or "": a code task lands
+    there itself only with delivery.code_tasks_may_push on. Off, only a review (or the push queue it
+    hands the change to) pushes there, whatever the spec says, and `--land` does not override it;
+    the run's `git` wrapper (gitguard.py) refuses a raw `git push` there the same way."""
+    try:
+        t = p.db.task(int(task))
+    except (ValueError, TypeError):
+        return ""
+    if not t or t.get("kind") != "code" or code_tasks_may_push(p.config()):
+        return ""
+    own = (" To publish the branch under its own name, run `ttp push --own --detach`."
+           if own_push({"delivery": d}) != "off" else "")
+    return (f"task #{task} is a code task and delivery.code_tasks_may_push is off: code tasks never push to "
+            f"{upstream}, whatever the spec says, and `--land` does not change that. Commit, run `ttp checks` "
+            f"and hand off; the review lands the change.{own}")
 
 
 def untested_landing(p: Project, repo: Path, task: str, d: dict) -> str:
