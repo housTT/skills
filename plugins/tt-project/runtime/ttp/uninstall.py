@@ -160,7 +160,7 @@ def _drop_path_line(f: Path) -> Callable[[], str]:
             if not keep.strip() and f.name == "tt-project.fish":
                 f.unlink()
             else:
-                f.write_bytes(keep)
+                project.durable_write(f.resolve(), keep)  # resolve: a symlinked dotfile stays a symlink
         except OSError as e:
             return f"{f}: {e}"
         return ""

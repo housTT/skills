@@ -154,6 +154,10 @@ def test_uninstall_removes_only_the_installers_marked_path_line(env, tmp_path):
     zshrc.write_bytes(own)                       # no marked line: left alone
     fish.parent.mkdir(parents=True)
     fish.write_text(f"fish_add_path -g $HOME/.local/bin{mark}\n")
+    dotfiles = tmp_path / "dotfiles" / "profile"   # a dotfile manager's symlink stays a symlink
+    dotfiles.parent.mkdir()
+    dotfiles.write_bytes(own + f'export PATH="$HOME/.local/bin:$PATH"{mark}\n'.encode())
+    (home / ".profile").symlink_to(dotfiles)
     try:
         rc, out, err = b["ttp"]("--dry-run")
         assert rc == 0, err
@@ -162,6 +166,7 @@ def test_uninstall_removes_only_the_installers_marked_path_line(env, tmp_path):
         rc, out, err = b["ttp"]("--yes")
         assert rc == 0 and "not done" not in err, err
         assert bashrc.read_bytes() == b"# top\n" + own and zshrc.read_bytes() == own
+        assert (home / ".profile").is_symlink() and dotfiles.read_bytes() == own
         assert not fish.exists() and fish.parent.is_dir()
         rc, out, err = b["ttp"]("--yes")
         assert rc == 0 and "remove nothing" in out and "PATH line the installer" not in out
