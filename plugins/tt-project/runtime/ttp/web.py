@@ -718,8 +718,10 @@ class Handler(BaseHTTPRequestHandler):
         refused = self._post_refusal()
         if refused:
             return self._send(refused[0], {"error": refused[1]})
-        length = int(self.headers.get("Content-Length") or 0)
         try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length < 0:
+                raise ValueError("negative length")
             body = json.loads(self.rfile.read(length) or b"{}")
         except ValueError:
             return self._send(400, {"error": "bad json"})

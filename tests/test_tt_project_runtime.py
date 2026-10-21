@@ -45571,3 +45571,27 @@ def test_guide_says_own_push_may_reuse_checks_pass():
     text = (pathlib.Path(__file__).resolve().parents[1] / "plugins/tt-project/docs/guide.md").read_text()
     bullet = text.split("- Checks run with `TTP_PUSH_MODE`", 1)[1].split("\n- ", 1)[0]
     assert "may instead reuse" in bullet and "cannot count on running" in bullet
+
+
+@needs_sockets
+def test_web_post_with_a_bad_content_length_answers_400(env):
+    p = make(env)
+    from ttp import web
+    import http.client
+    port = _start_web(p)
+    tok = web.token(p)
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1)
+            break
+        except OSError:
+            time.sleep(0.1)
+    for bad in ("abc", "-5"):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.putrequest("POST", "/api/schedule/none")
+        c.putheader("X-TTP-Token", tok)
+        c.putheader("Content-Type", "application/json")
+        c.putheader("Content-Length", bad)
+        c.endheaders()
+        assert c.getresponse().status == 400, bad
+        c.close()
