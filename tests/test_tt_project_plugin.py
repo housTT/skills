@@ -4565,6 +4565,16 @@ def test_one_line_install_skips_absent_hosts_with_a_note_and_closes_only_for_ins
     assert _calls(install_env.home)[-1].startswith("ttp setup from ")
 
 
+def test_one_line_install_fish_path_file_honours_xdg_config_home(install_env):
+    home = install_env.home
+    xdg = home.parent / "xdg"
+    r = install_env(on_path=False, env={"SHELL": "/usr/bin/fish", "XDG_CONFIG_HOME": str(xdg)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    rc = xdg / "fish" / "conf.d" / "tt-project.fish"
+    assert rc.read_text().startswith("fish_add_path -g $HOME/.local/bin ")
+    assert not (home / ".config" / "fish").exists()
+
+
 @pytest.mark.parametrize("login, profile", [("/bin/bash", ".bashrc"), ("/bin/bash on macOS", ".bash_profile"),
                                             ("/usr/bin/zsh", "zdot/.zshrc"),
                                             ("/usr/bin/fish", ".config/fish/conf.d/tt-project.fish")])

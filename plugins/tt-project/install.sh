@@ -30,7 +30,7 @@
 # "# added by tt-project installer", to the profile of your login shell ($SHELL), once: bash
 # ~/.bashrc (on macOS, whose terminals start login shells, the first of ~/.bash_profile,
 # ~/.bash_login and ~/.profile that exists, else a new ~/.bash_profile), zsh
-# ${ZDOTDIR:-~}/.zshrc, fish ~/.config/fish/conf.d/tt-project.fish, any other ~/.profile. It never
+# ${ZDOTDIR:-~}/.zshrc, fish ${XDG_CONFIG_HOME:-~/.config}/fish/conf.d/tt-project.fish, any other ~/.profile. It never
 # changes other lines; `ttp uninstall` removes that line. TT_PROJECT_NO_MODIFY_PATH=1 leaves your
 # profile alone and only says what to add.
 set -eu
@@ -160,7 +160,7 @@ PATH_MARK="# added by tt-project installer"
 add_to_path() {
     case ${SHELL:-} in
     */fish|fish)
-        rc=$HOME/.config/fish/conf.d/tt-project.fish
+        rc=${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/tt-project.fish
         line="fish_add_path -g \$HOME/.local/bin $PATH_MARK" now='fish_add_path -g $HOME/.local/bin' ;;
     *)
         case ${SHELL:-} in

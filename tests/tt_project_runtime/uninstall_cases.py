@@ -59,9 +59,9 @@ def _uninstall_box(env, tmp_path):
                "STUB_LOG": str(tmp_path / "calls.log"), "STUB_TAB": str(tab), "PYTHONPATH": str(RUNTIME),
                "ZDOTDIR": str(home)}    # never the real ZDOTDIR
 
-    def ttp(*args, stdin=""):
+    def ttp(*args, stdin="", extra_env=None):
         r = subprocess.run([sys.executable, "-m", "ttp", "uninstall", "--bin-dir", str(bindir), *args],
-                           env=run_env, input=stdin, capture_output=True, text=True, timeout=120)
+                           env={**run_env, **(extra_env or {})}, input=stdin, capture_output=True, text=True, timeout=120)
         return r.returncode, r.stdout.replace(str(tmp_path), "<tmp>"), r.stderr
     return {"ttp": ttp, "home": home, "units": units, "agents": agents, "root": root, "lib": lib, "bin": bindir,
             "shortcut": sc, "tab": tab, "mine": mine, "decoy": decoy, "daemon": daemon, "log": tmp_path / "calls.log"}
@@ -174,6 +174,21 @@ def test_uninstall_removes_only_the_installers_marked_path_line(env, tmp_path):
         assert not fish.exists() and fish.parent.is_dir()
         rc, out, err = b["ttp"]("--yes")
         assert rc == 0 and "remove nothing" in out and "PATH line the installer" not in out
+    finally:
+        b["daemon"].kill()
+        b["daemon"].wait()
+
+
+def test_uninstall_removes_the_fish_path_file_under_xdg_config_home(env, tmp_path):
+    b = _uninstall_box(env, tmp_path)
+    xdg = tmp_path / "xdg"
+    fish = xdg / "fish" / "conf.d" / "tt-project.fish"
+    fish.parent.mkdir(parents=True)
+    fish.write_text("fish_add_path -g $HOME/.local/bin # added by tt-project installer\n")
+    try:
+        rc, out, err = b["ttp"]("--yes", extra_env={"XDG_CONFIG_HOME": str(xdg)})
+        assert rc == 0 and "not done" not in err, err
+        assert not fish.exists()
     finally:
         b["daemon"].kill()
         b["daemon"].wait()
