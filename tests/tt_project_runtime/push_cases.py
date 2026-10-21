@@ -9242,3 +9242,122 @@ def test_a_long_queue_hold_on_an_environment_fault_raises_one_more_observation(e
     for t in (late, late + 120):
         assert pushq.due(s.p, t)[1].startswith("held:")
     assert [e["fingerprint"].split(":")[0] for e in _env_events(s.p)] == ["env", "env-hold"]
+
+
+# A push the remote refuses for a missing token scope (scopehold): the entries that need it are held,
+# the rest pushes at once, and the held rows go back in the queue once the scope check passes.
+_OAUTH = ("remote: error: refusing to allow an OAuth App to create or update workflow `.github/workflows/ci.yml` "
+          "without `workflow` scope\nTo github.com:org/repo.git\n ! [remote rejected] proj -> proj "
+          "(refusing to allow an OAuth App to create or update workflow `.github/workflows/ci.yml` without "
+          "`workflow` scope)\nerror: failed to push some refs\n")
+
+
+def test_a_scope_refusal_names_its_scope_and_files():
+    from ttp import scopehold
+    assert scopehold.classify(_OAUTH) == [{"scope": "workflow", "files": [".github/workflows/ci.yml"]}]
+    pat = ("! [remote rejected] HEAD -> main (refusing to allow a Personal Access Token to create or update "
+           "workflow `.github/workflows/a.yml` without `workflow` scope)")
+    assert scopehold.classify(pat) == [{"scope": "workflow", "files": [".github/workflows/a.yml"]}]
+    other = "remote: refusing to update `packages/x.tgz` without `write:packages` scope"
+    assert scopehold.classify(other) == [{"scope": "write:packages", "files": ["packages/x.tgz"]}]
+    assert scopehold.classify("! [remote rejected] proj -> proj (pre-receive hook declined)") == []
+    assert scopehold.classify("") == []
+
+
+def test_a_scope_refusal_matches_the_heads_that_change_its_paths_also_through_a_merge(env, monkeypatch):
+    from ttp import scopehold
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    need = {"scope": "workflow", "files": [".github/workflows/ci.yml"]}
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    plain = _entry(repo, "e1", {"a.txt": "a\n"})
+    flow = _entry(repo, "e2", {".github/workflows/other.yml": "on: push\n"})
+    named = _entry(repo, "e3", {"docs/x.md": "x\n"})
+    _git_out(repo, "checkout", "-q", "-B", "side", "origin/proj")
+    (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+    _commit(repo, ".github/workflows/ci.yml", "on: push\n")
+    _git_out(repo, "checkout", "-q", "-B", "e4", plain)
+    _git_out(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    merged = _git_out(repo, "rev-parse", "HEAD")
+    got = {h: scopehold.needs(scopehold.touched(repo, tip, h), need) for h in (plain, flow, named, merged)}
+    assert got == {plain: [], flow: [".github/workflows/other.yml"], named: [],
+                   merged: [".github/workflows/ci.yml"]}
+    assert scopehold.needs(["pkg/x.tgz", "a.txt"], {"scope": "write:packages", "files": ["pkg/x.tgz"]}) == ["pkg/x.tgz"]
+
+
+def _scope_hook(origin):
+    """The bare origin refuses, as GitHub does without the `workflow` scope, any push that changes a
+    workflow file."""
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nwhile read old new ref; do\n"
+                    "  for f in $(git diff --name-only \"$old\" \"$new\" 2>/dev/null); do case $f in .github/workflows/*)\n"
+                    "    echo \"error: refusing to allow an OAuth App to create or update workflow \\`$f\\` without "
+                    "\\`workflow\\` scope\" >&2; exit 1;; esac; done\ndone\nexit 0\n")
+    hook.chmod(0o755)
+
+
+def test_a_push_batch_holds_the_heads_a_scope_refusal_names_and_pushes_the_rest_at_once(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.push_rounds", 1)
+    _scope_hook(origin)
+    heads = [_entry(repo, "e1", {"a.txt": "a\n"}), _entry(repo, "e2", {".github/workflows/ci.yml": "on: push\n"}),
+             _entry(repo, "e3", {"b.txt": "b\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["outcome"] == "pushed", m.get("message")
+    assert [r["status"] for r in m["results"]] == ["pushed", "scope_held", "pushed"]
+    assert m["results"][1]["detail"]["scope"] == "workflow"
+    assert m["results"][1]["detail"]["files"] == [".github/workflows/ci.yml"]
+    [s] = m["scope_held"]
+    assert s["scope"] == "workflow" and s["entries"] == [2] and "gh auth status" in s["check"]
+    files = _git_out(origin, "ls-tree", "-r", "--name-only", "proj").split()
+    assert "a.txt" in files and "b.txt" in files and ".github/workflows/ci.yml" not in files
+
+
+def _scope_pq(env, monkeypatch, check="false"):
+    """_pq whose stub batch holds the review's row for the `workflow` scope, the check `check`."""
+    s = _pq(env, monkeypatch, push_scope_check=check, push_scope_probe_s=60)
+    _pq_plan(s, outcome="pushed", row="scope_held",
+             detail={"scope": "workflow", "files": [".github/workflows/ci.yml"], "check": check})
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    return s
+
+
+def _scope_alerts(p):
+    return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='alert' AND ref='push_scope:workflow'")]
+
+
+def test_a_held_push_raises_one_alert_and_requeues_once_the_scope_check_passes(env, monkeypatch):
+    from ttp import alerts, pushq, scopehold
+    s = _scope_pq(env, monkeypatch)
+    [row] = s.p.db.q("SELECT * FROM push_queue WHERE task=?", (s.review,))
+    assert row["status"] == "held"
+    t = s.p.db.task(s.review)
+    assert t["status"] == "pushing" and "`workflow`" in t["blocked_reason"]
+    [text] = _scope_alerts(s.p)
+    for want in ("lacks the `workflow` scope", ".github/workflows/ci.yml", f"#{s.review} review feature",
+                 "Nothing else was in the batch.", "`gh auth refresh -s workflow`", "once `false` passes"):
+        assert want in text, (want, text)
+    assert pushq.tend_scope_holds(s.p, now=time.time() + 120) == []   # the check fails: still held
+    assert s.p.db.one("SELECT status FROM push_queue WHERE id=?", (row["id"],))["status"] == "held"
+    assert s.p.db.kv(scopehold.KV)["workflow"]["probe"]
+    _pq_tend(s)
+    assert len(_scope_alerts(s.p)) == 1, "one alert per condition"
+    s.p.set_config("delivery.push_scope_check", "true")
+    assert pushq.tend_scope_holds(s.p, now=time.time() + 10) == [], "not before the next probe is due"
+    assert pushq.tend_scope_holds(s.p, now=time.time() + 400) == [row["id"]]
+    assert s.p.db.one("SELECT status FROM push_queue WHERE id=?", (row["id"],))["status"] == "approved"
+    assert not s.p.db.task(s.review)["blocked_reason"]
+    assert alerts.holds(s.p.db, "push_scope:workflow", time.time() - 60, time.time()), "until it pushes"
+    s.p.db.x("UPDATE push_queue SET status='pushed' WHERE id=?", (row["id"],))
+    pushq.tend_scope_holds(s.p)
+    assert not alerts.holds(s.p.db, "push_scope:workflow", time.time() - 60, time.time())
+    assert len(_scope_alerts(s.p)) == 1
+
+
+def test_the_push_queue_status_names_the_held_rows(env, monkeypatch):
+    from ttp import pushq
+    s = _scope_pq(env, monkeypatch)
+    [h] = pushq.summary(s.p)["held"]
+    assert h["task"] == s.review and h["scope"] == "workflow"
+    assert "held for the token scope `workflow`" in pushq.status_line(s.p)

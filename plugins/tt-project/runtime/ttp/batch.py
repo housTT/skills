@@ -38,7 +38,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import checkcap, checkdirs, conflictfix, envfault, locks, push, pushpass, runner, suitecost, worktree
+from . import checkcap, checkdirs, conflictfix, envfault, locks, push, pushpass, runner, scopehold, suitecost, worktree
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -630,6 +630,8 @@ class Batch:
         self.conflicted: set[int] = set()      # entries whose replay hit a conflict it did not settle
         self._settling: tuple[list[str], set] = ([], set())   # files and kinds of the replay running
         self.rescued: dict[int, str] = {}      # entry index -> its head, replayed again without a blamed entry
+        self.held: dict[int, dict] = {}        # entry index -> the token scope a refused push needs for it
+        self.scopes: list[dict] = []           # those refusals: scope, files, entry ids, check (scopehold)
         self.retried = False                   # this round checked the entries after a blamed one (_rescue)
         self.rescues = 0                       # such checks in the batch: at most RESCUES
 
@@ -645,7 +647,7 @@ class Batch:
         with it, or the tip it was found on), which a rebase made different from its reviewed head."""
         out = []
         for i, e in enumerate(self.entries):
-            st = self.status.get(i, "requeued")
+            st = "scope_held" if i in self.held else self.status.get(i, "requeued")
             r = {"id": e.get("id"), "task": e.get("task"), "status": st,
                  "detail": {**self.detail.get(i, {}), **self.settled.get(i, {})}}
             if st in ("pushed", "landed") and i in self.landed_at:
@@ -667,7 +669,7 @@ class Batch:
     def _all(self, status: str, outcome: str, message: str = "", keep: tuple = ()) -> str:
         """Every entry not in a status of `keep` gets `status`; returns `outcome`."""
         for i in range(len(self.entries)):
-            if self.status.get(i) not in keep:
+            if self.status.get(i) not in keep and i not in self.held:
                 self._set(i, status, **({"message": message} if message and status == "refused" else {}))
         self.message = message or self.message
         if message:
@@ -705,13 +707,17 @@ class Batch:
             return self._all("refused", "refused", why)
         if why:
             return self._all("requeued", "error", why)
-        for rnd in range(1, rounds + 1):
-            self.rounds = rnd
+        rnd = 0
+        while rnd < rounds:
+            rnd += 1
+            self.rounds += 1
             tip = push._fetch(self.repo, self.remote, self.branch)
             if not tip:
                 return self._all("requeued", "error", f"cannot fetch {self.target}", keep=("refused",))
             self.tip = tip
             self.status, self.detail, self.landed_at = {}, {}, {}
+            for i, d in self.held.items():
+                self._set(i, "scope_held", **d)
             self._prepare(tip)
             try:
                 outcome = self._round(tip, checks)
@@ -721,6 +727,10 @@ class Batch:
                 envfault.record(self.p, e.fault, queue=True)
                 return self._all("requeued", "env_fault", f"{e}; the batch is held, not failed",
                                  keep=("landed", "refused"))
+            if outcome == "held":   # a round of its own: each one holds at least one more entry
+                rnd -= 1
+                say("the rest of the batch goes again without the held entries")
+                continue
             if outcome != "moved":
                 return outcome
             say(f"{self.target} moved; round {rnd + 1}")
@@ -779,6 +789,8 @@ class Batch:
         if r.returncode != 0:
             if push._fetch(self.repo, self.remote, self.branch) != tip:
                 return "moved"
+            if self._hold_scoped(tip, carried, r.stderr):
+                return "held"
             self.message = f"push to {self.target} was rejected: {_last(r.stderr, 5)}"
             say(self.message)
             return self._close(0, "rejected", carried)
@@ -790,6 +802,29 @@ class Batch:
         except Exception:
             pass
         return outcome
+
+    def _hold_scoped(self, tip: str, carried: list, stderr: str) -> bool:
+        """A push the remote refused because the credential lacks a token scope (scopehold): hold the
+        carried entries whose changes need it, in batch order, so the rest goes again at once. False
+        when the refusal is no such one or no entry's changes match it."""
+        found = False
+        for need in scopehold.classify(stderr):
+            ids = []
+            for i, _ in carried:
+                if i in self.held:
+                    continue
+                files = scopehold.needs(scopehold.touched(self.repo, tip, str(self.entries[i].get("head"))), need)
+                if files:
+                    self.held[i] = {"scope": need["scope"], "files": files[:20],
+                                    "check": scopehold.check_cmd(self.d, need["scope"])}
+                    ids.append(self.entries[i].get("id"))
+                    say(f"entry {self.entries[i].get('id')} ({self.entries[i].get('branch')}): held, its "
+                        f"{', '.join(files[:3])} needs the token scope `{need['scope']}`")
+            if ids:
+                found = True
+                self.scopes.append({**need, "entries": ids, "check": scopehold.check_cmd(self.d, need["scope"]),
+                                    "stderr": _last(stderr, 5)})
+        return found
 
     def _mark_pushing(self, tip: str, head: str, k: int, carried: list, failed: tuple | None) -> None:
         """Record in the marker, before `git push`, what this push lands and what each entry's result
@@ -873,6 +908,8 @@ class Batch:
                 if not parent:
                     break
                 top = parent
+            if i in self.held:   # its push needs a token scope the credential lacks (_hold_scoped)
+                continue
             if top == base or self._on_tip(tip, base, top):
                 say(f"entry {e.get('id')} ({e.get('branch')}): already on {self.target}")
                 self._set(i, "landed")
@@ -1515,7 +1552,7 @@ def run_batch(p: Project, marker: Path) -> int:
     conflicts = b.conflicts()
     m.update(outcome=outcome, tip=b.tip, pushed_sha=b.pushed_sha, version=b.version, results=b.results(),
              checks=b.checks, rounds=b.rounds, message=b.message or None, conflicts=conflicts,
-             reach=b.reach or None)
+             reach=b.reach or None, scope_held=b.scopes or None)
     if ff:
         m["fast_forward"] = ff
     if conflicts["conflicted"]:
