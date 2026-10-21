@@ -34,6 +34,10 @@ def _uninstall_box(env, tmp_path):
         (units / f).write_text("[Unit]\n")
     for f in ("com.tt-project.tunnel.host-a.plist", "com.example.backup.plist"):
         (agents / f).write_text("<plist/>\n")
+    import plistlib
+    for app, bid in (("tt-project.app", "com.tt-project.notifier"), ("Other.app", "com.example.other")):
+        (home / "Applications" / app / "Contents").mkdir(parents=True)
+        (home / "Applications" / app / "Contents" / "Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": bid}))
     root = tmp_path / "proj"
     (root / "tt-project" / "state").mkdir(parents=True)
     (root / "tt-project" / "state" / "project.db").write_text("keep me\n")
@@ -116,6 +120,7 @@ def test_uninstall_removes_only_ttps_own_entries_and_a_second_run_is_harmless(en
         assert sorted(f.name for f in b["agents"].iterdir()) == ["com.example.backup.plist"]
         assert b["tab"].read_text() == b["mine"] + b["decoy"]
         assert not b["lib"].exists() and not (b["bin"] / "ttp").exists() and not b["shortcut"].exists()
+        assert sorted(f.name for f in (b["home"] / "Applications").iterdir()) == ["Other.app"], "the notifier app goes"
         assert (b["root"] / "tt-project" / "state" / "project.db").read_text() == "keep me\n"
         assert (b["root"] / "notes.txt").exists()
         assert json.loads((env["home"] / "registry.json").read_text())["projects"]["demo"]

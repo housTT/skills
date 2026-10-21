@@ -194,6 +194,10 @@ def plan(bin_dir: Path) -> list[Action]:
     if is_shim(shim):
         acts.append((f"remove the ttp command {shim}", lambda: shim.unlink(missing_ok=True) or ""))
     acts += [(f"remove the PATH line the installer added to {f}", _drop_path_line(f)) for f in _profiles() if _marked(f)]
+    from . import notifier
+    app = notifier.app_ready()
+    if app:
+        acts.append((f"remove the desktop notifier app {app}", lambda: shutil.rmtree(app, ignore_errors=True) or ""))
     lib = project.HOME_DIR / "lib"
     if lib.exists():
         acts.append((f"remove the installed lib {lib}", lambda: shutil.rmtree(lib, ignore_errors=True) or ""))

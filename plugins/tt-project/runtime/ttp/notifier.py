@@ -4,8 +4,10 @@
 
 One small agent per workstation watches every project in this machine's registry — local ones by
 reading their database, remote ones with one ssh call per minute — and shows each new alert at
-or above the severity floor as a native notification with a sound (macOS Notification Center through
-terminal-notifier or osascript, or notify-send on a Linux desktop). It never marks anything read; chats
+or above the severity floor as a native notification with a sound, meant to stay until closed (macOS
+Notification Center through the tt-project app, which asks for the persistent style, once macOS lists it
+(ensure_app, app_registered; notifier.json `app: false` skips it), else terminal-notifier or osascript; or
+notify-send, critical with no expiry, on a Linux desktop; notifier.json `persistent: false` lets them go). It never marks anything read; chats
 and the web app keep their own cursors. Every delivery is recorded (DELIVERY): a failure goes to the
 notifier log and raises one alert in this machine's projects until a later delivery succeeds
 (Daemon.check_notifier); `ttp notifier test` sends one and tells how to fix a blocked one. The agent
@@ -48,6 +50,10 @@ LABEL = "com.tt-project.notifier"   # the launchd agent
 UNIT = "tt-project-notifier.service"   # the systemd user unit
 ALERT_KEY = "notifier"   # the projects' alert while desktop delivery fails (Daemon.check_notifier)
 TIMEOUT_S = 10
+BUNDLE_ID = "com.tt-project.notifier"   # the macOS notifier app (ensure_app): its own Notifications entry
+APP_NAME = "tt-project"
+CLICK_URL = HOME_DIR / "notifier-click-url"   # the app opens it when an alert is clicked
+STYLES = {0: "none", 8: "banners", 16: "persistent"}   # com.apple.ncprefs flags & 0x38, read only
 
 
 def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
@@ -201,9 +207,246 @@ def _track_daemons(state: dict, health: dict[str, dict | None], hosts_of: dict[s
         daemons[name] = {"alarmed": now, "since": since}
 
 
+def _conf_on(key: str) -> bool:
+    """A notifier.json switch that is on unless set to false."""
+    try:
+        return json.loads(CONF.read_text()).get(key, True) is not False
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+def persistent() -> bool:
+    """Alerts stay on screen until closed: the default; notifier.json `"persistent": false` turns it off."""
+    return _conf_on("persistent")
+
+
+def app_wanted() -> bool:
+    """macOS: build and send through the tt-project app; notifier.json `"app": false` turns it off (the
+    notifier then keeps terminal-notifier or osascript). Setup and upgrade never write notifier.json."""
+    return _conf_on("app")
+
+
+def app_path() -> Path:
+    return Path.home() / "Applications" / f"{APP_NAME}.app"
+
+
+# The app: an AppleScript applet (osacompile ships with macOS, no compiler or paid signing identity),
+# so `display notification` is posted by the app itself and shows under its own name, icon and
+# Notifications entry, not Script Editor's. Started with --ttp-notify it posts one; started any other
+# way (a click on one of its alerts) it opens the last alert's web app link.
+APP_SCRIPT = """use AppleScript version "2.4"
+use framework "Foundation"
+use scripting additions
+
+on run
+	set argv to (current application's NSProcessInfo's processInfo()'s arguments()) as list
+	set i to 0
+	repeat with k from 1 to count of argv
+		if item k of argv is "--ttp-notify" then set i to k
+	end repeat
+	if i > 0 and (count of argv) >= i + 3 then
+		display notification (item (i + 2) of argv) with title (item (i + 1) of argv) sound name (item (i + 3) of argv)
+		delay 1
+	else
+		try
+			set u to do shell script "cat " & quoted form of "@CLICK_URL@"
+			if u starts with "http" then open location u
+		end try
+	end if
+end run
+"""
+
+
+def app_info(keep: bool | None = None) -> dict:
+    """The Info.plist keys ensure_app sets on the applet osacompile makes."""
+    keep = persistent() if keep is None else keep
+    return {"CFBundleIdentifier": BUNDLE_ID, "CFBundleName": APP_NAME, "CFBundleDisplayName": APP_NAME,
+            # the default style macOS gives the app when it first posts: alert = stays until closed
+            "NSUserNotificationAlertStyle": "alert" if keep else "banner",
+            "LSBackgroundOnly": True,   # no Dock icon; LSUIElement stops an applet's notifications
+            "CFBundleIconFile": "applet"}
+
+
+def _app_rev(info: dict, script: str) -> str:
+    import hashlib
+    return hashlib.sha256((script + json.dumps(info, sort_keys=True)).encode()).hexdigest()[:12]
+
+
+def _icon_png(n: int = 256) -> bytes:
+    """A plain app icon (a white T on a rounded purple square) as PNG, made here: no image files shipped."""
+    import struct
+    import zlib
+    r, bar, stem = n * 0.18, (n * 0.22, n * 0.78, n * 0.22, n * 0.34), (n * 0.43, n * 0.57, n * 0.34, n * 0.80)
+    rows = []
+    for y in range(n):
+        row = bytearray(b"\0")
+        for x in range(n):
+            dx, dy = max(r - x, x - (n - 1 - r), 0), max(r - y, y - (n - 1 - r), 0)
+            if dx * dx + dy * dy > r * r:
+                row += b"\0\0\0\0"
+            elif bar[0] <= x < bar[1] and bar[2] <= y < bar[3] or stem[0] <= x < stem[1] and stem[2] <= y < stem[3]:
+                row += b"\xff\xff\xff\xff"
+            else:
+                row += b"\x5b\x2b\x9e\xff"
+        rows.append(bytes(row))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
+def _icns() -> bytes:
+    import struct
+    png = _icon_png(256)
+    entry = b"ic08" + struct.pack(">I", 8 + len(png)) + png   # ic08: 256x256 PNG
+    return b"icns" + struct.pack(">I", 8 + len(entry)) + entry
+
+
+def app_ready() -> Path | None:
+    """The notifier app when it is installed and is ours (show sends through it), else None."""
+    import plistlib
+    app = app_path()
+    try:
+        info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    return app if info.get("CFBundleIdentifier") == BUNDLE_ID else None
+
+
+def ensure_app() -> tuple[Path | None, str]:
+    """macOS: build (or rebuild, when its script or keys changed) the notifier app under ~/Applications,
+    ad-hoc signed (`codesign -s -`: no paid identity), with no root. Idempotent: an app of the same
+    revision is left alone. (the app or None, a line to print: empty when nothing changed). A failure
+    keeps the older app, if any, and the notifier falls back to terminal-notifier or osascript."""
+    import plistlib
+    import tempfile
+    if sys.platform != "darwin" or not app_wanted():
+        return None, ""
+    script = APP_SCRIPT.replace("@CLICK_URL@", str(CLICK_URL))
+    info = app_info()
+    rev = _app_rev(info, script)
+    app = app_path()
+    try:
+        if plistlib.loads((app / "Contents" / "Info.plist").read_bytes()).get("TTProjectRev") == rev:
+            return app, ""
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        pass
+    missing = [t for t in ("osacompile", "codesign") if not shutil.which(t)]
+    if missing:
+        return app_ready(), f"notifier app not built: {' and '.join(missing)} not found"
+    app.parent.mkdir(parents=True, exist_ok=True)
+    new, old = app.with_name(f".{app.name}.new"), app.with_name(f".{app.name}.old")
+    for d in (new, old):
+        shutil.rmtree(d, ignore_errors=True)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "notifier.applescript"
+            src.write_text(script, encoding="utf-8")
+            _must(["osacompile", "-o", str(new), str(src)])
+        plist = new / "Contents" / "Info.plist"
+        keys = plistlib.loads(plist.read_bytes())
+        keys.update(info, TTProjectRev=rev)
+        plist.write_bytes(plistlib.dumps(keys))
+        (new / "Contents" / "Resources").mkdir(parents=True, exist_ok=True)
+        (new / "Contents" / "Resources" / "applet.icns").write_bytes(_icns())
+        _must(["codesign", "--force", "--deep", "--sign", "-", str(new)])   # the edited plist voids osacompile's
+        if app.exists():
+            app.rename(old)
+        new.rename(app)
+        shutil.rmtree(old, ignore_errors=True)
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as e:
+        shutil.rmtree(new, ignore_errors=True)
+        if old.exists() and not app.exists():
+            old.rename(app)
+        log(f"notifier app not built: {e}")
+        return app_ready(), f"notifier app not built: {e}"
+    lsreg = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework"
+             "/Support/lsregister")
+    if os.path.exists(lsreg):   # Launch Services reads the new Info.plist now, not at its next scan
+        subprocess.run([lsreg, "-f", str(app)], capture_output=True, timeout=60)
+    return app, f"notifier app {app} ready ({'persistent' if persistent() else 'banner'} alerts requested)"
+
+
+def _must(args: list[str]) -> None:
+    r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"{args[0]} exited {r.returncode}: {(r.stderr or r.stdout).strip()[:200]}")
+
+
+def alert_style() -> str:
+    """How macOS shows the app's notifications, read (never written) from its Notifications settings:
+    persistent, banners, none, 'not registered' (it has not posted yet) or 'unknown'."""
+    import plistlib
+    try:
+        prefs = plistlib.loads((Path.home() / "Library" / "Preferences" / "com.apple.ncprefs.plist").read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return "unknown"
+    for a in prefs.get("apps", []) if isinstance(prefs, dict) else []:
+        if isinstance(a, dict) and a.get("bundle-id") == BUNDLE_ID:
+            try:
+                return STYLES.get(int(a.get("flags", 0)) & 0x38, "unknown")
+            except (TypeError, ValueError):
+                return "unknown"
+    return "not registered"
+
+
+def app_registered() -> bool:
+    """macOS lists the app in its Notifications settings: only then do alerts go through it (_command)."""
+    return alert_style() in STYLES.values()
+
+
+def _app_args(app: Path, title: str, body: str) -> list[str]:
+    # -n: a new instance per alert, so one still posting never swallows the next; -g: no focus
+    return ["open", "-g", "-n", "-a", str(app), "--args", "--ttp-notify", title, body, "Glass"]
+
+
+def app_pending() -> bool:
+    """macOS: the app is built and wanted but macOS does not list it yet (alerts use the old sender)."""
+    return sys.platform == "darwin" and app_wanted() and app_ready() is not None and not app_registered()
+
+
+def register_app() -> list[str]:
+    """macOS: while the app is built but not yet listed in Notifications, post one notification through
+    it, so macOS lists it and asks once to allow it. Alerts keep their sender until it is listed."""
+    app = app_ready() if sys.platform == "darwin" and app_wanted() and shutil.which("open") else None
+    if not app or app_registered():
+        return []
+    try:
+        r = subprocess.run(_app_args(app, APP_NAME, "tt-project alerts come from this app once you allow it."),
+                           capture_output=True, text=True, errors="replace", timeout=TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return [f"the {APP_NAME} app could not post its first notification: {e}"]
+    if r.returncode != 0:
+        return [f"the {APP_NAME} app could not post its first notification: exited {r.returncode}"]
+    return [f"the {APP_NAME} app posted its first notification: allow it if macOS asks"]
+
+
+def style_lines(backend: str) -> list[str]:
+    """After a macOS test notification: the alert style when macOS shows it, and the one fix line only
+    when alerts would still go away by themselves (banners, none, or a fallback sender)."""
+    if not persistent() or sys.platform != "darwin":
+        return []
+    if backend != APP_NAME:
+        entry = "Script Editor" if backend == "osascript" else backend
+        return [f"alerts come from {entry} and may go away by themselves: System Settings > Notifications > "
+                f"{entry} > alert style Persistent (older macOS: Alerts)"]
+    style = alert_style()
+    if style == "persistent":
+        return ["alert style: persistent (stays until closed)"]
+    if style in ("banners", "none"):
+        return [f"alert style: {style}; to keep alerts until closed: System Settings > Notifications > "
+                f"{APP_NAME} > Allow notifications on, alert style Persistent (older macOS: Alerts)"]
+    return [f"alert style: {style} (the app asks macOS for persistent alerts)"]
+
+
 def _command(title: str, body: str, url: str | None, severity: str = "high") -> tuple[str, list[str] | None, str]:
     """(the backend, its argv or None, why there is none) for this machine. Every one plays a sound."""
     if sys.platform == "darwin":
+        # the app only once macOS lists it (app_registered): until then, or opted out, the sender stays
+        app = app_ready() if shutil.which("open") and app_wanted() else None
+        if app and app_registered():
+            return APP_NAME, _app_args(app, title, body), ""
         tn = shutil.which("terminal-notifier")
         if tn:
             # no -group: a shared group would let a later alert replace an earlier unread one
@@ -220,9 +463,10 @@ def _command(title: str, body: str, url: str | None, severity: str = "high") -> 
             return "notify-send", None, "notify-send is not installed"
         if not any(os.environ.get(v) for v in ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS")):
             return "notify-send", None, "no desktop session (DISPLAY, WAYLAND_DISPLAY and DBUS_SESSION_BUS_ADDRESS unset)"
-        urgency = "critical" if severity == "critical" else "normal"   # critical stays until dismissed
-        return "notify-send", ["notify-send", "-a", "tt-project", "-u", urgency,
-                               "-h", "string:sound-name:message-new-instant", title, body], ""
+        keep = persistent()   # critical with no expiry: it stays until dismissed
+        urgency = "critical" if keep or severity == "critical" else "normal"
+        return "notify-send", ["notify-send", "-a", "tt-project", "-u", urgency] + (["-t", "0"] if keep else []) + [
+            "-h", "string:sound-name:message-new-instant", title, body], ""
     return sys.platform, None, f"no desktop notification backend on {sys.platform}"
 
 
@@ -243,6 +487,11 @@ def show(title: str, body: str, url: str | None = None, severity: str = "high") 
         else:
             if r.returncode == 0:
                 res.update(ok=True, confirmed=backend == "notify-send", error="")
+                if url and backend == APP_NAME:
+                    try:   # what a click on it opens (the app reads it when started without --ttp-notify)
+                        durable_write(CLICK_URL, url.encode())
+                    except OSError as e:
+                        log(f"could not keep the click link: {e}")
             else:
                 res["error"] = f"exited {r.returncode}: {(r.stderr or r.stdout).strip()[:200]}"
     record(res)
@@ -295,15 +544,26 @@ def fix_steps(res: dict) -> list[str]:
     """Short, exact steps that make desktop notifications show on this machine."""
     b, err = res.get("backend"), res.get("error") or ""
     again = "Then run `ttp notifier test` again."
+    other = ("  Or stop using the tt-project app: set \"app\": false in ~/.tt-project/notifier.json; alerts then "
+             "come from terminal-notifier (`brew install terminal-notifier`) or else osascript (Script Editor).")
+    pending = [f"The {APP_NAME} app is not in System Settings > Notifications yet, so alerts come from {b} until "
+               "it is: allow its first notification.", other] if b in ("osascript", "terminal-notifier") and \
+        app_pending() else []
     if b == "osascript":
-        return ["macOS shows these as from Script Editor. If you saw nothing:",
+        return pending + ["macOS shows these as from Script Editor. If you saw nothing:",
                 "  1. System Settings > Notifications > Script Editor: turn on Allow notifications (Banners or Alerts).",
                 "  2. Script Editor not listed: open Script Editor, run `display notification \"test\"` once, then do step 1.",
                 "  3. Turn off Focus (Do Not Disturb) or allow it there.",
                 "  Or `brew install terminal-notifier`: the notifier then uses it (its own entry in Notifications).",
                 "  " + again]
-    if b == "terminal-notifier":
+    if b == APP_NAME:
         return ["If you saw nothing:",
+                f"  1. System Settings > Notifications > {APP_NAME}: turn on Allow notifications "
+                "(alert style Persistent keeps them until closed).",
+                "  2. Turn off Focus (Do Not Disturb) or allow it there.",
+                other, "  " + again]
+    if b == "terminal-notifier":
+        return pending + ["If you saw nothing:",
                 "  1. System Settings > Notifications > terminal-notifier: turn on Allow notifications (Banners or Alerts).",
                 "  2. Turn off Focus (Do Not Disturb) or allow it there.",
                 "  " + again]
@@ -321,20 +581,23 @@ def fix_steps(res: dict) -> list[str]:
 def test(ask=None) -> tuple[bool, list[str]]:
     """Send one test notification the way alerts go (show). (delivered, lines to print). `ask(prompt)`
     (an interactive terminal) confirms what the backend cannot: whether the user saw it."""
+    built = ensure_app()[1]   # macOS: the tt-project app, built when it can be
+    pre = ([built] if built else []) + register_app()
     res = show("tt-project", "Test notification: desktop alerts from tt-project reach this machine.")
     b = res["backend"]
     if not res["ok"]:
-        return False, [f"test notification failed ({b}): {res['error']}"] + fix_steps(res)
+        return False, pre + [f"test notification failed ({b}): {res['error']}"] + fix_steps(res)
     if res["confirmed"]:
-        return True, [f"test notification delivered ({b})"]
+        return True, pre + [f"test notification delivered ({b})"]
     if ask is None:
-        return True, [f"test notification sent ({b}); macOS does not say whether it was shown"] + fix_steps(res)
+        return True, pre + [f"test notification sent ({b}); macOS does not say whether it was shown"] + \
+            style_lines(b) + fix_steps(res)
     if ask("Did a tt-project notification appear? [y/N] "):
         record(dict(res, confirmed=True, ts=time.time()))
-        return True, [f"test notification delivered ({b}), seen by you"]
+        return True, pre + [f"test notification delivered ({b}), seen by you"] + style_lines(b)
     res = dict(res, ok=False, confirmed=False, error="sent, but you did not see it", ts=time.time())
     record(res)
-    return False, [f"test notification not shown ({b}): macOS took it but did not show it"] + fix_steps(res)
+    return False, pre + [f"test notification not shown ({b}): macOS took it but did not show it"] + fix_steps(res)
 
 
 def code(runtime: Path) -> str:
@@ -449,17 +712,20 @@ def status_lines() -> list[str]:
 def refresh(send_test: bool, always: bool = False) -> list[str]:
     """`ttp setup`, `ttp upgrade`: restart an installed agent so it runs the installed code (`always`, or
     while it runs other code), then (`send_test`) send the test notification once per installed code
-    version: none once one went out on it. Lines to print; none without an installed agent, and none for
-    one the user disabled or booted out: install() would turn it back on."""
+    version: none once one went out on it. On macOS it first builds or refreshes the notifier app
+    (ensure_app); a new app gets its test too, which brings up macOS's one Allow prompt. Lines to print;
+    none without an installed agent, and none for one the user disabled or booted out: install() would
+    turn it back on."""
     if not enabled():
         return []
     want = installed_code()
     run = running()
-    out = []
+    built = ensure_app()[1]
+    out = ["desktop notifier: " + built] if built else []
     if always or not run or run.get("code") != want:
         out.append(f"desktop notifier: {install()} (runs ttp {want})")
     if send_test:
-        if delivery().get("tested") == want:
+        if delivery().get("tested") == want and not built:
             out.append(f"desktop notifier: a test notification already went out on ttp {want}; "
                        "`ttp notifier test` sends another")
         else:
@@ -468,8 +734,10 @@ def refresh(send_test: bool, always: bool = False) -> list[str]:
 
 
 def test_once(want: str | None = None, ask=None) -> tuple[bool, list[str]]:
-    """The test notification, remembered per installed code version once it went out."""
+    """The test notification, remembered per installed code version once it went out. Its outcome goes
+    to the notifier log too, so a later look at the log shows what the self-check found."""
     ok, lines = test(ask)
+    log("self-check: " + " | ".join(ln.strip() for ln in lines))
     if ok:
         d = delivery()
         d["tested"] = want or installed_code()

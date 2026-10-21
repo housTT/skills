@@ -82,6 +82,7 @@ def test_notifier_test_slack_prints_the_outcome_and_exits_1_on_failure(env, monk
     shown = []
     monkeypatch.setattr(notifier, "show", lambda *a, **kw: (shown.append(a), {"backend": "notify-send", "ok": True,
                         "confirmed": True, "error": "", "ts": 0.0})[1])   # show() returns its delivery result
+    monkeypatch.setattr(notifier, "ensure_app", lambda: (None, ""))
     monkeypatch.setattr(slack, "send_test", lambda project="tt-project": (False, "Slack test failed: auth.test: invalid_auth"))
     with pytest.raises(SystemExit) as e:
         cli.main(["notifier", "test", "--slack"])

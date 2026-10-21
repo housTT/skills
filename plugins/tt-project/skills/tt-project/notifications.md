@@ -14,10 +14,17 @@ Default channels need no accounts or setup.
   count only polls in a row: after a sleep or a stopped notifier it starts again.
 - A project whose daemon has not beaten for 3 h (`daemon_down_after_s`) while its service should keep it
   running gets one notification naming `ttp restart`, and one more when it runs again.
-- Desktop notifications play a sound. Backends: terminal-notifier, else osascript (macOS; allow
-  Script Editor in System Settings > Notifications); notify-send in a desktop session (Linux).
+- Desktop notifications play a sound and are meant to stay until closed. Linux: notify-send, critical,
+  no expiry. macOS: setup, upgrade and `ttp notifier install` build a small `tt-project` app
+  (`~/Applications/tt-project.app`, ad-hoc signed, Persistent style requested) without root; its first
+  notification brings macOS's one Allow prompt. Alerts go through it only once macOS lists it in
+  Notifications; until then, and with `"app": false`, through terminal-notifier, else osascript (Script
+  Editor). Not yet checked live on a Mac: whether the app gets Persistent without a System Settings change.
+  `"persistent": false` in `~/.tt-project/notifier.json` turns persistence off. `ttp uninstall` removes the app.
 - `ttp notifier test` sends one through the same path and says whether it worked, with the fix
   if not; exit 1 = failed. macOS does not report display: in a terminal it asks if you saw it.
+  On macOS it also reads (never writes) the app's alert style; only banners, off or a fallback
+  sender print the one System Settings > Notifications line to set it to Persistent.
 - `ttp notifier install`, `ttp setup` and `ttp upgrade` send that test once per installed ttp version.
   `ttp setup` and `ttp upgrade` also restart an enabled notifier on the new code (never one turned
   off); `ttp status` says when it runs older code (`ttp notifier restart`).

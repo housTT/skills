@@ -1094,6 +1094,14 @@ install it, to a desktop notifier on your workstation that covers all your proje
   `ttp config <name> notify.slack true` turns it on for a project, and `ttp notifier test --slack`
   sends a test message or prints Slack's exact error. The web app and `ttp doctor` say when Slack is
   not configured or its last send failed.
+- Desktop: alerts play a sound and are meant to stay until you close them. Linux: critical urgency with
+  no expiry. macOS: `ttp setup`, `ttp upgrade` and `ttp notifier install` build a small `tt-project`
+  app in `~/Applications` (no root) that asks for the Persistent style; alerts come from it once macOS
+  lists it under System Settings > Notifications (click Allow on its first notification), and until
+  then from terminal-notifier or osascript as before. Whether the app keeps the Persistent style
+  without a change in System Settings is not yet checked on a Mac; `ttp notifier test` shows the
+  style macOS reports and the one setting to change if alerts still go away. `"app": false` in
+  `~/.tt-project/notifier.json` turns the app off.
 
 Workers can read Slack links you paste, using your Slack connector if you have one.
 

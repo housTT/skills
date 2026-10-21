@@ -3292,9 +3292,7 @@ def test_every_desktop_notification_plays_a_sound(monkeypatch, tmp_path):
     argv = _notifier_stubs(monkeypatch, tmp_path, ["notify-send"])
     notifier.show("t", "b", severity="normal")
     got = argv("notify-send")
-    assert b"string:sound-name:message-new-instant" in got and got[got.index(b"-u") + 1] == b"normal"
-    notifier.show("t", "b", severity="critical")
-    assert argv("notify-send")[argv("notify-send").index(b"-u") + 1] == b"critical"
+    assert b"string:sound-name:message-new-instant" in got and got[got.index(b"-u") + 1] == b"critical"
 
 
 @pytest.mark.parametrize("platform,cmd,rc,answer,exit_code,says", [
@@ -3321,7 +3319,7 @@ def test_ttp_notifier_test_reports_the_backend_the_result_and_the_fix(env, monke
         raise SystemExit(0)
     out = capsys.readouterr().out
     assert e.value.code == exit_code and says in out, out
-    fix = {"osascript": "System Settings > Notifications > Script Editor", "terminal-notifier":
+    fix = {"osascript": "System Settings > Notifications > Script Editor:", "terminal-notifier":
            "System Settings > Notifications > terminal-notifier", "notify-send": "No notification server answered"}[cmd]
     assert (fix in out) == (exit_code == 1 or answer is None and platform == "darwin"), out
     if cmd == "osascript" and exit_code:
@@ -3744,3 +3742,186 @@ def test_a_stepped_alert_re_raises_by_severity_or_by_episode_as_documented(env, 
     assert wakes() == 5
     assert len(p.db.q("SELECT id FROM issues WHERE fingerprint LIKE ?",
                       (scr.key_fingerprint("watcher:hw", "box-b down") + "%",))) == 3
+
+
+def _mac_app_stubs(monkeypatch, tmp_path, tools=("osacompile", "codesign", "open", "osascript")):
+    """macOS on Linux: a temp HOME and stub osacompile (writes an applet's Info.plist), codesign, open and
+    osascript, each logging its argv as one JSON line to <tool>.calls."""
+    from ttp import notifier
+    _notifier_stubs(monkeypatch, tmp_path, [])
+    monkeypatch.setattr(notifier.sys, "platform", "darwin")
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(notifier, "CONF", tmp_path / "notifier.json")
+    monkeypatch.setattr(notifier, "CLICK_URL", tmp_path / "notifier-click-url")
+    for tool in tools:
+        stub = tmp_path / "bin" / tool
+        stub.write_text(f"#!{sys.executable}\nimport json, plistlib, sys, pathlib\n"
+                        f"open({str(tmp_path / (tool + '.calls'))!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                        "if pathlib.Path(sys.argv[0]).name == 'osacompile':\n"
+                        "    c = pathlib.Path(sys.argv[2]) / 'Contents'\n"
+                        "    c.mkdir(parents=True)\n"
+                        "    (c / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'com.apple.ScriptEditor.id.x',"
+                        " 'CFBundleExecutable': 'applet'}))\n")
+        stub.chmod(0o755)
+    return lambda tool: [json.loads(ln) for ln in (tmp_path / f"{tool}.calls").read_text().splitlines()] \
+        if (tmp_path / f"{tool}.calls").exists() else []
+
+
+def test_the_macos_notifier_app_asks_for_persistent_alerts_is_ad_hoc_signed_and_built_once(monkeypatch, tmp_path):
+    import plistlib
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)
+    app, line = notifier.ensure_app()
+    assert app == tmp_path / "userhome" / "Applications" / "tt-project.app" and "persistent alerts requested" in line
+    info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+    assert info["CFBundleIdentifier"] == "com.tt-project.notifier" and info["CFBundleName"] == "tt-project"
+    assert info["NSUserNotificationAlertStyle"] == "alert", "macOS's default style for the app: stays until closed"
+    assert info["LSBackgroundOnly"] is True and "LSUIElement" not in info and info["CFBundleExecutable"] == "applet"
+    assert (app / "Contents" / "Resources" / "applet.icns").read_bytes()[:4] == b"icns"
+    (compiled,) = calls("osacompile")
+    assert compiled[0] == "-o" and compiled[1].endswith(".tt-project.app.new")
+    (signed,) = calls("codesign")
+    assert signed[:4] == ["--force", "--deep", "--sign", "-"] and signed[4] == compiled[1], "signed after the plist edit"
+    assert notifier.ensure_app() == (app, ""), "a rerun leaves the same app alone"
+    assert len(calls("osacompile")) == 1 and len(calls("codesign")) == 1
+    assert [p.name for p in app.parent.iterdir()] == ["tt-project.app"], "no build leftovers"
+    notifier.CONF.write_text('{"persistent": false}')
+    assert "banner alerts requested" in notifier.ensure_app()[1], "the one switch rebuilds it"
+    assert plistlib.loads((app / "Contents" / "Info.plist").read_bytes())["NSUserNotificationAlertStyle"] == "banner"
+
+
+def _ncprefs(tmp_path, flags=None):
+    """macOS's Notifications settings as the app reads them; flags None: the app is not listed."""
+    import plistlib
+    prefs = tmp_path / "userhome" / "Library" / "Preferences" / "com.apple.ncprefs.plist"
+    prefs.parent.mkdir(parents=True, exist_ok=True)
+    apps = [{"bundle-id": "com.example.other", "flags": 16}]
+    if flags is not None:
+        apps.append({"bundle-id": "com.tt-project.notifier", "flags": flags})
+    prefs.write_bytes(plistlib.dumps({"apps": apps}, fmt=plistlib.FMT_BINARY))
+    return prefs
+
+
+def test_macos_alerts_keep_their_sender_until_macos_lists_the_app_and_with_the_opt_out(monkeypatch, tmp_path):
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)
+    assert notifier.ensure_app()[0], "the app is built"
+    for prefs in (None, "unreadable", "not listed"):   # never proven registered: the sender of today
+        if prefs == "not listed":
+            _ncprefs(tmp_path)
+        elif prefs == "unreadable":
+            p = tmp_path / "userhome" / "Library" / "Preferences" / "com.apple.ncprefs.plist"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"not a plist")
+        assert notifier.show("t", "b")["backend"] == "osascript" and not calls("open"), prefs
+    _ncprefs(tmp_path, 16)
+    assert notifier.show("t", "b")["backend"] == "tt-project"
+    notifier.CONF.write_text('{"app": false}')
+    n = len(calls("open"))
+    assert notifier.show("t", "b")["backend"] == "osascript" and len(calls("open")) == n, "opted out: never the app"
+    shutil.rmtree(notifier.app_path())
+    assert notifier.ensure_app() == (None, "") and not notifier.app_path().exists(), "opted out: never built again"
+    assert notifier.register_app() == []
+
+
+def test_an_app_test_that_shows_nothing_names_the_opt_out_and_the_other_senders(monkeypatch, tmp_path):
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)
+    notifier.ensure_app()
+    _ncprefs(tmp_path, 16)
+    ok, lines = notifier.test(ask=lambda q: False)
+    assert not ok and lines[0] == "test notification not shown (tt-project): macOS took it but did not show it"
+    text = "\n".join(lines)
+    assert '"app": false in ~/.tt-project/notifier.json' in text and "terminal-notifier" in text and "osascript" in text
+    assert len(calls("open")) == 1, "a listed app gets no first-notification ping"
+
+
+def test_macos_alerts_go_through_the_tt_project_app_and_a_click_opens_the_link(monkeypatch, tmp_path):
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)
+    app = notifier.ensure_app()[0]
+    _ncprefs(tmp_path, 16)   # macOS lists it: only then do alerts go through it
+    res = notifier.show("tt-project · a", "build → done", url="http://127.0.0.1:8765/?t=x")
+    assert res["ok"] and res["backend"] == "tt-project" and not res["confirmed"]
+    assert calls("open") == [["-g", "-n", "-a", str(app), "--args", "--ttp-notify", "tt-project · a", "build → done",
+                              "Glass"]] and not calls("osascript"), "not Script Editor's osascript"
+    assert notifier.CLICK_URL.read_text() == "http://127.0.0.1:8765/?t=x"
+    script = notifier.APP_SCRIPT
+    assert "display notification (item (i + 2) of argv)" in script and "open location u" in script
+
+
+def test_macos_falls_back_to_osascript_and_names_the_setting_when_the_app_cannot_be_built(monkeypatch, tmp_path):
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path, tools=("osascript", "open"))   # no osacompile, no codesign
+    ok, lines = notifier.test()
+    assert ok and calls("osascript") and not calls("open")
+    assert lines[0] == "notifier app not built: osacompile and codesign not found"
+    assert ("alerts come from Script Editor and may go away by themselves: System Settings > Notifications > "
+            "Script Editor > alert style Persistent (older macOS: Alerts)") in lines
+    notifier.CONF.write_text('{"persistent": false}')
+    assert not [ln for ln in notifier.test()[1] if "alert style Persistent" in ln], "no hint once persistence is off"
+
+
+@pytest.mark.parametrize("flags,says,hint", [
+    (16 | 0x2000000, "alert style: persistent (stays until closed)", False),
+    (8, "alert style: banners;", True),
+    (0, "alert style: none;", True),
+    (None, "The tt-project app is not in System Settings > Notifications yet, so alerts come from osascript", False),
+])
+def test_ttp_notifier_test_reads_the_macos_alert_style_and_hints_only_when_alerts_go_away(
+        monkeypatch, tmp_path, capsys, flags, says, hint):
+    import plistlib
+    from ttp import cli, notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)
+    prefs = _ncprefs(tmp_path, flags)
+    before = prefs.read_bytes()
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+    cli.main(["notifier", "test"])
+    out = capsys.readouterr().out
+    sender = "osascript" if flags is None else "tt-project"
+    assert f"test notification sent ({sender})" in out and says in out, out
+    if flags is None:   # not listed yet: one ping through the app brings macOS's Allow prompt
+        assert "the tt-project app posted its first notification" in out and '"app": false' in out
+        assert [c[-4:-1] for c in calls("open")] == [["--ttp-notify", "tt-project",
+                                                      "tt-project alerts come from this app once you allow it."]]
+    assert ("System Settings > Notifications > tt-project > Allow notifications on, alert style Persistent" in out) == hint
+    assert prefs.read_bytes() == before, "macOS's notification settings are only read"
+    assert "self-check: " in notifier.LOG.read_text() and says.rstrip(";") in notifier.LOG.read_text(), \
+        "the log keeps what the check found"
+
+
+@pytest.mark.parametrize("persist,urgency,expiry", [(None, b"critical", True), (False, b"normal", False)])
+def test_linux_desktop_alerts_stay_until_dismissed_by_default(monkeypatch, tmp_path, persist, urgency, expiry):
+    from ttp import notifier
+    monkeypatch.setattr(notifier.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    argv = _notifier_stubs(monkeypatch, tmp_path, ["notify-send"])
+    monkeypatch.setattr(notifier, "CONF", tmp_path / "notifier.json")
+    if persist is not None:
+        notifier.CONF.write_text(json.dumps({"persistent": persist}))
+    notifier.show("t", "b", severity="high")
+    got = argv("notify-send")
+    assert got[got.index(b"-u") + 1] == urgency and ((b"-t" in got and got[got.index(b"-t") + 1] == b"0") == expiry)
+    notifier.show("t", "b", severity="critical")
+    assert argv("notify-send")[argv("notify-send").index(b"-u") + 1] == b"critical", "critical stays critical"
+
+
+def test_setup_builds_the_macos_app_and_sends_its_first_test_even_on_a_tested_code_version(env, monkeypatch, tmp_path):
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)
+    monkeypatch.delenv("TTP_TEST_NO_NOTIFIER")
+    agent = tmp_path / "userhome" / "Library" / "LaunchAgents" / f"{notifier.LABEL}.plist"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("<plist/>")
+    monkeypatch.setattr(notifier, "install", lambda: "installed and started (test)")
+    notifier.write_json(notifier.DELIVERY, {"tested": notifier.installed_code()})
+    monkeypatch.setattr(notifier, "_service_on", lambda: False)
+    assert notifier.refresh(send_test=True) == [] and not calls("osacompile"), "an agent turned off: no app, no test"
+    monkeypatch.setattr(notifier, "_service_on", lambda: True)
+    out = notifier.refresh(send_test=True)
+    assert out[0].startswith("desktop notifier: notifier app ") and len(calls("open")) == 1, out
+    assert any("the tt-project app posted its first notification" in ln for ln in out), \
+        "the new app's first post brings the Allow prompt"
+    assert any("test notification sent (osascript)" in ln for ln in out), "the test goes the way alerts still go"
+    out = notifier.refresh(send_test=True)
+    assert len(calls("open")) == 1 and "already went out" in out[-1], "a rerun sends nothing more"
