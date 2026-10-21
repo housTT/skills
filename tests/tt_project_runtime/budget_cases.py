@@ -3057,6 +3057,120 @@ def test_old_plan_readings_never_make_a_billed_account_plan(env, monkeypatch):
 
 
 
+def _bk_billed_only(p, d, now):
+    """The budget line and detail of the provider's billed gate, with the global part left out so the
+    line falls back to the generic form (the one that could show plan windows)."""
+    from ttp.web import budget_line, gate_detail
+    g = d.gates["fake"].as_dict()
+    g["numbers"].pop("global_today", None)
+    return budget_line(p.db, now, "fake", g), gate_detail(g, now)
+
+
+def test_a_lapsed_plan_switch_to_billed_leaves_no_plan_text_holds_or_spend(env, monkeypatch):
+    """The same account goes from a plan to billing by use (its runs stop reporting windows). The gate,
+    the budget line and its detail use only the dollar caps: no old window, average or 'virtual'
+    text, and spend the plan paid for stays out of the caps. The holds the plan made are released,
+    and the coordinator hears of it once."""
+    from ttp import budget as bud, budgetkind, coordinator as coord
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    now = time.time()
+    resets = _fake_plan(p, ACCT_PLAN, now - 3600)   # at the line: red, holding work
+    bud.note_account(p.db, "fake", ACCT_PLAN)
+    p.db.spend("fake", 5.0, "task:1", account=ACCT_PLAN, ts=now - 4000)   # plan-paid spend
+    p.db.set_kv("limited:fake", {"until": now + 86400, "note": "usage limit"})
+    held = p.db.add_task("reindex the docs", "x", labels=coord.defer_labels(resets, "true", "until the 7d window resets"),
+                         not_before=resets)
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    assert d.gates["fake"].regime == "windows" and _bk_events(p) == []
+    for i in range(bud.PLAN_LAPSE_RUNS):   # paid runs of the same account with no windows: billed now
+        p.db.x("INSERT INTO runs(role,provider,account,started,ended,status,cost_usd) VALUES('worker','fake',?,?,?,'ok',2)",
+               (ACCT_PLAN, now - 900 + i, now - 600 + i))
+        p.db.spend("fake", 2.0, f"task:{i + 2}", account=ACCT_PLAN, ts=now - 600 + i)
+    _bk_tick(d, monkeypatch)
+    g = d.gates["fake"]
+    assert g.regime == "caps" and "plan" not in g.numbers and g.numbers["daily_cap"] == 100, g.numbers
+    assert g.numbers["spent_24h"] == 4.0, "the plan-paid $5 stays out of the dollar caps"
+    assert g.allow_new_work and g.max_parallel == int(p.config()["budget"].get("max_parallel_workers", 6)), g.reasons
+    line, detail = _bk_billed_only(p, d, time.time())
+    assert line.startswith("24h $4.00 actual"), line
+    for stale in ("5h", "7d", "avg", "virtual", "resets in"):
+        assert stale not in line, line
+    assert "account use" not in detail and "$4.00 of $100" in detail, detail
+    ev = _bk_events(p)
+    assert len(ev) == 1 and "budget kind plan -> billed" in ev[0]["text"], ev
+    assert float(p.db.kv("limited:fake")["until"]) == 0 and "limit pause" in ev[0]["text"]
+    assert _bk_deferral(p.db.task(held)) == {} and p.db.task(held)["not_before"] is None
+    for _ in range(3):
+        d.update_gates()
+    assert len(_bk_events(p)) == 1, "the same budget wakes nobody again"
+
+
+def test_billed_to_plan_and_back_swaps_caps_and_windows_cleanly(env, monkeypatch):
+    """Billed -> plan: the dollar caps, their text and the holds they made go; the plan runs every
+    slot below its line. Plan -> billed again: the caps return without the plan's spend, and the
+    windows leave the budget line. One event per switch, none after."""
+    from ttp import budget as bud, budgetkind, coordinator as coord
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    monkeypatch.setattr(budgetkind, "MIN_GAP_S", 0.0)
+    p = make(env)
+    from ttp.web import budget_line, gate_detail
+    now = time.time()
+    most = int(p.config()["budget"].get("max_parallel_workers", 6))
+    p.db.x("INSERT INTO runs(role,provider,account,started,ended,status,cost_usd) VALUES('worker','fake',?,?,?,'ok',3)",
+           (ACCT_BILLED, now - 7200, now - 6900))
+    p.db.spend("fake", 3.0, "task:1", account=ACCT_BILLED, ts=now - 6900)
+    bud.note_account(p.db, "fake", ACCT_BILLED)
+    p.db.x("UPDATE schedules SET enabled=1, next_run=?, last_status=? WHERE name='daily-review'",
+           (now + 1800, "skipped: budget red"))
+    capped = p.db.add_task("big sweep", "x", labels=coord.defer_labels(now + 6 * 3600, "true", "until the daily cap resets"),
+                           not_before=now + 6 * 3600)
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    assert d.gates["fake"].regime == "caps" and d.gates["fake"].numbers["spent_24h"] == 3.0
+
+    bud.note_account(p.db, "fake", ACCT_PLAN2)   # to a plan
+    _fake_plan(p, ACCT_PLAN2, time.time(), util=20.0)
+    p.db.spend("fake", 7.0, "task:2", account=ACCT_PLAN2, ts=time.time())   # plan-paid
+    _bk_tick(d, monkeypatch)
+    g = d.gates["fake"]
+    assert g.regime == "windows" and g.numbers["billing"] == "plan", g.reasons
+    for k in ("daily_cap", "weekly_cap", "spent_today", "spent_24h", "cap_ratio", "global_today"):
+        assert k not in g.numbers, (k, g.numbers)
+    assert g.level == "green" and g.allow_new_work and g.max_parallel == most, (g.level, g.max_parallel, g.reasons)
+    line = budget_line(p.db, time.time(), "fake", g.as_dict())
+    assert line.startswith("5h ") and " of $" not in line and "today" not in line and "this project" not in line, line
+    assert "account use:" in gate_detail(g.as_dict(), time.time())
+    ev = _bk_events(p)
+    assert len(ev) == 1 and "budget kind billed -> plan" in ev[0]["text"], ev
+    assert "schedule daily-review" in ev[0]["text"], ev[0]["text"]
+    assert _bk_deferral(p.db.task(capped)) == {} and p.db.task(capped)["not_before"] is None
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='daily-review'")["next_run"] <= time.time()
+    d.update_gates()
+    assert len(_bk_events(p)) == 1
+
+    bud.note_account(p.db, "fake", ACCT_BILLED)   # and back to billing by use
+    _bk_tick(d, monkeypatch)
+    g = d.gates["fake"]
+    assert g.regime == "caps" and "plan" not in g.numbers, g.reasons
+    assert g.numbers["daily_cap"] == 100 and g.numbers["weekly_cap"] == 200, g.numbers
+    assert g.numbers["spent_24h"] == 3.0 and g.numbers["spent_7d"] == 3.0, "the plan's $7 is not billed spend"
+    line, detail = _bk_billed_only(p, d, time.time())
+    for stale in ("5h", "7d", "avg", "virtual"):
+        assert stale not in line, line
+    assert "$3.00 of $100" in detail and "account use" not in detail, detail
+    ev = _bk_events(p)
+    assert len(ev) == 2 and "budget kind plan -> billed" in ev[1]["text"], [e["text"] for e in ev]
+    assert "dollar caps daily $100" in ev[1]["text"], ev[1]["text"]
+    for _ in range(3):
+        d.update_gates()
+    assert len(_bk_events(p)) == 2, "each switch is told once"
+
+
+
 def test_an_account_flap_on_the_same_billing_kind_wakes_nobody(env, monkeypatch):
     """The flapping case: the account label alternates between two usage-billed accounts with the
     same caps ('was billed by use ... now billed by use'). Each flap raised an event that woke the

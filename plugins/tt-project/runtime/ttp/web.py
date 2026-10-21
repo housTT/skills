@@ -186,7 +186,8 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     """The budget in one line, for the web app's header and `ttp status`:
     '5h 4% - resets in 3.9 h, 7d 21% - resets in 6.0 d, 24h $0.17 virtual, 5h avg 31%, 7d avg 72%'.
     The windows and averages are the current account's, from its plan readings (none once the
-    provider moved to another account until that one reports); an average is the mean of
+    provider moved to another account until that one reports, and none while the gate is on the dollar
+    caps: a plan that lapsed into billing by use); an average is the mean of
     each completed period's peak, 5-hour windows over 7 days and weekly ones over 3 weeks. The
     dollars are this project's last 24 h: 'virtual' (list-price equivalent) on a plan, 'actual' when
     billed by use, which counts only spend whose account was billed by use when it was spent
@@ -201,6 +202,8 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
                                          (now - 3 * WEEK,))]
     prov = core if core in provs else provs[0] if provs else ""
     wins = {w.window: w for w in bud.plan_windows(db, now) if w.provider == prov}
+    if (gate or {}).get("regime") and gate["regime"] != "windows":
+        wins = {}   # the gate is on dollar caps (the plan lapsed): its old readings are history
     parts = []
     for label, names, unit, secs in (("5h", FIVE_HOUR, "h", 3600), ("7d", SEVEN_DAY, "d", DAY)):
         w = next((wins[n] for n in names if n in wins), None)
