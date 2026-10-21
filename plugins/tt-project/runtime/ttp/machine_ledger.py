@@ -36,7 +36,7 @@ from that moment.
 
 Change ledger. Every live change to a shared machine (a drop-in, a disabled recovery switch, a pause) is
 recorded with `ttp machines change add <alias> "<what>" --undo "<cmd>" (--expires <t> | --until-probe
-"<cmd>" | --until-task <id>)`: who made it (the project), why (the text), how to undo it and when it ends. Each co-tenant's
+"<cmd>" | --until-task <id>)`, or an until-probe with an --expires (it ends at whichever comes first): who made it (the project), why (the text), how to undo it and when it ends. Each co-tenant's
 digest lists the open entries for machines in its Resources, one line each. An entry is overdue when it
 expires, its until-probe passes (exit 0: what it waited for is over, so the undo is due) or its until-task
 (a task of the project that made it, such as the follow-up that uses a staged build tree) is done, failed,
@@ -50,8 +50,9 @@ from its root, as end probes do, starting PROBE_GRACE_S after the entry; a probe
 PROBE_PASSES passes in a row (each logged with its output's tail), keeps running while the entry is open, and a
 later "not yet" (1 or 75) clears the pass and its pages; a broken one (an exit code other than 0, 1, 75 or ssh's own 255, or a
 timeout) queues one low `change_probe_broken` event per kind of breakage; the same daemon reads its until-tasks'
-states. `ttp machines change edit <id> [--what] [--undo] [--expires | --until-probe | --until-task]`
-corrects an open entry in place (same id), with an edit trail in the entry.
+states. `ttp machines change edit <id> [--what] [--undo] [--expires] [--until-probe | --until-task]`
+corrects an open entry in place (same id), with an edit trail in the entry; giving its until-probe again, even
+the same one, drops its result and passes so far: it is judged afresh after PROBE_GRACE_S.
 
 Planned power cycles. `ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle
 intent: an entry of kind `power_cycle` that needs no undo and closes itself POWER_CYCLE_AFTER_S after T
@@ -447,14 +448,15 @@ def _close(cid: int, why: str, by: str, now: float) -> dict:
 def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = None, expires: Any = None,
                 until_probe: str | None = None, now: float | None = None, until_task: int | None = None) -> dict:
     """Correct open entry #cid in place: its text, undo command or end (--expires, --until-probe or
-    --until-task, as add_change takes them; the same until-task again restarts its PROBE_END_S, so a
-    continuation task re-extends the entry). Keeps its id, alias, author and creation time; records who edited it, when
+    --until-task, as add_change takes them, an --until-probe with an --expires too; the same until-task again
+    restarts its PROBE_END_S, so a continuation task re-extends the entry, and the same until-probe again keeps
+    its end but is judged afresh). Keeps its id, alias, author and creation time; records who edited it, when
     and the values it replaced in `edits`. A new end starts afresh (`page_from`): its until-probe result and overdue
     pages are dropped. Refuses a closed or unknown id, a power-cycle intent's undo or end, and an edit
     that changes nothing."""
     now = time.time() if now is None else now
-    if sum(map(bool, (expires, until_probe, until_task))) > 1:
-        raise ValueError("give one end: --expires, --until-probe or --until-task")
+    if sum(map(bool, (expires, until_probe, until_task))) > 1 and not (expires and until_probe and not until_task):
+        raise ValueError("give one end: --expires, --until-probe (with or without --expires) or --until-task")
     new: dict[str, Any] = {}
     if what is not None:
         new["what"] = _one_line(what)
@@ -467,7 +469,8 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         if not probe:
             raise ValueError("the --until-probe command cannot be empty")
         ends.check_sh(probe, "--until-probe")
-        new.update(probe=probe, until_task=None, expires=now + PROBE_END_S)
+        new.update(probe=probe, until_task=None, expires=now + PROBE_END_S if not expires else
+                   float(expires) if isinstance(expires, (int, float)) else ends.parse_expires(expires, now))
     elif until_task:
         new.update(probe=None, until_task=int(until_task), expires=now + PROBE_END_S)
     elif expires:
@@ -485,14 +488,19 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         if c.get("kind") == POWER_CYCLE and set(new) - {"what"}:
             raise ValueError(f"machine change #{cid} is a planned power cycle: only --what can change; "
                              f"close it and record a new one for another time")
-        if until_probe is not None and new["probe"] == c.get("probe"):
-            del new["probe"], new["expires"]   # the same until-probe keeps its end
+        reprobe = until_probe is not None and new["probe"] == c.get("probe")
+        if reprobe:   # the same until-probe again keeps its end (unless --expires gives one) but starts afresh
+            del new["probe"]
+            if not expires:
+                del new["expires"]
         was = {k: c.get(k) for k, v in new.items() if c.get(k) != v}
+        if reprobe:
+            was["probe_passed"] = c.get("probe_passed")
         if not was:
             raise ValueError(f"machine change #{cid} already says that: nothing to change")
-        for k in was:
+        for k in set(was) & set(new):
             c[k] = new[k]
-        if "expires" in was:
+        if "expires" in was or reprobe:
             for k in ("probe_passed", "probe_job_failed", "probe_out", "task_ended", "page"):
                 c.pop(k, None)
             c["page_from"] = now   # a new page episode: its pages get ids of their own, not the delivered ones'
@@ -1230,7 +1238,7 @@ class Probes:
         self._probed: dict[int, float] = {}
         self._errs: dict[int, Any] = {}   # id(proc) -> its stderr file
         self._reported: dict[int, str] = {}   # change id -> the broken kind ("exit 2", "timeout") already reported
-        self._passes: dict[int, tuple[str, int]] = {}   # change id -> (probe, its passes in a row)
+        self._passes: dict[int, tuple[str, float, int]] = {}   # change id -> (probe, set at, its passes in a row)
 
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -1240,11 +1248,17 @@ class Probes:
         except OSError as e:   # kept queued for the next tick
             self.log(f"queued machine-ledger requests not applied yet: {e}")
         passed, unpassed = {}, set()
+        started = {cid: v[1] for cid, v in self._procs.items()}
+        since = {c.get("id"): float(c.get("page_from") or c.get("added") or 0) for c in changes()}
         for cid, (rc, probe, err) in ends.reap_probes(self._procs, self._errs, now, self.p).items():
+            if started.get(cid, now) < since.get(cid, 0):   # began before its probe was (re)set: says nothing of it
+                self._passes.pop(cid, None)
+                continue
             if rc == 0 or (rc not in ends.NOT_YET_RCS and detach.failed_check(probe, rc)):   # the jobs it waits on ended, even if one failed
                 self._reported.pop(cid, None)
-                n = self._passes[cid][1] + 1 if self._passes.get(cid, ("", 0))[0] == probe else 1
-                self._passes[cid] = (probe, n)
+                was = self._passes.get(cid, ("", 0.0, 0))
+                n = was[2] + 1 if was[:2] == (probe, since.get(cid, 0)) else 1
+                self._passes[cid] = (probe, since.get(cid, 0), n)
                 if n <= PROBE_PASSES:   # not every round while the entry stays open overdue
                     self.log(f"machine change #{cid}: its until-probe passed ({n} of {PROBE_PASSES} in a row; "
                              f"exit {rc}): {(err or 'no output')[-300:]}")

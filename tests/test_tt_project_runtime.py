@@ -37296,7 +37296,7 @@ def test_machine_change_edit_corrects_an_open_entry_in_place(env, capsys):
     assert c["probe"] == "test -e /tmp/done" and c["expires"] == pytest.approx(now + ml.PROBE_END_S)
     assert c["edits"][3]["was"]["probe"] is None
     with pytest.raises(ValueError, match="nothing to change"):
-        ml.edit_change(1, "beta", what="drop-in for a soak", until_probe="test -e /tmp/done", now=now + 60)
+        ml.edit_change(1, "beta", what="drop-in for a soak", now=now + 60)
     with pytest.raises(ValueError, match="say what to change"):
         ml.edit_change(1, "beta")
     with pytest.raises(ValueError, match="cannot be empty"):
@@ -37307,7 +37307,7 @@ def test_machine_change_edit_corrects_an_open_entry_in_place(env, capsys):
     with pytest.raises(ValueError, match="#2 is closed"):
         ml.edit_change(2, "beta", undo="x")
     for bad in (["9", "--undo", "x"], ["2", "--undo", "x"], ["1", "--what", "drop-in for a soak"],
-                ["1", "--expires", "1h", "--until-probe", "true"]):
+                ["1", "--until-task", "5", "--until-probe", "true"]):
         with pytest.raises(SystemExit):
             main(["machines", "change", "edit", *bad])
     pc = ml.add_power_cycle("box-a", "1h", "alpha", "firmware", now=now)
@@ -37315,6 +37315,78 @@ def test_machine_change_edit_corrects_an_open_entry_in_place(env, capsys):
         ml.edit_change(pc["id"], "beta", expires="2h")
     assert ml.edit_change(pc["id"], "beta", what="power-cycle intent: new firmware")["kind"] == ml.POWER_CYCLE
     assert [c["id"] for c in ml.changes()] == [1, pc["id"]] and ml._read(ml.LEDGER, {})["next"] == pc["id"] + 1
+
+
+def test_a_machine_change_keeps_an_until_probe_and_an_expires_given_together(env, capsys):
+    """`machines change add|edit` with --until-probe and --expires keeps both: the entry is overdue at
+    whichever comes first, its probe passing or its time. --expires with --until-task stays refused."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    main(["machines", "change", "add", "box-a", "paused", "--undo", "resume", "--until-probe", "false",
+          "--expires", "1h", "--by", p.name])
+    now = time.time()
+    c = ml.changes()[0]
+    assert c["probe"] == "false" and c["expires"] == pytest.approx(now + 3600, abs=60)
+    assert "until-probe `false`, at the latest" in capsys.readouterr().out
+    assert not ml.overdue(c, now) and ml.overdue(c, now + 3700).startswith("expired"), "its time comes first"
+    ml.add_change("box-a", "drained", "undrain", p.name, expires="1d", until_probe="true", now=now)
+    probes = ml.Probes(p, log=lambda s: None)
+    for n in range(ml.PROBE_PASSES):
+        _change_probe_round(probes, 2, now + ml.PROBE_GRACE_S + n * 600)
+    c = ml.changes()[1]
+    assert c["expires"] == pytest.approx(now + 86400) and ml.overdue(c, now + 3600) == "its until-probe passed"
+    main(["machines", "change", "edit", "1", "--until-probe", "test -e /nonexistent-ttp-probe", "--expires", "2h",
+          "--by", p.name])
+    c = ml.changes()[0]
+    assert c["probe"] == "test -e /nonexistent-ttp-probe" and c["expires"] == pytest.approx(now + 7200, abs=60)
+    with pytest.raises(SystemExit):
+        main(["machines", "change", "add", "box-a", "staged", "--undo", "rm -r it", "--until-task", "1",
+              "--expires", "1h", "--by", p.name])
+    assert len(ml.changes()) == 2
+
+
+def test_giving_a_machine_change_its_until_probe_again_judges_it_afresh(env):
+    """`machines change edit <id> --until-probe <the same probe>` keeps the end but drops the probe's
+    result, pages and passes so far: a probe still running from before the edit does not count, and it
+    needs PROBE_PASSES fresh passes after PROBE_GRACE_S to be overdue again."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    ml.add_change("box-a", "paused", "resume", p.name, until_probe="true", now=now)
+    probes = ml.Probes(p, log=lambda s: None)
+    for n in range(ml.PROBE_PASSES):
+        _change_probe_round(probes, 1, now + ml.PROBE_GRACE_S + n * 600)
+    with ml._locked():
+        doc = ml._read(ml.LEDGER, {})
+        doc["changes"][0]["page"] = {"stage": 1}
+        ml._write(ml.LEDGER, doc)
+    c = ml.changes()[0]
+    assert c["probe_passed"] and ml.overdue(c, now + 1000)
+    probes._probed.clear()
+    t = now + 2000
+    probes.tick(t)   # a pass in flight while the probe is set again
+    assert 1 in probes._procs
+    c = ml.edit_change(1, p.name, until_probe="true", now=t + 1)
+    assert c["probe"] == "true" and c["expires"] == pytest.approx(now + ml.PROBE_END_S)
+    assert "probe_passed" not in c and "page" not in c and c["page_from"] == t + 1
+    assert c["edits"][-1]["was"] == {"probe_passed": pytest.approx(now + ml.PROBE_GRACE_S + 600)}
+    probes._procs[1][0].wait(30)
+    probes._probed[1] = t + 2   # not due again yet
+    probes.tick(t + 2)
+    assert "probe_passed" not in ml.changes()[0] and 1 not in probes._passes, "the pass begun before is stale"
+    probes.tick(t + 60)
+    assert 1 not in probes._procs, "not run again during its grace"
+    _change_probe_round(probes, 1, t + 1 + ml.PROBE_GRACE_S)
+    assert "probe_passed" not in ml.changes()[0], "one fresh pass is not enough"
+    _change_probe_round(probes, 1, t + 1 + ml.PROBE_GRACE_S + 600)
+    assert ml.overdue(ml.changes()[0], t + 1 + ml.PROBE_GRACE_S + 601) == "its until-probe passed"
+    c = ml.edit_change(1, p.name, until_probe="true", now=t + 2000)
+    assert "probe_passed" not in c, "the same probe again clears a pass with no page too"
 
 
 def test_an_edited_machine_change_overdue_again_pages_afresh_and_a_stale_probe_pass_is_ignored(env, monkeypatch):

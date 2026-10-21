@@ -5071,6 +5071,8 @@ def _machine_change(a) -> None:
     tid = int(task) if task and task.isdigit() else None
     if a.power_cycle_at and (a.undo or a.expires or a.until_probe or a.until_task):
         die("a power cycle needs no --undo, --expires, --until-probe or --until-task: it closes itself after its time")
+    if a.expires and a.until_task:
+        die("give --until-task without --expires: it ends with the task, at the latest after 7 days")
     if not a.power_cycle_at and not a.undo:
         die("give the --undo command (or --power-cycle-at <t> for a planned power cycle)")
     if not a.power_cycle_at and not (a.expires or a.until_probe or a.until_task):
@@ -7471,8 +7473,8 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("alias", help="the machine")
     c.add_argument("what", help="what changed and why, one line")
     c.add_argument("--undo", help="the command that undoes it (required, except for --power-cycle-at)")
+    c.add_argument("--expires", help="when it ends: a delay (6h, 3d) or a time; with --until-probe, at the latest")
     end = c.add_mutually_exclusive_group()
-    end.add_argument("--expires", help="when it ends: a delay (6h, 3d) or a time")
     end.add_argument("--until-probe", dest="until_probe",
                      help="a command that exits 0 once the change should be undone (checked every 10 min)")
     end.add_argument("--until-task", dest="until_task", type=int, metavar="ID",
@@ -7498,10 +7500,11 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("id", type=int, help="the change's id, as `ttp machines change list` shows it")
     c.add_argument("--what", help="the new text: what changed and why, one line")
     c.add_argument("--undo", help="the new command that undoes it")
+    c.add_argument("--expires", help="a new end: a delay (6h, 3d) or a time; with --until-probe, at the latest")
     end = c.add_mutually_exclusive_group()
-    end.add_argument("--expires", help="a new end: a delay (6h, 3d) or a time")
     end.add_argument("--until-probe", dest="until_probe",
-                     help="a new end: a command that exits 0 once the change should be undone")
+                     help="a new end: a command that exits 0 once the change should be undone; the same "
+                          "one again is judged afresh")
     end.add_argument("--until-task", dest="until_task", type=int, metavar="ID",
                      help="a new end: once this open task ends; a continuation task gives its own id "
                           "to re-extend the entry (again 7 days at the latest)")
