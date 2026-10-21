@@ -2136,6 +2136,183 @@ def test_setup_box_agents_login_relays_link_and_code_and_keeps_tokens_on_the_box
     assert ba._state(out) == "logged-in"
 
 
+def _glean_fakes(home):
+    """Fake claude and codex CLIs whose `mcp` commands keep one server each in a file, like the real ones:
+    Claude Code's `mcp get` prints URL/Type/Status lines (Status from $HOME/claude-glean-status), Codex's
+    `mcp get --json` and `mcp list --json` print the entry (auth_status from $HOME/codex-glean-auth).
+    Other servers are ignored: a machine's login profile may add its own."""
+    bin_ = home / ".local/bin"
+    bin_.mkdir(parents=True, exist_ok=True)
+    (bin_ / "claude").write_text(
+        "#!/bin/bash\nf=$HOME/claude-mcp\necho \"$*\" >> $HOME/claude.log\n"
+        "[ \"$1\" = mcp ] && case \"$*\" in *glean*|'mcp list'*) ;; *) exit 0 ;; esac\ncase \"$1 $2\" in\n"
+        "'--version ') echo '2.1.0 (Claude Code)' ;;\n"
+        "'auth status') echo '{\"loggedIn\": true}' ;;\n"
+        "'mcp get') [ -f $f ] || { echo 'No MCP server found' >&2; exit 1; }; echo \"$3:\"; echo '  Scope: User config';"
+        " echo \"  Status: $(cat $HOME/claude-glean-status 2>/dev/null || echo '! Needs authentication')\";"
+        " echo '  Type: http'; echo \"  URL: $(cat $f)\"; echo '  Headers: Authorization: secret-header' ;;\n"
+        "'mcp add') [ -f $f ] && { echo exists >&2; exit 1; }; for a; do u=$a; done; echo \"$u\" > $f ;;\n"
+        "'mcp remove') rm -f $f ;;\n"
+        "esac\n")
+    (bin_ / "codex").write_text(
+        "#!/bin/bash\nf=$HOME/codex-mcp\necho \"$*\" >> $HOME/codex.log\n"
+        "[ \"$1\" = mcp ] && case \"$*\" in *glean*|'mcp list'*) ;; *) exit 0 ;; esac\n"
+        "entry() { printf '  {\\n    \"name\": \"glean\",\\n    \"transport\": {\\n      \"type\": \"streamable_http\",\\n'"
+        "; printf '      \"url\": \"%s\",\\n      \"http_headers\": {\"X\": \"secret-header\"}\\n    },\\n' \"$(cat $f)\"; }\n"
+        "case \"$1 $2\" in\n"
+        "'--version ') echo 'codex-cli 0.1' ;;\n"
+        "'login status') exit 0 ;;\n"
+        "'mcp get') [ -f $f ] || exit 1; entry ;;\n"
+        "'mcp list') echo '['; [ -f $f ] && { entry; echo \"    \\\"auth_status\\\": \\\"$(cat $HOME/codex-glean-auth 2>/dev/null"
+        " || echo not_logged_in)\\\"\"; echo '  }'; }; echo ']' ;;\n"
+        "'mcp add') echo \"$5\" > $f; echo 'Detected OAuth support. Starting OAuth flow'; sleep 1 ;;\n"
+        "'mcp remove') rm -f $f ;;\n"
+        "esac\n")
+    for c in ("claude", "codex"):
+        (bin_ / c).chmod(0o755)
+    (home / ".claude.json").write_text("{}")
+    (home / ".codex").mkdir(exist_ok=True)
+    (home / ".codex/config.toml").write_text("# codex\n")
+
+
+def test_setup_box_agents_glean_config_is_idempotent_and_fixes_a_wrong_entry_with_a_backup(tmp_path, monkeypatch):
+    import subprocess
+    ba = _agents(monkeypatch)
+    home, env = _agents_home(tmp_path)
+    _glean_fakes(home)
+    url = "https://glean.example.invalid/mcp/glean"
+    script = ba.install_script(["claude", "codex"], [], url)
+
+    def run():
+        r = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True, timeout=120)
+        return r, ba.read_install(r.stdout)
+    r, (lines, ok) = run()
+    assert r.returncode == 0 and ok and "claude: glean added" in lines and "codex: glean added" in lines, r.stdout
+    claude_log = (home / "claude.log").read_text()
+    assert f"mcp add --scope user --transport http glean {url}" in claude_log
+    assert f"mcp add glean --url {url}" in (home / "codex.log").read_text()
+    # Codex's add then waits on an OAuth callback: the wait is cut short, the entry stays.
+    assert "timeout 20" in script and (home / "codex-mcp").read_text().strip() == url
+    # A second run leaves both alone: no add, no backup.
+    r, (lines, ok) = run()
+    assert ok and "claude: glean present" in lines and "codex: glean present" in lines, r.stdout
+    assert (home / "claude.log").read_text().count("mcp add") == 1
+    assert not list(home.glob(".claude.json.ttp-bak-*"))
+    # A wrong entry is fixed, each config backed up first.
+    (home / "claude-mcp").write_text("https://old.example.invalid/mcp\n")
+    (home / "codex-mcp").write_text("https://old.example.invalid/mcp\n")
+    r, (lines, ok) = run()
+    assert ok and "claude: glean fixed" in lines and "codex: glean fixed" in lines, r.stdout
+    assert (home / "claude-mcp").read_text().strip() == url and (home / "codex-mcp").read_text().strip() == url
+    assert len(list(home.glob(".claude.json.ttp-bak-*"))) == 1
+    assert len(list((home / ".codex").glob("config.toml.ttp-bak-*"))) == 1
+    assert any("backed up to" in ln for ln in lines)
+    # A server's headers never reach the output.
+    assert "secret-header" not in r.stdout
+    # No URL: no Glean step at all.
+    assert "mcp add" not in ba.install_script(["claude", "codex"], [], None)
+
+
+def test_setup_box_agents_glean_url_comes_from_config_and_skips_with_one_line_when_missing(tmp_path, monkeypatch, capsys):
+    ba = _agents(monkeypatch)
+    import box
+    home = tmp_path / "h"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    site = tmp_path / "boxes.json"
+    site.write_text(json.dumps({"version": 1, "boxes": {"b": {"route": "bare", "workdir_root": "~/w"}}}))
+    calls = []
+    monkeypatch.setattr(box, "ssh_run", lambda alias, cmd, **k: calls.append(cmd[-1])
+                        or __import__("subprocess").CompletedProcess(cmd, 0, "cli_claude=present 1\n", ""))
+
+    def install(*extra):
+        args = box.build_parser().parse_args(["--site", str(site), "agents", "install", "b", "--cli", "claude",
+                                              "--run", *extra])
+        rc = args.func(args)
+        return rc, capsys.readouterr().out
+    rc, out = install()
+    assert rc == 0 and "mcp add" not in calls[-1]
+    skips = [ln for ln in out.splitlines() if ln.startswith("glean: skipped")]
+    assert len(skips) == 1 and "--glean-url" in skips[0] and '"mcp": {"glean"' in skips[0]
+    # This machine's own agent configs: Cursor, Codex and Claude Code.
+    (home / ".cursor").mkdir()
+    (home / ".cursor/mcp.json").write_text(json.dumps({"mcpServers": {"glean": {"url": "https://c.invalid/g"}}}))
+    assert ba.local_mcp_url(home) == ("https://c.invalid/g", "~/.cursor/mcp.json")
+    (home / ".codex").mkdir()
+    (home / ".codex/config.toml").write_text('[mcp_servers.other]\nurl = "https://o.invalid"\n\n'
+                                             '[mcp_servers.glean]\nurl = "https://x.invalid/g"\n')
+    (home / ".cursor/mcp.json").unlink()
+    assert ba.local_mcp_url(home) == ("https://x.invalid/g", "~/.codex/config.toml")
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {"glean": {"type": "http", "url": "https://l.invalid/g"}}}))
+    rc, out = install()
+    assert "G=https://l.invalid/g" in calls[-1] and "glean: skipped" not in out
+    # The site file wins over local configs (top level, then the box's own entry); --glean-url over all.
+    site.write_text(json.dumps({"version": 1, "mcp": {"glean": "https://s.invalid/g"},
+                                "boxes": {"b": {"route": "bare", "workdir_root": "~/w"}}}))
+    install()
+    assert "G=https://s.invalid/g" in calls[-1]
+    site.write_text(json.dumps({"version": 1, "mcp": {"glean": "https://s.invalid/g"}, "boxes": {
+        "b": {"route": "bare", "workdir_root": "~/w", "mcp": {"glean": "https://b.invalid/g"}}}}))
+    install()
+    assert "G=https://b.invalid/g" in calls[-1]
+    install("--glean-url", "https://f.invalid/g")
+    assert "G=https://f.invalid/g" in calls[-1]
+    assert box.check_site(json.loads(site.read_text()))[0] == []
+    assert box.check_site({"version": 1, "mcp": {"glean": 3}, "boxes": {"b": {"route": "bare", "workdir_root": "/w"}}})[0] \
+        == ["mcp must map server names to endpoints"]
+
+
+def test_setup_box_agents_check_reports_glean_missing_signed_out_or_working(tmp_path, monkeypatch):
+    import subprocess
+    ba = _agents(monkeypatch)
+    home, env = _agents_home(tmp_path)
+    _glean_fakes(home)
+    env["PATH"] = f"{home / '.local/bin'}:{env['PATH']}"
+    url = "https://glean.example.invalid/mcp/glean"
+    script = ba.probe_script(["claude", "codex"], editors=False)
+
+    def check(glean=url):
+        out = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True, timeout=120).stdout
+        assert "secret-header" not in out
+        return ba.read_check(out, "<box-alias>", ["claude", "codex"], [], glean)
+    # Missing.
+    lines, problems, fixes = check()
+    assert problems == ["claude: glean missing", "codex: glean missing"]
+    assert lines[0].endswith(", logged in, glean missing")
+    assert fixes == [f"{ba.BOX_PY} agents install <box-alias> --cli {c} --run" for c in ("claude", "codex")]
+    # Missing with no URL configured: said how to set it, not a gap.
+    lines, problems, _ = check(None)
+    assert problems == [] and "glean not set up (no URL configured" in lines[0]
+    # Configured, signed out.
+    for c in ("claude", "codex"):
+        (home / f"{c}-mcp").write_text(url + "\n")
+    lines, problems, fixes = check()
+    assert problems == ["claude: glean signed out", "codex: glean signed out"]
+    assert lines[1].endswith(", glean configured, signed out")
+    assert fixes == [f"{ba.BOX_PY} agents login <box-alias> {c} --mcp glean  (relay its sign-in link to the user)"
+                     for c in ("claude", "codex")]
+    # Working.
+    (home / "claude-glean-status").write_text("\u2713 Connected\n")
+    (home / "codex-glean-auth").write_text("o_auth\n")
+    lines, problems, fixes = check()
+    assert problems == [] and fixes == [] and all(ln.endswith(", glean working") for ln in lines), lines
+    # Another URL, or an error the CLI reports, is a gap too.
+    (home / "codex-mcp").write_text("https://old.example.invalid/mcp\n")
+    (home / "claude-glean-status").write_text("\u2718 Failed to connect\n")
+    lines, problems, _ = check()
+    assert problems == ["claude: glean not working (\u2718 Failed to connect)", "codex: glean on another URL"]
+    # The sign-in is Codex's paste flow, Claude Code's under a terminal; both are seen as signed in once done.
+    assert "mcp login glean --no-browser" in ba.login_script("codex", "glean")
+    assert "script -qefc" in ba.login_script("claude", "glean") and "\\r" in ba.code_script("claude", "glean")
+    (home / "codex-mcp").write_text(url + "\n")
+    for c in ("claude", "codex"):
+        st = subprocess.run(["sh", "-c", ba.status_script(c, "glean")], env=env, capture_output=True, text=True,
+                            timeout=120).stdout
+        assert ba._state(st) == ("logged-in" if c == "codex" else "logged-out"), (c, st)
+    assert ba.callback_forward(["https://g.invalid/oauth?redirect_uri=http%3A%2F%2F127.0.0.1%3A40635%2Fcb&x=1"]) \
+        == "40635:127.0.0.1:40635"
+
+
 def test_setup_box_agents_editor_defaults_merge_keeps_entries_and_comments(tmp_path, monkeypatch):
     ba = _agents(monkeypatch)
     text = ('{\n  // my settings\n  "editor.fontSize": 13,\n  "remote.SSH.defaultExtensions": [\n'
@@ -2190,7 +2367,9 @@ def test_setup_box_agents_questions_default_yes_and_plan_runs_the_scripted_steps
     box_py = "<plugin-root>/skills/setup-box/scripts/box.py"
     assert by["agent_clis"][0]["action"].startswith(f"`{box_py} agents install <box-alias> --cli claude,codex --run`")
     assert [s["check"] for s in by["agents.login"]] == [
-        f"{box_py} agents login <box-alias> {c} --status  (exit 0 logged in)" for c in ("claude", "codex")]
+        f"{box_py} agents login <box-alias> {c} --status  (exit 0 logged in)" for c in ("claude", "codex")] + [
+        f"{box_py} agents login <box-alias> {c} --mcp glean --status  (exit 0 signed in)" for c in ("claude", "codex")]
+    assert "glean MCP server" in by["agent_clis"][0]["action"]
     assert "--cli none --extensions --run" in by["agents.extensions"][0]["action"]
     assert "agents editor-defaults --run" in by["agents.defaults"][0]["action"]
     # No editor: no extension or editor-settings step; no CLIs: no login question.

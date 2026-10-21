@@ -25,7 +25,8 @@ prompt template or skill.
       "excluded_nodes": ["<node>"],
       "mcp": {"<server-name>": "<endpoint>"}
     }
-  }
+  },
+  "mcp": {"glean": "<glean-mcp-url>"}
 }
 ```
 
@@ -49,10 +50,11 @@ fails `box.py site check` with `missing version/boxes wrapper`.
 | `slurm.partitions` | `slurm` | non-empty list: `name`, `chips` (whole number > 0; leave it out or `"unknown"` until the first job measures it, `slurm.md`), `board` (board type), optional `exclusive` (whole-node only) |
 | `demo_nodes` | no | nodes kept for demos: never allocate them |
 | `excluded_nodes` | no | nodes never to use |
-| `mcp` | no | site-only MCP endpoints by server name |
+| `mcp` | no | site-only MCP endpoints by server name; `mcp.glean` is the Glean server `agents install` adds (`agents.md`) |
 | `setup` | no | the new-box answers, written by `box.py setup save` (`new-box.md`); never edit by hand |
 | `note` | no | free text for the reader |
 
+A top-level `mcp` (beside `boxes`) holds endpoints for every box; a box's own `mcp` wins.
 Other keys are reported as warnings, not errors.
 
 ## Check it

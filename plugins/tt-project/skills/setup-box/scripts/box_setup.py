@@ -404,7 +404,8 @@ def agent_steps(alias: str, answers: dict, box_py: str, step) -> None:
     if clis:
         step("agent_clis", f"`{box_py} agents install {alias} --cli {','.join(clis)} --run`: the official installers "
                            "as your user (no root), skipped when `--version` already works; ~/.local/bin on PATH for "
-                           "ssh commands and login shells",
+                           f"ssh commands and login shells; the {box_agents.MCP} MCP server in each CLI when its URL "
+                           "is configured",
              f"{box_py} agents check {alias} --cli {','.join(clis)}  (expect: each CLI with its version, on PATH)")
     if "cursor" in chosen:
         step("agent_clis", f"install the Cursor agent CLI on {alias} for the user, per its official instructions",
@@ -414,6 +415,10 @@ def agent_steps(alias: str, answers: dict, box_py: str, step) -> None:
             step("agents.login", f"`{box_py} agents login {alias} {c}`: tell the user its sign-in link and code word "
                                  "for word; they enter the code in their browser; tokens stay on the box",
                  f"{box_py} agents login {alias} {c} --status  (exit 0 logged in)")
+        for c in clis:
+            step("agents.login", f"`{box_py} agents login {alias} {c} --mcp {box_agents.MCP}` once its server is set "
+                                 "up: tell the user its sign-in link; pass back the address the browser ends on",
+                 f"{box_py} agents login {alias} {c} --mcp {box_agents.MCP} --status  (exit 0 signed in)")
     if answers.get("editor", "none") != "none" and answers.get("agents.extensions") == "yes":
         step("agents.extensions", f"`{box_py} agents install {alias} --cli none --extensions --run`: "
                                   f"{' and '.join(box_agents.EXTENSIONS)} on every Cursor and VS Code server build on "

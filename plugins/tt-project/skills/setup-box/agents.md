@@ -14,6 +14,7 @@ box.py agents install <box-alias> --run              # Claude Code and Codex CLI
 box.py agents install <box-alias> --cli none --extensions --run   # editor extensions only
 box.py agents login <box-alias> claude|codex         # a headless login; shows its link and code
 box.py agents login <box-alias> claude|codex --status
+box.py agents login <box-alias> claude|codex --mcp glean     # sign the agent in to Glean
 box.py agents editor-defaults --run                  # on the machine the editor runs on, only on the user's yes
 ```
 
@@ -74,3 +75,14 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
 
 - A site's MCP endpoints (device broker, other services) come from the site file
   (`mcp` in `site.md`), never from a repo or this skill.
+- Glean: `install` adds an HTTP MCP server named `glean` to each CLI it sets up (Claude Code
+  `claude mcp add --scope user --transport http glean <url>`, Codex `[mcp_servers.glean]`). A
+  correct entry is left alone; a wrong one is fixed after a backup (`<file>.ttp-bak-<time>`). The
+  URL comes from `--glean-url`, the site file's `mcp.glean`, or a `glean` server already in this
+  machine's Claude Code, Codex or Cursor config. With none, it skips Glean with one line saying so.
+- Sign-in: `login <box-alias> <cli> --mcp glean` starts the agent's own sign-in on the box and
+  prints its link. The user opens it; the browser then ends on a `localhost` address that does not
+  load. The user copies that address and the agent passes it on with `--code-stdin`. Or the user
+  runs the printed `ssh -N -L <port>:<host>:<port> <box-alias>` first and the page completes by
+  itself. Tokens stay on the box.
+- `check` reports Glean per agent: missing, configured but signed out, or working.

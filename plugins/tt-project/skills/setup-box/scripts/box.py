@@ -173,6 +173,8 @@ def check_site(site, known=KNOWN_KEYS) -> "tuple[List[str], List[str]]":
     warn: List[str] = []
     if site.get("version") != 1:
         err.append(f"version must be 1, not {site.get('version')!r}")
+    if "mcp" in site and not (isinstance(site["mcp"], dict) and all(_str(v) for v in site["mcp"].values())):
+        err.append("mcp must map server names to endpoints")
     boxes = site.get("boxes")
     if not isinstance(boxes, dict) or not boxes:
         err.append("boxes must be a non-empty object keyed by ttp machines alias")
