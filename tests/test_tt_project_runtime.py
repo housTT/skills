@@ -5908,6 +5908,41 @@ def test_doctor_loop_stops_at_its_spend_cap_and_reports_a_missing_cli_with_exit_
     assert e.value.code == 0 and capsys.readouterr().out.strip() == "cursor: not available: not installed"
 
 
+def test_doctor_loop_flushes_each_step_and_sweeps_a_killed_checks_scratch_project(env, monkeypatch):
+    """A detached `ttp doctor --loop` writes to a file, so each step line is flushed as it is said
+    (a block-buffered log showed nothing until the end). A check killed before its cleanup leaves
+    its scratch project; the next one removes it once past any check's wall clock, and keeps a young one."""
+    import inspect
+    from ttp import loopcheck
+
+    class Out(io.StringIO):
+        flushed = ""
+
+        def flush(self):
+            self.flushed = self.getvalue()
+
+    out = Out()
+    monkeypatch.setattr(sys, "stdout", out)
+    loopcheck.say("    3s  dispatch task #1")
+    monkeypatch.setattr(sys, "stdout", sys.__stdout__)
+    assert out.flushed == "    3s  dispatch task #1\n"
+    assert inspect.signature(loopcheck.run).parameters["emit"].default is loopcheck.say
+    home = pathlib.Path(os.environ["TTP_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    old, half, young = (home / f"loop-check-{n}" for n in ("old", "half", "young"))
+    loopcheck.setup(old, "fake", "0ld")
+    half.mkdir()
+    young.mkdir()
+    stale = time.time() - 2 * loopcheck.CAP_S - 60
+    for d in (old, half):
+        os.utime(d, (stale, stale))
+    stopped = []
+    monkeypatch.setattr(loopcheck, "stop_all", lambda p: stopped.append(p.root))
+    loopcheck.sweep(home)
+    assert not old.exists() and not half.exists() and young.exists()
+    assert stopped == [old.resolve() / "repo"], "the killed check's runs are stopped first"
+
+
 def test_doctor_names_unfenced_providers(env, monkeypatch, capsys):
     p = make(env)
     from ttp import cli

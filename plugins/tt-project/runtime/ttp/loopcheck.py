@@ -11,6 +11,7 @@ and the disk keep carries over, as across a restart. The daemon dispatches the t
 itself (review.auto) and pushes the approved head through its push queue (no model). It stops once the
 line is on the bare remote's push branch and the review is closed, a step fails, the wall clock
 (CAP_S) runs out or the runs spent CAP_USD; then it stops any run still going and removes the project.
+A check killed before that leaves its project behind; the next check stops its runs and removes it.
 
 The coordinator does not run (`--live` measures its turn), nor any tick step that reaches beyond the
 scratch project (STUBBED: releases, upstream notes, chat, machine-wide claims, backups, replicas).
@@ -190,6 +191,25 @@ class Watch:
         return None
 
 
+def say(line: str) -> None:
+    """One step line, flushed: a detached check's log shows each step as it happens."""
+    print(line, flush=True)
+
+
+def sweep(home: Path) -> None:
+    """Remove the scratch projects of a check killed before its cleanup, once past any check's wall clock."""
+    from .project import Project
+    for old in home.glob("loop-check-*"):
+        try:
+            if time.time() - old.stat().st_mtime < 2 * CAP_S:
+                continue
+            if (old / "repo" / "tt-project" / "state").is_dir():
+                stop_all(Project(old / "repo"))
+        except Exception:   # a half-made scratch project: nothing in it to stop
+            pass
+        shutil.rmtree(old, ignore_errors=True)
+
+
 def stop_all(p) -> None:
     """Stop every run still going and wait briefly for each to end, then end the detached checks
     still running in the scratch project (the daemon's prechecks, a run's own): left alone they run
@@ -231,7 +251,7 @@ def stop_checks(p) -> None:
 
 
 def run(provider: str, *, home: Path | None = None, cap_s: float = CAP_S, cap_usd: float = CAP_USD,
-        tick_s: float = TICK_S, emit: Callable[[str], None] = print) -> dict:
+        tick_s: float = TICK_S, emit: Callable[[str], None] = say) -> dict:
     """{"provider", "available", "reason", "outcome" ("pass" or why it stopped), "spend_usd", "steps"}."""
     import uuid
     from . import project
@@ -245,6 +265,7 @@ def run(provider: str, *, home: Path | None = None, cap_s: float = CAP_S, cap_us
     out["available"] = True
     home = Path(home or project.HOME_DIR)
     home.mkdir(parents=True, exist_ok=True)
+    sweep(home)
     tmp = Path(tempfile.mkdtemp(prefix="loop-check-", dir=home))
     word = uuid.uuid4().hex[:8]
     p = None
