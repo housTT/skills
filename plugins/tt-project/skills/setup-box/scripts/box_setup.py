@@ -30,6 +30,7 @@ from typing import Dict, List, Optional
 
 import box
 import box_account
+import box_agents
 import box_storage
 
 KNOWN_KEYS = {"setup"}
@@ -153,12 +154,34 @@ QUESTIONS: List[dict] = [
              ("pip-ttnn", "pip ttnn", "a virtualenv with the released ttnn wheel"),
              ("workspace", "Workspace env", "the workspace's own env, built with it"),
              ("none", "None", "tasks set up their own env")]),
-    dict(id="agent_clis", header="Agent CLIs", multi=True, suggest=["none"],
-         text="Agent CLIs to install on {alias} (only if projects will run there)?", options=[
-             ("claude", "Claude Code", "checked with `claude --version`"),
-             ("codex", "Codex", "checked with `codex --version`"),
+    dict(id="agent_clis", header="Agent CLIs", multi=True, suggest=["claude", "codex"],
+         text="Agent CLIs on {alias}, for your editor and the command line? (official installers, as your user; "
+              "on PATH for ssh commands and login shells)", options=[
+             ("claude", "Claude Code", "its official installer, checked with `claude --version`"),
+             ("codex", "Codex", "its official installer, checked with `codex --version`"),
              ("cursor", "Cursor agent", "checked with `cursor-agent --version`"),
              ("none", "None", "agents drive the box over ssh from the project box")]),
+    dict(id="agents.login", header="CLI logins", parent="agent_clis", when={"agent_clis": "!none"}, suggest="yes",
+         text="Log the CLIs in on {alias} now? Each shows a sign-in link and a code you enter in your browser; "
+              "the login stays on {alias}.", options=[
+             ("yes", "Log in now", "you only enter the code it shows; checked with `claude auth status` and "
+                                   "`codex login status`"),
+             ("no", "Later", "the box check reports them as not logged in")]),
+    dict(id="editor", header="Editor", text="Do you open {alias} in an editor over Remote-SSH?", options=[
+        ("cursor", "Cursor", "Cursor's Remote-SSH"),
+        ("vscode", "VS Code", "VS Code's Remote-SSH"),
+        ("both", "Both", "Cursor and VS Code"),
+        ("none", "No editor", "the command line only")]),
+    dict(id="agents.extensions", header="Extensions", parent="editor", when={"editor": "!none"}, suggest="yes",
+         text="Install the Claude Code and Codex extensions on every editor server build on {alias}? Your editor's "
+              "own login does not carry over: they log in on {alias}.", options=[
+             ("yes", "Install them", f"{', '.join(box_agents.EXTENSIONS)}, checked with --list-extensions"),
+             ("no", "No", "the editor on {alias} has no Claude Code or Codex")]),
+    dict(id="agents.defaults", header="New builds", parent="editor", when={"editor": "!none"}, suggest="yes",
+         text="An editor update brings a new server build without them. Add both to remote.SSH.defaultExtensions "
+              "in your editor's user settings on this machine?", options=[
+             ("yes", "Add them", "merged into the list, existing entries kept, the file backed up first"),
+             ("no", "No", "the box check finds a new build without them and installs them")]),
     dict(id="projects", header="Projects", suggest="all", other=_names,
          text="Which of your projects may use {alias}? (some: type their names, comma-separated)", options=[
              ("all", "All my projects", "every project whose charter names it"),
@@ -190,6 +213,8 @@ def qhash(q: dict) -> str:
 def applies(q: dict, answers: dict) -> bool:
     for k, want in (q.get("when") or {}).items():
         got = answers.get(k)
+        if isinstance(got, list):   # a multi answer: [] is none
+            got = ",".join(got) or "none"
         if got is None:
             return False
         if want.startswith("!") and got == want[1:] or not want.startswith("!") and got != want:
@@ -372,6 +397,35 @@ def account_steps(alias: str, entry: dict, answers: dict, box_py: str, step) -> 
          f"{box_py} site check; ssh {alias} id -un  (expect: ok; {user})")
 
 
+def agent_steps(alias: str, answers: dict, box_py: str, step) -> None:
+    """Agent CLIs, their logins and the editor extensions on the box, all run by `box.py agents` (`agents.md`)."""
+    chosen = answers.get("agent_clis") or []
+    clis = [c for c in chosen if c in box_agents.CLIS]
+    if clis:
+        step("agent_clis", f"`{box_py} agents install {alias} --cli {','.join(clis)} --run`: the official installers "
+                           "as your user (no root), skipped when `--version` already works; ~/.local/bin on PATH for "
+                           "ssh commands and login shells",
+             f"{box_py} agents check {alias} --cli {','.join(clis)}  (expect: each CLI with its version, on PATH)")
+    if "cursor" in chosen:
+        step("agent_clis", f"install the Cursor agent CLI on {alias} for the user, per its official instructions",
+             f"ssh {alias} {AGENT_CLIS['cursor']}")
+    if answers.get("agents.login") == "yes":
+        for c in clis:
+            step("agents.login", f"`{box_py} agents login {alias} {c}`: tell the user its sign-in link and code word "
+                                 "for word; they enter the code in their browser; tokens stay on the box",
+                 f"{box_py} agents login {alias} {c} --status  (exit 0 logged in)")
+    if answers.get("editor", "none") != "none" and answers.get("agents.extensions") == "yes":
+        step("agents.extensions", f"`{box_py} agents install {alias} --cli none --extensions --run`: "
+                                  f"{' and '.join(box_agents.EXTENSIONS)} on every Cursor and VS Code server build on "
+                                  f"{alias} (an editor's first Remote-SSH connect makes one: connect first)",
+             f"{box_py} agents check {alias}  (expect: each editor build `extensions ok`)")
+    if answers.get("editor", "none") != "none" and answers.get("agents.defaults") == "yes":
+        step("agents.defaults", f"on this machine, where your editor runs: `{box_py} agents editor-defaults --run`: "
+                                "remote.SSH.defaultExtensions in Cursor's and VS Code's user settings, merged and "
+                                "backed up, so a new server build on any box gets both",
+             f"{box_py} agents editor-defaults  (expect: already has {', '.join(box_agents.EXTENSIONS)})")
+
+
 def plan(alias: str, entry: dict, answers: dict, plugin_root: str = "<plugin-root>") -> List[dict]:
     """Ordered steps, each {"id", "action", "check"}; every answer becomes an action and its check."""
     box_py = f"{plugin_root}/skills/setup-box/scripts/box.py"
@@ -440,9 +494,7 @@ def plan(alias: str, entry: dict, answers: dict, plugin_root: str = "<plugin-roo
             step("python_env", "the workspace's own env, built with it (tt-buddy's `recipes/tt-metal/env.md`); "
                                "a broker job needs it too (the `tt-buddy:run` skill's `skills/run/mcp.md`)",
                  f"ssh {alias} test -x {_sh(where)}/python_env/bin/python")
-    for cli in answers.get("agent_clis") or []:
-        step("agent_clis", f"install the {cli} CLI on {alias} for the user, per `agents.md`; the user logs in",
-             f"ssh {alias} {AGENT_CLIS[cli]}")
+    agent_steps(alias, answers, box_py, step)
     projects = answers.get("projects")
     if projects and projects != "none":
         who = "each of your projects" if projects == "all" else f"projects {projects}"

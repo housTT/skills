@@ -1807,7 +1807,7 @@ def _setup_box(tmp_path, *args, entry=None):
                           capture_output=True, text=True, timeout=60)
 
 
-ALL_NONE = ["account.user=same", "account.admin=none", "account.keys=here", "account.outbound=none", "broker=none", "host_checks=driver,pcie", "storage=none", "workspace=none", "python_env=none", "agent_clis=none",
+ALL_NONE = ["account.user=same", "account.admin=none", "account.keys=here", "account.outbound=none", "broker=none", "host_checks=driver,pcie", "storage=none", "workspace=none", "python_env=none", "agent_clis=none", "editor=none",
             "projects=all", "recovery.owner=none", "lock=shared", "disk_guard=150"]
 
 
@@ -1819,7 +1819,7 @@ def test_setup_box_new_box_question_set_fits_the_question_tool_and_the_numbered_
     # The first pass asks every top-level topic of the new-box flow; follow-ups wait for their answer.
     assert [q["id"] for q in qs] == ["account.user", "account.admin", "account.keys", "account.outbound",
                                      "broker", "host_checks", "storage", "workspace", "python_env", "agent_clis",
-                                     "projects", "recovery.owner", "lock", "disk_guard"]
+                                     "editor", "projects", "recovery.owner", "lock", "disk_guard"]
     for b in batches:
         assert 1 <= len(b) <= 4
         for q in b:
@@ -1830,7 +1830,7 @@ def test_setup_box_new_box_question_set_fits_the_question_tool_and_the_numbered_
     assert "ttp lock <box-alias>-device -- <cmd>" in broker["options"][1]["description"]
     assert next(q for q in qs if q["id"] == "host_checks")["multiSelect"] is True
     num = _setup_box(tmp_path, "setup", "questions", "<box-alias>", "--format", "numbered").stdout
-    assert num.count("\n1. ") == 1 and "\n14. " in num and "   b) No broker:" in num
+    assert num.count("\n1. ") == 1 and "\n15. " in num and "   b) No broker:" in num
     assert "nothing is assumed" in num and "(suggested: install)" in num
 
 
@@ -1918,7 +1918,8 @@ def test_setup_box_new_box_install_plan_links_the_recipes(tmp_path, monkeypatch)
     for part in ("tenstorrent/tt-device-mcp", "documented installer", "never hand-edit",
                  "tt-device-broker active", "recipes/tt-metal/build.md", "ccache",
                  "git submodule update --init --recursive", "skills/run/mcp.md",
-                 "ssh <box-alias> claude --version", "ssh <box-alias> codex --version",
+                 "agents install <box-alias> --cli claude,codex --run",
+                 "agents check <box-alias> --cli claude,codex",
                  "--owner proj-a --fallback proj-b", "--unshared", "--min-free-gb 0",
                  "ssh <box-alias> test -x ~/work/tt-metal/python_env/bin/python"):
         assert part in text, part
@@ -1967,6 +1968,247 @@ def test_setup_box_new_box_page_covers_the_flow():
         assert part in page, part
     assert "`new-box.md`" in (SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8")
     assert "`new-box.md`" in (SKILLS / "setup-box" / "bare-metal.md").read_text(encoding="utf-8")
+
+
+def _agents(monkeypatch):
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_agents
+    return box_agents
+
+
+def _agents_home(tmp_path):
+    """A fake HOME and PATH: curl prints a stub installer, editor servers list and install extensions."""
+    home, shim = tmp_path / "home", tmp_path / "shim"
+    shim.mkdir()
+    home.mkdir()
+    (home / ".bashrc").write_text("case $- in *i*) ;; *) return;; esac\n")
+    (shim / "curl").write_text(
+        "#!/bin/sh\necho \"$*\" >> \"$HOME/curl.log\"\nfor a; do u=$a; done\ncase $u in\n"
+        "*claude*) n=claude ;; *codex*) n=codex ;; *) exit 22 ;; esac\n"
+        "cat <<EOF\nmkdir -p \"\\$HOME/.local/bin\"\nprintf '#!/bin/sh\\necho \"1.0 ($n)\"\\n' > \"\\$HOME/.local/bin/$n\"\n"
+        "chmod +x \"\\$HOME/.local/bin/$n\"\nEOF\n")
+    server = ("#!/bin/sh\nf=\"$HOME/ext-$(echo \"$0\" | tr / _)\"\n"
+              "case $1 in --list-extensions) cat \"$f\" 2>/dev/null ;;\n"
+              "--install-extension) echo \"$2\" >> \"$f\"; echo \"$0 $2\" >> \"$HOME/installs.log\" ;; esac\n")
+    for rel in (".cursor-server/bin/linux-x64/aaa/bin/cursor-server", ".cursor-server/bin/bbb/bin/cursor-server",
+                ".vscode-server/cli/servers/Stable-ccc/server/bin/code-server"):
+        p = home / rel
+        p.parent.mkdir(parents=True)
+        p.write_text(server)
+        p.chmod(0o755)
+    for p in shim.iterdir():
+        p.chmod(0o755)
+    # The system's tools, minus any agent CLI or editor installed on the machine running the tests.
+    sysbin = tmp_path / "sysbin"
+    sysbin.mkdir()
+    for d in ("/usr/bin", "/bin"):
+        for f in pathlib.Path(d).iterdir():
+            if f.name not in ("claude", "codex", "cursor", "code") and not os.path.lexists(sysbin / f.name):
+                (sysbin / f.name).symlink_to(f)
+    env = {"HOME": str(home), "PATH": f"{shim}:{sysbin}", "SHELL": "/bin/bash"}
+    return home, env
+
+
+def test_setup_box_agents_install_is_idempotent_and_covers_path_and_every_editor_build(tmp_path, monkeypatch):
+    import subprocess
+    ba = _agents(monkeypatch)
+    home, env = _agents_home(tmp_path)
+    script = ba.install_script(["claude", "codex"], list(ba.EXTENSIONS))
+    r = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True, timeout=60)
+    lines, ok = ba.read_install(r.stdout)
+    assert r.returncode == 0 and ok, r.stdout + r.stderr
+    assert "claude: installed 1.0 (claude)" in lines and "codex: installed 1.0 (codex)" in lines
+    # The official installers, one each; codex's never stops at a prompt.
+    curls = (home / "curl.log").read_text()
+    assert "https://claude.ai/install.sh" in curls and "https://chatgpt.com/codex/install.sh" in curls
+    assert "CODEX_NON_INTERACTIVE=1 sh" in script
+    # ~/.local/bin goes first in ~/.bashrc (before its non-interactive return) and into login shells.
+    assert (home / ".bashrc").read_text().splitlines()[0] == ba.PATH_LINE
+    assert (home / ".bashrc.ttp-bak").read_text().startswith("case $-")
+    assert ba.PATH_MARK in (home / ".profile").read_text()
+    n = subprocess.run(["bash", "-c", "source ~/.bashrc; command -v claude"], env=dict(env, PATH=str(tmp_path / "sysbin")),
+                       capture_output=True, text=True)
+    assert n.stdout.strip() == str(home / ".local/bin/claude"), n.stdout + n.stderr
+    # Every editor server build (Cursor's two layouts and VS Code's) gets both extensions.
+    assert len((home / "installs.log").read_text().splitlines()) == 6
+    assert sum("|installed" in ln for ln in r.stdout.splitlines()) == 6
+    # A second run changes nothing: no download, no install, no second PATH line.
+    r2 = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True, timeout=60)
+    lines2, ok2 = ba.read_install(r2.stdout)
+    assert r2.returncode == 0 and ok2 and "claude: present 1.0 (claude)" in lines2, r2.stdout
+    assert len((home / "curl.log").read_text().splitlines()) == 2
+    assert len((home / "installs.log").read_text().splitlines()) == 6
+    assert (home / ".bashrc").read_text().count(ba.PATH_MARK) == 1
+    # A failing installer is reported with its log tail, never as ok.
+    (home / ".local/bin/codex").unlink()
+    (tmp_path / "shim" / "curl").write_text("#!/bin/sh\necho 'network down' >&2\nexit 22\n")
+    r3 = subprocess.run(["sh", "-c", ba.install_script(["codex"], [])], env=env, capture_output=True, text=True)
+    lines3, ok3 = ba.read_install(r3.stdout)
+    assert r3.returncode == 1 and not ok3 and "codex: failed" in lines3, r3.stdout
+    assert any("network down" in ln for ln in lines3)
+
+
+def test_setup_box_agents_check_names_each_gap_with_the_fix_the_skill_runs(tmp_path, monkeypatch):
+    import subprocess
+    ba = _agents(monkeypatch)
+    import box
+    home, env = _agents_home(tmp_path)
+    script = ba.probe_script(["claude", "codex"])
+    out = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True, timeout=60).stdout
+    lines, problems, fixes = ba.read_check(out, "<box-alias>", ["claude", "codex"], list(ba.EXTENSIONS))
+    assert "claude: not installed" in problems and "codex: not installed" in problems
+    assert sum(p.startswith("editor ") for p in problems) == 3
+    assert any("editor cursor linux-x64/aaa: missing anthropic.claude-code, openai.chatgpt" == ln for ln in lines)
+    assert any(ln.startswith("editor vscode Stable-ccc") for ln in lines)
+    assert fixes == [f"{ba.BOX_PY} agents install <box-alias> --cli claude --run",
+                     f"{ba.BOX_PY} agents install <box-alias> --cli codex --run",
+                     f"{ba.BOX_PY} agents install <box-alias> --cli none --extensions --run"]
+    # Installed but off PATH for ssh commands, and logged out: each named, each with its fix.
+    out = ("ni_claude=\nlogin_claude=/h/.local/bin/claude\nbin_claude=/h/.local/bin/claude\n"
+           "ver_claude=2.1.0 (Claude Code)\nauth_claude=no\n"
+           "ni_codex=/h/.local/bin/codex\nlogin_codex=/h/.local/bin/codex\nbin_codex=/h/.local/bin/codex\n"
+           "ver_codex=codex-cli 0.1\nauth_codex=yes\n"
+           "server=/h/.cursor-server/bin/linux-x64/aaa/bin/cursor-server|anthropic.claude-code,openai.chatgpt,\n")
+    lines, problems, fixes = ba.read_check(out, "<box-alias>", ["claude", "codex"], list(ba.EXTENSIONS))
+    assert problems == ["claude: not on PATH for ssh commands", "claude: not logged in"]
+    assert lines[0] == "claude: 2.1.0 (Claude Code), not on PATH for ssh commands, not logged in"
+    assert lines[1] == "codex: codex-cli 0.1, logged in"
+    assert fixes[1].startswith(f"{ba.BOX_PY} agents login <box-alias> claude")
+    # The check reads login state only as yes/no: no status text, no credential file is printed.
+    assert "grep -q" in script and ".credentials" not in script and "auth.json" not in script
+    # The command: 0 ready, 1 a gap (with the fixes it runs, never a hand step), 255 ssh failed.
+    site = tmp_path / "boxes.json"
+    site.write_text(json.dumps({"version": 1, "boxes": {"<box-alias>": {"route": "bare", "workdir_root": "~/w"}}}))
+    ok = out.replace("ni_claude=\n", "ni_claude=/h/.local/bin/claude\n").replace("auth_claude=no", "auth_claude=yes")
+    for stdout, rc, want in ((ok, 0, 0), (out, 0, 1), ("", 255, 255)):
+        monkeypatch.setattr(box, "ssh_run", lambda *a, _o=stdout, _r=rc, **k: subprocess.CompletedProcess(a, _r, _o, "x"))
+        args = box.build_parser().parse_args(["--site", str(site), "agents", "check", "<box-alias>"])
+        assert args.func(args) == want
+
+
+def test_setup_box_agents_login_relays_link_and_code_and_keeps_tokens_on_the_box(tmp_path, monkeypatch):
+    import subprocess
+    import time
+    ba = _agents(monkeypatch)
+    home, env = _agents_home(tmp_path)
+    bin_ = home / ".local/bin"
+    bin_.mkdir(parents=True)
+    # A fake claude: logged in once a pasted code arrived; its login prints a link and asks for the code.
+    (bin_ / "claude").write_text(
+        "#!/bin/bash\ncase \"$1 $2\" in\n"
+        "'auth status') if [ -f \"$HOME/.claude-ok\" ]; then echo '{\"loggedIn\": true}'; exit 0; fi;"
+        " echo '{\"loggedIn\": false}'; exit 1 ;;\n"
+        "'auth login') echo 'visit: https://example.invalid/oauth?x=1'; echo 'secret sk-" + "a" * 48 + "';"
+        " echo 'Paste code here if prompted >'; read -r -t 20 c && [ \"$c\" = abc-123 ] && touch \"$HOME/.claude-ok\" ;;\n"
+        "esac\n")
+    (bin_ / "claude").chmod(0o755)
+    out = subprocess.run(["sh", "-c", ba.login_script("claude")], env=env, capture_output=True, text=True,
+                         timeout=60).stdout
+    assert ba._state(out) == "started", out
+    shown = ba.relay_lines(out)
+    assert "visit: https://example.invalid/oauth?x=1" in shown and "Paste code here if prompted >" in shown
+    assert not any("sk-aaaa" in ln for ln in shown)
+    login_dir = home / ".cache/tt-project/agent-login"
+    assert login_dir.stat().st_mode & 0o077 == 0
+    # A second start while it waits reuses the pending login.
+    again = subprocess.run(["sh", "-c", ba.login_script("claude")], env=env, capture_output=True, text=True,
+                           timeout=60).stdout
+    assert ba._state(again) == "pending"
+    # The code goes over stdin, never on a command line.
+    assert "abc-123" not in ba.code_script("claude")
+    sent = subprocess.run(["sh", "-c", ba.code_script("claude")], env=env, input="abc-123\n",
+                          capture_output=True, text=True, timeout=30)
+    assert ba._state(sent.stdout) == "sent", sent.stdout + sent.stderr
+    for _ in range(100):
+        st = ba._state(subprocess.run(["sh", "-c", ba.status_script("claude")], env=env, capture_output=True,
+                                      text=True, timeout=30).stdout)
+        if st == "logged-in":
+            break
+        time.sleep(0.1)
+    assert st == "logged-in"
+    # The login's output is removed once it ends.
+    for _ in range(100):
+        if not (login_dir / "claude.log").exists():
+            break
+        time.sleep(0.1)
+    assert not (login_dir / "claude.log").exists() and not (login_dir / "claude.in").exists()
+    out = subprocess.run(["sh", "-c", ba.login_script("claude")], env=env, capture_output=True, text=True).stdout
+    assert ba._state(out) == "logged-in"
+
+
+def test_setup_box_agents_editor_defaults_merge_keeps_entries_and_comments(tmp_path, monkeypatch):
+    ba = _agents(monkeypatch)
+    text = ('{\n  // my settings\n  "editor.fontSize": 13,\n  "remote.SSH.defaultExtensions": [\n'
+            '    "ms-python.python", // keep\n    "openai.chatgpt",\n  ],\n  /* tail */ "x": "a // b",\n}\n')
+    new, add = ba.merge_defaults(text)
+    assert add == ["anthropic.claude-code"]
+    assert "// my settings" in new and "/* tail */" in new and '"x": "a // b"' in new
+    assert json.loads(ba._blank_jsonc(new))[ba.SETTING] == ["ms-python.python", "openai.chatgpt",
+                                                             "anthropic.claude-code"]
+    assert ba.merge_defaults(new) == (None, [])
+    new, add = ba.merge_defaults('{\n  "a": 1 // c\n}')
+    assert json.loads(ba._blank_jsonc(new)) == {ba.SETTING: list(ba.EXTENSIONS), "a": 1} and "// c" in new
+    assert json.loads(ba.merge_defaults("")[0]) == {ba.SETTING: list(ba.EXTENSIONS)}
+    assert json.loads(ba._blank_jsonc(ba.merge_defaults('{"nested": {"remote.SSH.defaultExtensions": 1}}')[0]))[
+        ba.SETTING] == list(ba.EXTENSIONS)
+    for bad in ('{"remote.SSH.defaultExtensions": "x"}', "{not json", "[]"):
+        with pytest.raises(ValueError):
+            ba.merge_defaults(bad)
+    # Only the editors installed here; a dry run writes nothing; --run backs the file up first.
+    assert set(ba.settings_paths(tmp_path, "Linux")) == set()
+    (tmp_path / ".config/Cursor/User").mkdir(parents=True)
+    assert list(ba.settings_paths(tmp_path, "Linux")) == ["Cursor"]
+    (tmp_path / "Library/Application Support/Code/User").mkdir(parents=True)
+    assert list(ba.settings_paths(tmp_path, "Darwin")) == ["VS Code"]
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    f = tmp_path / "settings.json"
+    f.write_text(text)
+    import box
+    args = box.build_parser().parse_args(["agents", "editor-defaults", "--settings", str(f)])
+    assert args.func(args) == 0 and f.read_text() == text
+    args = box.build_parser().parse_args(["agents", "editor-defaults", "--settings", str(f), "--run"])
+    assert args.func(args) == 0 and "anthropic.claude-code" in f.read_text()
+    backups = list(tmp_path.glob("settings.json.ttp-bak-*"))
+    assert len(backups) == 1 and backups[0].read_text() == text
+
+
+def test_setup_box_agents_questions_default_yes_and_plan_runs_the_scripted_steps(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_setup as bs
+    saved = bs.merge({}, dict(kv.split("=", 1) for kv in ALL_NONE))
+    assert bs.pending(saved) == []
+    saved = bs.merge(saved, {"agent_clis": "claude,codex", "editor": "cursor"})
+    left = {q["id"]: q for q in bs.pending(saved)}
+    assert list(left) == ["agents.login", "agents.extensions", "agents.defaults"]
+    assert all(q["suggest"] == "yes" for q in left.values())
+    assert bs.BY_ID["agent_clis"]["suggest"] == ["claude", "codex"]
+    answers = bs.merge(saved, {"agents.login": "yes", "agents.extensions": "yes", "agents.defaults": "yes"})["answers"]
+    steps = bs.plan("<box-alias>", {"workdir_root": "~/w"}, answers)
+    by = {}
+    for s in steps:
+        by.setdefault(s["id"], []).append(s)
+    box_py = "<plugin-root>/skills/setup-box/scripts/box.py"
+    assert by["agent_clis"][0]["action"].startswith(f"`{box_py} agents install <box-alias> --cli claude,codex --run`")
+    assert [s["check"] for s in by["agents.login"]] == [
+        f"{box_py} agents login <box-alias> {c} --status  (exit 0 logged in)" for c in ("claude", "codex")]
+    assert "--cli none --extensions --run" in by["agents.extensions"][0]["action"]
+    assert "agents editor-defaults --run" in by["agents.defaults"][0]["action"]
+    # No editor: no extension or editor-settings step; no CLIs: no login question.
+    answers = bs.merge(saved, {"editor": "none", "agent_clis": "none"})
+    assert bs.pending(answers) == []
+    ids = {s["id"] for s in bs.plan("<box-alias>", {"workdir_root": "~/w"}, answers["answers"])}
+    assert not ids & {"agent_clis", "agents.login", "agents.extensions", "agents.defaults"}
+
+
+def test_setup_box_agents_page_says_extensions_log_in_on_the_box():
+    page = (SKILLS / "setup-box" / "agents.md").read_text(encoding="utf-8")
+    for part in ("https://claude.ai/install.sh", "https://chatgpt.com/codex/install.sh", "anthropic.claude-code",
+                 "openai.chatgpt", "remote.SSH.defaultExtensions", "box.py agents check <box-alias>",
+                 "codex login --device-auth", "claude auth status", "codex login status", "~/.cursor-server",
+                 "~/.vscode-server", "never copy", "only to its own\n  AI"):
+        assert part in page, part
+    assert "the editor's login carries over Remote-SSH" not in page
+    assert "box.py agents check <box-alias>" in (SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8")
 
 
 MNT = {"storage": "/path/to/mount", "storage.source": "fileserver.example:/export", "storage.fstype": "nfs4",

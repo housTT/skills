@@ -3,19 +3,53 @@
 An agent that edits and builds on the box runs there, or drives the box over ssh from the project
 box. Either way the work happens in the box's own checkout (`ssh-workflow.md`).
 
-## Agent CLIs
+## Agent CLIs, logins and editor extensions
 
-| Agent | Install and check | Headless login |
-|---|---|---|
-| Claude Code | install it per its current official instructions; check with `claude --version` | `claude` then `/login`; the login link opens on any machine |
-| Codex | install it per its current official instructions; check with `codex --version` | `codex login --device-auth` (a code typed on another machine; no browser on the box) |
-| Cursor | Remote-SSH from the user's editor to `<box-alias>`; the `cursor-agent` CLI on the box if used, checked with `cursor-agent --version` | the editor's login carries over Remote-SSH |
+The skill runs every step below itself, in the user's own account (`account.md`), never a shared
+admin login, and never as root. `box.py` is `<plugin-root>/skills/setup-box/scripts/box.py`.
 
-- Install for the user only (no root), unless the user says otherwise, in the user's own account
-  (`account.md`), never a shared admin login. Logins (agent CLIs, gh) live in the user's home.
+```
+box.py agents check <box-alias>                      # read-only: each gap and the command that fixes it
+box.py agents install <box-alias> --run              # Claude Code and Codex CLIs, PATH lines
+box.py agents install <box-alias> --cli none --extensions --run   # editor extensions only
+box.py agents login <box-alias> claude|codex         # a headless login; shows its link and code
+box.py agents login <box-alias> claude|codex --status
+box.py agents editor-defaults --run                  # on the machine the editor runs on, only on the user's yes
+```
+
+| Agent | Install | Login (on the box; the user enters a code in their browser) | Check |
+|---|---|---|---|
+| Claude Code | `curl -fsSL https://claude.ai/install.sh \| bash` | `claude auth login` | `claude --version`, `claude auth status` |
+| Codex | `curl -fsSL https://chatgpt.com/codex/install.sh \| sh` | `codex login --device-auth` | `codex --version`, `codex login status` |
+| Cursor agent | per its official instructions | its own login | `cursor-agent --version` |
+
+- `install` is idempotent: a CLI whose `--version` works is left alone. It puts `~/.local/bin` on
+  PATH for a plain `ssh <box-alias> <command>` (the first line of `~/.bashrc`, before any early
+  return for non-interactive shells; `~/.zshenv` for zsh) and for login shells (`~/.bash_profile`
+  or `~/.profile`), each file backed up once to `<file>.ttp-bak`.
+- Editors over Remote-SSH (Cursor, VS Code): the editor's own login carries over only to its own
+  AI. The Claude Code (`anthropic.claude-code`) and Codex (`openai.chatgpt`) extensions run on the
+  box's editor server and log in with the box's `~/.claude` and `~/.codex`, the same logins as the
+  CLIs. `install --extensions` installs both on every server build there (`~/.cursor-server`,
+  `~/.vscode-server`) and checks them with `--list-extensions`. A server build appears on the
+  editor's first connect: connect once, then install.
+- An editor update brings a new server build without the extensions. `editor-defaults` adds both
+  to `remote.SSH.defaultExtensions` in Cursor's and VS Code's user settings, so every new build on
+  every box gets them. It edits the user's own machine: only on their yes (the setup question),
+  merged into the list with existing entries and comments kept, the file backed up first. When
+  the editor runs on another machine than the agent, it says so and changes nothing; the box check
+  then finds a new build without them and `install --extensions` fixes it.
+- `login` starts the CLI's headless login on the box, detached, and prints its sign-in link and
+  code. Tell the user both word for word; they open the link and enter the code. When Claude
+  Code's page then shows a code to paste back, the user gives it to the agent, which passes it on
+  with `login <box-alias> claude --code-stdin` (on stdin; single-use, it only completes that
+  pending login). Then `login ... --status`. The login and its tokens stay on the box: never copy
+  `~/.claude` or `~/.codex` between machines, never print or log a token, and never put an API
+  key in a prompt, task or file.
+- `check` reports each missing CLI, PATH gap, login and editor extension with the command that
+  fixes it; run that command yourself. A login is the one step that needs the user: its code.
 - gh: a distro's packaged gh can be too old for a newer `hosts.yml`; install it from GitHub's own
-  apt repository.
-- Logins and tokens are typed by the user; never paste them into a prompt, task or file.
+  apt repository. Its login is the user's (`gh auth login`, a code in their browser).
 
 ## Building and running: tt-buddy
 

@@ -20,6 +20,9 @@ description: "Get a Tenstorrent device box and work on it over ssh: pick a route
   user first, then set it up: `new-box.md`. It is set up in the user's own account, created when
   missing, not in a shared admin login: `account.md`.
 - A project still syncs or mirrors files to a box: `migrate-off-sync.md`.
+- Claude Code or Codex is missing, logged out or absent from the user's editor (Cursor, VS Code)
+  on a box: `box.py agents check <box-alias>` names each gap and the command the skill runs to fix
+  it: `agents.md`.
 
 ## Route picker
 

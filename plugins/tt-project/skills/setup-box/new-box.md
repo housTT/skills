@@ -36,7 +36,10 @@ box.py setup questions <box-alias> --format numbered  # a plain numbered prompt
 | Shared mount | none, or a mount point for shared network storage; its source, type, options and how it persists (follow-ups) |
 | Workspace | a repo checkout and build under `workdir_root` (branch, ccache), or none |
 | Python env | pip ttnn, the workspace's own env, or none |
-| Agent CLIs | Claude Code, Codex, Cursor agent, or none (only if projects will run on the box) |
+| Agent CLIs | Claude Code, Codex, Cursor agent, or none; suggested: Claude Code and Codex |
+| CLI logins | log them in now (the user enters a code in their browser), or later (follow-up) |
+| Editor | Cursor, VS Code, both, or none: how the user opens the box over Remote-SSH |
+| Extensions, New builds | the Claude Code and Codex extensions on the box's editor servers, and `remote.SSH.defaultExtensions` in the user's editor settings on this machine; suggested yes (follow-ups) |
 | Projects | which of the user's projects may use the box |
 | Recovery | the project that recovers it, and a fallback |
 | Device lock | shared by all the user's projects, or per project |
@@ -83,7 +86,8 @@ not skipped.
 - Workspace and Python env: tt-buddy's `recipes/workspace.md`, `recipes/tt-metal/build.md` and
   `recipes/tt-metal/env.md`, plus the notes in `bare-metal.md` (submodules, ccache, build in
   place). A broker job needs an env too: the `tt-buddy:run` skill's `skills/run/mcp.md`.
-- Agent CLIs: `agents.md`. The user types any login.
+- Agent CLIs, logins and editor extensions: `box.py agents install|login|editor-defaults`, checked
+  with `box.py agents check <box-alias>`: `agents.md`. The user only enters a login code.
 - Projects: the box goes into each named project's charter Resources; the plan does not edit
   charters.
 - Recovery, device lock and disk guard: `ttp machines add <box-alias>` with `--owner`/`--fallback`,
