@@ -13783,3 +13783,27 @@ def test_worker_policies_keep_their_own_room_beside_long_goals_and_large_pinned_
     assert 0 < use["pinned_dropped"] < 30
     block = worker_system(p)
     assert "Policy 9: workers open a draft PR" in block and "more pinned memory entries for workers did not fit" in block
+
+
+def test_worker_memory_gives_task_ranked_entries_a_floor_past_a_long_charter(env):
+    """A charter digest that leaves less room than the pinned memory takes still leaves the worker
+    WORKER_RANKED_MIN_CHARS for unpinned entries: the one naming the task's path is shown, pinned ones
+    stay whole, and the memory never passes the pinned chars plus that floor."""
+    p = make(env)
+    from ttp.project import WORKER_RANKED_MIN_CHARS
+    from ttp.prompts import WORKER_MEMORY_CHARS, worker_context, worker_system
+    p.charter_path.write_text(_LONG_GOALS_CHARTER)
+    _memories(p, [("resource", "Box B (alias box-b): spare runner. " + "p" * 400),
+                  ("restriction", "Never reboot box B mid-job. " + "q" * 400),
+                  ("fact", "OLD-PATH: src/widget/cache.py holds the warm-up switch; " + "a" * 300)]
+              + [("fact", f"NEW-FACT-{i:02} unrelated news, see notes/log.txt; " + "n" * 300) for i in range(8)])
+    task = {"title": "code: speed up the warm-up", "spec": "Change src/widget/cache.py."}
+    text, mem, use = worker_context(p, task)
+    rest = WORKER_MEMORY_CHARS - use["charter_chars"]
+    assert use["pinned_chars"] > rest, (use, rest)   # the charter alone would leave no unpinned room
+    lines = [e["line"] for e in mem]
+    assert use["pinned_dropped"] == 0 and sum("p" * 400 in x or "q" * 400 in x for x in lines) == 2
+    assert any("OLD-PATH" in x for x in lines), lines
+    assert sum(len(x) + 1 for x in lines) <= use["pinned_chars"] + WORKER_RANKED_MIN_CHARS
+    assert "OLD-PATH" in worker_system(p, task)
+    assert not any("OLD-PATH" in e["line"] for e in worker_context(p)[1]), "no task: newest facts, as before"

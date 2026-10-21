@@ -802,6 +802,9 @@ WORKER_PINNED_MIN_CHARS = WORKER_MEMORY_CHARS // 2
 # Likewise the charter's policies and other items for workers get what its Goals and Resources leave
 # of it, never less than this, and never less because pinned memory is large.
 WORKER_POLICY_MIN_CHARS = WORKER_MEMORY_CHARS // 2
+# Room for a worker's unpinned (task-ranked) memory past the pinned entries shown, whatever the
+# charter digest leaves: ranking always has room to show something.
+WORKER_RANKED_MIN_CHARS = 1500
 # Memory kinds archive_hidden_memory may retire once no prompt shows them (never a standing entry).
 ARCHIVABLE_MEMORY_KINDS = ("decision", "fact")
 # An entry that cites the user's word (`user msg #N`, `(user, <date>)`, "the user's words"): the

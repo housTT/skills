@@ -14,8 +14,8 @@ from . import budget as bud
 from . import chaincap, conflictfix, replymsg, settinghold, settled, taskfacts, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
-from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, Project, code_tasks_may_push, own_push, push_allowed,
-                      push_queue_on, WORKER_POLICY_MIN_CHARS)
+from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, WORKER_RANKED_MIN_CHARS, Project,
+                      code_tasks_may_push, own_push, push_allowed, push_queue_on, WORKER_POLICY_MIN_CHARS)
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch, recovery_note
 
 
@@ -390,8 +390,8 @@ def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict
     for_workers) within what those leave of WORKER_MEMORY_CHARS, never less than
     WORKER_POLICY_MIN_CHARS; then memory pinned for workers (see worker_memory) in
     what is left of it, never less than WORKER_PINNED_MIN_CHARS, and the entries that share words with
-    `task`, those that speak of workers and the newest facts while all still fit WORKER_MEMORY_CHARS
-    (see worker_memory_select).
+    `task`, those that speak of workers and the newest facts while all still fit WORKER_MEMORY_CHARS,
+    or WORKER_RANKED_MIN_CHARS past the pinned ones if that is more (see worker_memory_select).
     Memory never pushes out a policy. Memory entries that restate the charter's restrictions are left
     out: the prompt states those whole in their own block. Pinned entries past their budget are
     counted in `pinned_dropped` (worker_system says where to read them). Returns (charter text,
@@ -427,12 +427,14 @@ def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict
             used -= len(h) + 3
     text = "\n\n".join(out)
     rest = max(0, WORKER_MEMORY_CHARS - heads - len(text))
-    room = max(rest, WORKER_PINNED_MIN_CHARS)   # for pinned entries; the others only fill `rest`
+    room = max(rest, WORKER_PINNED_MIN_CHARS)   # for pinned entries
     restated = restated_in(charter_restrictions(raw))
     mem, use = p.worker_memory_select(rest, task, room, restated)
     if use["pinned_dropped"]:   # make room for the line saying so
         room -= len(_PINNED_MORE.format(n=999, path=p.memory_dir)) + 1
         mem, use = p.worker_memory_select(min(rest, room), task, room, restated)
+    elif use["pinned_chars"] + WORKER_RANKED_MIN_CHARS > rest:   # every pinned one shown: the others' floor
+        mem, use = p.worker_memory_select(use["pinned_chars"] + WORKER_RANKED_MIN_CHARS, task, room, restated)
     return text, mem, dict(use, charter_chars=heads + len(text), charter_dropped=dropped, limit=WORKER_MEMORY_CHARS,
                            memory_limit=room)
 
