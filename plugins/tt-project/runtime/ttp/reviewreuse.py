@@ -5,7 +5,10 @@ running again. The daemon looks before it queues or starts a review, and the coo
 task_add of such a review is refused unless forced with a reason. A different head, other checks
 or an earlier review that failed or asked for changes still get a review. A review that would push
 (or a code task's review in a project that pushes) takes only a verdict whose head was delivered:
-a review-only verdict never pushed it, so reusing it would drop the delivery."""
+a review-only verdict never pushed it, so reusing it would drop the delivery. A review that also
+covers a head the accepted one does not contain (a rebase review naming the old head beside the
+rebased branch) reuses it only when that head's commits past the base carry the same patches
+(rebased_away)."""
 from __future__ import annotations
 
 import hashlib
@@ -78,6 +81,48 @@ def accepted(db, sha: str, key: str, skip: int | None = None, p=None) -> dict | 
         orig = db.task(first) if isinstance(first, int) else None
         return orig if orig and orig["status"] == "done" else r
     return None
+
+
+def rebased_away(p, review: dict, sha: str) -> str:
+    """Why `review` must not reuse the verdict on `sha`, or "": each other head it covers
+    (worktree.covered_heads) that `sha` does not contain must carry the same commits past the base
+    branch as `sha`, by git patch-id, in order. A changed patch, an extra or missing commit, a merge
+    in either range, or a base or patch that cannot be read refuses reuse."""
+    from . import worktree
+    others = [h for h in worktree.covered_heads(p, review) if h != sha and not worktree.is_ancestor(p, h, sha)]
+    if not others:
+        return ""
+    try:
+        base = worktree.resolve_base(p)
+        mine = _patches(p, base, sha)
+        for h in others:
+            if (theirs := _patches(p, base, h)) != mine:
+                return (f"head {h[:12]}, which the review also covers, differs from {sha[:12]} past {base}: "
+                        f"{_difference(mine, theirs)}")
+    except Exception as e:
+        return f"its covered heads were not compared with {sha[:12]}: {e}"
+    return ""
+
+
+def _patches(p, base: str, head: str) -> list[str]:
+    """The patch-ids of `head`'s commits past `base`, oldest first. Raises on a merge in that range,
+    whose patch has no patch-id to compare."""
+    import subprocess
+    from . import worktree
+    if worktree._git(p.root, "rev-list", "--merges", f"{base}..{head}"):
+        raise ValueError(f"{head[:12]} has a merge past {base}")
+    commits = worktree._git(p.root, "rev-list", "--reverse", f"{base}..{head}").split()
+    log = worktree._git(p.root, "log", "--reverse", "-p", "--no-color", "--format=commit %H", f"{base}..{head}")
+    out = subprocess.run(["git", "-C", str(p.root), "patch-id", "--stable"], input=log + "\n",
+                         capture_output=True, text=True, timeout=120, check=True).stdout
+    ids = {c: pid for pid, c in (line.split()[:2] for line in out.splitlines() if line.strip())}
+    return [ids.get(c, "empty") for c in commits]
+
+
+def _difference(mine: list[str], theirs: list[str]) -> str:
+    if len(mine) != len(theirs):
+        return f"{len(theirs)} commit(s) against {len(mine)}"
+    return "a changed patch"
 
 
 def _result(task: dict) -> dict:

@@ -688,34 +688,62 @@ def continued_head(p: Project, task: dict) -> str | None:
     return None
 
 
-def reviewed_head(p: Project, review: dict) -> str | None:
-    """The commit a review reviewed: of the refs it covers (reviewed_refs) that resolve here or on
-    origin, the one that contains all the others (a fix branch on top of the reviewed branch), else
-    the first one named. None when none resolves."""
+def covered_heads(p: Project, review: dict) -> list[str]:
+    """The commits of the refs a review covers (reviewed_refs) that resolve here or on origin, without
+    duplicates: the heads of the review's dependencies (the code tasks it reviews, and fix branches on
+    them: dependency_refs) first, then the other spec-named ones."""
     heads = []
-    for ref in reviewed_refs(p, review):
+    for ref in _dependency_first(p, review, reviewed_refs(p, review)):
         for cand in (ref,) if _HEX.fullmatch(ref) else (ref, f"origin/{ref}"):
             head = _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
             if head:
                 heads.append(head)
                 break
-    heads = list(dict.fromkeys(heads))
+    return list(dict.fromkeys(heads))
+
+
+def is_ancestor(p: Project, older: str, newer: str) -> bool:
+    return older == newer or subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", older, newer],
+                                            capture_output=True, timeout=120).returncode == 0
+
+
+def reviewed_head(p: Project, review: dict) -> str | None:
+    """The commit a review reviewed: of the heads it covers (covered_heads), the one that contains all
+    the others (a fix branch on top of the reviewed branch), else, when they diverged (a rebase review
+    whose spec also names the old head), the first: its dependency's head over older spec-named ones.
+    None when none resolves."""
+    heads = covered_heads(p, review)
     for tip in heads:
-        if all(h == tip or subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", h, tip],
-                                          capture_output=True, timeout=120).returncode == 0 for h in heads):
+        if all(is_ancestor(p, h, tip) for h in heads):
             return tip
     return heads[0] if heads else None
+
+
+def dependency_refs(p: Project, review: dict) -> list[str]:
+    """The branches of the tasks a review depends on, and the fix branches built on them (fix_branches)."""
+    from .db import dependency_ids
+    ids = [i for i in dependency_ids(review) if i is not None]
+    deps = [r["branch"] for r in p.db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL AND branch!=''")
+            if r["id"] in ids]
+    return list(dict.fromkeys(deps + list(fix_branches(p, review, deps))))
+
+
+def _dependency_first(p: Project, review: dict, refs: list[str]) -> list[str]:
+    deps = set(dependency_refs(p, review))
+    return [r for r in refs if r in deps] + [r for r in refs if r not in deps]
 
 
 def review_workdir(p: Project, review: dict, prefer: str = "") -> Path | None:
     """Where a review runs, never the project root: a review that rebases or checks out a head there
     moves the checkout other tasks branch from. The worktree under worktrees/ that holds a branch the
-    review covers (`prefer` first, e.g. a push-conflict fix's branch; reviewed_refs), else one of
+    review covers (`prefer` first, e.g. a push-conflict fix's branch, then its dependencies' branches;
+    reviewed_refs), else one of
     its own (worktrees/t<id>, detached at reviewed_head) made here. None when it reviews no commit
     found here: it then runs in the root."""
     own = p.worktrees / f"t{review['id']}"
     recs = _records(p)
-    names = [r for r in dict.fromkeys([prefer] + reviewed_refs(p, review)) if r and not _HEX.fullmatch(r)]
+    names = [r for r in dict.fromkeys([prefer] + _dependency_first(p, review, reviewed_refs(p, review)))
+             if r and not _HEX.fullmatch(r)]
     base = p.worktrees.resolve()
     for name in names:
         for rec in recs.values():

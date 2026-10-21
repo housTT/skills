@@ -100,3 +100,89 @@ def test_a_coordinator_fix_review_leads_with_the_delta_from_the_recorded_failed_
         p.db.task(rev3["id"])["spec"]
 
 
+
+
+def _rebased(p, old_branch, name, *, patch=None, extra=False, merge=False):
+    """A code task branched from the base after it moved on, carrying `old_branch`'s commit
+    (cherry-picked, or with `patch` as that file's text), plus an extra commit or a merge."""
+    _commit_file(p.root, f"base-{name}")
+    tid, path, branch = _code_task(p, name)
+    if patch is None:
+        _git_out(path, *_IDENT, "cherry-pick", old_branch)
+    else:
+        (path / "a.txt").write_text(patch)
+        _git_out(path, "add", ".")
+        _git_out(path, *_IDENT, "commit", "-qm", "a")
+    if extra:
+        _commit_file(path, "more")
+    if merge:
+        _git_out(path, "checkout", "-qb", f"side-{name}", "HEAD~1")
+        _commit_file(path, "side")
+        _git_out(path, "checkout", "-q", branch)
+        _git_out(path, *_IDENT, "merge", "-q", "--no-ff", "-m", "merge side", f"side-{name}")
+    return tid, branch, _git_out(path, "rev-parse", "HEAD")
+
+
+def _accepted_old_head(p, monkeypatch):
+    """A code task with one commit whose head a review accepted: (daemon, started, task id, branch, head)."""
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    d, started = _reuse_daemon(p, monkeypatch)
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(first, status="done", result=json.dumps({"status": "done", "summary": "ok"}))
+    return d, started, tid, branch, _git_out(path, "rev-parse", "HEAD")
+
+
+def _rebase_review(p, tid, old_branch, old_head):
+    """A review of rebase task `tid` whose spec also names the old branch and head."""
+    return p.db.add_task("Review the rebase", f"Review {old_branch} ({old_head}) rebased.", kind="review",
+                         tier="light", origin="coordinator", provider="claude", budget_usd=8.0, depends_on=[tid])
+
+
+def test_a_rebase_review_reviews_its_dependency_head_not_the_older_spec_named_one(env, monkeypatch):
+    from ttp import reviewreuse, worktree
+    p = make(env)
+    d, started, tid, branch, old = _accepted_old_head(p, monkeypatch)
+    new_tid, new_branch, new = _rebased(p, branch, "rebase it")
+    review = _rebase_review(p, new_tid, branch, old)
+    assert worktree.reviewed_head(p, p.db.task(review)) == new, "the dependency's head, not the old one"
+    d.dispatch()
+    assert started[-1] == review and p.db.task(review)["status"] != "done", "the rebased head gets its own run"
+    assert reviewreuse.recorded(p.db.task(review))[0] == new
+    workdir = worktree.review_workdir(p, p.db.task(review))
+    assert workdir and workdir.resolve() == (p.worktrees / f"t{new_tid}").resolve(), "it runs in the rebased one"
+
+
+def test_verdict_reuse_needs_the_same_patches_on_every_covered_head(env, monkeypatch):
+    from ttp import reviewreuse
+    p = make(env)
+    d, started, tid, branch, old = _accepted_old_head(p, monkeypatch)
+    same = _rebased(p, branch, "same")
+    changed = _rebased(p, branch, "changed", patch="other text")
+    extra = _rebased(p, branch, "extra", extra=True)
+    merged = _rebased(p, branch, "merged", merge=True)
+
+    def covering(t):
+        return {"id": None, "spec": f"Review {old}.", "depends_on": json.dumps([t[0]])}
+    assert reviewreuse.rebased_away(p, covering(same), old) == "", "an identical rebase may reuse"
+    assert "changed patch" in reviewreuse.rebased_away(p, covering(changed), old)
+    assert "2 commit(s) against 1" in reviewreuse.rebased_away(p, covering(extra), old)
+    assert "merge" in reviewreuse.rebased_away(p, covering(merged), old)
+    # A head the accepted one contains (the code task's own branch) is no difference.
+    assert reviewreuse.rebased_away(p, {"id": None, "spec": "", "depends_on": json.dumps([tid])}, old) == ""
+
+
+def test_the_daemon_and_task_add_refuse_reuse_when_a_covered_head_differs(env, monkeypatch):
+    from ttp import coordinator as coord, worktree
+    p = make(env)
+    d, started, tid, branch, old = _accepted_old_head(p, monkeypatch)
+    new_tid, _, new = _rebased(p, branch, "changed", patch="other text")
+    # A review that still picks the old head (as before dependency heads came first) must not reuse it.
+    monkeypatch.setattr(worktree, "reviewed_head", lambda p, r: old)
+    review = _rebase_review(p, new_tid, branch, old)
+    d.dispatch()
+    assert started[-1] == review and p.db.task(review)["status"] != "done"
+    assert coord._rebased_away(p, [new_tid], f"Review {old}.", old)
+    same_tid, _, _ = _rebased(p, branch, "same")
+    assert coord._rebased_away(p, [same_tid], f"Review {old}.", old) == ""

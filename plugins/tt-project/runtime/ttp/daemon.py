@@ -8910,7 +8910,8 @@ class Daemon:
 
     def _reuse_review(self, task: dict) -> bool:
         """A review about to start whose head (worktree.reviewed_head) a review already accepted under
-        the same checks takes that verdict and closes with no run (reviewreuse.reuse): True. Else it
+        the same checks takes that verdict and closes with no run (reviewreuse.reuse), unless it also
+        covers a head that differs from it (reviewreuse.rebased_away): True. Else it
         records the head and check set it starts on, so a later review of that head can reuse it; a
         review forced past an accepted one runs. False whenever it runs."""
         db = self.p.db
@@ -8925,6 +8926,9 @@ class Daemon:
         labels = json.loads(task["labels"] or "[]")
         prior = None if reviewreuse.FORCED_LABEL in labels else reviewreuse.accepted(
             db, sha, key, skip=task["id"], p=self.p if reviewreuse.pushes(self.cfg, labels) else None)
+        if prior and (why := reviewreuse.rebased_away(self.p, task, sha)):
+            log(self.p, f"review {task['id']}: not reusing review #{prior['id']}'s verdict on {sha[:12]}: {why}")
+            prior = None
         if not prior:
             db.update_task(task["id"], labels=reviewreuse.with_head(labels, sha, key))
             return False

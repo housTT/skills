@@ -1455,6 +1455,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 head = _reviewed_head(p, deps, a.get("spec") or "") if review else None
                 prior = reviewreuse.accepted(db, head, reviewreuse.check_key(cfg),
                                              p=p if reviewreuse.pushes(cfg, labels) else None) if head else None
+                if prior and _rebased_away(p, deps, a.get("spec") or "", head):
+                    prior = None   # it also covers a head whose patches differ: it gets its own review
                 if prior and not (a.get("force") and str(a.get("reason") or "").strip()):
                     raise ValueError(f"task_add rejected: {reviewreuse.rejection(prior, head)}")
                 if prior:
@@ -2443,13 +2445,24 @@ def _covered(db, deps: list, spec: str) -> set[int]:
     return ids
 
 
+def _draft_review(deps: list, spec: str) -> dict:
+    return {"id": None, "spec": spec, "depends_on": json.dumps([d for d in deps if isinstance(d, int)])}
+
+
 def _reviewed_head(p, deps: list, spec: str) -> str | None:
     """The head a review with these dependencies and spec would review as it starts (worktree.reviewed_head)."""
     try:
-        return worktree.reviewed_head(p, {"id": None, "spec": spec,
-                                          "depends_on": json.dumps([d for d in deps if isinstance(d, int)])})
+        return worktree.reviewed_head(p, _draft_review(deps, spec))
     except Exception:
         return None
+
+
+def _rebased_away(p, deps: list, spec: str, head: str) -> str:
+    """Why such a review must not reuse the verdict on `head` (reviewreuse.rebased_away), or ""."""
+    try:
+        return reviewreuse.rebased_away(p, _draft_review(deps, spec), head)
+    except Exception as e:
+        return f"not checked: {e}"
 
 
 def _auto_reviews(db, covered: set[int]) -> dict[int, dict]:
