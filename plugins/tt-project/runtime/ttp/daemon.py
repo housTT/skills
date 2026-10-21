@@ -521,7 +521,7 @@ def _decisions(actions: list) -> list:
 def cleared_claims(p: Project, key: str) -> list[str]:
     """The claim keys a cleared machine-wide episode ends: the CLI's, or each filesystem this
     project's disk guard watches (the low one is no longer recorded once it cleared)."""
-    if key.startswith("auth:") or key == netwait.KEY:
+    if key.startswith("auth:") or key in (netwait.KEY, "notifier"):
         return [f"{hostname()}|{key}"]
     out = []
     for path in (p.base, p.worktrees):
@@ -1051,7 +1051,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger):
+                     self.check_linger, self.check_notifier):
             if step in lease_off:
                 continue
             self._run_step(step)
@@ -2332,6 +2332,17 @@ class Daemon:
             self.alert(downtime.LINGER_KEY, downtime.linger_text(name), severity="normal")
         elif db.kv(downtime.LINGER_KV):
             db.x("DELETE FROM kv WHERE key=?", (downtime.LINGER_KV,))
+
+    def check_notifier(self) -> None:
+        """Alert once while this machine's desktop notifier fails to deliver (notifier.DELIVERY: a refused
+        or timed-out notification, no backend); it clears once a later delivery succeeds."""
+        from . import notifier
+        bad = notifier.failing()
+        if bad:
+            since = timefmt.short(float(bad.get("failing_since") or bad.get("ts") or time.time()), self.p)
+            self.alert(notifier.ALERT_KEY, f"Desktop notifications on {hostname()} fail since {since} "
+                       f"({bad.get('backend')}: {str(bad.get('error'))[:160]}). Alerts still reach this chat and "
+                       f"the web app. `ttp notifier test` on {hostname()} shows the fix.", severity="normal")
 
     def _tell_reboot(self) -> None:
         """Once per boot, after every run of an earlier boot is reaped: record the boot (when, the
@@ -9569,7 +9580,7 @@ class Daemon:
         """The per-user claim key of a condition every project on this machine sees alike: a
         logged-out CLI, a lost VPN or network sign-in (netwait), linger off (downtime), or a low disk on the filesystem the
         guard found short. None otherwise."""
-        if key.startswith(("auth:", "account-mismatch:")) or key in (netwait.KEY, downtime.LINGER_KEY):
+        if key.startswith(("auth:", "account-mismatch:")) or key in (netwait.KEY, downtime.LINGER_KEY, "notifier"):
             return f"{hostname()}|{key}"
         if key == "disk":
             path = (self.p.db.kv("disk_low") or {}).get("path")

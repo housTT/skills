@@ -1478,6 +1478,9 @@ def cmd_status(a) -> None:
         print(json.dumps(state_payload(p, p.db), default=str, indent=1))
     else:
         print(status_text(p, verbose=a.verbose))
+        from . import notifier
+        for ln in notifier.status_lines():   # this machine's notifier: on old code, or failing to deliver
+            print(ln)
     from . import upstream
     upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this shell
 
@@ -5532,6 +5535,9 @@ def cmd_setup(a) -> None:
     line = shortcut.remove() if a.no_shortcut else shortcut.install()
     if line:
         print(line)
+    from . import notifier
+    for ln in notifier.refresh(send_test=True, always=True):   # an installed notifier runs this code from now on
+        print(ln)
     from .project import DEFAULT_CONFIG
     print("defaults for new projects:")
     for ln in new_project_defaults_lines():
@@ -5588,6 +5594,9 @@ def cmd_upgrade(a) -> None:
             print(mm.push(entry.get("ssh") or entry["host"]))
             sys.exit(forward(entry, sys.argv[1:]))
         p = need(a.name, sys.argv[1:])
+    from . import notifier
+    for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
+        print(ln)
     held = locks.try_take([release.upgrade_lock(p)], f"ttp upgrade (pid {os.getpid()})", "ttp upgrade")
     if held is None:
         if a.auto:
@@ -6581,8 +6590,14 @@ def cmd_notifier(a) -> None:
         if why:
             die(f"notifier not installed: {why}", consent.NEEDS_ANSWER)
         print(notifier.install())
+        ok, lines = notifier.test_once()
+        print("\n".join(lines))
     elif a.action == "run":
         sys.exit(notifier.main())
+    elif a.action == "restart":
+        if not notifier.agent_file():
+            die("no desktop notifier installed here; `ttp notifier install` installs one")
+        print(notifier.install())
     elif a.action == "test" and a.slack:
         from .slack import send_test
         ok, text = send_test()
@@ -6590,8 +6605,13 @@ def cmd_notifier(a) -> None:
         if not ok:
             sys.exit(1)
     elif a.action == "test":
-        notifier.show("tt-project", "Test notification: desktop alerts work on this machine.")
-        print("sent a test notification")
+        ask = None
+        if sys.stdin.isatty() and sys.stdout.isatty():   # the user at a terminal can say what macOS cannot
+            ask = lambda q: input(q).strip().lower() in ("y", "yes")
+        ok, lines = notifier.test_once(ask=ask)
+        print("\n".join(lines))
+        if not ok:
+            sys.exit(1)
 
 
 def cmd_daemon(a) -> None:
@@ -7554,8 +7574,10 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_consent)
 
     s = sub.add_parser("notifier", help="desktop notifications on this machine for all your projects")
-    s.add_argument("action", choices=["install", "run", "test"],
-                   help="install: start it at login; run: run it here; test: show one test notification")
+    s.add_argument("action", choices=["install", "restart", "run", "test"],
+                   help="install: start it at login and send a test notification; restart: on the installed code; "
+                        "run: run it here; test: send one test notification and say whether it got through "
+                        "(exit 1 when not) and how to fix it")
     s.add_argument("--slack", action="store_true",
                    help="with test: send one test message to your Slack DM instead (optional; set up with `ttp secret slack`)")
     s.set_defaults(fn=cmd_notifier)

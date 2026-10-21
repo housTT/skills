@@ -1082,6 +1082,7 @@ reaches the coordinator once as a normal observation, not once per deploy.
 Alerts go to every attached chat, to the web app, and, if you
 install it, to a desktop notifier on your workstation that covers all your projects
 (`ttp notifier install`; asked once per user, recorded with `ttp consent notifier yes|no`). Only decisions, reviews, merges, funds and outages notify by default.
+`ttp notifier test` checks that desktop notifications show (with sound) and prints the fix if not.
 
 - Web app: the Notifications card on the Overview tab shows the browser's state (on, not allowed yet,
   blocked, unavailable on this address, unsupported), an Allow button and Send test. While the page

@@ -2723,7 +2723,7 @@ def test_the_desktop_notifier_alarms_once_when_a_remote_host_stays_unreachable_a
                         lambda entry, name, after, floor, *a: ([], True, None) if up[entry["host"]] else (None, False, None))
     monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
     shown = []
-    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None, **kw: shown.append(body))
     t0, state = 1_800_000_000, {}
 
     def poll(t, st=None):
@@ -2768,7 +2768,7 @@ def test_the_desktop_notifier_starts_a_host_down_streak_anew_after_a_gap_between
     from ttp import notifier, timefmt
     monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
     shown = []
-    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None, **kw: shown.append(body))
     t0, st = 1_800_000_000, {}
     notifier._track_hosts(st, {"h": True}, t0, 1200)
     notifier._track_hosts(st, {"h": False}, t0 + 60, 1200)
@@ -2810,7 +2810,7 @@ def _slow_ssh_notifier(monkeypatch, n_projects=9, ssh_s=40):
     monkeypatch.setattr(notifier, "_remote_alerts", remote)
     monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
     shown = []
-    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None, **kw: shown.append(body))
     state = {}
 
     def poll(sleep_s=60):   # one run, then the notifier's sleep
@@ -2880,7 +2880,7 @@ def _daemon_notifier(monkeypatch, projects):
     monkeypatch.setattr(notifier, "_remote_alerts", remote)
     monkeypatch.setattr(timefmt, "ambient", lambda: "Europe/Berlin")
     shown = []
-    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None, **kw: shown.append(body))
 
     def poll(t, st):   # a round trip through the state file, as the notifier keeps it
         return json.loads(json.dumps(notifier.run_once(st, "high", 1200, now=1_800_000_000 + t,
@@ -2976,7 +2976,7 @@ def test_the_desktop_notifier_alarms_a_down_local_daemon_from_its_own_health(env
     monkeypatch.setattr(service, "installed", lambda p: {"kind": "systemd", "watchdog": True})
     monkeypatch.setattr(timefmt, "ambient", lambda: "UTC")
     shown = []
-    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None, **kw: shown.append(body))
     hb = p.state / "heartbeat"
     hb.write_text("{}")
     now = time.time()
@@ -3194,14 +3194,22 @@ def test_a_tick_step_failing_three_ticks_in_a_row_is_alerted_then_cleared_by_a_s
 def _notifier_stubs(monkeypatch, tmp_path, names, rc=0):
     """Stub notifier commands on an otherwise empty PATH; each records its argv NUL-separated."""
     bindir = tmp_path / "bin"
-    bindir.mkdir()
+    bindir.mkdir(exist_ok=True)
     for name in names:
         stub = bindir / name
         stub.write_text(f"#!/bin/sh\nprintf '%s\\0' \"$@\" > \"{tmp_path}/{name}.argv\"\n"
                         f"echo 'stub refused' >&2\nexit {rc}\n")
         stub.chmod(0o755)
     monkeypatch.setenv("PATH", str(bindir))
+    _notifier_files(monkeypatch, tmp_path)
     return lambda name: (tmp_path / f"{name}.argv").read_bytes().split(b"\0")[:-1]
+
+
+def _notifier_files(monkeypatch, tmp_path):
+    """The notifier's delivery record, start record and log in the test folder, never the account's."""
+    from ttp import notifier
+    for attr in ("DELIVERY", "RUNNING", "LOG"):
+        monkeypatch.setattr(notifier, attr, tmp_path / pathlib.Path(getattr(notifier, attr)).name)
 
 
 def test_the_desktop_notifier_passes_non_ascii_text_to_osascript_byte_for_byte(monkeypatch, tmp_path, capsys):
@@ -3216,17 +3224,264 @@ def test_the_desktop_notifier_passes_non_ascii_text_to_osascript_byte_for_byte(m
     assert b"item 1 of argv" in b" ".join(got) and capsys.readouterr().err == ""
 
 
+_LOG_LINE = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \S* ?notifier: "
+
+
 @pytest.mark.parametrize("platform,cmd", [("darwin", "osascript"), ("darwin", "terminal-notifier"),
                                           ("linux", "notify-send")])
-def test_the_desktop_notifier_logs_a_failing_notifier_command(monkeypatch, tmp_path, capsys, platform, cmd):
+def test_the_desktop_notifier_logs_and_records_a_refused_notification(monkeypatch, tmp_path, platform, cmd):
+    """A non-zero exit (macOS refusing it, no notification server) is logged with a timestamp and the
+    backend, and recorded as failing from the first failure until a delivery succeeds."""
     from ttp import notifier
     monkeypatch.setattr(notifier.sys, "platform", platform)
     monkeypatch.setenv("DISPLAY", ":0")
     argv = _notifier_stubs(monkeypatch, tmp_path, [cmd], rc=3)
-    notifier.show("tt-project · a", "alert one")
+    res = notifier.show("tt-project · a", "alert one")
     assert argv(cmd), "the stub ran"
-    err = capsys.readouterr().err
-    assert f"{cmd} exited 3" in err and "stub refused" in err
+    assert res["ok"] is False and res["backend"] == cmd and res["error"] == "exited 3: stub refused"
+    (line,) = notifier.LOG.read_text().splitlines()
+    assert re.match(_LOG_LINE + f"{cmd} delivery failed: exited 3: stub refused$", line), line
+    first = notifier.failing()
+    assert first and first["failing_since"] == res["ts"]
+    notifier.show("tt-project · a", "alert two")
+    assert notifier.failing()["failing_since"] == first["failing_since"], "one failing stretch, not one per alert"
+    _notifier_stubs(monkeypatch, tmp_path, [cmd], rc=0)
+    assert notifier.show("tt-project · a", "alert three")["ok"]
+    assert notifier.failing() is None and "failing_since" not in notifier.delivery()
+    assert len(notifier.LOG.read_text().splitlines()) == 2, "a success logs nothing"
+
+
+def test_the_desktop_notifier_logs_a_timeout_and_a_missing_backend(monkeypatch, tmp_path):
+    from ttp import notifier
+    _notifier_stubs(monkeypatch, tmp_path, ["osascript"])
+    monkeypatch.setattr(notifier.sys, "platform", "darwin")
+
+    def hang(args, **kw):
+        raise subprocess.TimeoutExpired(args, kw["timeout"])
+    monkeypatch.setattr(notifier.subprocess, "run", hang)
+    res = notifier.show("t", "b")
+    assert not res["ok"] and res["error"] == f"timed out after {notifier.TIMEOUT_S}s"
+    monkeypatch.setattr(notifier.sys, "platform", "linux")
+    res = notifier.show("t", "b")   # PATH holds no notify-send
+    assert not res["ok"] and res["backend"] == "notify-send" and res["error"] == "notify-send is not installed"
+    _notifier_stubs(monkeypatch, tmp_path, ["notify-send"])
+    for var in ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"):
+        monkeypatch.delenv(var, raising=False)
+    res = notifier.show("t", "b")
+    assert not res["ok"] and res["error"].startswith("no desktop session")
+    monkeypatch.setattr(notifier.sys, "platform", "win32")
+    assert notifier.show("t", "b")["error"] == "no desktop notification backend on win32"
+    lines = notifier.LOG.read_text().splitlines()
+    assert len(lines) == 4 and all(re.match(_LOG_LINE, ln) for ln in lines)
+    assert "osascript delivery failed: timed out" in lines[0] and "notify-send delivery failed: notify-send is not" in lines[1]
+
+
+def test_every_desktop_notification_plays_a_sound(monkeypatch, tmp_path):
+    from ttp import notifier
+    monkeypatch.setattr(notifier.sys, "platform", "darwin")
+    argv = _notifier_stubs(monkeypatch, tmp_path, ["osascript"])
+    notifier.show("t", "b")
+    assert any(b'sound name "' in a for a in argv("osascript")), "the macOS command includes the sound clause"
+    argv = _notifier_stubs(monkeypatch, tmp_path, ["terminal-notifier"])
+    notifier.show("t", "b")
+    got = argv("terminal-notifier")
+    assert got[got.index(b"-sound") + 1] == b"default"
+    monkeypatch.setattr(notifier.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    argv = _notifier_stubs(monkeypatch, tmp_path, ["notify-send"])
+    notifier.show("t", "b", severity="normal")
+    got = argv("notify-send")
+    assert b"string:sound-name:message-new-instant" in got and got[got.index(b"-u") + 1] == b"normal"
+    notifier.show("t", "b", severity="critical")
+    assert argv("notify-send")[argv("notify-send").index(b"-u") + 1] == b"critical"
+
+
+@pytest.mark.parametrize("platform,cmd,rc,answer,exit_code,says", [
+    ("darwin", "osascript", 0, None, 0, "test notification sent (osascript); macOS does not say whether it was shown"),
+    ("darwin", "osascript", 0, "y", 0, "test notification delivered (osascript), seen by you"),
+    ("darwin", "osascript", 0, "n", 1, "test notification not shown (osascript)"),
+    ("darwin", "osascript", 1, None, 1, "test notification failed (osascript): exited 1: stub refused"),
+    ("darwin", "terminal-notifier", 1, None, 1, "test notification failed (terminal-notifier)"),
+    ("linux", "notify-send", 0, None, 0, "test notification delivered (notify-send)"),
+    ("linux", "notify-send", 1, None, 1, "test notification failed (notify-send)"),
+])
+def test_ttp_notifier_test_reports_the_backend_the_result_and_the_fix(env, monkeypatch, tmp_path, capsys, platform,
+                                                                     cmd, rc, answer, exit_code, says):
+    from ttp import cli, notifier
+    monkeypatch.setattr(notifier.sys, "platform", platform)
+    monkeypatch.setenv("DISPLAY", ":0")
+    _notifier_stubs(monkeypatch, tmp_path, [cmd], rc=rc)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: answer is not None, raising=False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: answer is not None, raising=False)
+    monkeypatch.setattr("builtins.input", lambda q: answer)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["notifier", "test"])
+        raise SystemExit(0)
+    out = capsys.readouterr().out
+    assert e.value.code == exit_code and says in out, out
+    fix = {"osascript": "System Settings > Notifications > Script Editor", "terminal-notifier":
+           "System Settings > Notifications > terminal-notifier", "notify-send": "No notification server answered"}[cmd]
+    assert (fix in out) == (exit_code == 1 or answer is None and platform == "darwin"), out
+    if cmd == "osascript" and exit_code:
+        assert "brew install terminal-notifier" in out
+    assert bool(notifier.failing()) == bool(exit_code)
+
+
+def _fake_agent(monkeypatch, tmp_path, running_code):
+    """An installed notifier agent whose running process reports `running_code` (None: no start record)."""
+    from ttp import notifier
+    _notifier_files(monkeypatch, tmp_path)
+    monkeypatch.delenv("TTP_TEST_NO_NOTIFIER")
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(notifier.sys, "platform", "linux")
+    unit = tmp_path / "userhome" / ".config" / "systemd" / "user" / notifier.UNIT
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\n")
+    if running_code:
+        notifier.write_json(notifier.RUNNING, {"pid": os.getpid(), "code": running_code})
+    calls = []
+    monkeypatch.setattr(notifier, "install", lambda: calls.append("restart") or "installed and started (test)")
+    monkeypatch.setattr(notifier, "test", lambda ask=None: calls.append("test") or (True, ["test notification sent (x)"]))
+    return calls
+
+
+@pytest.mark.parametrize("running", ["old", "current", None])
+def test_setup_restarts_the_notifier_and_sends_one_test_per_code_version(env, monkeypatch, tmp_path, running):
+    from ttp import notifier
+    calls = _fake_agent(monkeypatch, tmp_path, {"old": "0.0.1 (abc)", "current": None, None: None}[running])
+    want = notifier.installed_code()
+    if running == "current":
+        notifier.write_json(notifier.RUNNING, {"pid": os.getpid(), "code": want})
+    out = notifier.refresh(send_test=True, always=True)   # `ttp setup`
+    assert calls == ["restart", "test"] and out[0].startswith("desktop notifier: installed and started"), out
+    assert out[1] == "desktop notifier: test notification sent (x)"
+    calls.clear()
+    out = notifier.refresh(send_test=True, always=True)   # again on the same code: restart, no second test
+    assert calls == ["restart"] and "already went out on ttp " + want in out[1]
+
+
+def test_upgrade_restarts_only_a_notifier_on_other_code_and_auto_sends_no_test(env, monkeypatch, tmp_path):
+    from ttp import notifier
+    calls = _fake_agent(monkeypatch, tmp_path, "0.0.1 (abc)")
+    assert notifier.status_lines() == [f"desktop notifier runs ttp 0.0.1 (abc), not the installed "
+                                       f"{notifier.installed_code()}: `ttp notifier restart`"]
+    notifier.refresh(send_test=False)   # `ttp upgrade --auto`
+    assert calls == ["restart"]
+    notifier.write_json(notifier.RUNNING, {"pid": os.getpid(), "code": notifier.installed_code()})
+    calls.clear()
+    notifier.refresh(send_test=False)
+    assert calls == [] and notifier.status_lines() == []
+    notifier.refresh(send_test=True)   # `ttp upgrade` by hand: the test once on this code
+    notifier.refresh(send_test=True)
+    assert calls == ["test"]
+    monkeypatch.setenv("TTP_TEST_NO_NOTIFIER", "1")
+    assert notifier.refresh(send_test=True, always=True) == [] and calls == ["test"]
+
+
+@pytest.mark.parametrize("argv,auto", [(["upgrade", "demo"], False), (["upgrade", "demo", "--auto"], True)])
+def test_ttp_upgrade_refreshes_the_notifier_and_only_a_hand_upgrade_tests_it(env, monkeypatch, argv, auto):
+    from ttp import cli, notifier
+    make(env)
+    got = []
+
+    class Stop(Exception):
+        pass
+
+    def refresh(send_test, always=False):
+        got.append((send_test, always))
+        raise Stop
+    monkeypatch.setattr(notifier, "refresh", refresh)
+    with pytest.raises(Stop):
+        cli.main(argv)
+    assert got == [(not auto, False)]
+
+
+def test_ttp_setup_restarts_the_installed_notifier(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, notifier
+    got = []
+    monkeypatch.setattr(notifier, "refresh", lambda send_test, always=False: got.append((send_test, always))
+                        or ["desktop notifier: restarted (test)"])
+    cli.main(["setup", "--bin-dir", str(tmp_path / "bin"), "--force"])
+    assert got == [(True, True)] and "desktop notifier: restarted (test)" in capsys.readouterr().out
+
+
+def test_the_notifier_unit_runs_the_installed_runtime_path_and_is_restarted(env, monkeypatch, tmp_path):
+    """The agent runs from lib/current, not the release folder it resolves to, so a restart picks up new
+    code; a running systemd unit is restarted, as `enable --now` would leave it on the old code."""
+    from ttp import notifier, release
+    _install_template(env)
+    _notifier_files(monkeypatch, tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(notifier.sys, "platform", "linux")
+    ran = []
+    monkeypatch.setattr(notifier.subprocess, "run", lambda args, **kw: ran.append(args[2:]) or
+                        subprocess.CompletedProcess(args, 0, "", ""))
+    assert notifier.install() == "installed and started (systemd user unit)"
+    unit = (tmp_path / "userhome" / ".config" / "systemd" / "user" / notifier.UNIT).read_text()
+    assert f"Environment=PYTHONPATH={release.installed() / 'runtime'}\n" in unit
+    assert ran == [["daemon-reload"], ["enable", notifier.UNIT], ["restart", notifier.UNIT]]
+
+
+def test_the_notifier_logs_its_code_at_start_and_exits_once_the_installed_code_changes(env, monkeypatch, tmp_path):
+    from ttp import notifier, release
+    _install_template(env)
+    _notifier_files(monkeypatch, tmp_path)
+    rt = release.installed() / "runtime"
+    monkeypatch.setattr(notifier, "own_runtime", lambda: rt)
+    monkeypatch.setattr(notifier, "run_once", lambda state, *a, **kw: state)
+    monkeypatch.setattr(notifier, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(notifier, "CONF", tmp_path / "conf.json")
+    mine = notifier.code(rt)
+    sleeps = []
+
+    def sleep(s):   # one minute later, `ttp setup` installed other code
+        sleeps.append(s)
+        init = rt / "ttp" / "__init__.py"
+        init.write_text(init.read_text().replace(f'"{notifier.code(rt).split()[0]}"', '"9.9.9"'))
+    monkeypatch.setattr(notifier.time, "sleep", sleep)
+    assert notifier.main() == 0 and len(sleeps) == 1
+    rec = json.loads(notifier.RUNNING.read_text())
+    assert rec["code"] == mine and rec["pid"] == os.getpid() and rec["python"]
+    lines = notifier.LOG.read_text().splitlines()
+    assert re.match(_LOG_LINE + re.escape(f"started: ttp {mine} under Python "), lines[0]), lines
+    assert "installed code is now ttp 9.9.9" in lines[1]
+    monkeypatch.setattr(notifier, "own_runtime", lambda: tmp_path)   # run from elsewhere: never exits for it
+    assert not notifier.outdated("0.0.1 (abc)")
+
+
+def test_a_failing_desktop_notifier_raises_one_chat_alert_that_clears_once_a_delivery_succeeds(env, monkeypatch, tmp_path):
+    from ttp import alerts, notifier
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.check_notifier()
+    assert not p.db.one("SELECT id FROM messages WHERE ref='notifier'"), "nothing failed yet"
+    monkeypatch.setattr(notifier.sys, "platform", "darwin")
+    _notifier_stubs(monkeypatch, tmp_path, ["osascript"], rc=1)
+    for _ in range(3):   # three alerts fail to show: one chat alert, not three
+        notifier.show("tt-project · demo", "an alert")
+        d.check_notifier()
+    (msg,) = p.db.q("SELECT * FROM messages WHERE ref='notifier'")
+    assert msg["severity"] == "normal" and msg["channel"] == "chat" and msg["chat"] is None
+    assert "Desktop notifications on" in msg["text"] and "osascript: exited 1: stub refused" in msg["text"]
+    assert "`ttp notifier test`" in msg["text"]
+    assert alerts.tracked("alert", "normal", notifier.ALERT_KEY) and not alerts.sweep(p.db)
+    _notifier_stubs(monkeypatch, tmp_path, ["osascript"], rc=0)
+    notifier.show("tt-project · demo", "another alert")
+    (ep,) = alerts.sweep(p.db)
+    assert ep["key"] == notifier.ALERT_KEY
+    told = p.db.one("SELECT * FROM messages WHERE text LIKE 'Cleared: Desktop notifications deliver again%'")
+    assert told and told["severity"] == "low"
+    d.check_notifier()
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='notifier' AND kind='alert'")) == 1
+
+
+def test_the_notifier_module_stays_python_3_9_syntax():
+    """The agent may run under macOS's system Python 3.9."""
+    import ast
+    src = (RUNTIME / "ttp" / "notifier.py").read_text()
+    ast.parse(src, feature_version=(3, 9))
+    assert "from __future__ import annotations" in src, "X | None annotations need it before 3.10"
 
 
 def test_the_desktop_notifier_never_lets_a_later_alert_replace_an_earlier_one(monkeypatch, tmp_path):

@@ -78,15 +78,17 @@ CLEARED_TEXT = {
     "paused": "The project is no longer paused; new runs start again.",
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
     "linger-off": "Linger is on again: the daemon starts at boot without a login.",
+    "notifier": "Desktop notifications deliver again.",
     "tick-step": "Daemon tick step {arg} runs again.",
     "account-mismatch": "{arg}'s current account has plan readings of its own again, is known to be billed by use, or the old readings aged out.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
 # linger-off: the systemd service would not start at boot without a login (downtime.py).
-USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off")   # paused: a long project pause (projpause)
+# notifier: this machine's desktop notifications fail (notifier.py; a system setting or a missing tool).
+USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier")   # paused: a long project pause (projpause)
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low", "account-mismatch": "low",
-                    "linger-off": "low"}
+                    "linger-off": "low", "notifier": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 # account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
 # run reports them, or it turns out billed by use.
@@ -248,6 +250,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return turnsize.holds(db)
     if key == "linger-off":   # Daemon.check_linger keeps the flag while linger is off
         return bool(db.kv("linger_off"))
+    if key == "notifier":   # until a later desktop delivery on this machine succeeds
+        from . import notifier
+        return bool(notifier.failing())
     if kind == "tick-step":   # Daemon._run_step keeps the step while it keeps failing
         return arg in (db.kv("tick_steps_failing", {}) or {})
     if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
@@ -281,7 +286,7 @@ def _checkable(key: str) -> bool:
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
-                                         "coord-budget", "account-mismatch", "linger-off", "tick-step")
+                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "notifier")
 
 
 def _since(ep: dict) -> float:

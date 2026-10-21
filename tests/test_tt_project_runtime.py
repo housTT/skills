@@ -473,6 +473,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills
     monkeypatch.setenv("TTP_TEST_NO_SYNC", "1")   # setup and upgrades skip the host-wide flush (minutes on a busy host)
+    monkeypatch.setenv("TTP_TEST_NO_NOTIFIER", "1")   # setup, upgrade and status never restart or test the account's own notifier
     # Tests may run inside a live run, detached checks, `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",
@@ -4553,7 +4554,7 @@ def test_relays_skip_high_alerts_whose_condition_cleared_before_delivery(env, ca
     assert held in out and follow_up in out, out
 
     shown = []
-    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None, **kw: shown.append(body))
     state = notifier.run_once({"demo": 0}, "high")
     assert shown == [held], shown
     assert state["demo"] == p.db.one("SELECT MAX(id) m FROM messages WHERE severity='high'")["m"], state
@@ -4576,7 +4577,7 @@ def test_the_desktop_notifier_moves_past_a_run_of_quiet_broadcasts(env, monkeypa
         p.db.post("out", f"fyi {i}", chat=None, kind="alert", severity="normal")
     p.db.post("out", "Only 1.0 GB free", chat=None, kind="alert", severity="high")
     shown = []
-    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None, **kw: shown.append(body))
     notifier.run_once({"demo": 0}, "high")
     assert shown == ["Only 1.0 GB free"], "quiet broadcasts hid a high alert from the desktop notifier"
 
@@ -22339,7 +22340,7 @@ def test_a_host_reboot_is_information_only(env, tmp_path, monkeypatch):
     # Pushed channels skip it even when it is loud (a host that keeps rebooting).
     p.db.post("out", "The host rebooted (3rd reboot in 24 h)", kind="info", severity="high", ref="reboot:x")
     shown = []
-    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None, **kw: shown.append(body))
     notifier.run_once({"demo": 0}, "high")
     assert shown == [], shown
 

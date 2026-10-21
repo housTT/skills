@@ -14,7 +14,15 @@ Default channels need no accounts or setup.
   count only polls in a row: after a sleep or a stopped notifier it starts again.
 - A project whose daemon has not beaten for 3 h (`daemon_down_after_s`) while its service should keep it
   running gets one notification naming `ttp restart`, and one more when it runs again.
-- `ttp notifier test` shows a sample notification.
+- Desktop notifications play a sound. Backends: terminal-notifier, else osascript (macOS; allow
+  Script Editor in System Settings > Notifications); notify-send in a desktop session (Linux).
+- `ttp notifier test` sends one through the same path and says whether it worked, with the fix
+  if not; exit 1 = failed. macOS does not report display: in a terminal it asks if you saw it.
+- `ttp notifier install`, `ttp setup` and `ttp upgrade` send that test once per installed ttp version.
+  `ttp setup` and `ttp upgrade` also restart the notifier on the new code; `ttp status` says when it
+  runs older code (`ttp notifier restart`).
+- Each failed delivery goes to `~/.tt-project/notifier.log`; a failing stretch raises one chat
+  alert from the projects on that machine, cleared once a delivery works again.
 - Only `high` severity notifies by default: decisions, reviews, merges, funds, outages.
 - The user can ask the coordinator for more or fewer alerts.
 
