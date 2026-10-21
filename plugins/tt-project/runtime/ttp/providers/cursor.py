@@ -16,9 +16,12 @@ Write fence (from the docs; the CLI was not installed where this was probed). Wo
 | Fence writes to a list of dirs | yes with `--sandbox enabled`: Landlock + seccomp, kernel 6.2+ with unprivileged user namespaces; extra dirs in `.cursor/sandbox.json` `additionalReadwritePaths` | yes, Seatbelt |
 | Unix socket under `state/` from the sandbox | not documented | not documented |
 
-Credential reads: not enforced. Cursor's permission deny rules live in a config file
-(`.cursor/cli.json` or the user's own), which the harness does not write per run, and the harness
-hook does not run here."""
+Credential reads: not enforced. Cursor's permission deny rules and hooks live only in a config file
+(`.cursor/cli.json` in the worktree, or the user's own global one); no CLI flag or environment
+variable sets them for one run, and the harness writes neither file, so `denied_reads` is ignored
+and the harness hook does not run here. `CURSOR_CONFIG_DIR` would move the whole global config
+folder per run, but Cursor does not document whether the login, MCP servers and hooks move with
+it, so it is not used."""
 from __future__ import annotations
 
 import json
