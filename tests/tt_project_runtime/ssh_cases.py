@@ -99,7 +99,7 @@ def test_resolve_says_which_host_and_folder_a_chat_log_hit_registers(env, monkey
     seen = "/logs/session.jsonl"
     monkeypatch.setattr(cli, "local_project", lambda name: None)
     monkeypatch.setattr(cli, "remote_entry", lambda name: None)
-    monkeypatch.setattr(cli, "search_transcripts", lambda name: [{"host": "host-a", "dir": "/srv/p", "seen_in": seen, "mtime": 1}])
+    monkeypatch.setattr(cli, "search_transcripts", lambda name, cap_s=None: [{"host": "host-a", "dir": "/srv/p", "seen_in": seen, "mtime": 1}])
     registered = []
     monkeypatch.setattr(cli, "register", lambda name, entry: registered.append((name, entry)))
     p, entry = cli.resolve("demo")
@@ -121,3 +121,88 @@ def test_a_kept_tunnel_unit_keeps_percent_and_dollar_literal(env, tmp_path, monk
     f.write_text(unit)
     got = tunnel.installed("demo", "linux")
     assert got["host"] == "host-a" and got["local"] == 18800 and got["remote"] == 18700 and got["own"], got
+
+
+def _chat_logs_at(tmp_path, monkeypatch, n: int) -> list:
+    """`n` Claude Code chat logs in a fake home, file i modified at time i (so the last is newest)."""
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    logs = tmp_path / "userhome" / ".claude" / "projects" / "x"
+    logs.mkdir(parents=True)
+    files = []
+    for i in range(n):
+        f = logs / f"s{i}.jsonl"
+        f.write_text('{"text": "hello"}\n')
+        os.utime(f, (1000 + i, 1000 + i))
+        files.append(f)
+    return files
+
+
+def test_a_mistyped_name_stops_the_chat_log_search_at_its_cap_newest_logs_first(env, monkeypatch, tmp_path, capsys):
+    import subprocess as sp
+    from ttp import cli
+    files = _chat_logs_at(tmp_path, monkeypatch, 5)
+    clock = [0.0]
+    monkeypatch.setattr(cli, "_mono", lambda: clock[0])
+    monkeypatch.setattr(cli, "_GREP_BATCH", 1)
+    monkeypatch.setenv("TTP_CHATLOG_SEARCH_S", "10")
+    real_run, searched = sp.run, []
+
+    def slow_grep(cmd, *a, **kw):   # each log takes 4 s of the fake clock
+        searched.append(cmd[-1])
+        clock[0] += 4
+        return real_run(cmd, *a, **kw)
+    monkeypatch.setattr(cli.subprocess, "run", slow_grep)
+    with pytest.raises(SystemExit):
+        cli.need("demo-typo", ["status"])
+    # 10 s of budget: three 4 s logs at most, the newest first
+    assert searched == [str(f) for f in files[::-1][:3]], searched
+    err = capsys.readouterr().err
+    assert "chat-log search cut after 10s" in err and "ttp find demo-typo" in err, err
+
+
+def test_a_second_miss_for_the_same_name_skips_the_search_until_the_cache_expires(env, monkeypatch, tmp_path):
+    import stat
+    from ttp import cli
+    _chat_logs_at(tmp_path, monkeypatch, 2)
+    now = [5000.0]
+    monkeypatch.setattr(cli, "_now", lambda: now[0])
+    calls = []
+    real = cli.search_transcripts
+    monkeypatch.setattr(cli, "search_transcripts", lambda name, cap_s=None: calls.append(cap_s) or real(name, cap_s=cap_s))
+    assert cli.resolve("demo-typo") == (None, None) and calls == [10.0]
+    cache = cli._miss_cache_path()
+    assert stat.S_IMODE(cache.stat().st_mode) == 0o600
+    now[0] += 599
+    assert cli.resolve("demo-typo") == (None, None) and calls == [10.0], "a cached miss searches again"
+    assert cli.resolve("other-typo") == (None, None) and calls == [10.0, 10.0], "the cache is per name"
+    now[0] += 2
+    assert cli.resolve("demo-typo") == (None, None) and calls == [10.0, 10.0, 10.0], "an expired miss is searched"
+
+
+def test_ttp_find_searches_every_chat_log_even_after_a_cached_miss_and_a_hit_registers(env, monkeypatch, tmp_path, capsys):
+    from ttp import cli
+    from ttp.project import load_registry
+    files = _chat_logs_at(tmp_path, monkeypatch, 3)
+    calls = []
+    real = cli.search_transcripts
+    monkeypatch.setattr(cli, "search_transcripts", lambda name, cap_s=None: calls.append(cap_s) or real(name, cap_s=cap_s))
+    assert cli.resolve("demo") == (None, None)
+    files[0].write_text('{"text": "tt-project://demo@host-a:/srv/demo"}\n')   # the oldest log
+    assert cli.resolve("demo") == (None, None) and calls == [10.0]
+    with pytest.raises(SystemExit):   # a miss is never cached for ttp find
+        cli.main(["find", "nosuch"])
+    cli.main(["find", "demo"])
+    assert calls == [10.0, None, None], calls
+    out, err = capsys.readouterr()
+    assert "tt-project://demo@host-a:/srv/demo" in out and "registered demo at host-a:/srv/demo" in err
+    assert load_registry()["projects"]["demo"].items() >= {"host": "host-a", "dir": "/srv/demo"}.items()
+
+
+def test_a_chat_log_hit_still_registers_through_the_capped_search(env, monkeypatch, tmp_path, capsys):
+    from ttp import cli
+    from ttp.project import load_registry
+    files = _chat_logs_at(tmp_path, monkeypatch, 3)
+    files[1].write_text('{"text": "tt-project://demo@host-a:/srv/demo"}\n')
+    assert cli.resolve("demo") == (None, {"host": "host-a", "dir": "/srv/demo"})
+    assert load_registry()["projects"]["demo"].items() >= {"host": "host-a", "dir": "/srv/demo"}.items()
+    assert not cli._miss_cache_path().exists()

@@ -354,32 +354,113 @@ def _say_remote(name: str, entry: dict, text: str, chat: str | None, context: st
     return 0, f"queued:{entry.get('host')}"
 
 
-def search_transcripts(name: str) -> list[dict]:
-    """Find a project's location markers in agent chat logs (Claude Code, Codex, Cursor)."""
+CHAT_LOG_ROOTS = (".claude/projects", ".codex/sessions", ".cursor/projects")
+_mono = time.monotonic   # the search cap's clock, and the miss cache's: tests replace them
+_now = time.time
+_last_search_cut = False   # whether search_transcripts' last run stopped at its cap
+_GREP_BATCH = 1000   # files per grep: few processes, and the cap is checked between them
+
+
+def _env_s(var: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(var, default)))
+    except ValueError:
+        return default
+
+
+def _chat_logs(deadline: float | None) -> list[Path]:
+    """Every chat-log file, newest first. A walk past `deadline` returns what it has."""
+    found: list[tuple[float, str]] = []
+    stack = [str(Path.home() / r) for r in CHAT_LOG_ROOTS]
+    while stack:
+        if deadline is not None and _mono() >= deadline:
+            break
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file():
+                            found.append((e.stat().st_mtime, e.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return [Path(f) for _, f in sorted(found, reverse=True)]
+
+
+def search_transcripts(name: str, cap_s: float | None = None) -> list[dict]:
+    """Find a project's location markers in agent chat logs (Claude Code, Codex, Cursor), newest
+    logs first. With `cap_s`, stop after that many seconds in all; `_last_search_cut` says whether
+    it did."""
+    global _last_search_cut
     needle = f"tt-project://{name}@"
-    roots = [Path.home() / ".claude" / "projects", Path.home() / ".codex" / "sessions", Path.home() / ".cursor" / "projects"]
     hits: dict[str, dict] = {}
     rx = re.compile(re.escape(needle) + r"([A-Za-z0-9._-]+):(/[A-Za-z0-9._/~-]+)")
-    for root in roots:
-        if not root.is_dir():
-            continue
-        tool = shutil.which("rg")
-        cmd = [tool, "-l", "-F", needle, str(root)] if tool else ["grep", "-rlF", needle, str(root)]
+    deadline = None if cap_s is None else _mono() + cap_s
+    files = _chat_logs(deadline)
+    matched: list[str] = []
+    _last_search_cut = False
+    for i in range(0, len(files), _GREP_BATCH):
+        left = 120.0 if deadline is None else deadline - _mono()
+        if left <= 0:
+            _last_search_cut = True
+            break
         try:
-            files = subprocess.run(cmd, capture_output=True, text=True, timeout=120).stdout.split()
-        except subprocess.SubprocessError:
+            out = subprocess.run(["grep", "-lF", "--null", "-e", needle, "--", *map(str, files[i:i + _GREP_BATCH])],
+                                 capture_output=True, text=True, timeout=left).stdout
+        except subprocess.TimeoutExpired:
+            if deadline is not None:
+                break
             continue
-        for f in files:
-            try:
-                text = Path(f).read_text(errors="replace")
-            except OSError:
+        except (OSError, subprocess.SubprocessError):
+            continue
+        matched += [f for f in out.split("\0") if f]
+    if deadline is not None and _mono() >= deadline:
+        _last_search_cut = True
+    for f in matched:
+        try:
+            text = Path(f).read_text(errors="replace")
+            mtime = Path(f).stat().st_mtime
+        except OSError:
+            continue
+        for m in rx.finditer(text):
+            if m.group(1).startswith("-"):   # ssh would read it as an option
                 continue
-            for m in rx.finditer(text):
-                if m.group(1).startswith("-"):   # ssh would read it as an option
-                    continue
-                hits[f"{m.group(1)}:{m.group(2)}"] = {"host": m.group(1), "dir": m.group(2).rstrip(".,)"),
-                                                     "seen_in": f, "mtime": Path(f).stat().st_mtime}
+            hits.setdefault(f"{m.group(1)}:{m.group(2)}", {"host": m.group(1), "dir": m.group(2).rstrip(".,)"),
+                                                          "seen_in": f, "mtime": mtime})
     return sorted(hits.values(), key=lambda h: -h["mtime"])
+
+
+def _miss_cache_path() -> Path:
+    from .project import registry_path
+    return registry_path().with_name("chatlog-misses.json")
+
+
+def _cached_miss(name: str) -> bool:
+    try:
+        at = json.loads(_miss_cache_path().read_text()).get(name)
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(at, (int, float)) and 0 <= _now() - at < _env_s("TTP_CHATLOG_MISS_S", 600)
+
+
+def _cache_miss(name: str) -> None:
+    """Remember that the chat logs had no marker for `name` (only names that passed NAME_RE, at
+    most 200, expired ones dropped). A failed write only costs the next search."""
+    from .project import write_json
+    ttl, now = _env_s("TTP_CHATLOG_MISS_S", 600), _now()
+    try:
+        data = json.loads(_miss_cache_path().read_text())
+        data = {k: v for k, v in data.items() if isinstance(v, (int, float)) and 0 <= now - v < ttl}
+    except (OSError, ValueError, AttributeError):
+        data = {}
+    data[name] = now
+    try:
+        write_json(_miss_cache_path(), dict(sorted(data.items(), key=lambda kv: -kv[1])[:200]), mode=0o600)
+    except OSError:
+        pass
 
 
 def _found_in_chat_log(name: str, host: str, folder: str, seen_in: str) -> None:
@@ -388,14 +469,25 @@ def _found_in_chat_log(name: str, host: str, folder: str, seen_in: str) -> None:
           f"remove it from {registry_path()} if that is wrong)", file=sys.stderr)
 
 
-def resolve(name: str) -> tuple[Project | None, dict | None]:
+_quick_miss: dict[str, str] = {}   # name -> why resolve()'s chat-log search was not a full one
+
+
+def resolve(name: str, full: bool = False) -> tuple[Project | None, dict | None]:
+    """The project called `name`: here, in the registry, else from a chat-log marker (registered
+    then). A mistyped name costs at most TTP_CHATLOG_SEARCH_S seconds (newest logs first) and then
+    nothing for TTP_CHATLOG_MISS_S seconds; `full` (ttp find) searches every log, uncached."""
     p = local_project(name)
     if p:
         return p, None
     entry = remote_entry(name)
     if entry:
         return None, entry
-    for hit in search_transcripts(name):
+    if not full and _cached_miss(name):
+        _quick_miss[name] = "cached"
+        return None, None
+    cap = None if full else _env_s("TTP_CHATLOG_SEARCH_S", 10)
+    hits = search_transcripts(name) if cap is None else search_transcripts(name, cap_s=cap)
+    for hit in hits:
         if hit["host"] == hostname() and Project(hit["dir"]).exists():
             register(name, {"host": hostname(), "dir": str(Project(hit["dir"]).root)})
             _found_in_chat_log(name, hostname(), str(Project(hit["dir"]).root), hit["seen_in"])
@@ -405,6 +497,10 @@ def resolve(name: str) -> tuple[Project | None, dict | None]:
             register(name, entry)
             _found_in_chat_log(name, hit["host"], hit["dir"], hit["seen_in"])
             return None, entry
+    if NAME_RE.match(name):
+        _cache_miss(name)
+    if cap is not None and _last_search_cut:
+        _quick_miss[name] = f"cut after {cap:g}s"
     return None, None
 
 
@@ -426,8 +522,10 @@ def need(name: str, argv: list[str]) -> Project:
     if not p:
         import difflib
         close = difflib.get_close_matches(name, list(load_registry().get("projects", {})), n=3)
+        why = _quick_miss.get(name)
         die(f"no project named {name!r} on this machine or in the registry"
-            + (f"; did you mean {', '.join(close)}?" if close else ""))
+            + (f"; did you mean {', '.join(close)}?" if close else "")
+            + (f" (chat-log search {why}; `ttp find {name}` searches every log)" if why else ""))
     return p
 
 
@@ -4201,7 +4299,7 @@ def cmd_deployed(a) -> None:
 
 
 def cmd_find(a) -> None:
-    p, entry = resolve(a.name)
+    p, entry = resolve(a.name, full=True)
     if p:
         print(MARKER.format(name=a.name, host=hostname(), dir=p.root))
     elif entry:
