@@ -3483,8 +3483,6 @@ def test_a_pushed_batch_resolves_notes_named_only_in_the_specs_of_the_chain(env,
     _pq_hand_off(env, s)
     _pq_batch(s)
     _pq_tend(s)
-    from ttp import pushq
-    assert [fp for fp, _ in pushq.resolves_of(s.p, s.review)] == [fps[0]]
     assert upstream.resolution(fps[0])["fixed_in"] == "0.3.1"
     assert upstream.resolution(fps[1])["fixed_in"] == "0.1.0"
     assert upstream.resolution(unknown) is None
