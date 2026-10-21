@@ -5749,6 +5749,15 @@ def test_a_claude_worker_is_denied_reading_the_web_token(env, monkeypatch):
                 "python3 -c 'open(\"../state//web.token\").read()'"):
         out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}})
         assert "web token" in out["hookSpecificOutput"]["permissionDecisionReason"], cmd
+    for cmd in ("grep -e. state/web.token", "grep --regexp=. state/web.token", "rg -e. state/web.token",
+                "grep -Ee. tt-project/state/web.token", "git grep --no-index -e. state/web.token",
+                "grep -fpats state/web.token", "cat grep state/web.token", "cat my-rg state/web.token",
+                "head -n5 /usr/bin/grep state/web.token", "cat -- git commit -m state/web.token",
+                'cat "state/web.token"', "grep -f state/web.token x", "grep --file=state/web.token x",
+                "sh <<'EOF'\ncat state/web.token\nEOF", "cat <<'EOF' | sh\ncat state/web.token\nEOF"):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "web token" in reason and "git commit -F" in reason, cmd
     for cmd in ("grep -n web.token runtime/ttp/web.py", "ls state/web.tokens.bak/x"):
         out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}})
         assert out is None or "web token" not in str(out), cmd

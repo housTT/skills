@@ -471,7 +471,7 @@ def _log_bypass(cmd: str) -> None:
 
 
 # The project's web app token (state/web.token), named in a command
-WEB_TOKEN_RE = re.compile(r"(?:^|[/\s'\"])state/+web\.token\b")
+WEB_TOKEN_RE = re.compile(r"(?:^|[/\s'\"=:<>(,;|&])state/+web\.token\b")
 
 
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
@@ -490,7 +490,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
                    "and reach another project with `ttp note --to <project> \"<text>\"`")
     if not why and WEB_TOKEN_RE.search(cmd):
         # Whoever holds it acts as the user in the web app; the Read deny rule covers the file tools.
-        why = "the web token is the user's credential and a run must not read it"
+        why = ("the web token is the user's credential and a run must not read it; any command naming its "
+               "path is refused, so write a commit message with `git commit -F <file>` or call it 'the web token file'")
     if not why:
         path_changed = bool(PATH_CHANGE_RE.search(scan))
         for f in _scripts(segments, str(payload.get("cwd") or os.getcwd())):
