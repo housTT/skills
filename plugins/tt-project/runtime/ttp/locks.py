@@ -33,6 +33,7 @@ import math
 import os
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -676,6 +677,24 @@ def in_run(run_dir: Path | None) -> bool:
     return True
 
 
+def other_pid_ns() -> bool:
+    """Whether this process may run in a PID namespace other than its run's agent's: inside a `ttp
+    sandbox`, in another namespace than TTP_PIDNS, under a /proc of another namespace, or where it
+    cannot tell. Hosts other than Linux have no PID namespaces."""
+    from . import sandbox
+    if sandbox.inside():
+        return True
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        if int(os.readlink("/proc/self")) != os.getpid():
+            return True
+        ns = os.readlink("/proc/self/ns/pid")
+    except (OSError, ValueError):
+        return True
+    return bool((run_ns := os.environ.get("TTP_PIDNS")) and run_ns != ns)
+
+
 def _ancestors() -> set[int]:
     """The pids above this process, up to init (this process too)."""
     out, pid = set(), os.getpid()
@@ -689,7 +708,11 @@ def under_run_agent(dbs: list[Path] | None = None) -> bool:
     """Whether a live run's agent is an ancestor of this process: the child.pid of a running run of
     this machine's projects (or of `dbs`, project databases), with the start token it recorded. A
     worker can unset TTP_RUN_ID and the like, but not change which process started it. A run whose
-    agent's tools were re-parented (`nohup ... &` after its shell exited) is not seen."""
+    agent's tools were re-parented (`nohup ... &` after its shell exited) is not seen. In a PID
+    namespace of its own (`ttp sandbox`, or another than the run's TTP_PIDNS) the walk stops at the
+    namespace's init and cannot see the agent: True there, and whenever the namespace cannot be read."""
+    if other_pid_ns():
+        return True
     import sqlite3
     from .globalcap import connect_ro, local_projects
     from .runner import proc_start

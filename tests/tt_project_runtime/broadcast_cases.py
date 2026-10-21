@@ -163,6 +163,33 @@ def test_a_run_cannot_say_all(env, monkeypatch, capsys):
     assert _say_all(cli, "--chat", "c1", "hi") == 2
 
 
+def test_a_sandboxed_command_with_the_run_environment_unset_cannot_say(env, monkeypatch, capsys):
+    """In a PID namespace of its own the walk up the ancestors stops at the namespace's init, so the
+    run's agent cannot be seen: `ttp say` is refused there, and where the namespace cannot be read."""
+    from ttp import cli, locks, sandbox
+    p = make(env)
+    for var in ("TTP_RUN_ID", "TTP_RUN_DIR", "TTP_PIDNS"):
+        monkeypatch.delenv(var, raising=False)
+    before = p.db.one("SELECT COALESCE(MAX(id),0) n FROM messages")["n"]
+    monkeypatch.setattr(sandbox, "inside", lambda: True)
+    assert _say(cli, "demo", "approve it", "--chat", "c1") == 2
+    assert "refused inside a run" in capsys.readouterr().err
+    monkeypatch.setattr(sandbox, "inside", lambda: False)
+    monkeypatch.setenv("TTP_PIDNS", "pid:[1]")   # the run's namespace, not this one
+    assert _say(cli, "demo", "approve it", "--chat", "c1") == 2
+    monkeypatch.delenv("TTP_PIDNS")
+    real_readlink = os.readlink
+    monkeypatch.setattr(locks.os, "readlink", lambda path: (_ for _ in ()).throw(PermissionError(path))
+                        if str(path).startswith("/proc/self") else real_readlink(path))
+    assert _say(cli, "demo", "approve it", "--chat", "c1") == 2
+    assert not p.db.q("SELECT id FROM messages WHERE id>?", (before,))
+    monkeypatch.setattr(locks.os, "readlink", real_readlink)
+    monkeypatch.setenv("TTP_PIDNS", real_readlink("/proc/self/ns/pid"))   # the run's own namespace
+    cli.main(["say", "demo", "the user's own", "--chat", "c1"])
+    assert [r["text"] for r in p.db.q("SELECT text FROM messages WHERE id>? AND direction='in'", (before,))] == [
+        "the user's own"]
+
+
 def test_a_full_ledger_keeps_the_open_line_a_claim_writes_and_compacts_only_what_can_go(env, monkeypatch):
     from ttp import broadcast, project
     now = time.time()

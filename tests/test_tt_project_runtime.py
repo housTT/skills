@@ -510,6 +510,10 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setattr(os, "sync", lambda: None)   # setup and upgrade sync the whole disk
     # And for the harness's own commits, which pass the fsync settings per command; it doubles their
     # cost. Tests of those settings set TTP_TEST_GIT_FSYNC to get them back.
+    # Tests may run in a `ttp sandbox` (`ttp checks`), where `ttp say` is refused: tests that check
+    # the sandbox set it.
+    from ttp import sandbox
+    monkeypatch.setattr(sandbox, "inside", lambda: False)
     from ttp import project
     # TMPDIR may be a run folder inside a real repository and project. Test directories must
     # not discover either ancestor; keep the temporary files in the sandbox's writable TMPDIR.
