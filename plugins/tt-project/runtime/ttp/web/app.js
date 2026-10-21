@@ -397,7 +397,7 @@ async function pollChat() {
 $("#say").onsubmit = async (e) => { e.preventDefault(); const t = $("#msg").value.trim(); if (!t) return; $("#msg").value = ""; await api("/api/say", { text: t }); pollChat(); };
 
 refresh(); pollChat();
-// A hidden tab still looks once 30 s have passed since its last look (by the clock, not by ticks:
+// A hidden tab still looks once 30 s have passed since its last look (by the clock:
 // browsers slow timers in long-hidden tabs), so its notifications still come; it also looks when shown.
 let lastLook = Date.now();
 const look = () => { lastLook = Date.now(); return refresh(); };
