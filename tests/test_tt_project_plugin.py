@@ -4448,12 +4448,8 @@ def test_readme_one_line_install_is_the_installers_documented_usage():
     script = (PLUGIN / "install.sh").read_text()
     usage = [ln[2:].strip() for ln in script.splitlines() if ln.startswith("# ") and ln[2:].strip().startswith("curl ")]
     assert len(usage) == 2 and line == (usage[1].replace("<tag>", ref) if ref else usage[0])
-    assert usage[0] == f"curl -fsSL {RAW_INSTALL_URL} | sh"
-    if ref:    # a short hidden note gives the default-branch line to switch to at merge
-        section = (PLUGIN / "README.md").read_text(encoding="utf-8").split("\n## Install\n", 1)[1]
-        note = re.search(r"<!--(.*?)-->", section, re.S)
-        assert note and usage[0] in note.group(1) and section.index(note.group(0)) < section.index(line)
-    code = "\n".join(ln for ln in script.splitlines() if not ln.lstrip().startswith("#"))
+    assert usage[0] == f"curl -fsSL {RAW_INSTALL_URL} | sh"    # the default-branch line, kept in install.sh
+    code ="\n".join(ln for ln in script.splitlines() if not ln.lstrip().startswith("#"))
     assert "command -v git" in code and "sys.version_info < (3, 9)" in code
     assert "TT_PROJECT_REF" in code and "TT_PROJECT_REPO" in code
     doc = " ".join((PLUGIN / "docs" / "install.md").read_text(encoding="utf-8").split())
@@ -4700,11 +4696,12 @@ def test_one_line_install_carries_on_when_one_tools_step_fails_and_exits_non_zer
 
 
 def test_plugin_readme_is_short_with_the_one_line_install_and_links_to_the_docs():
-    """The README holds what it is, the one line, a quick start and links; reference text lives in docs/."""
+    """The README holds what it is, how to start a project from chat, the one line and links;
+    reference text lives in docs/."""
     text = (PLUGIN / "README.md").read_text(encoding="utf-8")
     assert len(text.splitlines()) < 80
     assert _install_line()
-    assert "ttp new " in text and "ttp web " in text and "connect to project" in text
+    assert "new tt-project named " in text and "by project name" in text and "Web UI" in text
     for doc in re.findall(r"\]\((docs/[\w.-]+)(?:#[\w-]+)?\)", text):
         assert (PLUGIN / doc).is_file(), doc
     assert {"docs/guide.md", "docs/install.md"} <= set(re.findall(r"\]\((docs/[\w.-]+)", text))

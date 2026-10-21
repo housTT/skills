@@ -7,7 +7,7 @@ Example 1:
 
 ``` 
 new tt-project named ltx25 to manage all of my LTX 2.5 related work in the Metal repo. The project should run
-on g05blx01, and can use g05blx01, g05blx02 and exabox bh-glx-120-b04u02 for device work. Research and implement
+on box-a, and can use box-a, box-b and exabox box-c for device work. Research and implement
 optimizations. Integrate relevant optimizations from other DIT models, and explore novel optimization ideas.
 Use profilers and profiling skills to pinpoint bottlenecks and address them. Babysit all of my LTX 2.5 related PRs.
 Any PR you open must stay in draft form until I review and move it out of draft. Only I'm allowed to merge.
@@ -60,7 +60,7 @@ Or just tell your agent "install tt-project from https://github.com/tenstorrent/
 Then reload your agent session. 
 Rerun the above to get the latest version. 
 
-If you're starting to work on a remote box you haven't worked on before (not project specific), you can say in the chat "/tt-project setup box g05blx01" and it will ask you a few questions and set up what you like: claude, claude cursor plugin, tt-device-mcp, and other options. You can also tell it to set up things that are not part of the skill. 
+If you're starting to work on a remote box you haven't worked on before (not project specific), you can say in the chat "/tt-project setup box box-a" and it will ask you a few questions and set up what you like: claude, claude cursor plugin, tt-device-mcp, and other options. You can also tell it to set up things that are not part of the skill. 
 
 ## Learn more
 
