@@ -1709,6 +1709,10 @@ def cmd_web(a) -> None:
 def cmd_note(a) -> None:
     # Model-free completion commands get only note context, never a full worker context.
     run_dir = os.environ.get("TTP_RUN_DIR") or os.environ.get(NOTE_RUN_ENV)
+    if getattr(a, "status", None) is not None:
+        return _note_status(a, run_dir)
+    if a.text is None:
+        die("ttp note: the note's text is required", 2)
     if not run_dir:
         die("ttp note only works inside a tt-project run")
     if a.to:
@@ -1810,11 +1814,28 @@ def _note_to(a, run_dir: str) -> None:
         return
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
           + f" as {upstream.note_id(a.to, text)}" + sent
-          + (f"; this machine's daemon sends it on to {(far.get('ssh') or far['host']) if far else at}" if far or at else ""))
+          + (f"; this machine's daemon sends it on to {(far.get('ssh') or far['host']) if far else at}" if far or at else "")
+          + f"; `ttp note --status {upstream.note_id(a.to, text)}` shows whether {a.to} read it")
     target = (far.get("ssh") or far["host"]) if far else at
     if target and target in upstream.failing():
         print(f"warning: {upstream.forward_line()}. The note stays queued and is sent once the target is "
               f"reached; this run also tries to send it. Nothing to wait for: keep working")
+
+
+def _note_status(a, run_dir: str | None) -> None:
+    """`ttp note --status <id>`: where a `ttp note --to` note stands (upstream.note_status). Exit 0 once
+    the project it is for read it, 1 while it is on its way, 2 when it cannot tell: a retry_when."""
+    from . import upstream
+    if a.text is not None or a.to:
+        die("ttp note --status takes only the note's id", 2)
+    base = os.environ.get("TTP_PROJECT")
+    try:
+        rc, line = upstream.note_status(a.status, Project(base).state if base else None,
+                                        Path(run_dir) if run_dir else None)
+    except ValueError as e:
+        die(str(e), 2)
+    print(line)
+    raise SystemExit(rc)
 
 
 def _note_upstream(a, me) -> None:
@@ -1854,6 +1875,12 @@ def cmd_upstream(a) -> None:
     from . import upstream
     if a.has_project is not None:
         print(json.dumps({"project": a.has_project, "here": upstream.has_project(a.has_project)}))
+        return
+    if a.note_state is not None:
+        try:
+            print(json.dumps(upstream.note_state(a.note_state), sort_keys=True))
+        except ValueError as e:
+            die(str(e), 2)
         return
     if a.fp is not None:
         title, spec = a.fp
@@ -6792,12 +6819,16 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_listen)
 
     s = sub.add_parser("note", help="append a progress note, or send one to another project")
-    s.add_argument("text", help="the note, one line")
+    s.add_argument("text", nargs="?", help="the note, one line")
     s.add_argument("--to", metavar="PROJECT",
                    help="also file the note in the inbox of another project, as this worker's; tt-project: an "
                         "`upstream: ...` note for its maintainers")
     s.add_argument("--severity", choices=["low", "normal", "high"], default="normal",
                    help="with --to: the severity of the event the other project's coordinator gets")
+    s.add_argument("--status", metavar="ID",
+                   help="where note ID (printed by --to) stands: queued, filed-local, forwarded (in the inbox of the "
+                        "machine that runs the project) or delivered (the project read it); exit 0 once delivered, "
+                        "1 while on its way, 2 unknown, so it serves as a retry_when")
     s.set_defaults(fn=cmd_note)
 
     s = sub.add_parser("notify", help="tell the user something; sent when the run ends")
@@ -6830,6 +6861,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--resolved", action="store_true", help="every resolved note and where it stands")
     s.add_argument("--has-project", metavar="NAME", help="print whether project NAME runs on this machine (JSON); "
                                                          "`ttp note --to` asks the forward targets this over ssh")
+    s.add_argument("--note-state", metavar="FP", help="print whether this machine's inbox holds note FP and whether "
+                                                      "the project it is for read it (JSON); `ttp note --status` asks this over ssh")
     s.set_defaults(fn=cmd_upstream)
 
     s = sub.add_parser("push", help="guarded push of this worktree to delivery.push_branch")

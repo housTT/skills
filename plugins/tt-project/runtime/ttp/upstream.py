@@ -65,6 +65,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1522,6 +1523,133 @@ def find_peer(name: str, timeout: float = PEER_LOOKUP_TIMEOUT_S) -> tuple[str | 
             return target, checked
         checked.append(f"{target} (no such project)" if isinstance(got, dict) else f"{target} (no answer it could read)")
     return None, checked
+
+
+# Where an addressed note stands (`ttp note --status <id>`) ----------------------------------------
+# filed-local: in this machine's inbox, not yet sent on (or not yet read by the project here);
+# forwarded: in the inbox of the machine that runs the project, not yet read there;
+# delivered: that project's daemon read it (an event for its coordinator).
+STATUS_TIMEOUT_S = 20   # the far machine's answer to `ttp upstream --note-state`
+DELIVERED, ON_ITS_WAY, UNKNOWN = 0, 1, 2
+
+
+def _find(fp: str) -> tuple[dict | None, int]:
+    """Note `fp` in this machine's inbox and the byte offset just past its line, or (None, 0)."""
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            raw = f.read()
+    except FileNotFoundError:
+        return None, 0
+    pos = 0
+    for ln in raw[:raw.rfind(b"\n") + 1].splitlines(keepends=True):
+        pos += len(ln)
+        try:
+            n = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(n, dict) and n.get("fp") == fp:
+            return n, pos
+    return None, 0
+
+
+def read_by(name: str, fp: str) -> bool | None:
+    """Whether project `name`, registered on this machine, has read note `fp` from the inbox here (its
+    daemon's cursor lists it); None when no such project runs here. Its database is opened read-only."""
+    if not has_project(name):
+        return None
+    from .globalcap import connect_ro
+    db = project.Project(project.load_registry()["projects"][name]["dir"]).state / "project.db"
+    if not db.is_file():
+        return False
+    try:
+        conn = connect_ro(db)
+        try:
+            row = conn.execute("SELECT value FROM kv WHERE key=?", (KV_CURSOR,)).fetchone()
+        finally:
+            conn.close()
+        cur = json.loads(row[0]) if row and row[0] else {}
+    except (sqlite3.Error, ValueError):
+        return False
+    return fp in (cur.get("seen") or []) if isinstance(cur, dict) else False
+
+
+def note_state(fp: str) -> dict:
+    """`ttp upstream --note-state <fp>`: whether this machine's inbox holds note `fp` and, for an addressed
+    note, whether its project here read it (`read`: None when it does not run here). Read-only: the
+    sending machine asks it over ssh."""
+    fp = _check_fp(fp)
+    n, _ = _find(fp)
+    out = {"fp": fp, "inbox": n is not None}
+    if n and n.get("to"):
+        out.update(to=n["to"], read=read_by(n["to"], fp))
+    return out
+
+
+def _queued(fp: str, state: Path | None, run_dir: Path | None) -> str:
+    """Where note `fp` waits before it is filed: this project's outbox or this run's directory, or ''."""
+    if state and any(n.get("fp") == fp for n in _outbox(state)):
+        return "in this project's outbox (the hourly limit); its daemon files it when the limit allows"
+    try:
+        lines = (Path(run_dir) / QUEUED_FILE).read_text().splitlines() if run_dir else []
+    except OSError:
+        lines = []
+    for ln in lines:
+        try:
+            n = json.loads(ln)
+            if note_id(n["to"], n["text"]) == fp:
+                return "in this run's directory; this project's daemon files it when the run ends"
+        except (ValueError, KeyError, TypeError):
+            continue
+    return ""
+
+
+def note_status(fp: str, state: Path | None = None, run_dir: Path | None = None) -> tuple[int, str]:
+    """`ttp note --status <id>`: where a note `ttp note --to` sent stands, as (exit code, one line):
+    0 delivered (the project it is for read it), 1 on its way (queued, filed-local or forwarded), 2
+    unknown. The machine that runs the project is asked over ssh once the forward cursor is past the
+    note; no answer leaves it at forwarded. Read-only, so a waiting hand-off can use it as retry_when."""
+    fp = _check_fp(fp)
+    n, end = _find(fp)
+    if n is None:
+        if where := _queued(fp, state, run_dir):
+            return ON_ITS_WAY, f"queued: note {fp} is not filed yet: it waits {where}"
+        return UNKNOWN, f"unknown: no note {fp} in this machine's inbox (use the id `ttp note --to` printed)"
+    to = n.get("to")
+    if not to:
+        return UNKNOWN, f"unknown: note {fp} is for tt-project's maintainers, not a project (`ttp upstream --mine`)"
+    target = None if n.get("via") else _remote_projects().get(to) or n.get("at")
+    if not target:
+        read = read_by(to, fp)
+        if read is None:
+            return UNKNOWN, f"unknown: note {fp} is in this machine's inbox, but no project {to} runs here"
+        if read:
+            return DELIVERED, f"delivered: {to}'s daemon read note {fp} from this machine's inbox"
+        return ON_ITS_WAY, f"filed-local: note {fp} is in this machine's inbox; {to}'s daemon has not read it yet"
+    st = (_json(forward_path()).get("targets") or {}).get(target) or {}
+    if int(st.get("cursor") or 0) < end:
+        why = (f" (sends there failing for {_failing_since(st, time.time()) / 3600:.1f} h: {st.get('last_error')})"
+               if st.get("fails") else "")
+        return ON_ITS_WAY, f"filed-local: note {fp} is in this machine's inbox; the daemon has not sent it on to {target} yet{why}"
+    out, err = ssh_pipe(target, f"upstream --note-state {fp}", b"", STATUS_TIMEOUT_S)
+    got = None
+    if out is not None:
+        try:
+            got = json.loads(out.decode(errors="replace").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            pass
+    if not isinstance(got, dict):
+        why = ("its tt-project is too old to answer" if "unrecognized arguments" in err
+               else f"no answer: {err}" if err else "no answer it could read")
+        return ON_ITS_WAY, f"forwarded: note {fp} was sent on to {target}; could not ask whether {to} read it ({why})"
+    if not got.get("inbox"):
+        return ON_ITS_WAY, (f"filed-local: the forward cursor for {target} is past note {fp}, but its inbox does not "
+                            f"hold it; the daemon sends it again if this machine's inbox is replaced")
+    if got.get("read") is True:
+        return DELIVERED, f"delivered: {to}'s daemon on {target} read note {fp} from that machine's inbox"
+    if got.get("read") is None:
+        return UNKNOWN, f"unknown: note {fp} is in {target}'s inbox, but no project {to} runs there"
+    return ON_ITS_WAY, f"forwarded: note {fp} is in {target}'s inbox; {to}'s daemon there has not read it yet"
 
 
 def ssh_pipe(target: str, args: str, data: bytes, timeout: float) -> tuple[bytes | None, str]:

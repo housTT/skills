@@ -217,3 +217,86 @@ def test_a_note_to_another_project_carries_the_named_tasks_records_at_send_time(
     long = f"#{done} " + "x" * (upstream.SPEC_CHARS - len(str(done)) - 2)
     assert _note(cli, "--to", "second", long) == 0
     assert any(x["spec"] == long for x in _upstream_inbox(env))
+
+
+def test_note_status_follows_a_remote_note_from_filed_local_to_forwarded_to_delivered(env, monkeypatch, capsys):
+    """`ttp note --to` a project on another machine prints the id `ttp note --status` takes; that says
+    filed-local until the forwarder sends it, then asks the far machine (`ttp upstream --note-state`
+    over ssh): forwarded while the project there has not read it, delivered (exit 0) once it has."""
+    from ttp import cli, upstream
+    from ttp.db import DB
+    from ttp.project import register
+    p = make(env)
+    _note_run(env, monkeypatch, p)
+    fake = _fake_forward_ssh(env, monkeypatch)
+    register("far", {"host": "farbox", "dir": "/w/far"})
+    assert _note(cli, "--to", "far", "please rerun the sweep") == 0
+    (n,) = _upstream_inbox(env)
+    assert f"`ttp note --status {n['fp']}` shows whether far read it" in capsys.readouterr().out
+    assert _note(cli, "--status", n["fp"]) == 1
+    assert capsys.readouterr().out.startswith("filed-local: ") and not fake["log"].exists(), "no ssh before the send"
+    assert upstream.forward(time.time()) == 1
+    # The far machine holds it but runs no project of that name.
+    assert _note(cli, "--status", n["fp"]) == 2
+    assert "is in farbox's inbox, but no project far runs there" in capsys.readouterr().out
+    far_dir = env["tmp"] / "remote" / "farbox" / "w-far"
+    (far_dir / "tt-project" / "state").mkdir(parents=True)
+    (env["tmp"] / "remote" / "farbox" / ".tt-project" / "registry.json").write_text(
+        json.dumps({"projects": {"far": {"dir": str(far_dir)}}}))
+    far_db = DB(far_dir / "tt-project" / "state" / "project.db")
+    assert _note(cli, "--status", n["fp"]) == 1
+    assert capsys.readouterr().out.startswith(f"forwarded: note {n['fp']} is in farbox's inbox; far's daemon")
+    far_db.set_kv(upstream.KV_CURSOR, {"offsets": {}, "seen": ["0" * 16, n["fp"]]})
+    # Outside a run too: a probe a waiting hand-off runs from the project root.
+    monkeypatch.delenv("TTP_RUN_DIR")
+    assert _note(cli, "--status", n["fp"].upper()) == 0
+    assert capsys.readouterr().out.startswith("delivered: far's daemon on farbox read note")
+    # The far machine cannot be asked: still forwarded, never delivered or unknown.
+    fake["mode"].write_text("down")
+    assert _note(cli, "--status", n["fp"]) == 1
+    assert "forwarded: note" in (out := capsys.readouterr().out) and "could not ask whether far read it" in out
+    # An id no note has, or not an id at all.
+    assert _note(cli, "--status", "0123456789abcdef") == 2
+    assert capsys.readouterr().out.startswith("unknown: no note 0123456789abcdef")
+    assert _note(cli, "--status", "nope") == 2
+    assert _note(cli, "--status", n["fp"], "some text") == 2
+
+
+def test_note_status_of_a_local_or_queued_note(env, monkeypatch, capsys):
+    """A note for a project on this machine is delivered once its daemon read the inbox; one past the
+    hourly limit, or one a sandbox could not file, is queued; `--note-state` answers for this machine."""
+    from ttp import cli, upstream
+    from ttp.cli import bootstrap
+    from ttp.daemon import Daemon
+    from ttp.project import register
+    p = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    dst = bootstrap(repo2, "second", "Another project.", "fake")
+    register("second", {"host": "testhost", "dir": str(dst.root)})
+    run_dir = _note_run(env, monkeypatch, p)
+    assert _note(cli, "--to", "second", "the cache is stale") == 0
+    (n,) = _upstream_inbox(env)
+    capsys.readouterr()
+    assert _note(cli, "--status", n["fp"]) == 1
+    assert "filed-local: " in (out := capsys.readouterr().out) and "second's daemon has not read it" in out
+    assert upstream.note_state(n["fp"]) == {"fp": n["fp"], "inbox": True, "to": "second", "read": False}
+    Daemon(dst.base).read_upstream()
+    assert _note(cli, "--status", n["fp"]) == 0
+    assert capsys.readouterr().out.startswith("delivered: second's daemon read note")
+    assert _upstream_cli(cli, "--note-state", n["fp"]) == 0
+    assert json.loads(capsys.readouterr().out)["read"] is True
+    # Queued: in this run's directory (a read-only sandbox) and in the project's outbox (the hourly limit).
+    upstream.queue(run_dir, "second", "from a sandbox")
+    assert _note(cli, "--status", upstream.note_id("second", "from a sandbox")) == 1
+    assert "waits in this run's directory" in capsys.readouterr().out
+    now = time.time()
+    for i in range(upstream.NOTES_PER_HOUR):
+        upstream.send(p.name, 5, "second", f"filler {i}", now=now)
+    assert upstream.send_or_queue(p.state, p.name, 5, "second", "past the limit", now=now)[0] == "queued"
+    assert _note(cli, "--status", upstream.note_id("second", "past the limit")) == 1
+    assert "waits in this project's outbox" in capsys.readouterr().out
+    # An upstream note for the maintainers is not addressed: --mine follows it.
+    upstream.append("demo", 3, [{"title": "upstream: a lesson", "spec": "s"}])
+    assert _note(cli, "--status", upstream.fingerprint("upstream: a lesson", "s")) == 2
+    assert "ttp upstream --mine" in capsys.readouterr().out
