@@ -100,11 +100,9 @@ def _hook_file() -> Path:
     d = Path(run) / "githooks" if run and os.path.isdir(run) else Path(tempfile.mkdtemp(prefix="ttp-githooks-"))
     d.mkdir(exist_ok=True)
     f = d / "pre-push"
-    if not f.is_file() or f.read_text() != HOOK:
-        tmp = d / f".pre-push.{os.getpid()}"
-        tmp.write_text(HOOK)
-        tmp.chmod(0o755)
-        os.replace(tmp, f)
+    if not f.is_file() or f.read_text() != HOOK or not os.access(f, os.X_OK):
+        from .project import durable_write
+        durable_write(f, HOOK, mode=0o755)
     return d
 
 

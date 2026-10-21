@@ -27907,7 +27907,7 @@ def test_the_code_prompt_lands_only_through_the_guarded_push_and_only_when_asked
     code, review = (prompts / "kind-code.md").read_text(), (prompts / "kind-review.md").read_text()
     assert "NEVER push to or force-push a shared branch, except as below" in code
     assert ('"code tasks may land on <branch> with ttp push=True"\n  AND your spec asks you to land on that branch. '
-            "Otherwise never push to a shared branch.") in code
+            "Otherwise never push to a shared branch (`ttp push`\n  and `git push` refuse the push branch)") in code
     assert "NEVER use\n  `git push` to a shared branch" in code
     assert "run `ttp push --detach`" in code and "NEVER run it detached" not in code
     # The same exit-code table as the review prompt.

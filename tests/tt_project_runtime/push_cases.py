@@ -5715,6 +5715,7 @@ def test_a_code_task_whose_title_ends_in_notes_still_delivers_its_own_branch_as_
     the push branch and own_target carries it onto the task's pr_branch."""
     from ttp import push, worktree
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
     _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
     for labels in ([], ["pr_branch:feature/x"]):
         tid = p.db.add_task("Update release notes", "s", kind="code", labels=labels)
