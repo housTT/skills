@@ -6628,6 +6628,13 @@ def cmd_doctor(a) -> None:
         r = live.row(a.live)
         print(json.dumps(r, indent=1) if a.json else live.format_row(r))
         sys.exit(1 if any(c["status"] == live.FAIL for c in r["checks"].values()) else 0)
+    if getattr(a, "loop", None):
+        # One tiny code task through dispatch, review and push, in a scratch project: real spend.
+        from . import loopcheck
+        r = loopcheck.run(a.loop)
+        if a.json:
+            print(json.dumps(r, indent=1))
+        sys.exit(0 if not r["available"] or r["outcome"] == "pass" else 1)
     if getattr(a, "scheduler", False):
         # The installed runtime's command-watcher lifecycle, in a scratch project: model-free, $0.
         from . import schedcheck
@@ -6636,7 +6643,7 @@ def cmd_doctor(a) -> None:
             print(f"{'pass' if ok else 'FAIL'}  {what}" + (f": {why}" if why else ""))
         sys.exit(0 if rows and all(ok for _, ok, _ in rows) else 1)
     if not a.name:
-        die("ttp doctor: name a project, --live <provider> or --scheduler")
+        die("ttp doctor: name a project, --live <provider>, --loop <provider> or --scheduler")
     p = need(a.name, sys.argv[1:])
     from .providers import all_providers
     print(status_text(p))
@@ -6815,7 +6822,11 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--live", choices=["claude", "codex", "cursor"], metavar="PROVIDER",
                            help="measure one agent CLI with real runs in a scratch project (spends up to "
                            "about $0.55; a missing or logged-out CLI is reported, exit 0)")
-            s.add_argument("--json", action="store_true", help="with --live: the row as JSON")
+            s.add_argument("--loop", choices=["claude", "codex", "cursor"], metavar="PROVIDER",
+                           help="run one tiny code task end to end (dispatch, hand-off, review, push to a local "
+                           "bare remote) in a scratch project, each daemon tick in a fresh process (spends up to "
+                           "about $1, at most 15 minutes; a missing or logged-out CLI is reported, exit 0)")
+            s.add_argument("--json", action="store_true", help="with --live or --loop: the result as JSON")
             s.add_argument("--scheduler", action="store_true",
                            help="check the command-watcher scheduler's lifecycle in a scratch project, each tick in "
                            "a fresh process (no model, $0; exit 1 on a failed step)")

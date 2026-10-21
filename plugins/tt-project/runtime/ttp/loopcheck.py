@@ -1,0 +1,243 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""`ttp doctor --loop <provider>`: one tiny code task end to end on a real agent CLI. Opt-in, and it
+spends money (capped at CAP_USD), so the tests run it only with the fake provider.
+
+It makes a scratch project under the tt-project home (registered nowhere, no service installed, no
+daemon started; Jev, chat notices and schedules off) whose repository's only remote is a local bare
+repository: nothing reaches a real remote. It queues one light code task (add a line to NOTES.md and
+land it on the push branch) and runs daemon ticks, each in a fresh process, so only what the database
+and the disk keep carries over, as across a restart. The daemon dispatches the task, queues its review
+itself (review.auto) and pushes the approved head through its push queue (no model). It stops once the
+line is on the bare remote's push branch and the review is closed, a step fails, the wall clock
+(CAP_S) runs out or the runs spent CAP_USD; then it stops any run still going and removes the project.
+
+The coordinator does not run (`--live` measures its turn), nor any tick step that reaches beyond the
+scratch project (STUBBED: releases, upstream notes, chat, machine-wide claims, backups, replicas).
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable
+
+NAME = "loop-check"
+BRANCH = "loop-check"     # the push branch on the bare remote
+CAP_S = 900               # the whole loop's wall clock
+CAP_USD = 1.0             # all runs together; a run still going when it is passed is stopped
+TASK_USD = 0.5            # each task's budget (budget.task_default_usd for light)
+TICK_S = 5.0              # between ticks
+TICK_TIMEOUT_S = 180
+STOP_WAIT_S = 30          # for stopped runs to end before the project is removed
+STUBBED = ("maybe_coordinate", "run_schedules", "review_jev", "check_release", "poll_slack", "deliver_outbound",
+           "read_upstream", "wake_upstream_fixes", "forward_upstream", "drain_note_outbox", "remind_logouts",
+           "relay_when_blocked", "replicate_state", "backup_branches", "check_notifier", "check_linger",
+           "route_machines", "check_unreachable", "sync_shared_pauses")
+ENDED = ("failed", "blocked", "cancelled")
+# A run's identity, when the check itself runs inside one: the scratch project's runs get their own.
+RUN_VARS = ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT", "TTP_PIDNS", "TTP_CGROUP",
+            "TTP_LOCKS_HELD", "TTP_DETACHED")
+
+
+def tick(base: str) -> None:
+    """One daemon tick in this process, with the STUBBED steps off."""
+    from .daemon import Daemon
+    d = Daemon(base)
+    for name in STUBBED:
+        setattr(d, name, lambda *a, **k: None)
+    d.tick()
+
+
+def _fresh_tick(base: Path) -> None:
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); from ttp import loopcheck; "
+            "loopcheck.tick(sys.argv[2])")
+    env = {k: v for k, v in os.environ.items() if k not in RUN_VARS}
+    out = subprocess.run([sys.executable, "-c", code, str(Path(__file__).resolve().parent.parent), str(base)],
+                         capture_output=True, text=True, timeout=TICK_TIMEOUT_S, stdin=subprocess.DEVNULL, env=env)
+    if out.returncode:
+        raise RuntimeError(f"tick exited {out.returncode}: {(out.stderr or out.stdout).strip()[-400:]}")
+
+
+def _git(*args: str, cwd: Path | None = None) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL).stdout.strip()
+
+
+def setup(tmp: Path, provider: str, word: str):
+    """The scratch project: repo/ with NOTES.md, its origin the bare remote.git holding main and BRANCH."""
+    from .cli import bootstrap
+    from .project import write_json
+    remote, repo = tmp / "remote.git", tmp / "repo"
+    _git("init", "-q", "--bare", "-b", "main", str(remote))
+    _git("init", "-q", "-b", "main", str(repo))
+    (repo / "NOTES.md").write_text("# Notes\n")
+    _git("add", "NOTES.md", cwd=repo)
+    _git("-c", "user.name=ttp", "-c", "user.email=ttp@localhost", "commit", "-qm", "notes", cwd=repo)
+    _git("remote", "add", "origin", str(remote), cwd=repo)
+    _git("push", "-q", "origin", "main", f"main:{BRANCH}", cwd=repo)
+    _git("fetch", "-q", "origin", cwd=repo)
+    p = bootstrap(repo, NAME, "Run one tiny code task end to end.", provider)
+    cfg = json.loads(p.config_path.read_text())
+    cfg.update({"jev": {"enabled": False}, "notify": {"slack": False},
+                "delivery": {"push_branch": BRANCH, "base_ref": "origin/main", "push_allowed": True,
+                             "push_queue": True, "push_batch_s": 0, "push_min_gap_s": 0,
+                             "push_checks": ["git diff --check origin/main...HEAD"]},
+                "budget": {**cfg.get("budget", {}), "task_default_usd": {"light": TASK_USD, "standard": TASK_USD,
+                                                                         "deep": TASK_USD}}})
+    write_json(p.config_path, cfg)
+    write_json(p.harness / "schedules.json", [])
+    p.db.x("UPDATE messages SET handled=1")   # the "project created" note is the coordinator's
+    spec = (f"Add the line `loop check {word}` at the end of NOTES.md in the repository, commit it on your "
+            f"branch and land it on the push branch {BRANCH} through the review. Change nothing else.")
+    tid = p.db.add_task("Add a line to NOTES.md", spec, kind="code", tier="light", origin="user",
+                        provider=provider)
+    return p, remote, tid
+
+
+class Watch:
+    """Reads the scratch project after each tick and reports each new step once."""
+
+    def __init__(self, p, remote: Path, tid: int, word: str, emit: Callable[[str], None]):
+        self.p, self.remote, self.tid, self.word, self.emit = p, remote, tid, word, emit
+        self.seen: set[str] = set()
+        self.t0 = time.time()
+        self.steps: dict[str, bool] = {}
+
+    def spent(self) -> float:
+        return float(self.p.db.one("SELECT COALESCE(SUM(cost_usd),0) s FROM runs")["s"] or 0)
+
+    def say(self, key: str, step: str, text: str, ok: bool = True) -> None:
+        if key in self.seen:
+            return
+        self.seen.add(key)
+        self.steps[step] = self.steps.get(step, True) and ok
+        self.emit(f"{time.time() - self.t0:5.0f}s  {'' if ok else 'FAIL '}{step:<8} {text} · "
+                  f"spent ${self.spent():.2f}")
+
+    def landed(self) -> str:
+        try:
+            log = _git("--git-dir", str(self.remote), "log", "--format=%H", BRANCH, "--", "NOTES.md")
+            notes = _git("--git-dir", str(self.remote), "show", f"{BRANCH}:NOTES.md")
+        except subprocess.CalledProcessError:
+            return ""
+        return log.splitlines()[0] if log and f"loop check {self.word}" in notes else ""
+
+    def _runs(self, task: int, step: str) -> str | None:
+        """Report the task's runs; the status of an auth failure, else None."""
+        for r in self.p.db.q("SELECT * FROM runs WHERE task=? ORDER BY id", (task,)):
+            self.say(f"start{r['id']}", "dispatch", f"task #{task} run #{r['id']} on {r['provider']}"
+                     + (f" {r['model']}" if r["model"] else "") + (f" ({r['effort']})" if r["effort"] else ""))
+            if r["status"] == "running":
+                continue
+            try:
+                res = json.loads((Path(r["dir"] or self.p.runs / str(r["id"])) / "result.json").read_text())
+            except (OSError, ValueError):
+                res = {}
+            ok = r["status"] in ("ok", "done") and bool(res)
+            self.say(f"end{r['id']}", step, f"run #{r['id']} {r['status']}, "
+                     + (f"hand-off {res.get('status')}: {str(res.get('summary') or '')[:120]}" if res
+                        else "no hand-off") + f" · run ${float(r['cost_usd'] or 0):.2f}", ok)
+            if r["status"] == "auth":
+                return "auth"
+        return None
+
+    def check(self) -> str | None:
+        """None while the loop goes on; "pass", "auth" or a failure's reason once it ended."""
+        db = self.p.db
+        task = db.task(self.tid)
+        if self._runs(self.tid, "hand-off") == "auth":
+            return "auth"
+        if task["status"] in ENDED:
+            self.say("task-end", "hand-off", f"task #{self.tid} {task['status']}", False)
+            return f"the code task {task['status']}"
+        reviews = [t for t in db.q("SELECT * FROM tasks WHERE kind='review' ORDER BY id")]
+        for rv in reviews:
+            self.say(f"review{rv['id']}", "review", f"review #{rv['id']} queued ({rv['tier']})")
+            if self._runs(rv["id"], "review") == "auth":
+                return "auth"
+            if rv["status"] in ENDED:
+                self.say(f"review-end{rv['id']}", "review", f"review #{rv['id']} {rv['status']}", False)
+                return f"review #{rv['id']} {rv['status']}"
+        for q in db.q("SELECT * FROM push_queue ORDER BY id"):
+            self.say(f"approved{q['id']}", "review", f"review #{q['task']} passed: approved {q['head'][:12]} "
+                     f"for {q['target']}")
+            if q["batch"]:
+                self.say(f"batch{q['id']}", "push", f"batch {q['batch']} started for {q['head'][:12]}")
+            if q["status"] in ("pushed", "landed") or q["pushed_sha"]:
+                self.say(f"pushed{q['id']}", "push", f"pushed {str(q['pushed_sha'] or '')[:12]} to {BRANCH}")
+            elif q["status"] in ("failed", "conflict", "cancelled", "rejected"):
+                self.say(f"push-end{q['id']}", "push", f"{q['status']}: {str(q['detail'] or '')[:160]}", False)
+                return f"the push {q['status']}"
+        sha = self.landed()
+        if sha:
+            self.say("landed", "landed", f"{sha[:12]} on {BRANCH} of the bare remote has the line")
+            open_ = [rv["id"] for rv in reviews if rv["status"] not in ("done",) + ENDED]
+            if not open_:
+                return "pass"
+        return None
+
+
+def stop_all(p) -> None:
+    """Stop every run still going and wait briefly for each to end."""
+    from .runner import stop_runs
+    ids = stop_runs(p.db, p.runs, why="loop check over")
+    deadline = time.time() + STOP_WAIT_S
+    for rid in ids:
+        exit_file = p.runs / str(rid) / "exit.json"
+        while not exit_file.exists() and time.time() < deadline:
+            time.sleep(1)
+
+
+def run(provider: str, *, home: Path | None = None, cap_s: float = CAP_S, cap_usd: float = CAP_USD,
+        tick_s: float = TICK_S, emit: Callable[[str], None] = print) -> dict:
+    """{"provider", "available", "reason", "outcome" ("pass" or why it stopped), "spend_usd", "steps"}."""
+    import uuid
+    from . import project
+    from .live import unavailable
+    from .providers import get_provider
+    out = {"provider": provider, "available": False, "reason": "", "outcome": "", "spend_usd": 0.0, "steps": {}}
+    out["reason"] = unavailable(get_provider(provider))
+    if out["reason"]:
+        emit(f"{provider}: not available: {out['reason']}")
+        return out
+    out["available"] = True
+    home = Path(home or project.HOME_DIR)
+    home.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="loop-check-", dir=home))
+    word = uuid.uuid4().hex[:8]
+    p = None
+    try:
+        p, remote, tid = setup(tmp, provider, word)
+        w = Watch(p, remote, tid, word, emit)
+        w.emit(f"    0s  queued   task #{tid}: add `loop check {word}` to NOTES.md, land it on {BRANCH}")
+        outcome = None
+        while outcome is None:
+            try:
+                _fresh_tick(p.base)
+            except (RuntimeError, subprocess.TimeoutExpired) as e:
+                outcome = f"tick failed: {str(e)[:300]}"
+                break
+            outcome = w.check()
+            if outcome is None and w.spent() > cap_usd:
+                outcome = f"spend cap ${cap_usd:g} reached"
+            elif outcome is None and time.time() - w.t0 > cap_s:
+                outcome = f"time cap {cap_s:.0f}s reached"
+            elif outcome is None:
+                time.sleep(tick_s)
+        if outcome == "auth":
+            out["available"], out["reason"] = False, f"logged out ({get_provider(provider).login_hint})"
+        out["outcome"], out["steps"], out["spend_usd"] = outcome, w.steps, round(w.spent(), 4)
+        emit(f"{time.time() - w.t0:5.0f}s  {'pass' if outcome == 'pass' else 'FAIL'}     "
+             + ("the change landed after review" if outcome == "pass" else outcome)
+             + f" · spent ${w.spent():.2f}")
+    finally:
+        if p is not None:
+            stop_all(p)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return out

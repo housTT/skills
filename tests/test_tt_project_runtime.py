@@ -5812,6 +5812,58 @@ def test_doctor_scheduler_checks_the_watcher_lifecycle_in_fresh_processes(env, c
     assert "issues" in rows[1][2] and "'fixed'" in rows[1][2]
 
 
+# The fake agent's work in `ttp doctor --loop`: the code task appends the line its spec names and
+# commits it; the review approves its branch's head for the push queue.
+LOOP_FAKE_SHELL = r"""
+if grep -q "Independently review" "$TTP_RUN_DIR/prompt.md"; then
+  b=$(grep -o 'branch ttp/t[^,]*' "$TTP_RUN_DIR/prompt.md" | head -1 | cut -d' ' -f2)
+  printf '{"status":"done","summary":"looks right","push":[{"branch":"%s","head":"%s"}]}' \
+    "$b" "$(git rev-parse "$b")" > "$TTP_RUN_DIR/result.json"
+else
+  w=$(grep -o 'loop check [0-9a-f]*' "$TTP_RUN_DIR/prompt.md" | head -1)
+  echo "$w" >> NOTES.md && git add NOTES.md && git -c user.name=t -c user.email=t@x commit -qm "notes: $w"
+fi
+"""
+
+
+def test_doctor_loop_lands_one_code_task_on_a_local_bare_remote_through_review(env, monkeypatch):
+    """`ttp doctor --loop`: one code task goes through dispatch, hand-off, review, the push queue and
+    lands on the scratch project's bare remote, each tick in a fresh process; one line per step with
+    the spend so far. Nothing is registered and the scratch project is removed."""
+    from ttp import loopcheck
+    monkeypatch.setenv("TTP_FAKE_SHELL", LOOP_FAKE_SHELL)
+    monkeypatch.setenv("TTP_FAKE_COST", "0.01")
+    lines = []
+    r = loopcheck.run("fake", tick_s=0.05, cap_s=120, emit=lines.append)
+    assert r["outcome"] == "pass" and r["available"] and r["spend_usd"] == 0.02, (r, lines)
+    assert r["steps"] == {"dispatch": True, "hand-off": True, "review": True, "push": True, "landed": True}, lines
+    steps = [l.split()[1] for l in lines]
+    for step in ("dispatch", "hand-off", "review", "push", "landed", "pass"):
+        assert step in steps, lines
+    assert steps.index("hand-off") < steps.index("push") < steps.index("landed") < steps.index("pass"), lines
+    assert all("spent $" in l for l in lines[1:]), lines
+    home = pathlib.Path(os.environ["TTP_HOME"])
+    assert not list(home.glob("loop-check-*")), "the scratch project is removed"
+    assert not (home / "registry.json").exists(), "and was never registered"
+
+
+def test_doctor_loop_stops_at_its_spend_cap_and_reports_a_missing_cli_with_exit_0(env, monkeypatch, capsys):
+    from ttp import cli, loopcheck
+    from ttp.providers import base
+    monkeypatch.setenv("TTP_FAKE_SHELL", LOOP_FAKE_SHELL)
+    monkeypatch.setenv("TTP_FAKE_COST", "0.01")
+    lines = []
+    r = loopcheck.run("fake", tick_s=0.05, cap_s=120, cap_usd=0.005, emit=lines.append)
+    assert r["outcome"] == "spend cap $0.005 reached" and r["spend_usd"] == 0.01, (r, lines)
+    assert not any("run #2" in l for l in lines) and lines[-1].split()[1] == "FAIL", "no run starts past the cap"
+    assert not list(pathlib.Path(os.environ["TTP_HOME"]).glob("loop-check-*"))
+    monkeypatch.setattr(base.Provider, "available", lambda self: False)
+    monkeypatch.setattr(loopcheck, "setup", lambda *a, **k: pytest.fail("nothing runs"))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["doctor", "--loop", "cursor"])
+    assert e.value.code == 0 and capsys.readouterr().out.strip() == "cursor: not available: not installed"
+
+
 def test_doctor_names_unfenced_providers(env, monkeypatch, capsys):
     p = make(env)
     from ttp import cli

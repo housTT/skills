@@ -3,7 +3,8 @@
 """A deterministic stand-in agent for tests and dry runs: no model, no network, no cost.
 
 Coordinator runs echo a scripted action list (TTP_FAKE_ACTIONS, JSON) or, by default, reply to
-every user message and queue one task per message. Worker runs write result.json and exit.
+every user message and queue one task per message. Worker runs write result.json and exit; with
+TTP_FAKE_SHELL set they first run it with sh in their working directory (it may write result.json).
 With TTP_FAKE_SESSIONS set to a directory, each run saves a session transcript there, and
 `--resume <id>` continues one (or fails to start, like a real agent, when it is gone).
 """
@@ -88,9 +89,13 @@ def _main(role: str, args: list[str] | None = None) -> int:
             out = {"actions": actions or [{"type": "noop"}]}
     else:
         run_dir = Path(os.environ["TTP_RUN_DIR"])
-        result = json.loads(os.environ.get("TTP_FAKE_RESULT") or "null") or {
-            "status": "done", "summary": f"fake {role} finished", "followups": []}
-        (run_dir / "result.json").write_text(json.dumps(result))
+        if os.environ.get("TTP_FAKE_SHELL"):
+            import subprocess
+            subprocess.run(["sh", "-c", os.environ["TTP_FAKE_SHELL"]], stdin=subprocess.DEVNULL)
+        if not (os.environ.get("TTP_FAKE_SHELL") and (run_dir / "result.json").exists()):
+            result = json.loads(os.environ.get("TTP_FAKE_RESULT") or "null") or {
+                "status": "done", "summary": f"fake {role} finished", "followups": []}
+            (run_dir / "result.json").write_text(json.dumps(result))
         out = {"ok": True}
     out["_cost"] = cost
     out["_session"] = session
