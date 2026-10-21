@@ -1493,7 +1493,8 @@ def tend_scope_holds(p: Project, cfg: dict | None = None, now: float | None = No
 def resolves_of(p: Project, review_id: int) -> list[tuple[str, dict]]:
     """The upstream note fingerprints (upstream.fingerprint) the change review `review_id` approved
     fixes, each with the task that names it: the `resolves` lists in the hand-offs of the review, of
-    the code tasks it covers (push._reviewed) and of the tasks they continue."""
+    the code tasks it covers (push._reviewed) and of the tasks they continue, plus the open known notes
+    their specs name as `[note <fp>]`."""
     review = p.db.task(review_id)
     tasks = [review] if review else []
     seen: set[int] = set()
@@ -1510,6 +1511,11 @@ def resolves_of(p: Project, review_id: int) -> list[tuple[str, dict]]:
             fp = str(fp).strip().lower()
             if re.fullmatch(r"[0-9a-f]{16}", fp) and len(out) < RESOLVES_MAX:
                 out.setdefault(fp, t)
+    for t in tasks:   # a split or fix task may drop `resolves`: the specs still name the notes
+        for fp in re.findall(r"\[note ([0-9a-fA-F]{16})\]", str(t.get("spec") or "")):
+            fp = fp.lower()
+            if len(out) < RESOLVES_MAX and fp not in out and upstream._filed(fp) and upstream.state(fp) == "open":
+                out[fp] = t
     return list(out.items())
 
 

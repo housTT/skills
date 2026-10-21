@@ -27,6 +27,7 @@
 - A change that fixes upstream notes (the spec names them, `[note <fp>]`): list them in result.json
   as `"resolves": ["<fp>"]`, in `on_pass` too. Once the push queue ships it, each is recorded fixed
   in that release; never guess the version with `ttp upstream --resolve`.
+  A task that splits, continues or fixes a task whose spec names `[note <fp>]` carries those fingerprints in its `resolves`.
 <!-- /ttp:if upstream_ingest -->
 
 ## Landing on the project's branch (only when both hold)

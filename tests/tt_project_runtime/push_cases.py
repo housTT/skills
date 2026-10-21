@@ -3465,6 +3465,31 @@ def test_a_pushed_batch_resolves_the_upstream_notes_its_hand_offs_name_with_its_
     assert len(upstream._records()) == n, "a batch without a version resolved notes"
 
 
+def test_a_pushed_batch_resolves_notes_named_only_in_the_specs_of_the_chain(env, monkeypatch):
+    """No hand-off lists `resolves`: `[note <fp>]` in the original spec of the continued chain counts;
+    an unknown or already-resolved fingerprint is ignored."""
+    from ttp import upstream
+    s = _pq(env, monkeypatch)
+    notes = [{"title": f"upstream: s{i}", "spec": "s"} for i in range(2)]
+    upstream.append("other", 2, notes)
+    fps = [upstream.fingerprint(n["title"], "s") for n in notes]
+    upstream.resolve(fps[1], "0.1.0", "earlier", "demo")
+    unknown = "0123456789abcdef"
+    first = s.p.db.add_task("first try", f"fix [note {fps[0]}] [note {fps[0].upper()}] [note {fps[1]}] [note {unknown}]",
+                            kind="code", origin="coordinator")
+    s.p.db.update_task(s.code, result=json.dumps({"status": "done", "summary": "fixed"}),
+                       labels=json.dumps([f"continues:{first}"]))
+    _pq_plan(s, outcome="pushed", sha="ab" * 20, tip="cd" * 20, version="0.3.1")
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    from ttp import pushq
+    assert [fp for fp, _ in pushq.resolves_of(s.p, s.review)] == [fps[0]]
+    assert upstream.resolution(fps[0])["fixed_in"] == "0.3.1"
+    assert upstream.resolution(fps[1])["fixed_in"] == "0.1.0"
+    assert upstream.resolution(unknown) is None
+
+
 def test_ttp_landed_finds_a_rebased_commit_by_patch_id_or_author_date_and_subject(env, monkeypatch, capsys):
     from ttp import cli, landed
     p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
