@@ -25,7 +25,7 @@ down the checks for several agents to do. Report to me if you find any mistakes.
 satisfied that everything's been thoroughly checked.
 ```
 
-The project is run by a coordinator agent that's a cron job, so it runs independently of your chat whenever the machine is on, but you interact with it through your chat. You give it instructions or ask it questions and it responds when it needs to update you in the chat. The coordinator listens to your instructions from chat, plans the work, hands it to headless workers in isolated git worktrees, watches pull requests and logs to find and auto-fix issues, whatever responsibilities you gave it. 
+The project is run by a coordinator agent that's a cron job running in the background and waking up periodically to check on the project, so it runs independently of your chat whenever the machine is on, but you interact with it through your chat. You give it instructions or ask it questions and it responds when it needs to update you in the chat. The background coordinator listens to your instructions from chat, plans the work, hands it to headless workers in isolated git worktrees, watches pull requests and logs to find and auto-fix issues, whatever responsibilities you gave it. 
 
 Features:
 - Supports: Claude Code, Cursor and Codex.
