@@ -25929,6 +25929,7 @@ DURABLE_EXEMPT = {
     ("archive.py", 'open(tmp, "wb") as fh'): "archive._write_new syncs a new patch before placing it (never over another)",
     ("archive.py", 'open(dst, "wb") as fo'): "archive.copy writes a big file's .part copy, synced before it is placed",
     ("project.py", '"daemon.log", "a") as f'): "a log line",
+    ("notifier.py", 'open(LOG, "a", encoding="utf-8")'): "a log line; delivery state goes to notifier-delivery.json",
     ("db.py", 'with log.open("a") as fh'): "logs/slow-tx.log, a diagnostic report line",
     ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
     ("svcscan.py", "path.write_text(body)"): "a worker's throwaway shim scripts, re-written by each `ttp svcscan --shim`",
