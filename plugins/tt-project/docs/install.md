@@ -13,9 +13,9 @@ The [README](../README.md#install) line runs `plugins/tt-project/install.sh`, wh
 
 A failed step for one tool does not stop the others; the installer lists failures and exits 1.
 
-To install a release tag or branch, name it in the URL and in `TT_PROJECT_REF` (the README's `HEAD`
-URL works only once tt-project is on the default branch; until then curl reports a 404 and nothing
-is installed):
+To install a release tag or branch, name it in the URL and in `TT_PROJECT_REF` (until tt-project is
+on the default branch, the README's line names its branch; a `HEAD` URL reports a 404 and installs
+nothing):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/<tag>/plugins/tt-project/install.sh | TT_PROJECT_REF=<tag> sh

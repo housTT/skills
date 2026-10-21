@@ -4321,6 +4321,17 @@ def _install_line() -> str:
     return blocks[0]
 
 
+def _readme_ref() -> str:
+    """The ref the README's line installs: "" for the default-branch (HEAD) line, else the branch or tag
+    it names in the URL and in TT_PROJECT_REF (a branch while tt-project is not yet on the default branch)."""
+    m = re.fullmatch(r"curl -fsSL https://raw\.githubusercontent\.com/tenstorrent/skills/(\S+)/plugins/tt-project/"
+                     r"install\.sh \| (?:TT_PROJECT_REF=(\S+) )?sh", _install_line())
+    assert m, _install_line()
+    url_ref, ref = m.groups()
+    assert (url_ref, ref) == ("HEAD", None) or url_ref == ref, "the URL and TT_PROJECT_REF must name the same ref"
+    return ref or ""
+
+
 def _git(cwd, *args):
     import subprocess
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main",
@@ -4372,7 +4383,7 @@ def install_env(tmp_path):
             (tools / tool).symlink_to(found)
     repo = _fixture_repo(tmp_path)
 
-    def run(hosts=("claude", "codex", "cursor-agent"), ref="", shell="bash", on_path=True, env=None):
+    def run(hosts=("claude", "codex", "cursor-agent"), ref="", shell="bash", on_path=True, env=None, readme_ref=_readme_ref()):
         import subprocess
         for name, body in (("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX), ("cursor-agent", "#!/bin/sh\n")):
             f = tools / name
@@ -4381,7 +4392,11 @@ def install_env(tmp_path):
                 f.chmod(0o755)
             elif f.exists():
                 f.unlink()
-        line = _install_line().replace(f"curl -fsSL {RAW_INSTALL_URL}", f"cat {PLUGIN / 'install.sh'}", 1)
+        line = _install_line()
+        if readme_ref:    # the default-branch form; the README's own ref is tested by itself
+            line = line.replace(f"/{readme_ref}/", "/HEAD/", 1).replace(f"TT_PROJECT_REF={readme_ref} ", "", 1)
+        line = re.sub(r"^curl -fsSL \S+/install\.sh ", f"cat {PLUGIN / 'install.sh'} ", line)
+        assert line.startswith("cat "), line
         if ref:
             assert line.endswith(" | sh")
             line = line[:-len("sh")] + f"TT_PROJECT_REF={ref} sh"
@@ -4428,12 +4443,16 @@ def test_install_from_a_source_without_origin_keeps_the_public_origin_on_the_kep
 def test_readme_one_line_install_is_the_installers_documented_usage():
     """The README's line is one short line, the one install.sh documents: it downloads install.sh
     and pipes it to sh. Every check and option lives in install.sh, none in the line."""
-    line = _install_line()
-    assert len(line) < 150, len(line)
-    assert line == f"curl -fsSL {RAW_INSTALL_URL} | sh"
+    line, ref = _install_line(), _readme_ref()
+    assert len(line) < 160, len(line)
     script = (PLUGIN / "install.sh").read_text()
     usage = [ln[2:].strip() for ln in script.splitlines() if ln.startswith("# ") and ln[2:].strip().startswith("curl ")]
-    assert usage[0] == line and len(usage) == 2
+    assert len(usage) == 2 and line == (usage[1].replace("<tag>", ref) if ref else usage[0])
+    assert usage[0] == f"curl -fsSL {RAW_INSTALL_URL} | sh"
+    if ref:    # a short hidden note gives the default-branch line to switch to at merge
+        section = (PLUGIN / "README.md").read_text(encoding="utf-8").split("\n## Install\n", 1)[1]
+        note = re.search(r"<!--(.*?)-->", section, re.S)
+        assert note and usage[0] in note.group(1) and section.index(note.group(0)) < section.index(line)
     code = "\n".join(ln for ln in script.splitlines() if not ln.lstrip().startswith("#"))
     assert "command -v git" in code and "sys.version_info < (3, 9)" in code
     assert "TT_PROJECT_REF" in code and "TT_PROJECT_REPO" in code
@@ -4441,6 +4460,18 @@ def test_readme_one_line_install_is_the_installers_documented_usage():
     assert "`TT_PROJECT_REF`" in doc and "`TT_PROJECT_REPO`" in doc
     assert "Rerunning with the same ref installs what it points at now" in doc
     assert os.access(PLUGIN / "install.sh", os.X_OK)
+
+
+def test_readme_line_as_written_installs_the_ref_it_names(install_env):
+    """The README's line, unchanged but for the download, installs the branch or tag it names (the
+    default branch when it is the HEAD line)."""
+    ref = _readme_ref()
+    if ref:
+        _bump(install_env.repo, "1.0.1")    # main moves past the README's ref, so a default-branch install shows
+        _git(install_env.repo, "branch", ref, "v1")
+    r = install_env(readme_ref="")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _clone_head(install_env.home) == _head(install_env.repo, ref or "HEAD")
 
 
 def test_install_download_cut_short_does_nothing(install_env, tmp_path):

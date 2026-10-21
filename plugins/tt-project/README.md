@@ -9,12 +9,13 @@ connects to it by name.
 
 Needs Python 3.9+, `git`, and Claude Code, Codex or Cursor. In a terminal:
 
+<!-- Until tt-project is merged, the line installs branch smartonTT/tt-project. At merge, make it:
+curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/HEAD/plugins/tt-project/install.sh | sh -->
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/HEAD/plugins/tt-project/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/smartonTT/tt-project/plugins/tt-project/install.sh | TT_PROJECT_REF=smartonTT/tt-project sh
 ```
 
-Rerun it to update, then start a new agent session. Release tags (needed until tt-project is on the
-default branch), manual steps and uninstall:
+Rerun it to update, then start a new agent session. Release tags, manual steps and uninstall:
 [docs/install.md](docs/install.md).
 
 ## Quick start
