@@ -798,7 +798,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   default the folder the files share). After each rebase, when the change touches `paths`, it
   sets every listed file one patch version above the tip's and adds a changeset when the change
   brings none, in one `<package>: X.Y.Z (<subject>)` commit (optional `changeset_file`, a repo-relative
-  `.md` path: one release changeset per package, which the bump appends the batch subjects to as
+  `.md` path: one release changeset per package, which the bump (of `ttp push` and the push
+  queue alike) appends the batch subjects to as
   bullets, skipping lines already there, or creates when missing, instead of one file per batch); a later round replaces that commit.
 - `delivery.push_queue: true` hands pushing to the daemon. A review that passes approves the
   exact head it reviewed (`"push": [{"branch", "head"}]` in its hand-off) and becomes `pushing`; it

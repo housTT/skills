@@ -9439,9 +9439,11 @@ def test_version_bump_changeset_file_keeps_one_release_changeset(tmp_path):
     assert text.count("- old thing") == 1 and "- new a" in text and "- new b" in text
     assert sorted(p.name for p in (tmp_path / ".changeset").iterdir()) == ["pk-release.md"]
     assert '"version": "1.0.1"' in (tmp_path / "plug" / "p.json").read_text()
-    # appending the same batch again adds nothing
+    # the same batch again (its bump commit dropped, the appended changeset kept) adds nothing
     before = text
-    push.bump(tmp_path, tip, cfg, lambda m: None)
+    g("reset", "-q", "HEAD~1")
+    g("checkout", "--", "plug/p.json")
+    assert push.bump(tmp_path, tip, cfg, lambda m: None) == 0
     assert (tmp_path / ".changeset" / "pk-release.md").read_text() == before
     # missing file: created
     batch("only")
@@ -9460,3 +9462,32 @@ def test_version_bump_changeset_file_keeps_one_release_changeset(tmp_path):
     batch("plain")
     assert push.bump(tmp_path, tip, push.bump_of(base), lambda m: None) == 0
     assert (tmp_path / ".changeset" / "pk-main.md").is_file()
+
+
+def test_a_push_batch_with_changeset_file_adds_to_the_release_changeset(env, monkeypatch):
+    """With `changeset_file` set the push queue's bump keeps one release changeset: the first batch
+    creates it, later ones append only new lines (none twice), an entry that edits it itself brings
+    its own, and no per-batch file is written. Unset keeps <package>-<batch>.md (the batch test above)."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    rel = ".changeset/p-release.md"
+    p.set_config("delivery.version_bump", {"files": ["plugins/p/.claude-plugin/plugin.json", "plugins/p/rt/__init__.py"],
+                                           "changeset_dir": ".changeset", "changeset_file": rel})
+    sets = lambda: _git_out(origin, "ls-tree", "--name-only", "proj", ".changeset/").split()
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2)]
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b1"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"] * 2, m
+    assert sets() == [rel]
+    assert _git_out(origin, "show", f"proj:{rel}") == (
+        '---\n"p": patch\n---\n\n`p`:\n\n- e1: edit plugins/p/f1.txt\n- e2: edit plugins/p/f2.txt')
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "again\n"}), _entry(repo, "e3", {"plugins/p/f3.txt": "3\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"] * 2, m
+    assert sets() == [rel] and _versions(origin) == ("0.1.2", "0.1.2")
+    assert _git_out(origin, "show", f"proj:{rel}").endswith(
+        "\n\n- e1: edit plugins/p/f1.txt\n- e2: edit plugins/p/f2.txt\n- e3: edit plugins/p/f3.txt")
+    own = _git_out(origin, "show", f"proj:{rel}") + "\n- written by hand\n"
+    heads = [_entry(repo, "e4", {"plugins/p/f4.txt": "4\n", rel: own}), _entry(repo, "e5", {"plugins/p/f5.txt": "5\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b3"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"] * 2, m
+    text = _git_out(origin, "show", f"proj:{rel}")
+    assert sets() == [rel] and "e4:" not in text and text.endswith("\n- written by hand\n- e5: edit plugins/p/f5.txt")

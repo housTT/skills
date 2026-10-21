@@ -2618,6 +2618,22 @@ def set_version(repo: Path, files: list[str], new: str, package: str = "") -> st
     return package
 
 
+def release_changeset(repo: Path, csfile: str, package: str, lines: list[str]) -> None:
+    """Add `lines` as `- ` bullets to the one release changeset `csfile` (delivery.version_bump.
+    changeset_file), skipping those it already holds, or create it; then stage it."""
+    cs = repo / csfile
+    cs.parent.mkdir(parents=True, exist_ok=True)
+    lines = list(dict.fromkeys(lines))
+    if cs.is_file():
+        text = cs.read_text().rstrip("\n")
+        have = {ln.strip() for ln in text.splitlines()}
+        durable_write(cs, text + "".join(f"\n- {s}" for s in lines if f"- {s}" not in have) + "\n")
+    else:
+        durable_write(cs, f'---\n"{package}": patch\n---\n\n`{package}`:\n\n'
+                      + "\n".join(f"- {s}" for s in lines) + "\n")
+    _git(repo, "add", "--", csfile)
+
+
 def bump(repo: Path, tip: str, cfg: dict, say: Callable[[str], None]) -> int:
     """After a rebase onto `tip`: when the change touches `cfg["paths"]`, set every file in
     `cfg["files"]` one patch version above the highest version they hold at tip, add a changeset
@@ -2646,17 +2662,7 @@ def bump(repo: Path, tip: str, cfg: dict, say: Callable[[str], None]) -> int:
         if csfile and csfile in _git(repo, "diff", "--name-only", tip, "HEAD", "--", csfile).stdout.split():
             added = [csfile]     # the batch brings its own edit of the release changeset
         if not added and package and csfile:
-            cs = repo / csfile   # one release changeset per package: append what is new, or create it
-            cs.parent.mkdir(parents=True, exist_ok=True)
-            if cs.is_file():
-                text = cs.read_text().rstrip("\n")
-                have = {ln.strip() for ln in text.splitlines()}
-                new_lines = [f"- {s}" for s in dict.fromkeys(subjects) if f"- {s}" not in have]
-                durable_write(cs, text + "".join(f"\n{ln}" for ln in new_lines) + "\n")
-            else:
-                durable_write(cs, f'---\n"{package}": patch\n---\n\n`{package}`:\n\n'
-                              + "\n".join(f"- {s}" for s in dict.fromkeys(subjects)) + "\n")
-            _git(repo, "add", "--", csfile)
+            release_changeset(repo, csfile, package, subjects)
             wrote = True
         elif not added and package:
             branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()

@@ -919,6 +919,9 @@ class Batch:
                                         f"{base}..{top}").stdout.splitlines() if s.strip()]
             brings = bool(csdir) and any(f.endswith(".md") for f in _git(
                 self.repo, "diff", "--name-only", "--diff-filter=A", base, top, "--", csdir).stdout.split())
+            if csdir and (csfile := self.cfg.get("changeset_file") or "") and not brings:
+                # an entry that edits the release changeset itself brings its own changeset
+                brings = csfile in _git(self.repo, "diff", "--name-only", base, top, "--", csfile).stdout.split()
             self.info[i] = {"subjects": subjects, "changeset": brings, "top": top}
             if not checks and (code := push.code_paths(self.repo, base, top)):
                 more = f" and {len(code) - 3} more" if len(code) > 3 else ""
@@ -1015,7 +1018,8 @@ class Batch:
 
     def _head(self, tip: str, carried: list[tuple[int, str]], k: int) -> str:
         """The head that pushes the first `k` carried entries: their replayed head plus one version
-        bump (push.bump's rules), with a batch changeset for the entries that bring none."""
+        bump (push.bump's rules), with a batch changeset for the entries that bring none (added to
+        the release changeset instead when `changeset_file` is set)."""
         h = carried[k - 1][1]
         cfg = self.cfg
         if not cfg:
@@ -1041,7 +1045,10 @@ class Batch:
         title = f"{package}: {new} ({first}{more})" if package else f"{new} ({first}{more})"
         lines = ["; ".join(subjects(i)) for i, _ in carried[:k] if not self.info.get(i, {}).get("changeset")]
         csdir, wrote = cfg["changeset_dir"], False
-        if csdir and package and lines:
+        if csdir and package and lines and cfg.get("changeset_file"):
+            push.release_changeset(self.wt, cfg["changeset_file"], package, lines)
+            wrote = True
+        elif csdir and package and lines:
             body = (f"`{package}`: {lines[0]}." if len(lines) == 1
                     else f"`{package}`:\n\n" + "\n".join(f"- {s}" for s in lines))
             cs = self.wt / csdir / f"{push._slug(package)}-{push._slug(self.id)}.md"
