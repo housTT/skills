@@ -8,7 +8,9 @@ chat notices and schedules off) whose repository's only remote is a local bare r
 reaches a real remote. It queues one light code task (add a line to NOTES.md and land it on the push
 branch) and ticks one daemon process of its own, as the service does: a waiting task's background
 probe is read back on a later tick of the same daemon. The daemon dispatches the task, queues its review
-itself (review.auto) and pushes the approved head through its push queue (no model). It stops once the
+itself (review.auto; a needs_review hand-off's from its review sweep, run each tick here, as the service's
+waits review.sweep_after_s behind the coordinator) and pushes the approved head through its push queue
+(no model). The task asks the worker to commit and not push: the review and push queue land it. It stops once the
 line is on the bare remote's push branch and the review is closed, a step fails, the wall clock
 (CAP_S) runs out or the runs spent CAP_USD; then it stops any run still going and removes the project.
 A check killed before that leaves its project behind; the next check stops its runs and removes it.
@@ -58,6 +60,7 @@ def ticker(base: str) -> None:
     for name in STUBBED:
         setattr(d, name, lambda *a, **k: None)
     for _ in sys.stdin:
+        d._review_swept = 0   # the review sweep runs each tick (REVIEW_SWEEP_EVERY_S in the service)
         try:
             d.tick()
             print(f"{DONE} ok", flush=True)
@@ -131,13 +134,14 @@ def setup(tmp: Path, provider: str, word: str):
                 "delivery": {"push_branch": BRANCH, "base_ref": "origin/main", "push_allowed": True,
                              "push_queue": True, "push_batch_s": 0, "push_min_gap_s": 0,
                              "push_checks": ["git diff --check origin/main...HEAD"]},
+                "review": {**cfg.get("review", {}), "sweep_after_s": 1},
                 "budget": {**cfg.get("budget", {}), "task_default_usd": {"light": TASK_USD, "standard": TASK_USD,
                                                                          "deep": TASK_USD}}})
     write_json(p.config_path, cfg)
     write_json(p.harness / "schedules.json", [])
     p.db.x("UPDATE messages SET handled=1")   # the "project created" note is the coordinator's
-    spec = (f"Add the line `loop check {word}` at the end of NOTES.md in the repository, commit it on your "
-            f"branch and land it on the push branch {BRANCH} through the review. Change nothing else.")
+    spec = (f"Add the line `loop check {word}` at the end of NOTES.md in the repository and commit it on your "
+            f"branch. Do not push: the review and push queue put it on {BRANCH}. Change nothing else.")
     tid = p.db.add_task("Add a line to NOTES.md", spec, kind="code", tier="light", origin="user",
                         provider=provider)
     return p, remote, tid

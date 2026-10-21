@@ -5910,6 +5910,26 @@ def test_doctor_loop_wakes_a_worker_that_hands_off_waiting_on_its_probe(env, mon
     assert any("hand-off waiting" in l for l in lines) and any("hand-off done: checks passed" in l for l in lines), lines
 
 
+def test_doctor_loop_reviews_a_needs_review_hand_off_and_asks_no_worker_push(env, monkeypatch):
+    """A worker that hands off `needs_review` gets its review from the daemon's review sweep, which in
+    the service waits review.sweep_after_s (30 min) behind the coordinator: the check sweeps each tick
+    so the loop lands within its cap. Its spec asks the worker not to push (asked to land, a real
+    worker pushed straight to the remote)."""
+    from ttp import loopcheck
+    monkeypatch.setenv("TTP_FAKE_SHELL", LOOP_FAKE_SHELL.replace(
+        'commit -qm "notes: $w"', 'commit -qm "notes: $w" && printf \'{"status":"needs_review",'
+        '"summary":"line added"}\' > "$TTP_RUN_DIR/result.json"'))
+    monkeypatch.setenv("TTP_FAKE_COST", "0.01")
+    lines, prompts = [], []
+    real = loopcheck.setup
+    monkeypatch.setattr(loopcheck, "setup", lambda *a: (lambda r: prompts.append(r[0].db.task(r[2])["spec"]) or r)(
+        real(*a)))
+    r = loopcheck.run("fake", tick_s=0.05, cap_s=60, emit=lines.append)
+    assert r["outcome"] == "pass" and r["spend_usd"] == 0.02, (r, lines)
+    assert any("hand-off needs_review" in l for l in lines), lines
+    assert "Do not push" in prompts[0] and "land it" not in prompts[0], prompts
+
+
 def test_doctor_loop_stops_at_its_spend_cap_and_reports_a_missing_cli_with_exit_0(env, monkeypatch, capsys):
     from ttp import cli, loopcheck
     from ttp.providers import base
