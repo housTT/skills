@@ -1,7 +1,7 @@
 # tt-project
 
 Manages long-running, self-driving projects, sort of like Cursor and Claude projects, but they run locally, not in the cloud. 
-Start a new project, give it a name and a description of what it should manage and how it should behave, and a custom harness will be generated to manage your project. Not only for coding! It can handle finance, legal, any project. 
+Start a new project, give it a name and a description of what it should manage and how it should behave, and a custom harness will be generated to manage your project. Not only for coding! It can handle finance, legal, data center, any project. 
 
 Example 1: 
 
