@@ -7,7 +7,8 @@ runs there instead: the exact commit being checked (HEAD of the checkout the che
 copied with `git archive` over ssh into a fresh temporary directory, made a git checkout (`git init`
 and one commit of that tree, so tests that need a repository work), and the command runs in it with
 the check's `env` exported (values expand in the remote shell, e.g. "$HOME/.local/bin:$PATH"). Its
-output streams back and its exit code is the check's. The temporary directory is always removed.
+output streams back and its exit code is the check's. A stopped check (a timeout, a stop) stops
+its command there too (_run_script). The temporary directory is always removed.
 
 ssh failing (an unreachable host, a refused key, a dropped connection) or a host that cannot take
 the tree is an environment fault, not the change's: this exits FAULT_RC, which the callers
@@ -119,13 +120,15 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str) -> str:
     run = f"bash -e -o pipefail -c {shlex.quote(cmd)}"
     return (f"cd {q} || exit 97\ntrap 'cd / && rm -rf {q}' EXIT\n{exports_}"
             f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- sh -e -c {shlex.quote(cmd)}; fi\n"
-            "if command -v setsid >/dev/null 2>&1; then setsid \"$@\" </dev/null &\n"
-            "elif command -v perl >/dev/null 2>&1; then perl -e 'setpgrp(0,0); exec @ARGV or exit 127' \"$@\" </dev/null &\n"
-            "else \"$@\" </dev/null &\nfi\n"
+            # A background job's stdin is /dev/null unless redirected: the watcher reads ssh's from fd 3.
+            "exec 3<&0\n"
+            "if command -v setsid >/dev/null 2>&1; then setsid \"$@\" </dev/null 3<&- &\n"
+            "elif command -v perl >/dev/null 2>&1; then perl -e 'setpgrp(0,0); exec @ARGV or exit 127' \"$@\" </dev/null 3<&- &\n"
+            "else \"$@\" </dev/null 3<&- &\nfi\n"
             "pid=$!\n"
-            "(cat >/dev/null; kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null; "
+            "(cat <&3 >/dev/null; kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null; "
             f"sleep {STOP_GRACE_S}; kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null) >/dev/null 2>&1 &\n"
-            "watch=$!\n"
+            "watch=$!\nexec 3<&-\n"
             "wait $pid\nrc=$?\nkill $watch 2>/dev/null\ntrap '' PIPE\n"
             f"printf '\\n%s%s\\n' {mark} \"$rc\"\nexit $rc\n")
 
