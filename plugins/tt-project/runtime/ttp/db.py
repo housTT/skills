@@ -302,6 +302,7 @@ class DB:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S, isolation_level=None)
         self._after_commit: list[Callable[[], Any]] = []
+        self._on_rollback: list[Callable[[], Any]] = []
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_S * 1000)}")
         retry_busy(lambda: self.conn.execute("PRAGMA journal_mode=WAL"))
@@ -568,25 +569,43 @@ END""")
             yield
         except BaseException:
             _tx_local.spawns = outer
-            self._after_commit.clear()
-            if self.conn.in_transaction:   # SQLite may have rolled back already (SQLITE_FULL, IOERR)
-                self.conn.execute("ROLLBACK")
+            self._rolled_back()
             raise
         _tx_local.spawns = outer
         try:
             self.conn.execute("COMMIT")
         except BaseException:
-            self._after_commit.clear()
-            if self.conn.in_transaction:
-                self.conn.execute("ROLLBACK")
+            self._rolled_back()
             raise
+        self._on_rollback.clear()
         ended = time.monotonic()
         held = ended - began
         if held > SLOW_TX_S:
             self._log_slow_tx(held, _slowest(spawns, ended))
         pending, self._after_commit = self._after_commit, []
-        for fn in pending:
-            fn()
+        failed = None
+        for fn in pending:   # each runs: one that raises never drops the commits queued after it
+            try:
+                fn()
+            except Exception as e:
+                failed = failed or e
+        if failed:
+            raise failed
+
+    def _rolled_back(self) -> None:
+        """The open transaction failed: roll it back, drop what waited for its commit and undo,
+        newest first, the file changes made inside it (on_rollback), so files and rows agree."""
+        self._after_commit.clear()
+        undo, self._on_rollback = self._on_rollback, []
+        try:
+            if self.conn.in_transaction:   # SQLite may have rolled back already (SQLITE_FULL, IOERR)
+                self.conn.execute("ROLLBACK")
+        finally:
+            for fn in reversed(undo):
+                try:
+                    fn()
+                except Exception:
+                    pass   # the next undo still runs; what is left is the harness sweep's
 
     def _log_slow_tx(self, held: float, slowest: str = "") -> None:
         """One line per slow write transaction, with the code that held it: slow work (git, a subprocess,
@@ -609,6 +628,12 @@ END""")
             self._after_commit.append(fn)
         else:
             fn()
+
+    def on_rollback(self, fn: Callable[[], Any]) -> None:
+        """Run fn if the open transaction rolls back (none open: never). A file change made inside a
+        transaction registers its undo here, so a rollback never leaves it on disk uncommitted."""
+        if self.conn.in_transaction:
+            self._on_rollback.append(fn)
 
     def meta(self, key: str) -> str | None:
         r = self.one("SELECT value FROM meta WHERE key=?", (key,))

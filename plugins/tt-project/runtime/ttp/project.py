@@ -854,6 +854,7 @@ class Project:
         self.worktrees = self.base / "worktrees"
         self.memory_dir = self.harness / "memory"
         self._db: DB | None = None
+        self._harness_queued: dict[str, int] = {}   # harness path -> commits queued for it (commit_harness)
         self._last_good: dict | None = None   # project.json as this process last read it valid
         self.config_status = "ok"             # how raw_config last found it (see read_config)
 
@@ -946,14 +947,36 @@ class Project:
 
         Only the named paths are committed: a harness task may be editing other files right now,
         and its half-done work must not be swept into this commit. Inside a database transaction
-        the commit waits until the transaction ends, so git never holds the write lock.
+        the commit waits until the transaction ends, so git never holds the write lock; until it
+        runs, this process's sweep leaves its paths to it, so each change keeps its own commit
+        (a file change made in the transaction registers its undo with db.on_rollback).
         """
         top = self.harness.resolve()
         rel = [str(Path(x).resolve().relative_to(top)) for x in paths if Path(x).exists()]
         gone = [str(Path(x).resolve().relative_to(top)) for x in removed if not Path(x).exists()]
         if not (rel or gone) or not (self.harness / ".git").exists():
             return
-        self.db.after_commit(lambda: self._git_commit(rel, message, gone))
+        if not self.db.conn.in_transaction:
+            self._git_commit(rel, message, gone)
+            return
+        mine = [*rel, *gone]
+        queued = self._harness_queued
+
+        def release() -> None:
+            for x in mine:
+                if queued.get(x, 0) <= 1:
+                    queued.pop(x, None)
+                else:
+                    queued[x] -= 1
+
+        def run() -> None:
+            release()
+            self._git_commit(rel, message, gone)
+
+        for x in mine:
+            queued[x] = queued.get(x, 0) + 1
+        self.db.after_commit(run)
+        self.db.on_rollback(release)
 
     def _harness_git_cfg(self, key: str) -> float:
         # Read project.json directly: read_config would keep this process's last good copy, which a
@@ -1073,6 +1096,8 @@ class Project:
         rel, gone, cut = [], [], []
         for entry in filter(None, out.stdout.split("\0")):
             path = entry[3:]
+            if path in self._harness_queued:
+                continue   # a commit this process queued (commit_harness) takes it, with its message
             f = self.harness / path
             try:
                 if now - f.stat().st_mtime < min_age_s:
@@ -1131,12 +1156,37 @@ class Project:
                                 f"{f'audience: {audience}' + chr(10) if audience in MEMORY_AUDIENCES else ''}{tag}"
                                 f"---\n{text}\n")
         index = self.memory_index.read_text() if self.memory_index.exists() else ""
+        line = None
         if f"](memory/{path.name})" not in index:
-            durable_append(self.memory_index, f"- [{title}](memory/{path.name}) ({kind}"
-                                              f"{', standing' if standing else ''})\n")
+            line = f"- [{title}](memory/{path.name}) ({kind}{', standing' if standing else ''})\n"
+            durable_append(self.memory_index, line)
+
+        def undo() -> None:   # the transaction this ran in rolled back: so does the entry
+            if not same:
+                path.unlink(missing_ok=True)
+            if line:
+                self._reindex_memory(drop=[line])
+        self.db.on_rollback(undo)
         if commit:
             self.commit_harness([path, self.memory_index], f"memory ({kind}): {title}")
         return path
+
+    def _reindex_memory(self, drop: list[str] = (), add: list[str] = (), before: str | None = None,
+                        after: str | None = None) -> None:
+        """Undo an index change of a rolled-back transaction: the text `before` it while the index is
+        still the `after` it wrote, else take out the lines `drop` and put back the lines `add`,
+        leaving every other line (one another process wrote meanwhile) as it is."""
+        text = self.memory_index.read_text() if self.memory_index.exists() else ""
+        if before is not None and text == after:
+            durable_write(self.memory_index, before)
+            return
+        lines = text.splitlines(keepends=True)
+        for x in drop:
+            if x in lines:
+                lines.remove(x)
+        lines += [x for x in add if x not in lines]
+        if "".join(lines) != text:
+            durable_write(self.memory_index, "".join(lines))
 
     def _memory_entries(self) -> list[dict]:
         """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`,
@@ -1271,7 +1321,7 @@ class Project:
         why = " ".join((why or "").split())
         from .forbidden import check
         check(self, "memory retirement reason (why)", why)   # it goes into the archive and the commit message
-        done, errors, moved = [], [], []
+        done, errors, moved, again = [], [], [], []
         for raw in names:
             try:
                 name, archived = self._resolve_memory_name(Path(raw.strip().strip("[]")).stem, keep)
@@ -1281,6 +1331,7 @@ class Project:
             src, dst = self.memory_dir / f"{name}.md", self.memory_dir / "archive" / f"{name}.md"
             if archived:
                 done.append(dst)
+                again.append(name)   # a replay: commit it if a killed run left it uncommitted
                 continue
             if not why and re.search(r"^standing:[ \t]*true[ \t]*$", src.read_text().split("\n---\n", 1)[0], re.M):
                 errors.append(f"[{name}] is a standing instruction; nothing retired. It applies every time its "
@@ -1292,19 +1343,43 @@ class Project:
             os.replace(src, dst)
             done.append(dst)
             moved.append(name)
-        if not moved:
+        again = [n for n in again if commit and self._harness_dirty([f"memory/{n}.md", f"memory/archive/{n}.md"])]
+        if not (moved or again):
             return done, errors
         fsync_dir(self.memory_dir / "archive")
         fsync_dir(self.memory_dir)
-        if self.memory_index.exists():
-            lines = self.memory_index.read_text().splitlines(keepends=True)
-            durable_write(self.memory_index, "".join(x for x in lines
-                                                     if not any(f"](memory/{n}.md)" in x for n in moved)))
+        dropped, before, after = [], None, None
+        if moved and self.memory_index.exists():
+            before = self.memory_index.read_text()
+            lines = before.splitlines(keepends=True)
+            dropped = [x for x in lines if any(f"](memory/{n}.md)" in x for n in moved)]
+            after = "".join(x for x in lines if x not in dropped)
+            durable_write(self.memory_index, after)
+
+        def undo() -> None:   # the transaction this ran in rolled back: so does the retirement
+            for n in moved:
+                a, b = self.memory_dir / "archive" / f"{n}.md", self.memory_dir / f"{n}.md"
+                if a.exists() and not b.exists():
+                    os.replace(a, b)
+            self._reindex_memory(add=dropped, before=before, after=after)
+        self.db.on_rollback(undo)
         if commit:
-                self.commit_harness([*(self.memory_dir / "archive" / f"{n}.md" for n in moved), self.memory_index],
-                                f"memory retired: {', '.join(moved)}" + (f" ({why})" if why else ""),
-                                removed=[self.memory_dir / f"{n}.md" for n in moved])
+            gone = [*moved, *again]
+            self.commit_harness([*(self.memory_dir / "archive" / f"{n}.md" for n in gone), self.memory_index],
+                                f"memory retired: {', '.join(gone)}" + (f" ({why})" if why else ""),
+                                removed=[self.memory_dir / f"{n}.md" for n in gone])
         return done, errors
+
+    def _harness_dirty(self, rel: list[str]) -> bool:
+        """Whether git shows any of these harness paths changed from the last commit."""
+        if not (self.harness / ".git").exists():
+            return False
+        try:
+            out = subprocess.run(["git", "-C", str(self.harness), "status", "--porcelain", "--", *rel],
+                                 capture_output=True, text=True, timeout=self._harness_git_cfg("timeout_s"))
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return bool(out.stdout.strip())
 
     def note_memory_shown(self, names: list[str], now: float | None = None) -> None:
         """Record that a prompt being built carries the entries `names`, and when a prompt was last
