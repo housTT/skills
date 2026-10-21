@@ -25,6 +25,13 @@
 # It fetches the one ref and checks out FETCH_HEAD, rather than `git clone --branch`, which warns
 # that an annotated tag "is not a commit". Piped, nothing runs before the line that calls
 # fetch_and_run, so a download cut short does nothing.
+#
+# When ~/.local/bin (where `ttp setup` puts `ttp`) is not on PATH, it appends one line, marked
+# "# added by tt-project installer", to the profile of your login shell ($SHELL), once: bash
+# ~/.bashrc (~/.bash_profile on macOS, whose terminals start login shells), zsh
+# ${ZDOTDIR:-~}/.zshrc, fish ~/.config/fish/conf.d/tt-project.fish, any other ~/.profile. It never
+# changes other lines; `ttp uninstall` removes that line. TT_PROJECT_NO_MODIFY_PATH=1 leaves your
+# profile alone and only says what to add.
 set -eu
 
 MARKET=tenstorrent-skills
@@ -147,6 +154,39 @@ cursor_steps() {
     say "Cursor: copied the plugin to $local_dir/$PLUGIN"
 }
 
+# Put ~/.local/bin on PATH for new shells: one marked line in the login shell's profile, added once.
+PATH_MARK="# added by tt-project installer"
+add_to_path() {
+    case ${SHELL:-} in
+    */fish|fish)
+        rc=$HOME/.config/fish/conf.d/tt-project.fish
+        line="fish_add_path -g \$HOME/.local/bin $PATH_MARK" now='fish_add_path -g $HOME/.local/bin' ;;
+    *)
+        case ${SHELL:-} in
+        */bash|bash) rc=$HOME/.bashrc; [ "$(uname -s 2>/dev/null)" != Darwin ] || rc=$HOME/.bash_profile ;;
+        */zsh|zsh) rc=${ZDOTDIR:-$HOME}/.zshrc ;;
+        *) rc=$HOME/.profile ;;
+        esac
+        line="export PATH=\"\$HOME/.local/bin:\$PATH\" $PATH_MARK" now='export PATH="$HOME/.local/bin:$PATH"' ;;
+    esac
+    old=$( [ -f "$rc" ] && cat "$rc"; printf x )    # the x keeps a last newline the $( ) would strip
+    case $old in
+    *"$PATH_MARK"*) say "  ttp: $rc already puts ~/.local/bin on PATH for new shells" ;;
+    *)
+        nl=""
+        case $old in x|*"
+x") ;; *) nl="
+" ;; esac    # the file's last line has no newline: end it first
+        if mkdir -p "$(dirname "$rc")" 2>/dev/null && printf '%s%s\n' "$nl" "$line" >> "$rc" 2>/dev/null; then
+            say "  ttp: added ~/.local/bin to PATH for new shells in $rc"
+        else
+            say "  ttp: could not write $rc: add ~/.local/bin to PATH in your shell profile, then open a new shell"
+            return 0
+        fi ;;
+    esac
+    say "  ttp: to use it in this shell, run: $now"
+}
+
 found=""
 done_hosts=""
 if command -v claude >/dev/null 2>&1; then
@@ -187,7 +227,11 @@ done
 if [ -n "$ttp_ok" ]; then
     case ":$PATH:" in
     *":$HOME/.local/bin:"*) say "  ttp: ready in this shell" ;;
-    *) say "  ttp: add ~/.local/bin to PATH in your shell profile, then open a new shell" ;;
+    *) if [ "${TT_PROJECT_NO_MODIFY_PATH:-}" = 1 ]; then
+           say "  ttp: add ~/.local/bin to PATH in your shell profile, then open a new shell"
+       else
+           add_to_path
+       fi ;;
     esac
 fi
 if [ -n "$failed" ]; then

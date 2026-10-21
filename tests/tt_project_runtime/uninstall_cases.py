@@ -56,7 +56,8 @@ def _uninstall_box(env, tmp_path):
     daemon = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", "fake-ttp-daemon"])
     (root / "tt-project" / "state" / "daemon.pid").write_text(f"{daemon.pid}\n")
     run_env = {**os.environ, "HOME": str(home), "PATH": f"{stubs}{os.pathsep}/usr/bin{os.pathsep}/bin",
-               "STUB_LOG": str(tmp_path / "calls.log"), "STUB_TAB": str(tab), "PYTHONPATH": str(RUNTIME)}
+               "STUB_LOG": str(tmp_path / "calls.log"), "STUB_TAB": str(tab), "PYTHONPATH": str(RUNTIME),
+               "ZDOTDIR": str(home)}    # never the real ZDOTDIR
 
     def ttp(*args, stdin=""):
         r = subprocess.run([sys.executable, "-m", "ttp", "uninstall", "--bin-dir", str(bindir), *args],
@@ -142,3 +143,28 @@ def test_uninstall_is_refused_inside_a_run(env, monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["uninstall", "--dry-run"])
     assert e.value.code == 2 and "refused inside a run" in capsys.readouterr().err
+
+
+def test_uninstall_removes_only_the_installers_marked_path_line(env, tmp_path):
+    b = _uninstall_box(env, tmp_path)
+    home, mark = b["home"], " # added by tt-project installer"
+    bashrc, zshrc, fish = home / ".bashrc", home / ".zshrc", home / ".config" / "fish" / "conf.d" / "tt-project.fish"
+    own = b"alias ll='ls -l'\r\n# my PATH\nexport PATH=\"$HOME/bin:$PATH\"\n"
+    bashrc.write_bytes(b"# top\n" + f'export PATH="$HOME/.local/bin:$PATH"{mark}\n'.encode() + own)
+    zshrc.write_bytes(own)                       # no marked line: left alone
+    fish.parent.mkdir(parents=True)
+    fish.write_text(f"fish_add_path -g $HOME/.local/bin{mark}\n")
+    try:
+        rc, out, err = b["ttp"]("--dry-run")
+        assert rc == 0, err
+        assert "remove the PATH line the installer added to <tmp>/userhome/.bashrc" in out
+        assert "added to <tmp>/userhome/.config/fish/conf.d/tt-project.fish" in out and ".zshrc" not in out
+        rc, out, err = b["ttp"]("--yes")
+        assert rc == 0 and "not done" not in err, err
+        assert bashrc.read_bytes() == b"# top\n" + own and zshrc.read_bytes() == own
+        assert not fish.exists() and fish.parent.is_dir()
+        rc, out, err = b["ttp"]("--yes")
+        assert rc == 0 and "remove nothing" in out and "PATH line the installer" not in out
+    finally:
+        b["daemon"].kill()
+        b["daemon"].wait()

@@ -38,7 +38,8 @@ Rerun the line to update or switch refs; it updates the clone and the same entri
 - Codex: start a new session.
 - Cursor: restart it, or run **Developer: Reload Window**. On Teams and Enterprise plans an admin
   must allow local plugin imports.
-- `ttp`: needs `~/.local/bin` on `PATH`; add it in your shell profile if it is not.
+- `ttp`: needs `~/.local/bin` on `PATH`; if it is not, the installer adds it to your shell profile
+  and prints the command for the current shell. `ttp uninstall` removes that line.
 
 ## Skills
 

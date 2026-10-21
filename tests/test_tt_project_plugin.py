@@ -4555,13 +4555,59 @@ def test_one_line_install_skips_absent_hosts_with_a_note_and_closes_only_for_ins
     assert not (install_env.home / ".cursor").exists()
     assert "Codex: start a new session" in out
     assert "Claude Code: start" not in out and "Cursor: restart" not in out
-    assert "ttp: add ~/.local/bin to PATH" in out
+    # no $SHELL: the PATH line goes to ~/.profile
+    assert f"ttp: added ~/.local/bin to PATH for new shells in {install_env.home / '.profile'}" in out
     # none present: still sets up ttp, and says what to install
     r = install_env(hosts=())
     assert r.returncode == 0, r.stdout + r.stderr
     assert "no Claude Code, Codex or Cursor found" in r.stdout
     assert "Codex: start" not in r.stdout
     assert _calls(install_env.home)[-1].startswith("ttp setup from ")
+
+
+@pytest.mark.parametrize("login, profile", [("/bin/bash", ".bashrc"), ("/bin/bash on macOS", ".bash_profile"),
+                                            ("/usr/bin/zsh", "zdot/.zshrc"),
+                                            ("/usr/bin/fish", ".config/fish/conf.d/tt-project.fish")])
+def test_one_line_install_puts_local_bin_on_path_in_the_login_shells_profile_once(install_env, login, profile):
+    """~/.local/bin not on PATH: one marked line in the login shell's profile, never a second, none when
+    it is on PATH or with TT_PROJECT_NO_MODIFY_PATH=1; the user's own lines stay as they were."""
+    import subprocess
+    home = install_env.home
+    env = {"SHELL": login.split()[0], "ZDOTDIR": str(home / "zdot")}
+    if "macOS" in login:
+        uname = home.parent / "bin" / "uname"
+        uname.write_text("#!/bin/sh\necho Darwin\n")
+        uname.chmod(0o755)
+    rc = home / profile
+    off = install_env(on_path=False, env={**env, "TT_PROJECT_NO_MODIFY_PATH": "1"})
+    assert off.returncode == 0, off.stdout + off.stderr
+    assert "ttp: add ~/.local/bin to PATH in your shell profile, then open a new shell" in off.stdout
+    assert not rc.exists() and "added" not in off.stdout
+    own = "alias ll='ls -l'"            # the user's own last line, without a final newline
+    if profile != ".config/fish/conf.d/tt-project.fish":
+        rc.parent.mkdir(parents=True, exist_ok=True)
+        rc.write_text(own)
+    r = install_env(on_path=False, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = rc.read_text().splitlines()
+    marked = [ln for ln in lines if ln.endswith(" # added by tt-project installer")]
+    assert len(marked) == 1 and lines == ([] if "fish" in login else [own]) + marked, lines
+    assert f"ttp: added ~/.local/bin to PATH for new shells in {rc}\n" in r.stdout
+    if "fish" in login:
+        assert marked[0].startswith("fish_add_path -g $HOME/.local/bin ")
+        assert "in this shell, run: fish_add_path -g $HOME/.local/bin\n" in r.stdout
+    else:
+        assert 'in this shell, run: export PATH="$HOME/.local/bin:$PATH"\n' in r.stdout
+        path = subprocess.run(["sh", "-c", f'. "{rc}" 2>/dev/null; printf %s "$PATH"'], capture_output=True, text=True,
+                              env={"HOME": str(home), "PATH": "/usr/bin:/bin"}).stdout
+        assert path == f"{home}/.local/bin:/usr/bin:/bin"
+    before = rc.read_bytes()
+    again = install_env(on_path=False, env=env)
+    assert again.returncode == 0 and rc.read_bytes() == before
+    assert f"ttp: {rc} already puts ~/.local/bin on PATH for new shells" in again.stdout and "added" not in again.stdout
+    on = install_env(on_path=True, env=env)
+    assert on.returncode == 0 and rc.read_bytes() == before
+    assert "ttp: ready in this shell" in on.stdout and "PATH for new shells" not in on.stdout
 
 
 def test_one_line_install_reruns_update_the_clone_in_place_without_duplicates(install_env):

@@ -5541,7 +5541,7 @@ def cmd_uninstall(a) -> None:
     from . import uninstall
     bin_dir = Path(a.bin_dir).expanduser()
     acts = uninstall.plan(bin_dir)
-    print(("would " if a.dry_run else "") + ("remove:" if acts else "remove nothing: no ttp service, shortcut, shim or lib here"))
+    print(("would " if a.dry_run else "") + ("remove:" if acts else "remove nothing: no ttp service, shortcut, shim, lib or PATH line here"))
     for what, _ in acts:
         print(f"  {what}")
     if acts and not a.dry_run:

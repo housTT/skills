@@ -6,7 +6,8 @@ It stops and removes every tt-project service in the user's service folders (pro
 watchdogs, the notifier, kept web tunnels: systemd user units named tt-project-* or com.tt-project.*,
 launchd agents com.tt-project.*), the crontab lines service.py wrote (each recognised whole: it ends
 with that project's `# tt-project:<folder>` tag and runs `-m ttp.daemon <folder>`), any project daemon
-still running, the /tt-project shortcut, the `ttp` shim setup wrote and the installed lib. It never
+still running, the /tt-project shortcut, the `ttp` shim setup wrote, the installed lib and the PATH line
+install.sh added to a shell profile (only lines ending with its marker). It never
 deletes project folders or their tt-project/ state, never changes linger and never touches another
 crontab line. What it leaves is printed with the commands that remove it by hand.
 """
@@ -31,6 +32,7 @@ MARKETPLACE = "tenstorrent-skills"
 UNIT_RE = re.compile(r"^(tt-project-.+|com\.tt-project\..+)\.(service|timer)$")
 AGENT_RE = re.compile(r"^com\.tt-project\..+\.plist$")
 
+PATH_MARK = "# added by tt-project installer"      # install.sh ends its PATH line with this
 Action = tuple[str, Callable[[], str]]   # what it does, and the step (returns a problem, or "")
 
 
@@ -132,6 +134,39 @@ def is_shim(f: Path) -> bool:
         return False
 
 
+def _profiles() -> list[Path]:
+    """Every shell profile install.sh may add its PATH line to."""
+    home = Path.home()
+    zdot = Path(os.environ.get("ZDOTDIR") or home)
+    files = [home / ".bashrc", home / ".bash_profile", home / ".zshrc", zdot / ".zshrc", home / ".profile",
+             home / ".config" / "fish" / "conf.d" / "tt-project.fish"]
+    return list(dict.fromkeys(files))
+
+
+def _marked(f: Path) -> list[str]:
+    try:
+        return [ln for ln in f.read_text(errors="replace").splitlines() if ln.rstrip().endswith(PATH_MARK)]
+    except OSError:
+        return []
+
+
+def _drop_path_line(f: Path) -> Callable[[], str]:
+    """Remove only the marked lines, keeping every other byte; the fish file is the installer's own, so
+    it goes once nothing else is left in it."""
+    def step() -> str:
+        try:
+            mark = PATH_MARK.encode()
+            keep = b"".join(ln for ln in f.read_bytes().splitlines(keepends=True) if not ln.rstrip().endswith(mark))
+            if not keep.strip() and f.name == "tt-project.fish":
+                f.unlink()
+            else:
+                f.write_bytes(keep)
+        except OSError as e:
+            return f"{f}: {e}"
+        return ""
+    return step
+
+
 def plan(bin_dir: Path) -> list[Action]:
     """Every step a real run takes, in order: services first, so none restarts what the later steps end."""
     acts: list[Action] = [(f"stop and remove systemd user unit {f.name}", _stop_unit(f)) for f in _units()]
@@ -157,6 +192,7 @@ def plan(bin_dir: Path) -> list[Action]:
     shim = bin_dir / "ttp"
     if is_shim(shim):
         acts.append((f"remove the ttp command {shim}", lambda: shim.unlink(missing_ok=True) or ""))
+    acts += [(f"remove the PATH line the installer added to {f}", _drop_path_line(f)) for f in _profiles() if _marked(f)]
     lib = project.HOME_DIR / "lib"
     if lib.exists():
         acts.append((f"remove the installed lib {lib}", lambda: shutil.rmtree(lib, ignore_errors=True) or ""))
