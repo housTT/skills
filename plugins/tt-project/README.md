@@ -44,7 +44,7 @@ Features:
 - Works best if you have Glean MCP enabled
 - Leverages existing skills, understands TT dev workflows, machine setup, etc.
 - Will stay within dollar budgets on usage billed plans and daily/weekly budgets on prepaid plans.
-- Budgets are set per project and globally.
+- Budgets are set per project and global totals of all projects.
 - Throttles or restarts work as token availability changes.
 - Switching between plans is also fine. 
 - If you want a project to go faster, just tell it to increase its budget.
