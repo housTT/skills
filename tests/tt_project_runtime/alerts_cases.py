@@ -3745,7 +3745,8 @@ def test_a_stepped_alert_re_raises_by_severity_or_by_episode_as_documented(env, 
 
 
 def _mac_app_stubs(monkeypatch, tmp_path, tools=("osacompile", "codesign", "open", "osascript")):
-    """macOS on Linux: a temp HOME and stub osacompile (writes an applet's Info.plist), codesign, open and
+    """macOS on Linux: a temp HOME and stub osacompile (writes an applet's Info.plist, or like the real one a
+    script file when the output name does not end in .app), codesign, open and
     osascript, each logging its argv as one JSON line to <tool>.calls."""
     from ttp import notifier
     _notifier_stubs(monkeypatch, tmp_path, [])
@@ -3757,7 +3758,9 @@ def _mac_app_stubs(monkeypatch, tmp_path, tools=("osacompile", "codesign", "open
         stub = tmp_path / "bin" / tool
         stub.write_text(f"#!{sys.executable}\nimport json, plistlib, sys, pathlib\n"
                         f"open({str(tmp_path / (tool + '.calls'))!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                        "if pathlib.Path(sys.argv[0]).name == 'osacompile':\n"
+                        "if pathlib.Path(sys.argv[0]).name == 'osacompile' and not sys.argv[2].endswith('.app'):\n"
+                        "    pathlib.Path(sys.argv[2]).write_bytes(b'compiled script')  # like osacompile: no .app, no applet\n"
+                        "elif pathlib.Path(sys.argv[0]).name == 'osacompile':\n"
                         "    c = pathlib.Path(sys.argv[2]) / 'Contents'\n"
                         "    c.mkdir(parents=True)\n"
                         "    (c / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'com.apple.ScriptEditor.id.x',"
@@ -3771,6 +3774,9 @@ def test_the_macos_notifier_app_asks_for_persistent_alerts_is_ad_hoc_signed_and_
     import plistlib
     from ttp import notifier
     calls = _mac_app_stubs(monkeypatch, tmp_path)
+    stray = tmp_path / "userhome" / "Applications" / ".tt-project.app.new"
+    stray.parent.mkdir(parents=True)
+    stray.write_bytes(b"compiled script")   # what an older build left: a script file, not an app
     app, line = notifier.ensure_app()
     assert app == tmp_path / "userhome" / "Applications" / "tt-project.app" and "persistent alerts requested" in line
     info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
@@ -3779,7 +3785,7 @@ def test_the_macos_notifier_app_asks_for_persistent_alerts_is_ad_hoc_signed_and_
     assert info["LSBackgroundOnly"] is True and "LSUIElement" not in info and info["CFBundleExecutable"] == "applet"
     assert (app / "Contents" / "Resources" / "applet.icns").read_bytes()[:4] == b"icns"
     (compiled,) = calls("osacompile")
-    assert compiled[0] == "-o" and compiled[1].endswith(".tt-project.app.new")
+    assert compiled[0] == "-o" and compiled[1].endswith("/.new-tt-project.app")
     (signed,) = calls("codesign")
     assert signed[:4] == ["--force", "--deep", "--sign", "-"] and signed[4] == compiled[1], "signed after the plist edit"
     assert notifier.ensure_app() == (app, ""), "a rerun leaves the same app alone"
@@ -3918,10 +3924,36 @@ def test_setup_builds_the_macos_app_and_sends_its_first_test_even_on_a_tested_co
     monkeypatch.setattr(notifier, "_service_on", lambda: False)
     assert notifier.refresh(send_test=True) == [] and not calls("osacompile"), "an agent turned off: no app, no test"
     monkeypatch.setattr(notifier, "_service_on", lambda: True)
-    out = notifier.refresh(send_test=True)
+    out = notifier.refresh(send_test=True)   # current macOS: no ncprefs file, `defaults` gives nothing either
     assert out[0].startswith("desktop notifier: notifier app ") and len(calls("open")) == 1, out
-    assert any("the tt-project app posted its first notification" in ln for ln in out), \
-        "the new app's first post brings the Allow prompt"
-    assert any("test notification sent (osascript)" in ln for ln in out), "the test goes the way alerts still go"
+    assert any("alerts come from the tt-project app from now on" in ln for ln in out), out
+    assert any("test notification sent (tt-project)" in ln for ln in out) and not calls("osascript"), \
+        "the test is the app's first post (the Allow prompt), and the only notification setup sends"
+    assert any(ln.startswith("alert style: macOS does not say here") and "> tt-project > alert style Persistent" in ln
+               for ln in out), "the one line naming what only the user can set"
     out = notifier.refresh(send_test=True)
-    assert len(calls("open")) == 1 and "already went out" in out[-1], "a rerun sends nothing more"
+    assert len(calls("open")) == 1 and len(calls("osacompile")) == 1 and "already went out" in out[-1], \
+        "a rerun builds and sends nothing more"
+    assert notifier.show("t", "b")["backend"] == "tt-project" and not calls("osascript"), "alerts now use the app"
+
+
+def test_macos_notification_settings_are_read_through_defaults_when_the_plist_file_is_gone(monkeypatch, tmp_path):
+    import plistlib
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)
+    notifier.ensure_app()
+    prefs = tmp_path / "ncprefs.out"
+    stub = tmp_path / "bin" / "defaults"
+    stub.write_text(f"#!{sys.executable}\nimport sys\nopen({str(tmp_path / 'defaults.calls')!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                    f"sys.stdout.buffer.write(open({str(prefs)!r}, 'rb').read())\n")
+    stub.chmod(0o755)
+    for flags, style, sender in ((None, "not registered", "osascript"), (8, "banners", "tt-project"),
+                                 (16, "persistent", "tt-project")):
+        apps = [] if flags is None else [{"bundle-id": "com.tt-project.notifier", "flags": flags}]
+        prefs.write_bytes(plistlib.dumps({"apps": apps}))
+        assert notifier.alert_style() == style and notifier.show("t", "b")["backend"] == sender, flags
+    assert set((tmp_path / "defaults.calls").read_text().splitlines()) == {"export com.apple.ncprefs -"}, "read only"
+    prefs.write_bytes(plistlib.dumps({"apps": []}))
+    assert notifier.register_app()[0].startswith("the tt-project app posted its first notification")
+    assert len(calls("open")) == 3 and notifier.show("t", "b")["backend"] == "osascript", \
+        "readable settings that do not list the app keep the sender, even after its first post"

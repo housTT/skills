@@ -17,9 +17,13 @@ Default channels need no accounts or setup.
 - Desktop notifications play a sound and are meant to stay until closed. Linux: notify-send, critical,
   no expiry. macOS: setup, upgrade and `ttp notifier install` build a small `tt-project` app
   (`~/Applications/tt-project.app`, ad-hoc signed, Persistent style requested) without root; its first
-  notification brings macOS's one Allow prompt. Alerts go through it only once macOS lists it in
-  Notifications; until then, and with `"app": false`, through terminal-notifier, else osascript (Script
-  Editor). Not yet checked live on a Mac: whether the app gets Persistent without a System Settings change.
+  notification brings macOS's one Allow prompt. Alerts go through it once macOS lists it in
+  Notifications, or, where macOS's notification settings cannot be read (current macOS has no
+  `com.apple.ncprefs.plist` and `defaults export` gives nothing), from setup's test notification on;
+  until then, and with `"app": false`, through terminal-notifier, else osascript (Script Editor).
+  Not yet checked live on a Mac: whether the app gets Persistent without a System Settings change. Only
+  the user can set an app's alert style, so where macOS does not report it, setup and `ttp notifier test`
+  print one line naming System Settings > Notifications > tt-project > Persistent.
   `"persistent": false` in `~/.tt-project/notifier.json` turns persistence off. `ttp uninstall` removes the app.
 - `ttp notifier test` sends one through the same path and says whether it worked, with the fix
   if not; exit 1 = failed. macOS does not report display: in a terminal it asks if you saw it.

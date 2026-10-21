@@ -1097,8 +1097,9 @@ install it, to a desktop notifier on your workstation that covers all your proje
 - Desktop: alerts play a sound and are meant to stay until you close them. Linux: critical urgency with
   no expiry. macOS: `ttp setup`, `ttp upgrade` and `ttp notifier install` build a small `tt-project`
   app in `~/Applications` (no root) that asks for the Persistent style; alerts come from it once macOS
-  lists it under System Settings > Notifications (click Allow on its first notification), and until
-  then from terminal-notifier or osascript as before. Whether the app keeps the Persistent style
+  lists it under System Settings > Notifications (click Allow on its first notification), or, where
+  macOS's notification settings cannot be read, from setup's test notification on, and until then from
+  terminal-notifier or osascript as before. Whether the app keeps the Persistent style
   without a change in System Settings is not yet checked on a Mac; `ttp notifier test` shows the
   style macOS reports and the one setting to change if alerts still go away. `"app": false` in
   `~/.tt-project/notifier.json` turns the app off.
