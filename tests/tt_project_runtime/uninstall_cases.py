@@ -57,7 +57,7 @@ def _uninstall_box(env, tmp_path):
     (root / "tt-project" / "state" / "daemon.pid").write_text(f"{daemon.pid}\n")
     run_env = {**os.environ, "HOME": str(home), "PATH": f"{stubs}{os.pathsep}/usr/bin{os.pathsep}/bin",
                "STUB_LOG": str(tmp_path / "calls.log"), "STUB_TAB": str(tab), "PYTHONPATH": str(RUNTIME),
-               "ZDOTDIR": str(home)}    # never the real ZDOTDIR
+               "ZDOTDIR": str(home), "XDG_CONFIG_HOME": str(home / ".config")}    # never the real ones
 
     def ttp(*args, stdin="", extra_env=None):
         r = subprocess.run([sys.executable, "-m", "ttp", "uninstall", "--bin-dir", str(bindir), *args],
@@ -140,6 +140,7 @@ def test_uninstall_removes_only_ttps_own_entries_and_a_second_run_is_harmless(en
 def test_uninstall_is_refused_inside_a_run(env, monkeypatch, capsys):
     from ttp import cli
     monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"] / "run"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(env["tmp"] / "config"))   # never the real one
     with pytest.raises(SystemExit) as e:
         cli.main(["uninstall", "--dry-run"])
     assert e.value.code == 2 and "refused inside a run" in capsys.readouterr().err
@@ -189,6 +190,25 @@ def test_uninstall_removes_the_fish_path_file_under_xdg_config_home(env, tmp_pat
         rc, out, err = b["ttp"]("--yes", extra_env={"XDG_CONFIG_HOME": str(xdg)})
         assert rc == 0 and "not done" not in err, err
         assert not fish.exists()
+    finally:
+        b["daemon"].kill()
+        b["daemon"].wait()
+
+
+def test_uninstall_tests_never_touch_the_real_xdg_config_home(env, tmp_path, monkeypatch):
+    # The developer's own XDG_CONFIG_HOME stays out of reach: the box pins it inside tmp_path.
+    real = tmp_path / "real-config" / "fish" / "conf.d" / "tt-project.fish"
+    real.parent.mkdir(parents=True)
+    real.write_text("fish_add_path -g $HOME/.local/bin # added by tt-project installer\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "real-config"))
+    b = _uninstall_box(env, tmp_path)
+    pinned = b["home"] / ".config" / "fish" / "conf.d" / "tt-project.fish"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_text(real.read_text())
+    try:
+        rc, out, err = b["ttp"]("--yes")
+        assert rc == 0 and "not done" not in err, err
+        assert real.exists() and not pinned.exists()
     finally:
         b["daemon"].kill()
         b["daemon"].wait()
