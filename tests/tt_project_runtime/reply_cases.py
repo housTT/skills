@@ -51,7 +51,10 @@ def test_ordinary_answers_still_post(env):
                     "The notifier sent the user a toast at 09:30 PDT; its log shows it was delivered.",
                     "The user's config sets review.auto to false, so no review was queued.",
                     "Run it again with --strict.",
-                    "Sent the fix to the push queue; it landed as 1a2b3c4."):
+                    "Sent the fix to the push queue; it landed as 1a2b3c4.",
+                    "Coverage is 92%; it is above the 90% target.",
+                    "Yes, the release note is ready to send.",
+                    "Sent the user the steps: 1) git pull 2) ttp setup 3) ttp notifier test."):
         task, replies = _reply_hand_off(env, p, {"status": "done", "summary": summary}, chat=f"c{len(summary)}")
         assert task["status"] == "done" and replies == [summary], summary
     # A failed or blocked run describing itself is still reported: its summary says what went wrong.
@@ -67,8 +70,20 @@ def test_replymsg_flags_only_short_self_descriptions():
         assert replymsg.undelivered({"summary": t}), t
     long_steps = _SELF_DESCRIBED + "\nSteps:\n1. `git checkout abc`\n2. `ttp notifier check`"
     for t in (long_steps, "You returned them as the message for the user; that is fine.\n" * 12,
-              "Yes, it is.", "Sent you the steps by mail.", "As shown in the log, the job passed."):
+              "Yes, it is.", "Sent you the steps by mail.", "As shown in the log, the job passed.",
+              # a comparison, not the reply placed above
+              "Coverage is 92%; it is above the 90% target.", "Temperature: it is above 80C on chip 3.",
+              "Spend this week: they are above budget on both boxes.", "The answer is above 1000 for every run.",
+              # a named deliverable's state, not the reply's
+              "Yes, the release note is ready to send.",
+              # the deliverable follows the phrase
+              "Sent the user the steps: 1) git pull 2) ttp setup 3) ttp notifier test.",
+              "Mac rerun steps (ready to paste): git pull; ttp setup; ttp notifier test.",
+              "Returned them as the message for the user: run ttp setup, then ttp notifier test."):
         assert not replymsg.undelivered({"summary": t}), t
+    for t in ("The steps are written out above.", "The steps are written out above, ready to send.",
+              "Done: returned them as the message for the user."):
+        assert replymsg.undelivered({"summary": t}), t
     assert replymsg.text({"summary": "s", "message": "  "}) == "s", "an empty message falls back to the summary"
     assert replymsg.text({"summary": "s", "message": "m"}) == "m"
 
