@@ -1652,7 +1652,7 @@ def test_version_bump_config_is_validated(env):
     from ttp.project import config_problems
     assert push.bump_of(None) is None and push.bump_of({}) is None
     assert push.bump_of('{"files": ["a/x.json", "a/b/y.py"]}') == \
-        {"files": ["a/x.json", "a/b/y.py"], "paths": ["a"], "package": "", "changeset_dir": ""}
+        {"files": ["a/x.json", "a/b/y.py"], "paths": ["a"], "package": "", "changeset_dir": "", "changeset_file": ""}
     for bad in ("x.json", {"files": []}, {"files": ["/abs.json"]}, {"files": ["../up.json"]},
                 {"files": ["x.json"], "extra": 1}, [1]):
         with pytest.raises(ValueError):
