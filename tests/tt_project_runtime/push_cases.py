@@ -8091,6 +8091,73 @@ def test_the_hourly_push_audit_raises_one_issue_per_missing_push_and_closes_them
     assert json.loads(capsys.readouterr().out)["counts"] == {"confirmed": 1, "missing": 0, "unknown": 0}
 
 
+def test_the_hourly_push_audit_closes_an_ask_only_once_every_task_it_names_landed(env, monkeypatch):
+    """An ask for a task closes as 'resolved: its work landed' once the push audit confirms the task's
+    push on the remote; an ask for a task whose push is missing, one naming a task only as context
+    (done before it was asked) and one naming no task stay open."""
+    from ttp import audit, daemon as dmod, pushclaim, unblock
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    now = time.time()
+    _commit(repo, "a.txt", "a\n")
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _commit(repo, "b.txt", "b\n")
+    unpushed = _git_out(repo, "rev-parse", "HEAD")
+
+    def ask(text, ago=3600):
+        return p.db.x("INSERT INTO messages(ts,direction,kind,text,ref) VALUES(?,?,?,?,?)",
+                      (now - ago, "out", "ask", text, "blocking:access"))
+    asks = {}
+    asks["landed"] = ask("The token needs the workflow scope before #{landed}'s CI job can be pushed.")
+    asks["missing"] = ask("Grant the scope so #{missing} can push?")
+    asks["both"] = ask("Unblock #{landed} and #{missing}?")
+    asks["unlinked"] = ask("Grant the gh token the workflow scope?")
+    asks["context"] = ask("Like #{old} (done before this ask), may #{old} change again?")
+    asks["ask_ref"] = ask("Same question as ask #{landed}?")
+
+    def done(title, summary):
+        tid = p.db.add_task(title, "s", kind="code", origin="user", branch="work")
+        p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": summary}))
+        return tid
+    ids = {"landed": done("ci job", f"pushed {sha[:10]} to origin/proj"),
+           "missing": done("other", f"pushed {unpushed[:10]} to origin/proj"),
+           "old": done("earlier", f"pushed {sha[:10]} to origin/proj")}
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 7200, ids["old"]))
+    for k, aid in asks.items():
+        text = p.db.one("SELECT text FROM messages WHERE id=?", (aid,))["text"].format(**ids)
+        p.db.x("UPDATE messages SET text=? WHERE id=?", (text, aid))
+    dmod.Daemon(p.base).audit_pushes()
+    assert set(pushclaim.audit(p)["landed"]) == {ids["landed"], ids["old"]}
+    open_ = {r["id"] for r in p.db.q("SELECT id FROM messages WHERE kind='ask' AND handled=0")}
+    assert asks["landed"] not in open_
+    assert open_ == {asks[k] for k in ("missing", "both", "unlinked", "context", "ask_ref")}
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400)}
+    assert rows[asks["landed"]]["landed"]["tasks"] == [ids["landed"]] and not rows[asks["landed"]]["answered"]
+    assert rows[asks["missing"]]["landed"] is None
+    out = "\n".join(audit.lines(p.db))
+    assert f"ask {asks['landed']} (access): " in out
+    assert f"resolved: its work landed (#{ids['landed']}), after 1.0 h with no answer" in out
+    assert f"ask {asks['unlinked']} (access): \"Grant the gh token the workflow scope?\"; no answer yet" in out
+    assert f"ask {asks['missing']} (access): \"Grant the scope so #{ids['missing']} can push?\"; no answer yet" in out
+    assert "asks: 6 sent, 0 answered, 0 handed back, 1 resolved as their work landed" in out
+    assert unblock.close_landed(p.db, [ids["landed"], ids["old"]]) == [], "closed once"
+
+
+def test_close_landed_never_closes_an_ask_without_a_confirmed_landed_task(env):
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    tid = p.db.add_task("work", "s", origin="user")
+    a = msg("out", f"May #{tid} go ahead?", 600, "ask", ref="blocking:access")
+    b = msg("out", "Anything else?", 600, "ask", ref="blocking:access")
+    p.db.update_task(tid, status="done")
+    assert unblock.close_landed(p.db, []) == [], "no confirmed landing: nothing closes"
+    held = p.db.add_task("held", "s", origin="user")
+    p.db.update_task(held, status="blocked", labels=[f"waits:ask:{b}"])
+    assert unblock.ask_tasks(p.db, {"id": b, "text": "Anything else?"}) == [held], "an anchored task is linked"
+    assert unblock.close_landed(p.db, [held]) == [], "a task not done keeps its ask open"
+    assert unblock.close_landed(p.db, [tid]) == [a]
+
+
 def test_review_rules_do_not_tell_reviews_to_publish_another_tasks_branch():
     """The review template never invites --own onto a branch another task carries (the push refuses it)."""
     import re

@@ -3363,7 +3363,8 @@ class Daemon:
 
     def audit_pushes(self) -> None:
         """Hourly, model-free: done tasks of the last days whose claimed pushes are not on the remote
-        (pushclaim.audit), one keyed observation each; quiet, and earlier ones closed, when none.
+        (pushclaim.audit), one keyed observation each; quiet, and earlier ones closed, when none. An open
+        ask whose tasks all landed is closed (unblock.close_landed).
         Skipped while the network is held; past the tick's Budget it resumes next tick from the answers so far."""
         db, now = self.p.db, time.time()
         last = db.kv(pushclaim.AUDIT_KV)
@@ -3381,7 +3382,12 @@ class Daemon:
             log(self.p, f"push audit failed: {type(e).__name__}: {e}")
             db.set_kv(pushclaim.AUDIT_KV, {**(last if isinstance(last, dict) else {}), "at": now})
             return
-        db.set_kv(pushclaim.AUDIT_KV, {**a, "gaps": a["gaps"][:50]})
+        db.set_kv(pushclaim.AUDIT_KV, {**{k: v for k, v in a.items() if k != "landed"}, "gaps": a["gaps"][:50]})
+        try:
+            for aid in unblock.close_landed(db, a.get("landed") or [], now):
+                log(self.p, f"ask #{aid} resolved: its work landed")
+        except Exception as e:
+            log(self.p, f"closing asks whose work landed failed: {type(e).__name__}: {e}")
         missing = [g for g in a["gaps"] if g["state"] == pushclaim.MISSING]
         for g in missing:
             self.observe("daemon:push-audit", pushclaim.gap_text(g), "normal", key=pushclaim.gap_key(g), whole=True)

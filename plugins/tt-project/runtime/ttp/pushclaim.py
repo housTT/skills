@@ -543,7 +543,8 @@ def _reattribute(p, t, c: dict, state: str, why: str, claimed: dict, tips: dict)
 def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int = AUDIT_REFS,
           cache: dict | None = None) -> dict:
     """Done tasks of the last `days` whose claimed pushes are not on the remote: {"counts": {state: n},
-    "gaps": [{"task", "title", "state", "why"}], "tasks": n}. Read-only, apart from fetching the
+    "gaps": [{"task", "title", "state", "why"}], "tasks": n, "landed": [ids of the tasks that claim a
+    push, every one confirmed]}. Read-only, apart from fetching the
     remote's tracking refs. Past `max_refs` distinct refs the rest count as unknown. `cache`: the
     remote's answers so far (with a Budget, an audit that ran out of time resumes from them)."""
     from .db import load_result
@@ -557,7 +558,7 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
     refs: set = set()
     tips: dict = {}                    # repo -> the push branch's local tip, read once
     claimed: dict[str, list] = {}      # sha -> the tasks claiming it (for a shared claim)
-    todo = []
+    todo, landed = [], []
     for t in rows:
         prev = load_result(t["result"])
         run = _last_run(db, t["id"])
@@ -604,11 +605,13 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
                 gaps.append({"task": t["id"], "title": t["title"], "state": state, "why": why,
                              "sha": c.get("sha", ""), "source": c.get("source", "")})
         why = "" if all_ok else _on_pass_gap(prev, run)    # claims the remote has: the on_pass_cmd's work is there
+        if all_ok:
+            landed.append(t["id"])
         if why:
             counts[MISSING] += 1
             gaps.append({"task": t["id"], "title": t["title"], "state": MISSING, "why": why, "sha": "",
                          "source": "on_pass"})
-    return {"at": now, "days": days, "tasks": len(rows), "counts": counts, "gaps": gaps}
+    return {"at": now, "days": days, "tasks": len(rows), "counts": counts, "gaps": gaps, "landed": landed}
 
 
 def gap_key(g: dict) -> str:

@@ -485,12 +485,59 @@ def stuck_line(eps: list[dict]) -> str:
             f"longest #{top['task']} {top['title'][:70]} {_dur(top['s'])}{' (still open)' if top['open'] else ''}")
 
 
-def record_resolve(db: DB, ask_id: int, messages: list[int]) -> None:
+def record_resolve(db: DB, ask_id: int, messages: list[int], landed: list[int] | None = None) -> None:
     """Remember that the coordinator resolved `ask_id` now, in a turn started for `messages` (the
-    user messages it answered; none for a turn of its own). asks() links those messages to it."""
+    user messages it answered; none for a turn of its own). asks() links those messages to it.
+    `landed`: the tasks whose landing closed it instead (close_landed)."""
     rec = db.kv(RESOLVED_KEY, {}) or {}
     rec[str(ask_id)] = {"ts": time.time(), "messages": [int(m) for m in messages]}
+    if landed:
+        rec[str(ask_id)]["landed"] = [int(t) for t in landed]
     db.set_kv(RESOLVED_KEY, dict(sorted(rec.items(), key=lambda kv: int(kv[0]))[-RESOLVED_KEEP:]))
+
+
+# `#<id>` in an ask's text names a task, unless it names an ask, a PR or an issue.
+_NAMED_TASK = re.compile(r"(\b(?:ask|asks|pr|prs|pull|issue|issues)\s*)?#(\d+)(?!\d)", re.I)
+
+
+def ask_tasks(db: DB, ask: dict) -> list[int]:
+    """The tasks an ask is for: those its text names as `#<id>` and those anchored on it (`waits:ask:<id>`)."""
+    from .waits import _held_ask
+    named = {int(m.group(2)) for m in _NAMED_TASK.finditer(str(ask.get("text") or "")) if not m.group(1)}
+    ids = {t["id"] for t in db.q(f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(named))})",
+                                 sorted(named))} if named else set()
+    ids |= {t["id"] for t in db.q("SELECT id, labels FROM tasks WHERE labels LIKE '%waits:ask:%'")
+            if _held_ask(t) == int(ask["id"])}
+    return sorted(ids)
+
+
+def close_landed(db: DB, landed, now: float | None = None) -> list[int]:
+    """Close each open ask whose work landed: it is for at least one task (ask_tasks), and every such
+    task is done, finished after the ask was sent, and in `landed` (the done tasks whose every claimed
+    push the push audit confirmed on its remote, pushclaim.audit). An ask for no task, or for a task
+    not confirmed landed, stays open. Each is recorded resolved with its tasks (record_resolve), which
+    asks() and the daily audit report as "resolved: its work landed". Returns the asks closed."""
+    now = time.time() if now is None else now
+    landed = {int(t) for t in landed or ()}
+    if not landed:
+        return []
+    closed = []
+    for a in db.q("SELECT id, ts, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0 ORDER BY id"):
+        tasks = ask_tasks(db, a)
+        if not tasks or not set(tasks) <= landed:
+            continue
+        rows = db.q(f"SELECT t.id, t.status, t.updated, (SELECT MAX(ts) FROM events e WHERE e.task=t.id AND "
+                    f"e.kind='task_done') AS done_at FROM tasks t WHERE t.id IN ({','.join('?' * len(tasks))})", tasks)
+        # A task named only as context (done before the ask was sent) is not the work the ask was for.
+        if len(rows) != len(tasks) or any(r["status"] != "done" or float(r["done_at"] or r["updated"] or 0) <= float(a["ts"])
+                                          for r in rows):
+            continue
+        with db.tx():
+            if db.one("SELECT id FROM messages WHERE id=? AND kind='ask' AND handled=0", (a["id"],)):
+                db.x("UPDATE messages SET handled=1 WHERE id=?", (a["id"],))
+                record_resolve(db, a["id"], [], landed=tasks)
+                closed.append(a["id"])
+    return closed
 
 
 def inventory_line(rows: list[dict]) -> str:
@@ -581,8 +628,14 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
             link(open_[0], m, m["text"], "only_open")
         elif open_ and prev is not None and sum(a["ts"] > prev for a in open_) == 1 and open_[-1]["ts"] > prev:
             link(open_[-1], m, m["text"], "newest")
-    return [{**{k: v for k, v in rows[a["id"]].items() if k != "first"}, "answered_at": rows[a["id"]]["first"]}
-            for a in sent if a["ts"] >= since]
+    return [{**{k: v for k, v in rows[a["id"]].items() if k != "first"}, "answered_at": rows[a["id"]]["first"],
+             "landed": _landed(resolved, a["id"])} for a in sent if a["ts"] >= since]
+
+
+def _landed(resolved: dict, ask_id: int) -> dict | None:
+    """{"tasks", "ts"} when close_landed closed the ask, else None."""
+    r = resolved.get(str(ask_id))
+    return {"tasks": list(r["landed"]), "ts": float(r.get("ts") or 0)} if isinstance(r, dict) and r.get("landed") else None
 
 
 def asks_line(rows: list[dict]) -> str:
