@@ -38,6 +38,7 @@ from . import anchors
 from . import askrethink
 from . import audit
 from . import replica
+from . import replymsg
 from . import awake
 from . import budget as bud
 from . import budgetkind
@@ -3715,6 +3716,13 @@ class Daemon:
             # Waits a reboot cut short count against max_reboot_losses; a block starts the count over.
             extra["reboot_wakes"] = wakes
         shown = rstatus or status
+        # A done reply that delivers nothing (replymsg.undelivered) is not posted: the task goes to
+        # review saying so, so the coordinator sees that the chat got nothing.
+        undelivered = replymsg.undelivered(result) if task["reply_chat"] and new == "done" else ""
+        if undelivered:
+            new, reason = "review", f"nothing was posted to the chat: {undelivered}"
+            extra["undelivered"] = undelivered
+            log(self.p, f"task {task['id']}: {reason}")
         if status in ("limit", "auth") and not rstatus and (prev := load_result(task["result"])).get("status") == "waiting":
             # A wake the account refused is the same wait: its retry stays a cheap wake.
             extra.update({k: prev[k] for k in WAIT_KEYS if k in prev})
@@ -3791,7 +3799,7 @@ class Daemon:
             except Exception as e:
                 log(self.p, f"review {task['id']}: its stats were not recorded: {e}")
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
-            text = summary if new == "done" else f"(task #{task['id']} {outcome}) {summary}"
+            text = replymsg.text(result) if new == "done" else f"(task #{task['id']} {outcome}) {summary}"
             need = upd.get("blocked_reason") if new == "blocked" else None
             if need and need not in summary:
                 text += f"\nNeeds from you: {need}"
@@ -3817,6 +3825,9 @@ class Daemon:
         head = (f"#{task['id']} {task['title']} → {outcome} (run {ended or status}, {'~' if usage.estimated else ''}"
                 f"${usage.cost_usd:.2f}): ")
         text = ""   # the daemon's own lines after the summary, which the digest must show whole
+        if undelivered:
+            text += (f"\nNot posted to the chat: {undelivered}. The user got nothing: post the deliverable "
+                     f"(a `reply`) or rerun the task asking for it in result.json `{replymsg.FIELD}`.")
         notes = "".join(f"\nNot an upstream note (names nothing of tt-project), so proposed as this project's "
                         f"follow-up: {t[:200]}" for t in local)
         if len(fups) > MAX_FOLLOWUPS:

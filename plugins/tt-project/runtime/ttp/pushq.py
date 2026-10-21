@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, push, runner, scopehold, sharedchecks, timefmt, upstream
+from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, push, replymsg, runner, scopehold, sharedchecks, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -173,6 +173,12 @@ def _reply(db, task: dict, new: str, text: str, need: str | None = None) -> None
         text += f"\nNeeds from you: {need}"
     db.post("out", text[:6000], chat=None if task["reply_chat"] == "all" else task["reply_chat"],
             kind="reply", severity="normal")
+
+
+def _done_text(prev: dict, summary: str, tail: str) -> str:
+    """A landed task's reply: its hand-off's `message` (replymsg) with how it landed, else its summary."""
+    msg = prev.get(replymsg.FIELD)
+    return f"{msg.strip()} ({tail})" if isinstance(msg, str) and msg.strip() else summary
 
 
 def _short(sha: str | None) -> str:
@@ -1139,7 +1145,7 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         # Handled: the coordinator sees it in its next turn's task list; no turn is spent on it.
         _event(db, task, "task_done", f"#{tid} {task['title']} → done ({tail}, batch {b['id']}): {summary[:1200]}",
                queued=False)
-        _reply(db, task, "done", result["summary"])
+        _reply(db, task, "done", _done_text(prev, result["summary"], tail))
         settle_reviewed(db, now, only=_covers(db, task, rows))
     # else: some of its rows are still approved or batched; it keeps waiting.
 
@@ -1282,7 +1288,7 @@ def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) 
                                    "WHERE id=? AND status='review'", (dump_result(result), now, t["id"])).rowcount:
                 continue
             _event(db, t, "task_done", f"#{t['id']} {t['title']} → done ({tail})", queued=False)
-            _reply(db, t, "done", result["summary"])
+            _reply(db, t, "done", _done_text(prev, result["summary"], tail))
         closed.append(t["id"])
     return closed
 
