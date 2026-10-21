@@ -5,7 +5,7 @@
 One small agent per workstation watches every project in this machine's registry — local ones by
 reading their database, remote ones with one ssh call per minute — and shows each new alert at
 or above the severity floor as a native notification with a sound, meant to stay until closed (macOS
-Notification Center through the tt-project app, which asks for the persistent style, once macOS lists it
+Notification Center through the tt-project app, which asks for the persistent style, once macOS shows it allowed
 (ensure_app, app_registered; notifier.json `app: false` skips it), else terminal-notifier or osascript; or
 notify-send, critical with no expiry, on a Linux desktop; notifier.json `persistent: false` lets them go). It never marks anything read; chats
 and the web app keep their own cursors. Every delivery is recorded (DELIVERY): a failure goes to the
@@ -54,6 +54,12 @@ BUNDLE_ID = "com.tt-project.notifier"   # the macOS notifier app (ensure_app): i
 APP_NAME = "tt-project"
 CLICK_URL = HOME_DIR / "notifier-click-url"   # the app opens it when an alert is clicked
 STYLES = {0: "none", 8: "banners", 16: "persistent"}   # com.apple.ncprefs flags & 0x38, read only
+LOG_TIMEOUT_S = 20   # one read of macOS's unified log (usernoted)
+LOG_CHECK_S = 60   # while the app's allowance is unknown: how often an alert re-reads the log
+LOG_WINDOW_S = 24 * 3600   # how long after the app's first post its log entries are looked for
+SENDER_IDS = {APP_NAME: BUNDLE_ID, "osascript": "com.apple.ScriptEditor2",
+              "terminal-notifier": "fr.julienxx.oss.terminal-notifier"}   # whose usernoted lines a test reads
+DENIED = ("denied", "not authorized", "unauthorized", "disallowed", "not allowed")
 
 
 def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
@@ -401,13 +407,17 @@ def _ncprefs() -> bytes:
 
 def alert_style() -> str:
     """How macOS shows the app's notifications, read (never written) from its Notifications settings:
-    persistent, banners, none, 'not registered' (it has not posted yet) or 'unknown'."""
+    persistent, banners, none, 'not registered' (they list apps, not this one: it has not posted yet) or
+    'unknown' (unreadable, or no apps listed: current macOS may export an empty dict)."""
     import plistlib
     try:
         prefs = plistlib.loads(_ncprefs())
     except (ValueError, plistlib.InvalidFileException):
         return "unknown"
-    for a in prefs.get("apps", []) if isinstance(prefs, dict) else []:
+    apps = prefs.get("apps") if isinstance(prefs, dict) else None
+    if not isinstance(apps, list) or not apps:
+        return "unknown"
+    for a in apps:
         if isinstance(a, dict) and a.get("bundle-id") == BUNDLE_ID:
             try:
                 return STYLES.get(int(a.get("flags", 0)) & 0x38, "unknown")
@@ -417,9 +427,69 @@ def alert_style() -> str:
 
 
 def app_registered() -> bool:
-    """macOS lists the app in its Notifications settings: only then do alerts go through it (_command).
-    A failed, timed-out, empty or unreadable read keeps the sender."""
-    return alert_style() in STYLES.values()
+    """macOS shows the app allowed: only then do alerts go through it (_command). Its Notifications
+    settings decide when they list apps; where they say nothing, usernoted's log (app_allowed). A failed,
+    timed-out or empty read of both keeps the sender."""
+    style = alert_style()
+    return style in STYLES.values() or style == "unknown" and app_allowed()
+
+
+def _usernoted(bundle: str, since: float) -> list[str] | None:
+    """usernoted's unified-log lines naming `bundle` since `since`, read only; None when unreadable."""
+    if not shutil.which("log"):
+        return None
+    start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
+    try:
+        r = subprocess.run(["log", "show", "--style", "compact", "--start", start, "--predicate",
+                            f'process == "usernoted" AND eventMessage CONTAINS "{bundle}"'],
+                           capture_output=True, text=True, errors="replace", timeout=LOG_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return [ln for ln in r.stdout.splitlines() if bundle in ln] if r.returncode == 0 else None
+
+
+def _log_verdict(lines: list[str]) -> str:
+    """'denied' (any denial), 'allowed' (a record delivered or presented) or 'none'."""
+    low = [ln.lower() for ln in lines]
+    if any(w in ln for ln in low for w in DENIED):
+        return "denied"
+    return "allowed" if any("delivering" in ln or "presenting" in ln for ln in low) else "none"
+
+
+def app_allowed(force: bool = False) -> bool:
+    """Where macOS's settings list no apps: whether usernoted's log shows the app's notification delivered
+    or presented, with no denial, since its first post (register_app). Remembered once seen; until then
+    re-read at most every LOG_CHECK_S (`force`: now), only for LOG_WINDOW_S after that post. An unreadable
+    log, a denial or nothing: False, the sender stays."""
+    d, now = delivery(), time.time()
+    if d.get("app_allowed"):
+        return True
+    posted = d.get("app_posted")
+    if not isinstance(posted, (int, float)) or now - posted > LOG_WINDOW_S or \
+            not force and now - float(d.get("app_log_checked") or 0) < LOG_CHECK_S:
+        return False
+    lines = _usernoted(BUNDLE_ID, posted - 5)
+    verdict = "unreadable" if lines is None else _log_verdict(lines)
+    d = dict(delivery(), app_log_checked=now, app_log=verdict)
+    if verdict == "allowed":
+        d["app_allowed"] = now
+    try:
+        write_json(DELIVERY, d)
+    except OSError as e:
+        log(f"could not record the app's log check: {e}")
+    return verdict == "allowed"
+
+
+def muted_lines(backend: str, since: float) -> list[str]:
+    """macOS: why a test notification sent since `since` was held back, from usernoted's log (read only)."""
+    bundle = SENDER_IDS.get(backend)
+    lines = [ln.lower() for ln in (_usernoted(bundle, since - 2) or [])] if sys.platform == "darwin" and bundle else []
+    if any("muted by display state" in ln for ln in lines):
+        return ["macOS muted the test notification while the screen is shared or mirrored (display state); "
+                "alerts show again once that ends"]
+    if any("focus" in ln or "do not disturb" in ln for ln in lines):
+        return ["macOS held the test notification back for a Focus mode: turn it off or allow tt-project's sender there"]
+    return []
 
 
 def _app_args(app: Path, title: str, body: str) -> list[str]:
@@ -438,6 +508,7 @@ def register_app() -> list[str]:
     app = app_ready() if sys.platform == "darwin" and app_wanted() and shutil.which("open") else None
     if not app or app_registered():
         return []
+    r_ts = time.time()
     try:
         r = subprocess.run(_app_args(app, APP_NAME, "tt-project alerts come from this app once you allow it."),
                            capture_output=True, text=True, errors="replace", timeout=TIMEOUT_S)
@@ -445,6 +516,13 @@ def register_app() -> list[str]:
         return [f"the {APP_NAME} app could not post its first notification: {e}"]
     if r.returncode != 0:
         return [f"the {APP_NAME} app could not post its first notification: exited {r.returncode}"]
+    d = delivery()
+    d.pop("app_allowed", None)
+    d.update(app_posted=r_ts, app_log_checked=0)
+    try:   # where macOS's settings say nothing, the log shows from here whether it was allowed (app_allowed)
+        write_json(DELIVERY, d)
+    except OSError as e:
+        log(f"could not record the app's first notification: {e}")
     return [f"the {APP_NAME} app posted its first notification: allow it if macOS asks"]
 
 
@@ -467,6 +545,9 @@ def style_lines(backend: str) -> list[str]:
     if style in ("banners", "none"):
         return [f"alert style: {style}; to keep alerts until closed: System Settings > Notifications > "
                 f"{APP_NAME} > Allow notifications on, alert style Persistent (older macOS: Alerts)"]
+    if style == "unknown":   # allowed per usernoted's log; the style itself is not readable here
+        return [f"alert style: macOS does not say here (the app asks for Persistent); if its alerts go away by "
+                f"themselves: System Settings > Notifications > {APP_NAME} > alert style Persistent (older macOS: Alerts)"]
     return [f"alert style: {style} (the app asks macOS for persistent alerts)"]
 
 
@@ -614,17 +695,23 @@ def test(ask=None) -> tuple[bool, list[str]]:
     built = ensure_app()[1]   # macOS: the tt-project app, built when it can be
     pre = ([built] if built else []) + register_app()
     res = show("tt-project", "Test notification: desktop alerts from tt-project reach this machine.")
-    b = res["backend"]
+    b = sb = res["backend"]   # sb: whose alert style counts from now on
+    if sys.platform == "darwin" and b != APP_NAME and app_wanted() and app_ready() and alert_style() == "unknown" \
+            and app_allowed(force=True):   # its first post may have been allowed since the test went out
+        pre.append(f"macOS shows the {APP_NAME} app allowed: alerts come from it from now on")
+        sb = APP_NAME
+    if res["ok"]:
+        pre += muted_lines(b, res["ts"])
     if not res["ok"]:
         return False, pre + [f"test notification failed ({b}): {res['error']}"] + fix_steps(res)
     if res["confirmed"]:
         return True, pre + [f"test notification delivered ({b})"]
     if ask is None:
         return True, pre + [f"test notification sent ({b}); macOS does not say whether it was shown"] + \
-            style_lines(b) + fix_steps(res)
+            style_lines(sb) + fix_steps(res)
     if ask("Did a tt-project notification appear? [y/N] "):
         record(dict(res, confirmed=True, ts=time.time()))
-        return True, pre + [f"test notification delivered ({b}), seen by you"] + style_lines(b)
+        return True, pre + [f"test notification delivered ({b}), seen by you"] + style_lines(sb)
     res = dict(res, ok=False, confirmed=False, error="sent, but you did not see it", ts=time.time())
     record(res)
     return False, pre + [f"test notification not shown ({b}): macOS took it but did not show it"] + fix_steps(res)

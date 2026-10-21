@@ -17,20 +17,23 @@ Default channels need no accounts or setup.
 - Desktop notifications play a sound and are meant to stay until closed. Linux: notify-send, critical,
   no expiry. macOS: setup, upgrade and `ttp notifier install` build a small `tt-project` app
   (`~/Applications/tt-project.app`, ad-hoc signed, Persistent style requested) without root; its first
-  notification brings macOS's one Allow prompt. Alerts go through it only once a read of macOS's
-  Notifications settings lists it with a style; until then, while those settings cannot be read
-  (current macOS may have no `com.apple.ncprefs.plist`; tt-project then reads
-  `defaults export com.apple.ncprefs -`, whose output for a missing domain is unverified, and an empty
-  answer reads as not listed), and with `"app": false`, through terminal-notifier, else osascript
-  (Script Editor). macOS lets no program set another app's alert style, so setup and
-  `ttp notifier test` print one line while the app is not listed: alerts still come from the old
-  sender; to keep them on screen, allow tt-project in System Settings > Notifications and set its
-  style to Persistent. Not yet checked live on a Mac: whether the app gets Persistent without that change.
+  notification brings macOS's one Allow prompt. Alerts go through it only once macOS shows it
+  allowed: its Notifications settings list it with a style, or, where they list no apps (current
+  macOS may have no `com.apple.ncprefs.plist`; `defaults export com.apple.ncprefs -` may give an
+  empty dict, and its output for a missing domain is unverified), usernoted's log
+  (`log show --predicate 'process == "usernoted"'`, read only, bounded) shows the app's notification
+  delivered or presented with no denial since its first post. A denial, nothing, or an unreadable log
+  keeps terminal-notifier, else osascript (Script Editor), as does `"app": false`. Whether current
+  macOS honours the app's requested Persistent style is not verified, and macOS lets no program set
+  another app's alert style, so while the app is not shown allowed setup and `ttp notifier test` print
+  one line: alerts still come from the old sender; to keep them on screen, allow tt-project in System
+  Settings > Notifications and set its style to Persistent. Clicking Allow once stays manual.
   `"persistent": false` in `~/.tt-project/notifier.json` turns persistence off. `ttp uninstall` removes the app.
 - `ttp notifier test` sends one through the same path and says whether it worked, with the fix
   if not; exit 1 = failed. macOS does not report display: in a terminal it asks if you saw it.
   On macOS it also reads (never writes) the app's alert style; only banners, off or a fallback
-  sender print the one System Settings > Notifications line to set it to Persistent.
+  sender print the one System Settings > Notifications line to set it to Persistent. It says when
+  usernoted's log shows the test muted by screen sharing (display state) or a Focus mode.
 - `ttp notifier install`, `ttp setup` and `ttp upgrade` send that test once per installed ttp version.
   `ttp setup` and `ttp upgrade` also restart an enabled notifier on the new code (never one turned
   off); `ttp status` says when it runs older code (`ttp notifier restart`).

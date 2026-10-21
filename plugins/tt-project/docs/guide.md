@@ -1097,14 +1097,17 @@ install it, to a desktop notifier on your workstation that covers all your proje
 - Desktop: alerts play a sound and are meant to stay until you close them. Linux: critical urgency with
   no expiry. macOS: `ttp setup`, `ttp upgrade` and `ttp notifier install` build a small `tt-project`
   app in `~/Applications` (no root) that asks for the Persistent style; alerts come from it once macOS
-  lists it under System Settings > Notifications (click Allow on its first notification), and until
-  then, or while macOS's notification settings cannot be read, from terminal-notifier or osascript as
-  before. macOS lets no program set another app's alert style, so setup and `ttp notifier test` print
-  one line while the app is not listed: allow the tt-project app in System Settings > Notifications
-  and set its style to Persistent. Whether the app keeps the Persistent style without that change is
-  not yet checked on a Mac. tt-project reads the settings with `defaults export com.apple.ncprefs -`
-  where the plist file is gone; what that prints for a domain that does not exist is unverified, and
-  an empty answer reads as not listed. `"app": false` in
+  shows it allowed: its Notifications settings list it with a style, or, where they list no apps
+  (current macOS may have no `com.apple.ncprefs.plist`, and `defaults export com.apple.ncprefs -`
+  may give an empty dict; what it prints for a missing domain is unverified), usernoted's log shows
+  the app's notification delivered or presented with no denial since its first post (click Allow on
+  it). Until then, or on a denial, an empty or unreadable log, alerts come from terminal-notifier or
+  osascript as before. The app's Info.plist asks for the Alerts (Persistent) style; whether current
+  macOS honours that for a new app is not verified, and macOS lets no program set another app's alert
+  style. So while the app is not shown allowed, setup and `ttp notifier test` print one line: allow
+  tt-project in System Settings > Notifications and set its style to Persistent. `ttp notifier test`
+  also says when macOS muted the test for screen sharing (display state) or a Focus mode. All of this
+  only reads macOS's settings and log. `"app": false` in
   `~/.tt-project/notifier.json` turns the app off.
 
 Workers can read Slack links you paste, using your Slack connector if you have one.

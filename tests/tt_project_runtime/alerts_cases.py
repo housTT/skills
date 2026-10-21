@@ -3952,7 +3952,8 @@ def test_macos_notification_settings_are_read_through_defaults_when_the_plist_fi
     stub.chmod(0o755)
     for flags, style, sender in ((None, "not registered", "osascript"), (8, "banners", "tt-project"),
                                  (16, "persistent", "tt-project")):
-        apps = [] if flags is None else [{"bundle-id": "com.tt-project.notifier", "flags": flags}]
+        apps = [{"bundle-id": "com.example.other", "flags": 16}] if flags is None else \
+            [{"bundle-id": "com.tt-project.notifier", "flags": flags}]
         prefs.write_bytes(plistlib.dumps({"apps": apps}))
         assert notifier.alert_style() == style and notifier.show("t", "b")["backend"] == sender, flags
     assert set((tmp_path / "defaults.calls").read_text().splitlines()) == {"export com.apple.ncprefs -"}, "read only"
@@ -3960,8 +3961,8 @@ def test_macos_notification_settings_are_read_through_defaults_when_the_plist_fi
     assert notifier.register_app()[0].startswith("the tt-project app posted its first notification")
     assert len(calls("open")) == 3 and notifier.show("t", "b")["backend"] == "osascript", \
         "readable settings that do not list the app keep the sender, even after its first post"
-    prefs.write_bytes(plistlib.dumps({}))   # an export with no apps key at all
-    assert notifier.alert_style() == "not registered" and notifier.show("t", "b")["backend"] == "osascript"
+    prefs.write_bytes(plistlib.dumps({}))   # an export with no apps key at all (current macOS): says nothing
+    assert notifier.alert_style() == "unknown" and notifier.show("t", "b")["backend"] == "osascript"
     assert notifier.register_app()[0].startswith("the tt-project app posted its first notification")
     assert len(calls("open")) == 4 and notifier.show("t", "b")["backend"] == "osascript", "never switches senders"
 
@@ -3986,4 +3987,86 @@ def test_a_failed_timed_out_or_empty_defaults_export_never_switches_senders(monk
         assert notifier.alert_style() == "unknown" and not notifier.app_registered()
         assert notifier.show("t", "b")["backend"] == "osascript", answer
         notifier.register_app()
-    assert len(calls("open")) == 2 and len(calls("osascript")) == 2 and "app_posted" not in notifier.delivery()
+    assert len(calls("open")) == 2 and len(calls("osascript")) == 2 and not notifier.delivery().get("app_allowed")
+
+
+def _usernoted_log(tmp_path, text=None, rc=0):
+    """A stub `log` that prints `text` (usernoted's lines) and logs its argv to log.calls; None: no `log`."""
+    stub = tmp_path / "bin" / "log"
+    if text is None:
+        stub.unlink(missing_ok=True)
+        return
+    stub.write_text(f"#!{sys.executable}\nimport json, sys\n"
+                    f"open({str(tmp_path / 'log.calls')!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                    f"sys.stdout.write({text!r})\nsys.exit({rc})\n")
+    stub.chmod(0o755)
+
+
+@pytest.mark.parametrize("text,rc,switches", [
+    ('usernoted: Delivering <NotificationRecord app:"com.tt-project.notifier" ident:"1">\n', 0, True),
+    ('usernoted: Presenting <NotificationRecord app:"com.tt-project.notifier" ident:"1">\n', 0, True),
+    ('usernoted: Delivering <NotificationRecord app:"com.tt-project.notifier">\n'
+     'usernoted: com.tt-project.notifier: authorization denied\n', 0, False),
+    ("", 0, False),   # nothing in the log
+    ('usernoted: Delivering <NotificationRecord app:"com.tt-project.notifier">\n', 1, False),   # log show fails
+    (None, 0, False),   # no `log` at all
+])
+def test_where_macos_settings_list_no_apps_usernoted_log_decides_the_app_is_allowed(monkeypatch, tmp_path,
+                                                                                      text, rc, switches):
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)   # no ncprefs file and no `defaults`: settings say nothing
+    _usernoted_log(tmp_path, text, rc)
+    ok, lines = notifier.test()
+    sender = "tt-project" if switches else "osascript"
+    assert ok and calls("open")[0][-2] == "tt-project alerts come from this app once you allow it.", "its first post"
+    assert f"test notification sent ({sender}); macOS does not say whether it was shown" in lines, lines
+    assert len(calls("open")) == (2 if switches else 1) and bool(calls("osascript")) != switches
+    step = [ln for ln in lines if ln.startswith("alerts still come from Script Editor")]
+    assert bool(step) != switches, "the one Allow/Persistent step only while macOS does not show it allowed"
+    assert any(ln.startswith("alert style: macOS does not say here") for ln in lines) == switches
+    assert notifier.show("t", "b")["backend"] == ("tt-project" if switches else "osascript")
+    if text is not None:
+        argv = json.loads((tmp_path / "log.calls").read_text().splitlines()[0])
+        assert argv[:2] == ["show", "--style"] and "--start" in argv and \
+            argv[-1] == 'process == "usernoted" AND eventMessage CONTAINS "com.tt-project.notifier"', "read only"
+    n = len((tmp_path / "log.calls").read_text().splitlines()) if text is not None else 0
+    notifier.show("t", "b")
+    m = len((tmp_path / "log.calls").read_text().splitlines()) if text is not None else 0
+    assert m == n, "an alert re-reads the log at most every LOG_CHECK_S, and never once it showed the app allowed"
+
+
+def test_the_app_allowance_in_the_log_is_looked_for_only_after_its_post_and_listed_apps_decide_first(
+        monkeypatch, tmp_path):
+    from ttp import notifier
+    calls = _mac_app_stubs(monkeypatch, tmp_path)
+    notifier.ensure_app()
+    _usernoted_log(tmp_path, 'usernoted: Delivering <NotificationRecord app:"com.tt-project.notifier">\n')
+    assert notifier.show("t", "b")["backend"] == "osascript" and not (tmp_path / "log.calls").exists(), \
+        "no post through the app yet: nothing to look for"
+    _ncprefs(tmp_path)   # settings list apps, not this one: they decide, the log is not read
+    notifier.register_app()
+    assert notifier.show("t", "b")["backend"] == "osascript" and not (tmp_path / "log.calls").exists()
+    (tmp_path / "userhome" / "Library" / "Preferences" / "com.apple.ncprefs.plist").unlink()
+    d = notifier.delivery()
+    notifier.write_json(notifier.DELIVERY, dict(d, app_posted=d["app_posted"] - notifier.LOG_WINDOW_S - 1))
+    assert notifier.show("t", "b")["backend"] == "osascript" and not (tmp_path / "log.calls").exists(), \
+        "a post older than LOG_WINDOW_S is not looked for"
+    assert len(calls("open")) == 1
+
+
+@pytest.mark.parametrize("line,says", [
+    ("Not presenting <NotificationRecord app:\"com.apple.ScriptEditor2\">: muted by display state",
+     "macOS muted the test notification while the screen is shared or mirrored"),
+    ("Not presenting <NotificationRecord app:\"com.apple.ScriptEditor2\">: suppressed by Focus",
+     "macOS held the test notification back for a Focus mode"),
+    ("Presenting <NotificationRecord app:\"com.apple.ScriptEditor2\">", None),
+])
+def test_ttp_notifier_test_says_when_macos_muted_the_test_for_screen_sharing_or_focus(monkeypatch, tmp_path, line, says):
+    from ttp import notifier
+    _mac_app_stubs(monkeypatch, tmp_path, tools=("osascript",))   # no app: the test goes through osascript
+    _usernoted_log(tmp_path, f"usernoted: {line}\n")
+    ok, lines = notifier.test()
+    assert ok and [ln for ln in lines if ln.startswith("macOS muted") or ln.startswith("macOS held")] == \
+        ([] if says is None else [next(ln for ln in lines if ln.startswith(says))])
+    assert json.loads((tmp_path / "log.calls").read_text().splitlines()[0])[-1].endswith(
+        'CONTAINS "com.apple.ScriptEditor2"'), "only the test sender's lines"
