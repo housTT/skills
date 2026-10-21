@@ -5490,6 +5490,33 @@ def cmd_setup(a) -> None:
         print("  " + ln)
 
 
+def cmd_uninstall(a) -> None:
+    """Remove ttp's services, crontab lines, shortcut, shim and lib for this user (uninstall.py); keep projects."""
+    if os.environ.get("TTP_RUN_DIR"):
+        die("ttp uninstall: refused inside a run; the user runs it", 2)
+    from . import uninstall
+    bin_dir = Path(a.bin_dir).expanduser()
+    acts = uninstall.plan(bin_dir)
+    print(("would " if a.dry_run else "") + ("remove:" if acts else "remove nothing: no ttp service, shortcut, shim or lib here"))
+    for what, _ in acts:
+        print(f"  {what}")
+    if acts and not a.dry_run:
+        if not a.yes:
+            try:
+                ok = input("go ahead? [y/N] ").strip().lower() in ("y", "yes")
+            except EOFError:
+                ok = False
+            if not ok:
+                die("ttp uninstall: nothing changed (add --yes to skip the question)", 1)
+        left = [f"{what.splitlines()[0]}: {err}" for what, step in acts if (err := step())]
+        for ln in left:
+            print(f"  not done: {ln}", file=sys.stderr)
+        print("done" + (f", {len(left)} step(s) not done" if left else ""))
+    print("left in place (remove by hand if you want them gone):")
+    for ln in uninstall.leftovers(bin_dir):
+        print(f"  {ln}")
+
+
 def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
@@ -6603,7 +6630,7 @@ COMMAND_GROUPS = (
                                          "deployed", "goal")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "spend-today")),
+               "push-audit", "ttr", "spend-today", "uninstall")),
 )
 
 
@@ -7420,6 +7447,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--no-shortcut", action="store_true",
                    help="remove (and do not install) the plain /tt-project command for Claude Code")
     s.set_defaults(fn=cmd_setup)
+
+    s = sub.add_parser("uninstall", help="remove ttp for this user on this machine: stops and removes its services, "
+                                         "its own crontab lines, the /tt-project shortcut, the ttp command and the "
+                                         "installed lib; keeps project folders and linger, and prints what it left")
+    s.add_argument("--bin-dir", default="~/.local/bin", help="where setup put the ttp command (default ~/.local/bin)")
+    s.add_argument("--dry-run", action="store_true", help="list every step and change nothing")
+    s.add_argument("--yes", action="store_true", help="do not ask before removing")
+    s.set_defaults(fn=cmd_uninstall)
 
     s = sub.add_parser("upgrade", help="merge the installed tt-project template into a project's harness")
     s.add_argument("name", help="the project")

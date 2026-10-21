@@ -177,13 +177,13 @@ def test_install_doc_pins_the_release_ref_with_each_hosts_ref_syntax():
     assert f'fetch -q --depth 1 https://github.com/tenstorrent/skills.git "{tag}"' in section
     for cmd in (f"claude plugin install {plugin}@{market}", f"codex plugin add {plugin}@{market}",
                 f"claude plugin marketplace remove {market}", f"codex plugin marketplace remove {market}",
-                "bin/ttp\" setup", "ttp stop <name> --kill"):
+                "bin/ttp\" setup", "ttp uninstall"):
         assert cmd in section, cmd
     # `claude plugin details` lists the skills the plugin ships, sorted.
     skills = sorted(p.parent.name for p in SKILLS.glob("*/SKILL.md"))
     assert f"# Skills ({len(skills)}): {', '.join(skills)}\n" in section
-    # Uninstall removes every per-user path ttp writes, its cache included.
-    assert '"${XDG_CACHE_HOME:-$HOME/.cache}/ttp"' in section
+    # The uninstall section names the command; what it leaves, the cache included, it prints itself
+    # (test_uninstall_removes_only_ttps_own_entries_and_a_second_run_is_harmless).
 
 
 def _is_stdlib(name):

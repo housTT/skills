@@ -113,17 +113,16 @@ Running projects take in the new release within an hour and keep their work.
 
 ## Uninstall
 
-Stop every project (`ttp list` names them), then remove the shortcut, the plugin and the per-user
-files (project registry, saved keys, ttp's cache and the installed `ttp`):
+`ttp uninstall` (`--dry-run` first to see each step) stops and removes ttp's services, crontab lines,
+shortcut, command and lib. It keeps project folders and linger, and prints the commands that remove the rest.
+
+Then remove the plugin and the per-user files it does not touch:
 
 ```bash
-ttp stop <name> --kill          # each project: ends its daemon and workers, removes its service
-ttp setup --no-shortcut
 claude plugin marketplace remove tenstorrent-skills
 codex plugin remove tt-project@tenstorrent-skills && codex plugin marketplace remove tenstorrent-skills
 rm -rf ~/.cursor/plugins/local/tt-project
-rm -rf ~/.tt-project ~/.local/bin/ttp "${XDG_CACHE_HOME:-$HOME/.cache}/ttp"
-rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/tt-project"    # the install line's clone
+rm -rf ~/.tt-project "${XDG_DATA_HOME:-$HOME/.local/share}/tt-project"    # registry, saved keys, the install line's clone
 ```
 
 Each project keeps its files in `<project root>/tt-project/`; delete that folder too to drop its
