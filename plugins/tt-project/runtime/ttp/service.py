@@ -221,6 +221,12 @@ def _install_systemd(p: Project) -> str:
     _run("systemctl", "--user", "daemon-reload")
     r = _run("systemctl", "--user", "enable", "--now", f"{unit_name(p)}.service")
     if r.returncode != 0:
+        # Remove the unit that never ran: installed(), refresh() and restart_service() go by its file,
+        # and would treat the crontab watchdog that takes over as a systemd service.
+        _run("systemctl", "--user", "disable", f"{unit_name(p)}.service")
+        for path in (_unit(p), *_watchdog_units(p)):
+            path.unlink(missing_ok=True)
+        _run("systemctl", "--user", "daemon-reload")
         return SYSTEMD_FAILED + " (" + r.stderr.strip()[:200] + "); " + _install_cron(p)
     w = _run("systemctl", "--user", "enable", "--now", _watchdog_unit(p, "timer").name)
     return f"systemd user unit {unit_name(p)}" + (" with a watchdog timer" if w.returncode == 0 else

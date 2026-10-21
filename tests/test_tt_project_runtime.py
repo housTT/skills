@@ -8878,6 +8878,49 @@ def test_a_cron_fallback_is_named_by_new_doctor_and_setup(env, monkeypatch, caps
     assert msg == "crontab install failed: no crontab for you" and not service.recorded(p)["fallback"]
 
 
+def test_a_failed_systemd_enable_leaves_no_unit_so_the_cron_fallback_is_the_service(env, monkeypatch, tmp_path):
+    """systemctl --user enable --now fails: install() falls back to cron and removes the unit it wrote, so
+    installed(), down_note() and restart_service() see the crontab watchdog, not a systemd unit that never
+    ran. Stubbed systemctl and crontab in a temp HOME."""
+    from ttp import service
+    p = make(env)
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(service.shutil, "which", lambda name: f"/usr/bin/{name}" if name in ("systemctl", "crontab") else None)
+    tab = {"text": ""}
+    calls, spawned = [], []
+
+    def run(*argv):
+        calls.append(argv)
+        if argv[:2] == ("crontab", "-l"):
+            return subprocess.CompletedProcess(argv, 0, tab["text"], "")
+        if argv[:4] == ("systemctl", "--user", "enable", "--now"):
+            return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    real_run = subprocess.run
+
+    def sub_run(argv, *a, input=None, **k):
+        if argv[0] == "crontab":
+            tab["text"] = input
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return real_run(argv, *a, input=input, **k)
+    monkeypatch.setattr(service, "_run", run)
+    monkeypatch.setattr(service.subprocess, "run", sub_run)
+    monkeypatch.setattr(service, "_spawn", lambda p: spawned.append(p.base))
+    service._WATCHDOG_SEEN.clear()
+    assert "because systemd --user could not start the unit" in service.install(p)
+    assert service.recorded(p)["fallback"]
+    assert not service._unit(p).exists()
+    assert not any(service._watchdog_unit(p, ext).exists() for ext in ("service", "timer"))
+    assert ("systemctl", "--user", "disable", f"{service.unit_name(p)}.service") in calls
+    assert service.installed(p) == {"kind": "cron", "watchdog": True}
+    assert service.down_note(p).startswith("its cron service restarts it by itself")
+    calls.clear(), spawned.clear()
+    assert service.restart_service(p) == "restarted"
+    assert spawned == [p.base] and not any(c[:3] == ("systemctl", "--user", "restart") for c in calls)
+    assert service.uninstall(p) == "cron"
+
+
 def test_setup_from_a_harness_copy_refuses(env, tmp_path):
     p = make(env)
     r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
