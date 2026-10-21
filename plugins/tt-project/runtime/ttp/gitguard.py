@@ -123,7 +123,8 @@ def command(real: str, args: list[str], env: dict) -> tuple[list[str], dict]:
     rest = [a for a in rest if a not in ("--no-verify", "--verify")]
     env = {**env, "TTP_PUSH_GUARD_REF": f"refs/heads/{branch}", "TTP_PUSH_GUARD_WHY": why,
            "TTP_PUSH_GUARD_HOOKS": hooks}
-    return [real, "-c", f"core.hooksPath={guard}", *globals_, "push", "--verify", *rest], env
+    # after the caller's own options: the last core.hooksPath wins, so theirs never replaces the guard
+    return [real, *globals_, "-c", f"core.hooksPath={guard}", "push", "--verify", *rest], env
 
 
 def main(argv: list[str]) -> int:

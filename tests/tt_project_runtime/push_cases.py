@@ -9563,3 +9563,43 @@ def test_a_code_tasks_run_never_pushes_to_the_push_branch_while_code_tasks_may_p
     out = git_push("origin", "HEAD:proj")
     assert out.returncode == 0, out.stderr
     assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_the_run_git_wrapper_skips_other_wrappers_on_path_and_keeps_its_hook(env, monkeypatch):
+    # Two harnesses' bin/ on one PATH (a scratch project's daemon started from a run, as
+    # `ttp doctor --loop` does) made each wrapper exec the other forever: every git call hung.
+    # A caller's own `-c core.hooksPath=<dir>` also replaced the guard's hook.
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    tid = p.db.add_task("notes", kind="code", spec="Add a line to NOTES.md and commit it.")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{tid}-notes")
+    _commit(repo, "NOTES.md", "loop check\n")
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    bins = []
+    for name in ("h1", "h2"):
+        (env["tmp"] / name / "bin").mkdir(parents=True)
+        (env["tmp"] / name / "runtime").symlink_to(RUNTIME)
+        shutil.copy2(RUNTIME.parent / "template" / "bin" / "git", env["tmp"] / name / "bin" / "git")
+        bins.append(str(env["tmp"] / name / "bin"))
+    run_env = {**os.environ, "TTP_PYTHON": sys.executable, "PATH": os.pathsep.join([*bins, os.environ["PATH"]])}
+    own_hooks = env["tmp"] / "own-hooks"
+    own_hooks.mkdir()
+    (own_hooks / "pre-push").write_text(f"#!/bin/sh\ncat >/dev/null\necho ran >> {env['tmp'] / 'own-hook'}\n")
+    (own_hooks / "pre-push").chmod(0o755)
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=repo, env=run_env, capture_output=True, text=True, timeout=20)
+
+    out = git("--version")
+    assert out.returncode == 0 and out.stdout.startswith("git version"), out.stderr
+    for args in (["push", "origin", "HEAD:proj"], ["-c", f"core.hooksPath={own_hooks}", "push", "origin", "HEAD:proj"],
+                 ["-c", f"core.hooksPath={own_hooks}", "push", "--no-verify", "origin", "HEAD:proj"]):
+        out = git(*args)
+        assert out.returncode != 0 and "delivery.code_tasks_may_push is off" in out.stderr, (args, out.stderr)
+    assert _git_out(origin, "rev-parse", "proj") == shared
+    out = git("-c", f"core.hooksPath={own_hooks}", "push", "origin", f"ttp/t{tid}-notes")
+    assert out.returncode == 0, out.stderr
+    assert (env["tmp"] / "own-hook").read_text() == "ran\n"   # the caller's own hook still ran
