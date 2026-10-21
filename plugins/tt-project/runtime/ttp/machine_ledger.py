@@ -64,6 +64,16 @@ POWER_CYCLE_LEAD_S before T, which the drain moves to the cycle once it records 
 Both files live next to machines.json, written whole under one lock, so co-tenant daemons and CLIs never
 lose each other's writes. Other projects' state is only read (their database, read-only), never written.
 
+Queued requests. A worker whose sandbox keeps the user's tt-project home read-only (it may write only its
+project's state, as a fenced Codex worker) cannot take the lock. Its `ttp machines change add` or `close`
+then writes the checked request to REQUESTS under the project's state instead, named by a hash of its
+content (request_id), and the project's own daemon records it on its next routing tick (apply_requests),
+model-free. A retry of the same command finds the request already queued, or its open entry (which keeps
+the request's id as `request`), and adds nothing; a daemon killed between the ledger write and the request's
+removal finds that entry and only removes the request. A request the ledger refuses by then (its machine
+gone) is kept as `<id>.failed.json` with the reason, and logged. `ttp machines change edit` is not queued:
+close the entry and add a new one.
+
 A page is never lost nor sent twice: `route` records each due page as pending, with a text fixed for its
 step, and hands it to one daemon at a time (a claim that lapses after CLAIM_S); that daemon marks it
 `delivered` only once it went out, or `release`s it for the next tick. A crash in between leaves it
@@ -72,6 +82,7 @@ pending, and the resend is idempotent (same inbox text, same event fingerprint, 
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -88,6 +99,8 @@ from .db import TERMINAL_TASK_STATES
 LEDGER = "machine-changes.json"
 ROUTES = "machine-routes.json"
 LOCK = "machine-ledger.lock"
+REQUESTS = "machine-requests"   # under a project's state: ledger writes a sandboxed worker queued (apply_requests)
+UNWRITABLE = (errno.EROFS, errno.EACCES, errno.EPERM)   # the shared ledger is fenced off, not broken
 CLAIM_S = 120               # a pending page one daemon took and did not mark delivered is retried after this
 UNAVAILABLE_S = 1800         # a target that cannot act this long is passed over
 REPAGE_S = 86400             # an item still open this long after its page is paged again, one step on
@@ -152,8 +165,10 @@ def _one_line(text: Any, chars: int = TEXT_CHARS) -> str:
 
 def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, until_probe: str | None = None,
                task: int | None = None, now: float | None = None, expects=None, extra: dict | None = None,
-               until_task: int | None = None) -> dict:
-    """Record a live change to machine `alias` made by project `by`; returns the entry. `expects`: the
+               until_task: int | None = None, queue: Path | None = None) -> dict:
+    """Record a live change to machine `alias` made by project `by`; returns the entry. `queue`: the project's
+    state dir, where the change is queued for its daemon when the shared ledger is read-only here (returns
+    the request then, with `queued`: its id; see Queued requests). `expects`: the
     event fingerprints or machine conditions (down, held) the change is known to cause, which then
     keep the coordinator's turn routine (coordinator._known_case). `extra`: more fields (a kind).
     `until_task`: a task of project `by` whose end (done, failed, cancelled, gone) makes it overdue
@@ -172,23 +187,39 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         ends.check_sh(probe, "--until-probe")
     end = float(expires) if isinstance(expires, (int, float)) else \
         ends.parse_expires(expires, now) if expires else now + PROBE_END_S   # a number: an epoch time
+    fields = {"alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now, "expires": end,
+              "probe": probe or None, **({"until_task": int(until_task)} if until_task else {}), **(extra or {})}
+    if expects:
+        fields["expects"] = [_one_line(x, 200) for x in expects if _one_line(x, 200)]
+    try:
+        return _store_change(fields)
+    except OSError as e:
+        if queue is None or e.errno not in UNWRITABLE:
+            raise
+        return _queue(queue, "add", fields)
+
+
+def _store_change(fields: dict, request: str | None = None) -> dict:
+    """Append entry `fields` under the next id; with `request`, only once: an open entry already made from
+    that request is returned instead."""
     with _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
+        if request:
+            done = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("request") == request
+                         and not c.get("closed")), None)
+            if done:
+                return done
         n = int(doc.get("next") or 1)
-        entry = {"id": n, "alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now,
-                 "expires": end, "probe": probe or None, **({"until_task": int(until_task)} if until_task else {}),
-                 **(extra or {})}
-        if expects:
-            entry["expects"] = [_one_line(x, 200) for x in expects if _one_line(x, 200)]
+        entry = {"id": n, **fields, **({"request": request} if request else {})}
         doc["next"] = n + 1
         doc["changes"] = [c for c in doc.get("changes", []) if not c.get("closed")
-                          or now - float(c["closed"]) < CLOSED_KEPT_S] + [entry]
+                          or float(fields["added"]) - float(c["closed"]) < CLOSED_KEPT_S] + [entry]
         _write(LEDGER, doc)
     return entry
 
 
 def add_power_cycle(alias: str, at: Any, by: str, why: str = "", task: int | None = None,
-                    now: float | None = None, extra: dict | None = None) -> dict:
+                    now: float | None = None, extra: dict | None = None, queue: Path | None = None) -> dict:
     """Record a planned power cycle of `alias` at `at` (a delay or a time, as --expires takes).
     `extra`: more fields (`ttp drain --reboot` adds the boot it was made on and its reason)."""
     now = time.time() if now is None else now
@@ -196,7 +227,7 @@ def add_power_cycle(alias: str, at: Any, by: str, why: str = "", task: int | Non
     what = f"power-cycle intent, at {ends.shown(when)}" + (f": {_one_line(why)}" if _one_line(why) else "")
     return add_change(alias, what, "none: a planned power cycle; the entry closes itself after it", by,
                       expires=when + POWER_CYCLE_AFTER_S, task=task, now=now, expects=["down"],
-                      extra={**(extra or {}), "kind": POWER_CYCLE, "at": when})
+                      extra={**(extra or {}), "kind": POWER_CYCLE, "at": when}, queue=queue)
 
 
 def cycle_window(c: dict) -> tuple[float, float]:
@@ -272,6 +303,89 @@ def restore_power_cycle(cid: int, was: dict, by: str, mark: str, now: float | No
         return c
 
 
+# queued requests (see Queued requests) ------------------------------------------------------------
+
+# fields a retry of the same command may change (it runs later): left out of its request id
+UNHASHED = ("added", "at", "expires")
+
+
+def request_id(op: str, fields: dict) -> str:
+    """The id of request `op` with `fields`: the same command run again gets the same one."""
+    key = {k: v for k, v in fields.items() if k not in UNHASHED}
+    return hashlib.sha256(json.dumps([op, key], sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _queue(state: Path, op: str, fields: dict) -> dict:
+    """Queue `op` for the project daemon in `state` (once per request id); returns the request."""
+    rid = request_id(op, fields)
+    req = {"queued": rid, "op": op, "fields": fields}
+    if op == "add":
+        made = next((c for c in changes() if c.get("request") == rid), None)
+        if made:
+            return made   # recorded already: a retry adds nothing
+    path = Path(state) / REQUESTS / f"{rid}.json"
+    try:
+        return {**json.loads(path.read_text()), "queued": rid}   # queued already
+    except (OSError, ValueError):
+        pass
+    try:
+        project.write_json(path, req, 0o600)
+    except OSError as e:
+        raise ValueError(f"the shared machine ledger is read-only here ({_path(LEDGER).parent}) and the request "
+                         f"could not be queued in {path.parent} ({e.strerror}): run the command where the "
+                         f"ledger is writable, or ask the coordinator to") from None
+    return req
+
+
+def pending(state: Path) -> list[dict]:
+    """The requests queued in project state dir `state`, oldest first."""
+    def age(f: Path) -> float:
+        try:
+            return f.stat().st_mtime
+        except OSError:
+            return 0.0
+    out = []
+    for f in sorted(Path(state, REQUESTS).glob("*.json"), key=age):
+        if f.name.endswith(".failed.json"):
+            continue
+        try:
+            req = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(req, dict) and isinstance(req.get("fields"), dict):
+            out.append({**req, "queued": f.stem})
+    return out
+
+
+def apply_requests(state: Path, log: Callable[[str], None] = print) -> list[dict]:
+    """Record the requests queued in project state dir `state` (oldest first) in the ledger, each once, and
+    remove it; one the ledger refuses is kept as `<id>.failed.json` with the reason. Returns the entries."""
+    done = []
+    for req in pending(state):
+        rid, f, path = req["queued"], req["fields"], Path(state, REQUESTS, req["queued"] + ".json")
+        try:
+            if req.get("op") == "add":
+                if f.get("alias") not in machines.load():
+                    raise ValueError(f"no machine {f.get('alias')!r} in `ttp machines list`")
+                c = _store_change(f, request=rid)
+                log(f"machine change #{c['id']} on {c['alias']} recorded from queued request {rid}")
+            elif req.get("op") == "close":
+                try:
+                    c = _close(int(f["id"]), f.get("why") or "", f.get("by") or "", float(f.get("at") or time.time()))
+                    log(f"machine change #{c['id']} closed from queued request {rid}")
+                except ValueError:
+                    c = {"id": f.get("id")}   # closed already: by an earlier run of this request, or by someone else
+            else:
+                raise ValueError(f"unknown request {req.get('op')!r}")
+        except (ValueError, TypeError, KeyError) as e:
+            log(f"queued machine-ledger request {rid} refused: {e}")
+            project.write_json(path.with_name(f"{rid}.failed.json"), {**req, "error": str(e)}, 0o600)
+        else:
+            done.append(c)
+        path.unlink(missing_ok=True)
+    return done
+
+
 END_HINT = "give an end: --expires <delay or time>, --until-probe <command> or --until-task <id>"
 
 
@@ -301,8 +415,21 @@ def changes(aliases=None, open_only: bool = True) -> list[dict]:
             and (aliases is None or c.get("alias") in aliases)]
 
 
-def close_change(cid: int, why: str = "", by: str = "", now: float | None = None) -> dict:
+def close_change(cid: int, why: str = "", by: str = "", now: float | None = None,
+                 queue: Path | None = None) -> dict:
+    """Close open entry #cid. `queue`: as add_change's (the request is returned, with `queued`)."""
     now = time.time() if now is None else now
+    try:
+        return _close(cid, why, by, now)
+    except OSError as e:
+        if queue is None or e.errno not in UNWRITABLE:
+            raise
+        if not any(c.get("id") == cid for c in changes()):
+            raise ValueError(f"no open machine change #{cid}") from None
+        return _queue(queue, "close", {"id": cid, "why": why, "by": by, "at": now})
+
+
+def _close(cid: int, why: str, by: str, now: float) -> dict:
     with _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
         for c in doc.get("changes", []):
@@ -1102,6 +1229,11 @@ class Probes:
 
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
+        try:
+            if getattr(self.p, "state", None):
+                apply_requests(self.p.state, self.log)
+        except OSError as e:   # kept queued for the next tick
+            self.log(f"queued machine-ledger requests not applied yet: {e}")
         passed = []
         for cid, (rc, probe, err) in ends.reap_probes(self._procs, self._errs, now, self.p).items():
             if rc in ends.NOT_YET_RCS:   # 255 only once ssh cannot reach the host it names

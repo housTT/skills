@@ -13604,3 +13604,87 @@ def test_worker_memory_keeps_charter_policies_drops_restated_restrictions_and_ma
     coord.memory_budget_check(p)
     alerts = p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
     assert len(alerts) == 1 and f"{n} of them" in alerts[0]["text"]
+
+
+def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_shared_ledger_is_read_only(
+        env, monkeypatch, capsys):
+    """A worker whose sandbox keeps the user's tt-project home read-only (no ledger lock) queues `ttp machines
+    change add|close` in its project's state; the project daemon records each once, with its undo and end,
+    at its next tick. A retry, or a daemon killed between the write and the request's removal, adds nothing;
+    a request the ledger refuses later is kept with its reason; an edit says what to do instead."""
+    import contextlib
+    import errno
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    task = p.db.add_task("stage a tree", "s", kind="work", tier="light", origin="user")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_TASK", str(task))
+    monkeypatch.chdir(p.root)
+    real = ml._locked
+
+    @contextlib.contextmanager
+    def read_only():
+        raise OSError(errno.EROFS, "Read-only file system", str(ml._path(ml.LOCK)))
+        yield
+
+    monkeypatch.setattr(ml, "_locked", read_only)
+    now = time.time()
+    add = ["machines", "change", "add", "box-a", "staged tree", "--undo", "rm -r tree"]
+    for _ in range(2):   # a retry queues nothing more
+        cli.main(add + ["--expires", "2h"])
+        out = capsys.readouterr().out
+        assert out.startswith("queued machine change on box-a: staged tree") and "read-only here" in out
+    cli.main(["machines", "change", "add", "box-a", "drop-in", "--undo", "rm drop-in", "--until-probe", "true"])
+    capsys.readouterr()
+    assert ml.changes() == [] and len(ml.pending(p.state)) == 2
+    cli.main(["machines", "change", "list"])
+    out = capsys.readouterr().out
+    assert "queued for this project's daemon" in out and "add box-a: staged tree" in out and "add box-a: drop-in" in out
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "change", "close", "7"])
+    assert "no open machine change #7" in capsys.readouterr().err
+    # Another error is no read-only ledger: it is raised, not queued.
+    monkeypatch.setattr(ml, "_locked", lambda: (_ for _ in ()).throw(OSError(errno.ENOSPC, "No space left")))
+    with pytest.raises(OSError):
+        ml.add_change("box-a", "other", "undo", p.name, expires="1h", queue=p.state)
+    monkeypatch.setattr(ml, "_locked", real)
+    # The daemon's tick records both, with their undo, end, task and author.
+    ml.Probes(p, log=lambda m: None).tick(now + 5)
+    assert ml.pending(p.state) == []
+    staged, drop = ml.changes()
+    assert (staged["what"], staged["undo"], staged["by"], staged["task"]) == ("staged tree", "rm -r tree", p.name, task)
+    assert staged["expires"] == pytest.approx(now + 7200, abs=60) and staged["request"]
+    assert drop["probe"] == "true" and drop["undo"] == "rm drop-in"
+    # A retry once recorded, or a request left behind by a daemon killed after the write, adds nothing.
+    monkeypatch.setattr(ml, "_locked", read_only)
+    cli.main(add + ["--expires", "2h"])
+    assert capsys.readouterr().out.startswith(f"recorded #{staged['id']} box-a")
+    ml.project.write_json(p.state / ml.REQUESTS / f"{staged['request']}.json",
+                          {"op": "add", "fields": {k: v for k, v in staged.items() if k not in ("id", "request")}})
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "change", "edit", str(staged["id"]), "--what", "x"])
+    assert f"`ttp machines change close {staged['id']}`" in capsys.readouterr().err
+    cli.main(["machines", "change", "close", str(drop["id"]), "--why", "undone"])
+    assert capsys.readouterr().out.startswith(f"queued close of machine change #{drop['id']}")
+    [req] = [r for r in ml.pending(p.state) if r["op"] == "close"]
+    monkeypatch.setattr(ml, "_locked", real)
+    ml.apply_requests(p.state, log=lambda m: None)
+    assert [c["id"] for c in ml.changes()] == [staged["id"]] and ml.pending(p.state) == []
+    closed = next(c for c in ml.changes(open_only=False) if c["id"] == drop["id"])
+    assert (closed["closed_why"], closed["closed_by"]) == ("undone", p.name)
+    # A close replayed after it went through is done, not refused.
+    ml.project.write_json(p.state / ml.REQUESTS / f"{req['queued']}.json", {k: v for k, v in req.items() if k != "queued"})
+    ml.apply_requests(p.state, log=lambda m: None)
+    assert ml.pending(p.state) == [] and not list((p.state / ml.REQUESTS).glob("*.failed.json"))
+    # A request the ledger refuses by then is kept with its reason, never dropped.
+    monkeypatch.setattr(ml, "_locked", read_only)
+    ml.add_change("box-a", "gone soon", "undo", p.name, expires="1h", queue=p.state)
+    monkeypatch.setattr(ml, "_locked", real)
+    mm.remove("box-a")
+    logged = []
+    assert ml.apply_requests(p.state, log=logged.append) == []
+    [failed] = (p.state / ml.REQUESTS).glob("*.failed.json")
+    assert "no machine 'box-a'" in json.loads(failed.read_text())["error"] and "refused" in logged[0]

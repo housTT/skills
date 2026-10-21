@@ -5030,15 +5030,21 @@ def _machine_change(a) -> None:
         for c in got:
             print(ml.change_line(c) + (f" (closed {ml.ends.shown(c['closed'])}: {c.get('closed_why')})"
                                        if c.get("closed") else ""))
+        p = here()
+        for r in ml.pending(p.state) if p else []:
+            print(f"queued for this project's daemon (request {r['queued']}): {r['op']} "
+                  + (f"#{r['fields'].get('id')}" if r["op"] == "close" else
+                     f"{r['fields'].get('alias')}: {r['fields'].get('what')}"))
         return
     p = here()
     by = a.by or (p.name if p else "")
+    queue = p.state if p else None   # a sandbox that keeps the shared ledger read-only: queued for the daemon
     if a.change == "close":
         try:
-            c = ml.close_change(a.id, a.why or "", by or "user")
+            c = ml.close_change(a.id, a.why or "", by or "user", queue=queue)
         except ValueError as e:
             die(str(e))
-        print(f"closed machine change #{c['id']} on {c['alias']}")
+        print(_queued_line(c) if c.get("queued") else f"closed machine change #{c['id']} on {c['alias']}")
         return
     if a.change == "edit":
         try:
@@ -5048,6 +5054,12 @@ def _machine_change(a) -> None:
             c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task)
         except ValueError as e:
             die(str(e))
+        except OSError as e:
+            if e.errno not in ml.UNWRITABLE:
+                raise
+            die(f"the shared machine ledger is read-only here ({e.strerror}), and an edit is not queued: "
+                f"`ttp machines change close {a.id}` and `ttp machines change add` a new entry (both are queued "
+                f"for this project's daemon)")
         print(f"edited {ml.change_line(c)}")
         return
     if not by:
@@ -5063,12 +5075,21 @@ def _machine_change(a) -> None:
     try:
         if a.until_task:
             _until_task_ok(p, by, a.until_task)
-        c = ml.add_power_cycle(a.alias, a.power_cycle_at, by, a.what, tid) if a.power_cycle_at else \
+        c = ml.add_power_cycle(a.alias, a.power_cycle_at, by, a.what, tid, queue=queue) if a.power_cycle_at else \
             ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect,
-                          until_task=a.until_task)
+                          until_task=a.until_task, queue=queue)
     except ValueError as e:
         die(str(e))
-    print(f"recorded {ml.change_line(c)}")
+    print(_queued_line(c) if c.get("queued") else f"recorded {ml.change_line(c)}")
+
+
+def _queued_line(req: dict) -> str:
+    """What `ttp machines change add|close` says when it queued the request (machine_ledger: Queued requests)."""
+    what = f"close of machine change #{req['fields']['id']}" if req["op"] == "close" else \
+        f"machine change on {req['fields']['alias']}: {req['fields']['what']}"
+    return (f"queued {what} (request {req['queued']}): the shared machine ledger is read-only here, so this "
+            f"project's daemon records it on its next tick, within a few minutes while it runs; "
+            f"`ttp machines change list` shows it. Running the command again adds nothing.")
 
 
 def _until_task_ok(p: Project | None, by: str, tid: int) -> None:
