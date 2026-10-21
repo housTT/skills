@@ -35,6 +35,7 @@ SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
 SETUP_TIMEOUT_S = 900
 CLEANUP_TIMEOUT_S = 120
 PROBE_TIMEOUT_S = 45
+STOP_GRACE_S = 5   # a stopped command's TERM before KILL on the host
 SIG = "env:check-host:"
 _TMP = re.compile(r"/[A-Za-z0-9._/-]*/ttp-check\.[A-Za-z0-9]+")
 # Runs the module from this runtime whatever the check's PYTHONPATH: argv[1] is the runtime folder.
@@ -109,6 +110,26 @@ def exports(env: dict) -> str:
     return "".join(f'export {k}="' + re.sub(r'([\\"`])', r"\\\1", v) + '"\n' for k, v in sorted(env.items()))
 
 
+def _run_script(q: str, exports_: str, cmd: str, mark: str) -> str:
+    """The host's side of a check run in directory `q`: the command in a process group of its own
+    (setsid, else perl's setpgrp), with stdin from /dev/null, and a watcher that stops that group (TERM,
+    then KILL after STOP_GRACE_S) once ssh's stdin ends: without a tty, ssh signals nothing when the
+    local side stops or dies, and the command would run on. Then the exit-code marker, and the
+    directory is removed."""
+    run = f"bash -e -o pipefail -c {shlex.quote(cmd)}"
+    return (f"cd {q} || exit 97\ntrap 'cd / && rm -rf {q}' EXIT\n{exports_}"
+            f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- sh -e -c {shlex.quote(cmd)}; fi\n"
+            "if command -v setsid >/dev/null 2>&1; then setsid \"$@\" </dev/null &\n"
+            "elif command -v perl >/dev/null 2>&1; then perl -e 'setpgrp(0,0); exec @ARGV or exit 127' \"$@\" </dev/null &\n"
+            "else \"$@\" </dev/null &\nfi\n"
+            "pid=$!\n"
+            "(cat >/dev/null; kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null; "
+            f"sleep {STOP_GRACE_S}; kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null) >/dev/null 2>&1 &\n"
+            "watch=$!\n"
+            "wait $pid\nrc=$?\nkill $watch 2>/dev/null\ntrap '' PIPE\n"
+            f"printf '\\n%s%s\\n' {mark} \"$rc\"\nexit $rc\n")
+
+
 class _Stop(Exception):
     pass
 
@@ -162,17 +183,18 @@ def main(args: list[str]) -> int:
         finally:
             archive.stdout.close()
             archive.wait()
+        # ssh or the host failing mid-copy kills git archive with SIGPIPE: that is the host, not the
+        # change. Only git archive failing on its own while the copy went through is the checkout's.
+        if copied.returncode != 0 or archive.returncode == -signal.SIGPIPE:
+            return _fault(host, f"cannot unpack the tree into a git checkout there (exit {copied.returncode}: "
+                                f"{(copied.stderr.strip().splitlines() or [''])[-1][:200]})")
         if archive.returncode != 0:
             _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
             return 2
-        if copied.returncode != 0:
-            return _fault(host, f"cannot unpack the tree into a git checkout there (exit {copied.returncode}: "
-                                f"{(copied.stderr.strip().splitlines() or [''])[-1][:200]})")
         mark = f"ttp-remote-rc:{secrets.token_hex(8)}:"
-        script = (f"cd {q} || exit 97\ntrap 'cd / && rm -rf {q}' EXIT\n{exports(env)}"
-                  f"if command -v bash >/dev/null 2>&1; then bash -e -o pipefail -c {shlex.quote(cmd)}; "
-                  f"else sh -e -c {shlex.quote(cmd)}; fi\nrc=$?\nprintf '\\n%s%s\\n' {mark} \"$rc\"\nexit $rc\n")
-        proc = subprocess.Popen(_ssh(host, script), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        script = _run_script(q, exports(env), cmd, mark)
+        # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
+        proc = subprocess.Popen(_ssh(host, script), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
         rc, held = None, b""
         out = sys.stdout.buffer
@@ -198,10 +220,16 @@ def main(args: list[str]) -> int:
     except _Stop:
         return 143
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(s, signal.SIG_IGN)
         if proc is not None and proc.poll() is None:
-            proc.kill()
-            proc.wait()
+            try:   # closes stdin: the host stops the command's group, removes its directory and exits
+                proc.communicate(timeout=STOP_GRACE_S + 15)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                proc.kill()
+                proc.wait()
+        if proc is not None and proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
         if tmp:
             try:
                 subprocess.run(_ssh(host, f"rm -rf {shlex.quote(tmp)}"), stdin=subprocess.DEVNULL,
