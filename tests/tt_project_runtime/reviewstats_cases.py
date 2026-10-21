@@ -186,3 +186,59 @@ def test_the_daemon_and_task_add_refuse_reuse_when_a_covered_head_differs(env, m
     assert coord._rebased_away(p, [new_tid], f"Review {old}.", old)
     same_tid, _, _ = _rebased(p, branch, "same")
     assert coord._rebased_away(p, [same_tid], f"Review {old}.", old) == ""
+
+
+def _quoting_review(p, spec, depends_on=()):
+    return p.db.add_task("Review it", spec, kind="review", tier="light", origin="daemon", provider="claude",
+                         budget_usd=8.0, depends_on=list(depends_on))
+
+
+def test_a_review_diff_has_only_its_branch_files_not_a_commit_its_spec_quotes(env):
+    from ttp import reviewcap, worktree
+    p = make(env)
+    tid, path, branch = _code_task(p, "the change")
+    head = _commit_files(path, {"daemon.py": "a\nb\n"}, "change")
+    _, other, _ = _code_task(p, "an unrelated one")
+    quoted = _commit_files(other, {"notifier.py": "x\ny\nz\n"}, "notifier")
+    spec = (f"Independently review the change of code task #{tid}: branch {branch}, head {head[:12]}.\n"
+            f"Its spec: Incident: the steps for notifier head {quoted[:8]} never arrived.")
+    for deps in ((), (tid,)):
+        review = p.db.task(_quoting_review(p, spec, deps))
+        assert quoted[:8] not in worktree.named_refs(p, review), "a quoted commit off the branch is evidence"
+        assert set(worktree.diff_lines(p, worktree.reviewed_refs(p, review))) == {"daemon.py"}
+        assert reviewcap.main_file(p, review) == "daemon.py"
+        assert worktree.reviewed_head(p, review) == head
+    # A quoted commit on the branch (an earlier head) still counts.
+    later = _commit_files(path, {"daemon.py": "a\nb\nc\n"}, "more")
+    review = p.db.task(_quoting_review(p, spec + f"\nNew head: {branch} at {later[:12]}."))
+    assert {head[:12], later[:12]} <= set(worktree.named_refs(p, review))
+    assert worktree.reviewed_head(p, review) == later
+
+
+def test_the_head_a_review_is_said_to_review_counts_even_off_its_branch(env):
+    from ttp import worktree
+    p = make(env)
+    tid, path, branch = _code_task(p, "the change")
+    old = _commit_files(path, {"daemon.py": "a\n"}, "change")
+    _git_out(path, "reset", "-q", "--hard", "HEAD~1")
+    _commit_files(path, {"other.py": "b\n"}, "rewritten")
+    for spec in (f"Review the change: branch {branch}, head {old[:12]}.", f"Branch: {branch} at {old}.",
+                 f"{branch} rebased as {old}: push it"):
+        review = p.db.task(_quoting_review(p, spec))
+        assert old[:12] in worktree.named_refs(p, review) or old in worktree.named_refs(p, review)
+        assert "daemon.py" in worktree.diff_lines(p, worktree.reviewed_refs(p, review))
+    # A commit built on the branch (a fix, a settled conflict) counts however the spec words it.
+    tip = _git_out(path, "rev-parse", "HEAD")
+    built = _git_out(path, "commit-tree", f"{old}^{{tree}}", "-p", tip, "-m", "settle")
+    review = p.db.task(_quoting_review(p, f"Push {built} of {branch}."))
+    assert built in worktree.named_refs(p, review)
+
+
+def test_a_review_spec_naming_only_a_hash_still_reviews_it(env):
+    from ttp import worktree
+    p = make(env)
+    _, path, _ = _code_task(p, "the change")
+    head = _commit_files(path, {"daemon.py": "a\n"}, "change")
+    review = p.db.task(_quoting_review(p, f"Review commit {head[:10]}."))
+    assert worktree.named_refs(p, review) == [head[:10]]
+    assert set(worktree.diff_lines(p, worktree.reviewed_refs(p, review))) == {"daemon.py"}

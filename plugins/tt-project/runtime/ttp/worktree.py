@@ -1740,16 +1740,53 @@ def reviewed_refs(p: Project, task: dict) -> list[str]:
     return list(dict.fromkeys(refs + list(fix_branches(p, task, refs))))
 
 
+# What follows a branch a review spec says it reviews: "branch B, head H", "B at H", "B rebased as H".
+_SAID_HEAD = re.compile(r"(?:,?\s*head:?|\s+(?:rebased\s+)?(?:at|as))\s+([0-9a-f]{7,40})\b")
+
+
 def named_refs(p: Project, task: dict) -> list[str]:
     """The branches of the tasks a review depends on, and the task branches and commit hashes its
-    spec names."""
+    spec names. With such a branch, a spec-quoted hash counts only when it is on one of them (an
+    ancestor of its head), builds on one (a descendant: a fix or a settled push conflict), or is the
+    head the spec says it reviews ("branch B, head H", "B at H", "B rebased as H"): a spec often
+    quotes other commits as evidence, and their files are not the change under review.
+    When none of those branches resolves here, every quoted hash counts."""
     from .db import dependency_ids, names_branch
     spec = task.get("spec") or ""
     ids = [i for i in dependency_ids(task) if i is not None]
-    refs = [r["branch"] for r in p.db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL AND branch!=''")
-            if r["id"] in ids or names_branch(spec, r["branch"])]
-    refs += _HEX.findall(spec)
-    return list(dict.fromkeys(refs))
+    branches = list(dict.fromkeys(
+        r["branch"] for r in p.db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL AND branch!=''")
+        if r["id"] in ids or names_branch(spec, r["branch"])))
+    hashes = list(dict.fromkeys(_HEX.findall(spec)))
+    heads = [h for h in (_branch_head(p, b) for b in branches) if h] if hashes else []
+    if heads:
+        said = {m.group(1) for b in branches for i in _find_all(spec, b)
+                if (m := _SAID_HEAD.match(spec, i + len(b)))}
+        hashes = [h for h in hashes if h in said or any(_on(p, h, tip) or _on(p, tip, h) for tip in heads)]
+    return list(dict.fromkeys(branches + hashes))
+
+
+def _branch_head(p: Project, branch: str) -> str:
+    for cand in (branch, f"origin/{branch}"):
+        if head := _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False):
+            return head
+    return ""
+
+
+def _find_all(text: str, sub: str) -> list[int]:
+    out, i = [], text.find(sub)
+    while i >= 0:
+        out.append(i)
+        i = text.find(sub, i + 1)
+    return out
+
+
+def _on(p: Project, commit: str, tip: str) -> bool:
+    """Whether `commit` is `tip` or an ancestor of it; False when either does not resolve or git hangs."""
+    try:
+        return tip.startswith(commit) or is_ancestor(p, commit, tip)
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def fix_branches(p: Project, task: dict, refs: list[str]) -> dict[str, str]:
