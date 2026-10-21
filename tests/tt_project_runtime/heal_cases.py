@@ -3012,3 +3012,30 @@ def test_health_coverage_trusts_a_recovery_owner_on_another_host_and_names_exclu
     assert line.endswith("; machine box-d excluded: bench box, checked by hand)")
     assert "box-d" not in str(rs.check_cover(items))
     assert pj.unknown_key_hint("health.exclude_machines") is None
+
+
+@pytest.mark.parametrize("ending", ["timeout", "raises", "watcher"])
+def test_heal_schedule_level_error_drops_back_to_every(env, monkeypatch, ending):
+    from ttp import heal
+    p, d, up = _heal_setup(env, healthy_every="1h")
+    up.touch()
+    for _ in range(heal.HEALTHY_RUNS):
+        p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+        d.run_schedules()
+    row = p.db.one("SELECT * FROM schedules WHERE name='svc'")
+    assert row["next_run"] - row["last_run"] == pytest.approx(3600)
+    if ending == "timeout":   # the run_schedules timeout path records this; heal.run never returned
+        d._schedule_ran(dict(row), "error: timed out after 900 s", None)
+    elif ending == "watcher":   # healthy, but its own command failed
+        d._schedule_ran(dict(row), "ok (healthy); error: watcher exited 2", None)
+    else:
+        def boom(*a, **k):
+            raise RuntimeError("check crashed")
+        monkeypatch.setattr(heal, "_run", boom)
+        p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+        d.run_schedules()
+    row = p.db.one("SELECT * FROM schedules WHERE name='svc'")
+    assert row["last_status"].startswith("error" if ending != "watcher" else "ok (healthy); error"), row["last_status"]
+    assert row["next_run"] - row["last_run"] <= 300, row["last_status"]
+    assert heal.STREAK_KEY not in heal.state(p.db, "svc")
+    assert heal.interval(p.db, row, _heal_spec(p)) == 300

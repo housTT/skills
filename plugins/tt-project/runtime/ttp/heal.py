@@ -128,8 +128,8 @@ handled as healthy or unhealthy as above.
 
 Backing off while healthy: `healthy_every` (an interval like the schedule's `every`, e.g. "1h", at least
 `every`) runs the check that often once it was healthy `healthy_runs` (HEALTHY_RUNS, 3) runs in a row. The
-first run that is anything else (unhealthy, unknown, a known state, an error or a fix that ran) goes straight
-back to `every`. The streak lives in the check's state (`healthy_streak`); `ttp heal list` and `ttp schedules`
+first run that is anything else (unhealthy, unknown, a known state, an error or a fix that ran, and a run
+that timed out, crashed or whose own command failed) goes straight back to `every`. The streak lives in the check's state (`healthy_streak`); `ttp heal list` and `ttp schedules`
 show the interval in force.
 
 Daemon time: `timeout_s` is capped at MAX_TIMEOUT_S (the daemon's command-watcher cap), a timeout
@@ -801,6 +801,15 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
     except Exception as e:   # the ledger is shared and best effort: the check's own result stands
         print(f"heal {name}: machine ledger report failed: {e}", file=sys.stderr)
     return out
+
+
+def end_streak(db: DB, name: str) -> None:
+    """The check's run ended without a plain healthy result heal.run saw (a schedule timeout, a crash,
+    a failing own command): its next run comes at `every` (module doc: backing off)."""
+    st = state(db, name)
+    if STREAK_KEY in st:
+        st.pop(STREAK_KEY)
+        _save(db, name, st)
 
 
 def interval(db: DB, row: dict, spec: dict) -> int:
