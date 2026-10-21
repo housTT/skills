@@ -6170,25 +6170,27 @@ def test_harness_commit_moves_stale_git_locks_aside_and_commits(env, monkeypatch
     assert p.clear_stale_git_locks() == [] and fresh.exists()
 
 
-def _real_git():
-    """The first git on PATH that is no tt-project git wrapper: a run puts its harness bin/ first on
-    PATH, and a wrapper linked alone into a test's PATH finds no git to exec."""
-    import os
-    import shutil
+def _real_git() -> str:
+    """The first git on PATH that is no tt-project git wrapper, as the wrapper itself picks it."""
     for d in os.environ.get("PATH", "").split(os.pathsep):
-        found = shutil.which("git", path=d) if d else None
-        if found:
-            try:
-                with open(found, errors="replace") as f:
-                    if "# tt-project git wrapper" not in f.read(4096):
-                        return found
-            except OSError:
-                continue
-    return shutil.which("git")
+        f = pathlib.Path(d) / "git"
+        try:
+            if d and f.is_file() and os.access(f, os.X_OK) and b"# tt-project git wrapper" not in f.read_bytes():
+                return str(f)
+        except OSError:
+            continue
+    raise AssertionError("no real git on PATH")
 
 
-def test_git_lock_holders_see_a_real_git_in_the_repo(env, tmp_path):
+def test_git_lock_holders_see_a_real_git_in_the_repo(env, tmp_path, monkeypatch):
     from ttp import gitlocks
+    # As inside a run, the plugin's git wrapper comes first on PATH. Until it execs the real git, its
+    # process is a shell, so the test starts the real git itself.
+    wrap = tmp_path / "wrapper-bin"
+    wrap.mkdir()
+    (wrap / "git").symlink_to(RUNTIME.parent / "template" / "bin" / "git")
+    monkeypatch.setenv("PATH", f"{wrap}{os.pathsep}{os.environ.get('PATH', '')}")
+    assert _real_git() != str(wrap / "git")
     p = make(env)
     gdir = gitlocks.git_dir(p.harness)
     proc = subprocess.Popen([_real_git(), "-C", str(p.harness), "hash-object", "--stdin"], stdin=subprocess.PIPE,

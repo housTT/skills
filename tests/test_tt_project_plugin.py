@@ -4790,21 +4790,30 @@ def _bump(repo: pathlib.Path, version: str) -> None:
     _git(repo, "commit", "-qam", "tt-project " + version)
 
 
-def _real_git():
-    """The first git on PATH that is no tt-project git wrapper: a run puts its harness bin/ first on
-    PATH, and a wrapper linked alone into a test's PATH finds no git to exec."""
-    import os
-    import shutil
+GIT_WRAPPER_MARK = b"# tt-project git wrapper"
+
+
+def _real_git() -> str | None:
+    """The first git on PATH that is no tt-project git wrapper, as the wrapper itself picks it: inside a
+    run the harness's wrapper comes first, and alone in a bin dir it finds no real git to exec."""
     for d in os.environ.get("PATH", "").split(os.pathsep):
-        found = shutil.which("git", path=d) if d else None
-        if found:
-            try:
-                with open(found, errors="replace") as f:
-                    if "# tt-project git wrapper" not in f.read(4096):
-                        return found
-            except OSError:
-                continue
-    return shutil.which("git")
+        f = pathlib.Path(d) / "git"
+        try:
+            if d and f.is_file() and os.access(f, os.X_OK) and GIT_WRAPPER_MARK not in f.read_bytes():
+                return str(f)
+        except OSError:
+            continue
+    return None
+
+
+@pytest.fixture
+def git_wrapper_first(tmp_path, monkeypatch):
+    """PATH as inside a tt-project run: the plugin's git wrapper first, the real git further down."""
+    wrap = tmp_path / "wrapper-bin"
+    wrap.mkdir()
+    (wrap / "git").symlink_to(PLUGIN / "template" / "bin" / "git")
+    monkeypatch.setenv("PATH", f"{wrap}{os.pathsep}{os.environ.get('PATH', '')}")
+    return wrap / "git"
 
 
 @pytest.fixture
@@ -5222,6 +5231,16 @@ def test_plugin_readme_is_short_with_the_one_line_install_and_links_to_the_docs(
     for doc in re.findall(r"\]\((docs/[\w.-]+)(?:#[\w-]+)?\)", text):
         assert (PLUGIN / doc).is_file(), doc
     assert {"docs/guide.md", "docs/install.md"} <= set(re.findall(r"\]\((docs/[\w.-]+)", text))
+
+
+def test_one_line_install_links_the_real_git_past_a_tt_project_git_wrapper(git_wrapper_first, install_env):
+    import shutil
+    assert shutil.which("git") == str(git_wrapper_first)
+    linked = (install_env.home.parent / "bin" / "git").resolve()
+    assert GIT_WRAPPER_MARK not in linked.read_bytes(), linked
+    r = install_env(hosts=("claude",))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _clone_head(install_env.home) == _head(install_env.repo)
 
 
 def test_one_line_install_without_git_says_so(install_env):
