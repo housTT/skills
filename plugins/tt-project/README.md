@@ -31,14 +31,15 @@ Features:
 - Supports: Claude Code, Cursor and Codex.
 - Manage many projects at the same time from many chats.
 - It's a meta-harness that generates a custom harness for each of your projects.
-- Very flexible, so it can manage software-, legal-, or finance projects.
-- Safe(ish?). It doesn't merge PRs or talk to humans in your name. It leaves sensitive operations to you, unless you tell it otherwise. 
+- Very flexible, so it can manage software, legal, or finance projects.
 - Your brief and subsequent messages specify how it behaves; if you don't like how it behaves, you tell it to behave better.
 - Each project has its own memory and remembers your preferences and lessons learned.
 - The project self-improves periodically by assessing its own performance.
+- Safe(ish?). It doesn't merge PRs or talk to humans in your name. It leaves sensitive operations to you, unless you tell it otherwise.
+- Changes are reviewed by a review agent before they're pushed.
 - Each project has a Web UI dashboard that you can check to see progress, critical messages, token budget, etc.
 - It keeps going when you close your computer (if it's running on an always-on box), or even if you close the chat.
-- Any later chat can re-connects to it by project name.
+- Any later chat can reconnect to it by project name.
 - The chat runs on your Mac (though it can run on a remote box as well), but the coordinator can run on a remote always-on box (or on your Mac as well).
 - You can also tell it to move the coordinator from the box to your Mac or vice versa, or to any other box, if needed.
 - Works best if you have Glean MCP enabled
@@ -62,7 +63,7 @@ Then reload your agent session.
 
 Rerun the above to update to the latest version of tt-project. 
 
-If you're starting to work on a remote box you haven't worked on before (not project specific), you can say in the chat "/tt-project setup box box-a" and it will ask you a few questions and set up what you like: claude, claude cursor plugin, tt-device-mcp, and other options. You can also tell it to set up things that are not part of the skill. 
+If you're starting to work on a remote box you haven't worked on before (not project specific), you can say in the chat "/tt-project setup box box-a" and it will ask you a few questions and set up what you like: claude, claude plugin for cursor, tt-device-mcp, and other options. You can also tell it to set up things that are not part of the skill. 
 
 ## Learn more
 
