@@ -1343,8 +1343,12 @@ class Project:
             os.replace(src, dst)
             done.append(dst)
             moved.append(name)
-        again = [n for n in again if commit and self._harness_dirty([f"memory/{n}.md", f"memory/archive/{n}.md"])]
+        # Whether a killed run left a replayed name uncommitted takes git, which never runs under the
+        # write lock: inside a transaction that check waits until it ends.
+        later = again if commit and self.db.conn.in_transaction else []
+        again = [n for n in again if commit and not later and self._harness_dirty(self._retired_paths(n))]
         if not (moved or again):
+            self._commit_replayed_later(later, why)
             return done, errors
         fsync_dir(self.memory_dir / "archive")
         fsync_dir(self.memory_dir)
@@ -1366,11 +1370,30 @@ class Project:
             self._reindex_memory(add=dropped, before=before, after=after)
         self.db.on_rollback(undo)
         if commit:
-            gone = [*moved, *again]
-            self.commit_harness([*(self.memory_dir / "archive" / f"{n}.md" for n in gone), self.memory_index],
-                                f"memory retired: {', '.join(gone)}" + (f" ({why})" if why else ""),
-                                removed=[self.memory_dir / f"{n}.md" for n in gone])
+            self._commit_retired([*moved, *again], why)
+        self._commit_replayed_later(later, why)   # after this retirement's own commit
         return done, errors
+
+    @staticmethod
+    def _retired_paths(name: str) -> list[str]:
+        return [f"memory/{name}.md", f"memory/archive/{name}.md"]
+
+    def _commit_retired(self, gone: list[str], why: str) -> None:
+        self.commit_harness([*(self.memory_dir / "archive" / f"{n}.md" for n in gone), self.memory_index],
+                            f"memory retired: {', '.join(gone)}" + (f" ({why})" if why else ""),
+                            removed=[self.memory_dir / f"{n}.md" for n in gone])
+
+    def _commit_replayed_later(self, names: list[str], why: str) -> None:
+        """Once the open transaction commits, commit the replayed retirements `names` a killed run left
+        uncommitted; one already committed makes no commit. A rollback drops it (after_commit)."""
+        if not names:
+            return
+
+        def run() -> None:
+            dirty = [n for n in names if self._harness_dirty(self._retired_paths(n))]
+            if dirty:
+                self._commit_retired(dirty, why)
+        self.db.after_commit(run)
 
     def _harness_dirty(self, rel: list[str]) -> bool:
         """Whether git shows any of these harness paths changed from the last commit."""

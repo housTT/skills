@@ -116,3 +116,60 @@ def test_a_process_ending_inside_the_transaction_leaves_no_uncommitted_retiremen
     n = len(_memory_commit_log(p))
     p.forget_memory(old.stem, why="done")
     assert len(_memory_commit_log(p)) == n
+
+
+def test_a_replayed_coordinator_forget_runs_no_git_under_the_write_lock(env, monkeypatch):
+    """A coordinator memory_forget of an entry already archived (a replayed turn) inside the run-end
+    transaction checks whether a killed run left it uncommitted only once the transaction ends:
+    git never runs while the write lock is held. It commits what was left, and a replay of a
+    retirement already committed makes no commit."""
+    p = make(env)
+    from ttp import coordinator as coord
+    old = p.add_memory("An old decision.", kind="decision")
+    code = (f"import os\nfrom ttp.project import Project\np = Project({str(p.base)!r})\n"
+            f"with p.db.tx():\n    p.forget_memory({old.stem!r}, why='done')\n    os._exit(3)\n")
+    r = subprocess.run([sys.executable, "-c", code], env={**os.environ, "PYTHONPATH": str(RUNTIME)},
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 3, r.stderr
+    assert not old.exists() and old.name in _harness_dirty(p)
+    real, locked = subprocess.run, []
+
+    def spy(cmd, *a, **kw):
+        if cmd and cmd[0] == "git" and p.db.conn.in_transaction:
+            locked.append(cmd)
+        return real(cmd, *a, **kw)
+    monkeypatch.setattr(subprocess, "run", spy)
+    for _ in range(2):   # the replay that commits the leftovers, then one with nothing left
+        n = len(_memory_commit_log(p))
+        with p.db.tx():
+            assert coord.apply(p, [{"type": "memory_forget", "name": old.stem}], turn=9) == []
+        assert locked == []
+        monkeypatch.setattr(subprocess, "run", real)
+        _committed_clean(p)
+        monkeypatch.setattr(subprocess, "run", spy)
+    assert len(_memory_commit_log(p)) == n
+    assert _memory_commit_log(p, f"memory/archive/{old.name}")[0].startswith(f"memory retired: {old.stem}")
+    # Retiring a live entry and replaying an archived one in one transaction: no git under the lock either.
+    fresh = p.add_memory("A fresh fact.", kind="fact")
+    with p.db.tx():
+        assert coord.apply(p, [{"type": "memory_forget", "name": old.stem},
+                               {"type": "memory_forget", "name": fresh.stem}], turn=10) == []
+    assert locked == []
+    monkeypatch.setattr(subprocess, "run", real)
+    _committed_clean(p)
+    assert (p.memory_dir / "archive" / fresh.name).exists()
+
+
+def test_an_undo_that_raises_on_rollback_is_logged_and_the_next_still_runs(env):
+    p = make(env)
+    ran = []
+
+    def bad():
+        raise OSError("disk gone")
+    with pytest.raises(RuntimeError):
+        with p.db.tx():
+            p.db.on_rollback(lambda: ran.append(1))
+            p.db.on_rollback(bad)
+            raise RuntimeError("x")
+    assert ran == [1]
+    assert "rollback undo" in _daemon_log_text(p) and "disk gone" in _daemon_log_text(p)

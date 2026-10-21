@@ -604,8 +604,19 @@ END""")
             for fn in reversed(undo):
                 try:
                     fn()
-                except Exception:
-                    pass   # the next undo still runs; what is left is the harness sweep's
+                except Exception as e:   # the next undo still runs; what is left is the harness sweep's
+                    self._log_undo_failure(fn, e)
+
+    def _log_undo_failure(self, fn: Callable[[], Any], e: Exception) -> None:
+        """A line in the daemon's log for an undo of a rolled-back transaction that raised. Never raises."""
+        try:
+            log = Path(self.path).parent / "logs" / "daemon.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} rollback undo "
+                         f"{getattr(fn, '__qualname__', fn)!s} failed: {e!r}\n")
+        except Exception:
+            pass
 
     def _log_slow_tx(self, held: float, slowest: str = "") -> None:
         """One line per slow write transaction, with the code that held it: slow work (git, a subprocess,
