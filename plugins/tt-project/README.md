@@ -60,7 +60,7 @@ Or just tell your agent "install tt-project from https://github.com/tenstorrent/
 
 Then reload your agent session. 
 
-Rerun the above to get the latest version. 
+Rerun the above to update to the latest version of tt-project. 
 
 If you're starting to work on a remote box you haven't worked on before (not project specific), you can say in the chat "/tt-project setup box box-a" and it will ask you a few questions and set up what you like: claude, claude cursor plugin, tt-device-mcp, and other options. You can also tell it to set up things that are not part of the skill. 
 
