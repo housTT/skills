@@ -2,21 +2,19 @@
 
 Long-running, self-driving projects for Claude Code, Codex and Cursor. Give a project a brief and its
 coordinator plans the work, hands it to headless workers in isolated git worktrees, watches pull
-requests and logs, and stays inside a budget. It runs on your own machine or an always-on box, keeps
-going when you close the chat, and any later chat can connect to it by name.
+requests and logs, and stays inside a budget. It keeps going when you close the chat; any later chat
+connects to it by name.
 
 ## Install
 
-You need Python 3.9+, `git`, and Claude Code, Codex or Cursor. Paste this line into a terminal:
+Needs Python 3.9+, `git`, and Claude Code, Codex or Cursor. In a terminal:
 
 ```bash
-(TT_PROJECT_REF=; command -v git >/dev/null || { echo "tt-project: install git first" >&2; exit 1; }; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git init -q "$d" && git -C "$d" fetch -q --depth 1 https://github.com/tenstorrent/skills.git "${TT_PROJECT_REF:-HEAD}" && git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
+curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/HEAD/plugins/tt-project/install.sh | sh
 ```
 
-Set `TT_PROJECT_REF` at its front to a release tag of `tenstorrent/skills`; empty installs the
-default branch. It installs for each of Claude Code, Codex and Cursor it finds and ends with a
-checked `ttp` in `~/.local/bin`. Rerun it to update. Then start a new agent session.
-Details, manual steps, update and uninstall: [docs/install.md](docs/install.md).
+Rerun it to update, then start a new agent session. Release tags, manual steps and uninstall:
+[docs/install.md](docs/install.md).
 
 ## Quick start
 

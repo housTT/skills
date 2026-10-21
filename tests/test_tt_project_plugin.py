@@ -4257,9 +4257,11 @@ def test_setup_box_ird_e2e_value_flag_without_value_exits_2(flag):
     assert "needs a value" in r.stderr
 
 
-# One-line install (README ## Install, install.sh). No network: the line's URL is swapped for
-# a file:// fixture repository, and claude, codex, cursor-agent and the fixture's bin/ttp are fakes.
+# One-line install (README ## Install, install.sh). No network: the line's download is swapped for
+# `cat` of this install.sh, TT_PROJECT_REPO points it at a file:// fixture repository, and claude,
+# codex, cursor-agent and the fixture's bin/ttp are fakes.
 INSTALL_URL = "https://github.com/tenstorrent/skills.git"
+RAW_INSTALL_URL = "https://raw.githubusercontent.com/tenstorrent/skills/HEAD/plugins/tt-project/install.sh"
 FAKE_CLAUDE = r"""#!/bin/sh
 # marketplace entries keyed by name, like the real one: a second add repoints, never duplicates
 echo "claude $*" >> "$HOME/calls.log"
@@ -4364,11 +4366,14 @@ def install_env(tmp_path):
                 f.chmod(0o755)
             elif f.exists():
                 f.unlink()
-        line = _install_line().replace(INSTALL_URL, "file://" + str(repo)).replace(
-            "(TT_PROJECT_REF=;", f"(TT_PROJECT_REF={ref};", 1)
+        line = _install_line().replace(f"curl -fsSL {RAW_INSTALL_URL}", f"cat {PLUGIN / 'install.sh'}", 1)
+        if ref:
+            assert line.endswith(" | sh")
+            line = line[:-len("sh")] + f"TT_PROJECT_REF={ref} sh"
         path = (str(home / ".local" / "bin") + ":" if on_path else "") + str(tools)
         env = {"HOME": str(home), "PATH": path, "TMPDIR": str(tmp), "GIT_CONFIG_NOSYSTEM": "1",
-               "GIT_CONFIG_GLOBAL": os.devnull, "LC_ALL": "C", **(env or {})}
+               "GIT_CONFIG_GLOBAL": os.devnull, "LC_ALL": "C", "TT_PROJECT_REPO": "file://" + str(repo),
+               **(env or {})}
         return subprocess.run([str(tools / shell), "-c", line], env=env, capture_output=True, text=True,
                               timeout=120)
 
@@ -4406,28 +4411,35 @@ def test_install_from_a_source_without_origin_keeps_the_public_origin_on_the_kep
 
 
 def test_readme_one_line_install_is_the_installers_documented_usage():
-    """The README's line is the one install.sh documents; it clones with git (the reader's own
-    credentials), never a raw download, and names the ref in one variable at its front."""
+    """The README's line is one short line, the one install.sh documents: it downloads install.sh
+    and pipes it to sh. Every check and option lives in install.sh, none in the line."""
     line = _install_line()
-    usage = [ln[2:] for ln in (PLUGIN / "install.sh").read_text().splitlines() if ln.startswith("# (TT_PROJECT_REF=")]
+    assert len(line) < 150, len(line)
+    assert line == f"curl -fsSL {RAW_INSTALL_URL} | sh"
+    script = (PLUGIN / "install.sh").read_text()
+    usage = [ln[2:] for ln in script.splitlines() if ln.startswith("# curl ")]
     assert usage == [line]
-    assert line.startswith("(TT_PROJECT_REF=;")
-    # init + fetch of the one ref: `git clone --branch <annotated tag>` warns that it "is not a commit"
-    assert (f'git init -q "$d" && git -C "$d" fetch -q --depth 1 {INSTALL_URL} "${{TT_PROJECT_REF:-HEAD}}" && '
-            'git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD && ') in line
-    assert " clone " not in line
-    assert 'sh "$d/plugins/tt-project/install.sh"' in line and "set TT_PROJECT_REF to a release tag" in line
-    for raw in ("curl", "wget", "raw.githubusercontent", "| sh", "| bash"):
-        assert raw not in line, raw
-    readme = " ".join((PLUGIN / "docs" / "install.md").read_text(encoding="utf-8").split())
-    assert "Rerunning the line with the same `TT_PROJECT_REF` installs whatever that ref points at now" in readme
-    assert "a release tag the publisher moves forward as a release channel gives the latest release" in readme
-    # Only the line reads TT_PROJECT_REF; install.sh itself never does, so the README must not say it does.
-    code = [ln for ln in (PLUGIN / "install.sh").read_text().splitlines() if not ln.lstrip().startswith("#")]
-    assert not any("TT_PROJECT_REF" in ln for ln in code)
-    assert "`install.sh` reads" not in readme
-    assert "the one-line install reads the same variable" in readme
+    code = "\n".join(ln for ln in script.splitlines() if not ln.lstrip().startswith("#"))
+    assert "command -v git" in code and "sys.version_info < (3, 9)" in code
+    assert "TT_PROJECT_REF" in code and "TT_PROJECT_REPO" in code
+    doc = " ".join((PLUGIN / "docs" / "install.md").read_text(encoding="utf-8").split())
+    assert "`... | TT_PROJECT_REF=<tag> sh`" in doc and "`TT_PROJECT_REPO`" in doc
+    assert "Rerunning with the same ref installs what it points at now" in doc
     assert os.access(PLUGIN / "install.sh", os.X_OK)
+
+
+def test_install_download_cut_short_does_nothing(install_env, tmp_path):
+    """Piped from curl, a download cut off before the line that starts the work runs nothing."""
+    import subprocess
+    lines = (PLUGIN / "install.sh").read_text().splitlines(keepends=True)
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("case $0 in"))
+    part = tmp_path / "part.sh"
+    part.write_text("".join(lines[:start + 1]))
+    env = {"HOME": str(install_env.home), "PATH": str(install_env.home.parent / "bin"), "LC_ALL": "C",
+           "TT_PROJECT_REPO": "file://" + str(install_env.repo)}
+    r = subprocess.run(["sh", "-c", f"cat {part} | sh"], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 or r.stdout == ""
+    assert not (install_env.home / ".local").exists() and _calls(install_env.home) == []
 
 
 def _need_shell(shell: str) -> None:
@@ -4622,7 +4634,7 @@ def test_plugin_readme_is_short_with_the_one_line_install_and_links_to_the_docs(
 def test_one_line_install_without_git_says_so(install_env):
     (install_env.home.parent / "bin" / "git").unlink()
     r = install_env()
-    assert r.returncode == 1 and "tt-project: install git first" in r.stderr, r.stderr
+    assert r.returncode == 1 and "tt-project: git is required; install it, then rerun" in r.stderr, r.stderr
     assert _calls(install_env.home) == []
 
 
@@ -4647,13 +4659,20 @@ def test_one_line_install_fails_when_the_installed_ttp_does_not_run(install_env)
 def test_one_line_install_fails_clearly_when_the_ref_has_no_tt_project(install_env):
     r = install_env(ref="old")
     assert r.returncode == 1
-    assert "tt-project: no installer at old; set TT_PROJECT_REF to a release tag" in r.stderr
+    assert f"tt-project: no installer at old of file://{install_env.repo}; set TT_PROJECT_REF to a release tag" \
+        in r.stderr, r.stderr
     assert _calls(install_env.home) == []
     assert not (install_env.home / ".local/share/tt-project").exists()
-    assert not list(install_env.tmp.iterdir()), "the temporary clone is removed"
     missing = install_env(ref="no-such-tag")
-    assert missing.returncode != 0 and _calls(install_env.home) == []
-    assert not list(install_env.tmp.iterdir())
+    assert missing.returncode == 1 and _calls(install_env.home) == []
+    assert "tt-project: no installer at no-such-tag of " in missing.stderr
+    assert not (install_env.home / ".local/share/tt-project").exists()
+    # an earlier install stays as it was
+    assert install_env(ref="v1").returncode == 0
+    head = _clone_head(install_env.home)
+    assert install_env(ref="old").returncode == 1 and install_env(ref="no-such-tag").returncode == 1
+    assert _clone_head(install_env.home) == head
+    assert (install_env.home / ".local/share/tt-project/skills/plugins/tt-project/bin/ttp").is_file()
 
 
 def test_worker_prompt_waits_on_landed_instead_of_blocking_on_another_task():

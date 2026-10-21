@@ -7,49 +7,82 @@
 # config entries in place. A step that fails does not stop the other tools or `ttp setup`: the
 # failures are listed at the end, and the installer then exits 1.
 #
-# Usage, from a shell (set TT_PROJECT_REF to a release tag; empty installs the default branch):
+# Usage:
 #
-# (TT_PROJECT_REF=; command -v git >/dev/null || { echo "tt-project: install git first" >&2; exit 1; }; d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT && git init -q "$d" && git -C "$d" fetch -q --depth 1 https://github.com/tenstorrent/skills.git "${TT_PROJECT_REF:-HEAD}" && git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD && if [ -f "$d/plugins/tt-project/install.sh" ]; then sh "$d/plugins/tt-project/install.sh"; else echo "tt-project: no installer at ${TT_PROJECT_REF:-the default branch}; set TT_PROJECT_REF to a release tag" >&2; exit 1; fi)
+# curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/HEAD/plugins/tt-project/install.sh | sh
 #
-# The line fetches the one ref (a tag, branch or commit) and checks out FETCH_HEAD, rather than
-# `git clone --branch`, which warns that an annotated tag "is not a commit".
+# Piped like that, it fetches TT_PROJECT_REF (a release tag, branch or commit; default: the default
+# branch) of TT_PROJECT_REPO (default: the public repository) into one clone kept at
+# $XDG_DATA_HOME/tt-project/skills (default ~/.local/share/tt-project/skills), then runs that
+# commit's own install.sh. `sh <checkout>/plugins/tt-project/install.sh` installs the commit that
+# checkout has instead. Claude Code and Codex use the clone as a local marketplace, and Cursor gets
+# a copy of its plugin folder.
 #
-# or `sh <checkout>/plugins/tt-project/install.sh` to install the commit that checkout has.
-# The commit is copied into one clone kept at $XDG_DATA_HOME/tt-project/skills (default
-# ~/.local/share/tt-project/skills): Claude Code and Codex use it as a local marketplace, and Cursor
-# gets a copy of its plugin folder.
+# It fetches the one ref and checks out FETCH_HEAD, rather than `git clone --branch`, which warns
+# that an annotated tag "is not a commit". Piped, nothing runs before the line that calls
+# fetch_and_run, so a download cut short does nothing.
 set -eu
 
 MARKET=tenstorrent-skills
 PLUGIN=tt-project
+REPO=https://github.com/tenstorrent/skills.git
 
 say() { printf 'tt-project: %s\n' "$*"; }
 die() { printf 'tt-project: %s\n' "$*" >&2; exit 1; }
 
-command -v git >/dev/null 2>&1 || die "git is required"
-command -v python3 >/dev/null 2>&1 || die "Python 3.9+ (python3) is required"
-python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null ||
-    die "Python 3.9+ is required; python3 here is $(python3 -V 2>&1)"
+need() {
+    command -v git >/dev/null 2>&1 || die "git is required; install it, then rerun"
+    command -v python3 >/dev/null 2>&1 || die "Python 3.9+ (python3) is required; install it, then rerun"
+    python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null ||
+        die "Python 3.9+ is required; python3 here is $(python3 -V 2>&1)"
+}
+
+data=${XDG_DATA_HOME:-$HOME/.local/share}/tt-project
+dest=$data/skills
+
+# Make $dest a git clone, or check that it is one. $made names what this run created.
+use_dest() {
+    made=""
+    [ -e "$data" ] || made=$data
+    if [ ! -e "$dest" ]; then
+        made=${made:-$dest}
+        mkdir -p "$data" && git init -q "$dest"
+    elif ! git -C "$dest" rev-parse --git-dir >/dev/null 2>&1 || [ "$(cd "$dest" && git rev-parse --show-toplevel)" != "$(cd "$dest" && pwd -P)" ]; then
+        die "$dest exists and is not a git clone; move it away and rerun"
+    fi
+}
+
+# Piped from curl: fetch the ref into the kept clone, then run that commit's own installer.
+fetch_and_run() {
+    url=${TT_PROJECT_REPO:-$REPO} name=${TT_PROJECT_REF:-the default branch}
+    use_dest
+    if ! git -C "$dest" fetch -q --depth 1 "$url" "${TT_PROJECT_REF:-HEAD}" ||
+        ! git -C "$dest" cat-file -e "FETCH_HEAD:plugins/$PLUGIN/install.sh" 2>/dev/null; then
+        [ -z "$made" ] || rm -rf "$made"
+        die "no installer at $name of $url; set TT_PROJECT_REF to a release tag"
+    fi
+    git -C "$dest" checkout -q -f --detach FETCH_HEAD
+    git -C "$dest" remote set-url origin "$url" 2>/dev/null || git -C "$dest" remote add origin "$url"
+    exec sh "$dest/plugins/$PLUGIN/install.sh"
+}
+
+case $0 in
+*install.sh) need ;;
+*) need; fetch_and_run ;;
+esac
 
 src=$(cd "$(dirname "$0")/../.." && pwd -P)
 [ -f "$src/plugins/$PLUGIN/bin/ttp" ] || die "$src has no plugins/$PLUGIN; run install.sh from a checkout of the skills repository"
 git -C "$src" rev-parse --verify -q HEAD >/dev/null || die "$src is not a git checkout"
 
-data=${XDG_DATA_HOME:-$HOME/.local/share}/tt-project
-dest=$data/skills
-mkdir -p "$data"
 dest_real=$( [ -d "$dest" ] && cd "$dest" && pwd -P || echo "" )
 if [ "$dest_real" != "$src" ]; then
-    if [ ! -e "$dest" ]; then
-        git init -q "$dest"
-    elif ! git -C "$dest" rev-parse --git-dir >/dev/null 2>&1 || [ "$(cd "$dest" && git rev-parse --show-toplevel)" != "$(cd "$dest" && pwd -P)" ]; then
-        die "$dest exists and is not a git clone; move it away and rerun"
-    fi
+    use_dest
     git -C "$dest" fetch -q --depth 1 "$src" HEAD
     git -C "$dest" checkout -q -f --detach FETCH_HEAD
-    # a one-line install's temporary checkout has no origin: fall back to the public repository
+    # a checkout without an origin: fall back to the public repository
     url=$(git -C "$src" remote get-url origin 2>/dev/null || true)
-    url=${url:-https://github.com/tenstorrent/skills.git}
+    url=${url:-$REPO}
     git -C "$dest" remote set-url origin "$url" 2>/dev/null || git -C "$dest" remote add origin "$url"
 fi
 plugin=$dest/plugins/$PLUGIN

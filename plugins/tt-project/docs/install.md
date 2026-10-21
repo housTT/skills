@@ -1,40 +1,35 @@
 # Installing tt-project
 
-The [README](../README.md) has the one-line install. This page covers what it does, the manual
-steps per host, updates and uninstall.
+## The install line
 
-## What the one-line install does
+The [README](../README.md#install) line runs `plugins/tt-project/install.sh`, which:
 
-It fetches one commit of `tenstorrent/skills` with `git` and your own git credentials and runs
-`plugins/tt-project/install.sh` from it. `TT_PROJECT_REF`, set at the front of the line, names a
-release tag (a branch or commit also works); empty means the default branch. A ref without the
-installer fails with a message to set `TT_PROJECT_REF` to a release tag.
+1. stops with a one-line message if `git` or Python 3.9+ is missing;
+2. fetches one commit of `tenstorrent/skills` into a clone kept at `~/.local/share/tt-project/skills`
+   (under `$XDG_DATA_HOME` when set) and runs that commit's own installer;
+3. adds the clone as the `tenstorrent-skills` marketplace for Claude Code and Codex, and copies the
+   plugin into Cursor's local plugin folder, for each tool it finds;
+4. runs `ttp setup`, which installs `ttp` in `~/.local/bin`, and checks that `ttp --version` runs.
 
-The installer:
+A failed step for one tool does not stop the others; the installer lists failures and exits 1.
 
-1. checks for `git` and Python 3.9+, and stops with a message naming what is missing;
-2. keeps one clone at `~/.local/share/tt-project/skills` (under `$XDG_DATA_HOME` when set);
-3. adds it as the `tenstorrent-skills` marketplace for Claude Code and Codex, and copies the plugin
-   into Cursor's local plugin folder, for each tool it finds (it skips the others with a note);
-4. runs `ttp setup`, which installs `ttp` in `~/.local/bin`, then checks that `ttp --version` runs.
+Options, set on `sh` at the end of the line, e.g. `... | TT_PROJECT_REF=<tag> sh`:
 
-If one tool's step fails, it still installs for the others and runs `ttp setup`, then lists the
-failed steps and exits non-zero.
+- `TT_PROJECT_REF`: a release tag, branch or commit; default the default branch. Rerunning with the
+  same ref installs what it points at now: a branch or a moving release tag gives its latest commit,
+  a fixed tag that exact release.
+- `TT_PROJECT_REPO`: another git URL to install from, such as a fork or a local mirror.
 
-Rerun the line to update, or with another tag to switch: it updates that clone and the same entries
-in place. Rerunning the line with the same `TT_PROJECT_REF` installs whatever that ref points at now:
-a branch gives its latest commit, and a release tag the publisher moves forward as a release channel
-gives the latest release. A tag that is never moved keeps you on exactly that release.
+Rerun the line to update or switch refs; it updates the clone and the same entries in place.
+`sh <checkout>/plugins/tt-project/install.sh` installs the commit a checkout has.
 
 ## Loading it
 
-- Claude Code: start a new session, or in an open one run `/reload-plugins` (and `/reload-skills`
-  for the plain `/tt-project`).
-- Codex: start a new session; open sessions do not see it.
+- Claude Code: start a new session, or run `/reload-plugins` (and `/reload-skills` for `/tt-project`).
+- Codex: start a new session.
 - Cursor: restart it, or run **Developer: Reload Window**. On Teams and Enterprise plans an admin
   must allow local plugin imports.
-- `ttp`: works in an open terminal when `~/.local/bin` is already on its `PATH`; otherwise add that
-  folder to `PATH` in your shell profile and open a new shell.
+- `ttp`: needs `~/.local/bin` on `PATH`; add it in your shell profile if it is not.
 
 ## Skills
 
@@ -46,22 +41,17 @@ To call a skill directly instead of just asking for a project:
 | Codex | `$tt-project:tt-project` | `$tt-project:tt-project-harness` | `$tt-project:setup-box` |
 | Cursor | `/tt-project` | `/tt-project-harness` | `/setup-box` |
 
-The device box skill gets a box (bare metal, a reservation or a Slurm job) and has agents edit,
-build and run in their own checkout on it over ssh. Site values stay in a local
-`~/.tt-project/boxes.json`, never in a repository.
+The device box skill gets a box (bare metal, a reservation or a Slurm job) where agents work in
+their own checkout over ssh; site values stay in a local `~/.tt-project/boxes.json`.
 
-Claude Code shows a plugin's skills under the plugin's name, so its own entry for the main skill is
-`/tt-project:tt-project`. `ttp setup` adds a small personal skill,
-`~/.claude/skills/tt-project/SKILL.md` (under `$CLAUDE_CONFIG_DIR` when set), listed as
-`/tt-project`, that loads the plugin's skill. Only you can run it, so Claude still sees one
-tt-project skill. If you already have your own skill named `tt-project`, setup leaves it alone.
-`ttp setup --no-shortcut` removes the shortcut.
+In Claude Code the plugin's own entry is `/tt-project:tt-project`; `ttp setup` adds a personal
+shortcut skill, `~/.claude/skills/tt-project/SKILL.md` (under `$CLAUDE_CONFIG_DIR` when set), listed
+as `/tt-project`. It leaves an existing skill of that name alone; `ttp setup --no-shortcut` removes it.
 
 ## Manual install
 
-The same steps by hand, per host. You need Python 3.9+, `git` with `user.name` and `user.email`
-set, and a logged-in agent CLI to run the project's workers. Set `TT_PROJECT_REF` to a release tag
-or branch (the one-line install reads the same variable, set at its front).
+The same steps by hand. Workers also need `git` with `user.name` and `user.email` set and a
+logged-in agent CLI. Set `TT_PROJECT_REF` to a release tag or branch.
 
 Claude Code (a branch or tag goes after `#`):
 
@@ -96,8 +86,8 @@ Then restart Cursor (or run **Developer: Reload Window**).
 
 ## Update
 
-Rerun the one-line install. After a manual install, remove the marketplace and repeat the steps
-above with the new ref, `ttp setup` included:
+Rerun the install line. After a manual install, remove the marketplace and repeat the steps above
+with the new ref, `ttp setup` included:
 
 ```bash
 claude plugin marketplace remove tenstorrent-skills    # also uninstalls its plugins
@@ -124,7 +114,7 @@ claude plugin marketplace remove tenstorrent-skills
 codex plugin remove tt-project@tenstorrent-skills && codex plugin marketplace remove tenstorrent-skills
 rm -rf ~/.cursor/plugins/local/tt-project
 rm -rf ~/.tt-project ~/.local/bin/ttp "${XDG_CACHE_HOME:-$HOME/.cache}/ttp"
-rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/tt-project"    # the one-line install's clone
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/tt-project"    # the install line's clone
 ```
 
 Each project keeps its files in `<project root>/tt-project/`; delete that folder too to drop its
