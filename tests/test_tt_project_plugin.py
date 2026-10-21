@@ -2145,6 +2145,7 @@ def _glean_fakes(home):
     bin_.mkdir(parents=True, exist_ok=True)
     (bin_ / "claude").write_text(
         "#!/bin/bash\nf=$HOME/claude-mcp\necho \"$*\" >> $HOME/claude.log\n"
+        "[ \"$1 $2\" = 'mcp login' ] && [ -f $HOME/no-mcp-login ] && exit 1\n"
         "[ \"$1\" = mcp ] && case \"$*\" in *glean*|'mcp list'*) ;; *) exit 0 ;; esac\ncase \"$1 $2\" in\n"
         "'--version ') echo '2.1.0 (Claude Code)' ;;\n"
         "'auth status') echo '{\"loggedIn\": true}' ;;\n"
@@ -2175,7 +2176,7 @@ def _glean_fakes(home):
     (home / ".codex/config.toml").write_text("# codex\n")
 
 
-def test_setup_box_agents_glean_config_is_idempotent_and_fixes_a_wrong_entry_with_a_backup(tmp_path, monkeypatch):
+def test_setup_box_agents_glean_config_is_idempotent_and_keeps_an_existing_entry(tmp_path, monkeypatch):
     import subprocess
     ba = _agents(monkeypatch)
     home, env = _agents_home(tmp_path)
@@ -2188,6 +2189,8 @@ def test_setup_box_agents_glean_config_is_idempotent_and_fixes_a_wrong_entry_wit
         return r, ba.read_install(r.stdout)
     r, (lines, ok) = run()
     assert r.returncode == 0 and ok and "claude: glean added" in lines and "codex: glean added" in lines, r.stdout
+    # Claude Code sessions already open load the new server only after a reload: said once, on an add.
+    assert sum("Reload Window" in ln for ln in lines) == 1
     claude_log = (home / "claude.log").read_text()
     assert f"mcp add --scope user --transport http glean {url}" in claude_log
     assert f"mcp add glean --url {url}" in (home / "codex.log").read_text()
@@ -2196,17 +2199,20 @@ def test_setup_box_agents_glean_config_is_idempotent_and_fixes_a_wrong_entry_wit
     # A second run leaves both alone: no add, no backup.
     r, (lines, ok) = run()
     assert ok and "claude: glean present" in lines and "codex: glean present" in lines, r.stdout
+    assert not any("Reload Window" in ln for ln in lines)
     assert (home / "claude.log").read_text().count("mcp add") == 1
     assert not list(home.glob(".claude.json.ttp-bak-*"))
-    # A wrong entry is fixed, each config backed up first.
-    (home / "claude-mcp").write_text("https://old.example.invalid/mcp\n")
-    (home / "codex-mcp").write_text("https://old.example.invalid/mcp\n")
+    # An existing entry on another URL (one the user added by hand) is kept as it is: no remove, no add.
+    old = "https://old.example.invalid/mcp"
+    (home / "claude-mcp").write_text(old + "\n")
+    (home / "codex-mcp").write_text(old + "\n")
     r, (lines, ok) = run()
-    assert ok and "claude: glean fixed" in lines and "codex: glean fixed" in lines, r.stdout
-    assert (home / "claude-mcp").read_text().strip() == url and (home / "codex-mcp").read_text().strip() == url
-    assert len(list(home.glob(".claude.json.ttp-bak-*"))) == 1
-    assert len(list((home / ".codex").glob("config.toml.ttp-bak-*"))) == 1
-    assert any("backed up to" in ln for ln in lines)
+    assert ok and f"claude: glean kept (on another URL: {old})" in lines, r.stdout
+    assert f"codex: glean kept (on another URL: {old})" in lines, r.stdout
+    assert (home / "claude-mcp").read_text().strip() == old and (home / "codex-mcp").read_text().strip() == old
+    for c in ("claude", "codex"):
+        assert "mcp remove" not in (home / f"{c}.log").read_text() and (home / f"{c}.log").read_text().count("mcp add") == 1
+    assert not list(home.glob(".claude.json.ttp-bak-*")) and not list((home / ".codex").glob("config.toml.ttp-bak-*"))
     # A server's headers never reach the output.
     assert "secret-header" not in r.stdout
     # No URL: no Glean step at all.
@@ -2296,11 +2302,13 @@ def test_setup_box_agents_check_reports_glean_missing_signed_out_or_working(tmp_
     (home / "codex-glean-auth").write_text("o_auth\n")
     lines, problems, fixes = check()
     assert problems == [] and fixes == [] and all(ln.endswith(", glean working") for ln in lines), lines
-    # Another URL, or an error the CLI reports, is a gap too.
+    # An entry on another URL is kept and only noted; an error the CLI reports is a gap.
     (home / "codex-mcp").write_text("https://old.example.invalid/mcp\n")
     (home / "claude-glean-status").write_text("\u2718 Failed to connect\n")
-    lines, problems, _ = check()
-    assert problems == ["claude: glean not working (\u2718 Failed to connect)", "codex: glean on another URL"]
+    lines, problems, fixes = check()
+    assert problems == ["claude: glean not working (\u2718 Failed to connect)"]
+    assert lines[1].endswith(", glean working (kept on another URL: https://old.example.invalid/mcp)"), lines
+    assert not any("agents install" in f for f in fixes)
     # The sign-in is Codex's paste flow, Claude Code's under a terminal; both are seen as signed in once done.
     assert "mcp login glean --no-browser" in ba.login_script("codex", "glean")
     assert "script -qefc" in ba.login_script("claude", "glean") and "\\r" in ba.code_script("claude", "glean")
@@ -2311,6 +2319,19 @@ def test_setup_box_agents_check_reports_glean_missing_signed_out_or_working(tmp_
         assert ba._state(st) == ("logged-in" if c == "codex" else "logged-out"), (c, st)
     assert ba.callback_forward(["https://g.invalid/oauth?redirect_uri=http%3A%2F%2F127.0.0.1%3A40635%2Fcb&x=1"]) \
         == "40635:127.0.0.1:40635"
+    # A Claude Code too old for `mcp login` starts nothing and gets the one step the user can take.
+    (home / "no-mcp-login").write_text("")
+    out = subprocess.run(["sh", "-c", ba.login_script("claude", "glean")], env=env, capture_output=True, text=True,
+                         timeout=120).stdout
+    assert ba._state(out) == "no-login-cmd" and not (home / ".cache/tt-project/agent-login/claude-glean.pid").exists()
+    monkeypatch.setattr(ba, "_ssh", lambda alias, script, timeout, input=None: subprocess.CompletedProcess(
+        [], 0, "state=no-login-cmd\n", ""))
+    import argparse, contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = ba.cmd_login(argparse.Namespace(alias="<box-alias>", cli="claude", mcp="glean", status=False,
+                                             code_stdin=False))
+    assert rc == 1 and "too old for `claude mcp login`" in buf.getvalue() and "/mcp" in buf.getvalue()
 
 
 def test_setup_box_agents_editor_defaults_merge_keeps_entries_and_comments(tmp_path, monkeypatch):

@@ -16,11 +16,12 @@
   VS Code's user settings on this machine (merged, existing entries kept, the file backed up), so a
   new editor server build on any box gets them. Only on the user's yes: it is their machine.
 - Glean: `install` also adds the HTTP MCP server `glean` to each CLI (Claude Code user scope, Codex
-  `[mcp_servers.glean]`), left alone when right, fixed with a backup when wrong. Its URL comes from
+  `[mcp_servers.glean]`); an existing `glean` entry is always kept, even on another URL. Its URL comes from
   `--glean-url`, the site file's `mcp.glean` (the box's entry, else top level) or this machine's own
   agent configs, never from a repo; with none it skips with one line. `login <alias> <cli> --mcp glean`
   runs the CLI's paste-the-redirect-URL OAuth sign-in on the box; `check` reports Glean per CLI as
-  missing, signed out or working.
+  missing, signed out or working. Claude Code loads MCP servers when a session starts: one open before
+  the server was added (an editor's Claude panel too) needs a reload to see it.
 """
 
 from __future__ import annotations
@@ -205,16 +206,13 @@ def _read_mcp(kv: Dict[str, str], c: str, alias: str, glean: Optional[str], prob
         fix(install)
         return f", {MCP} missing"
     url, auth = kv.get(f"mcpurl_{c}", ""), kv.get(f"mcpauth_{c}", "")
-    if glean and url != glean:
-        problems.append(f"{c}: {MCP} on another URL")
-        fix(install)
-        return f", {MCP} on another URL ({url or 'none'})"
+    other = f" (kept on another URL: {url or 'none'})" if glean and url != glean else ""
     working = _mcp_working(c, auth)
     if working:
-        return f", {MCP} working"
+        return f", {MCP} working{other}"
     problems.append(f"{c}: {MCP} " + ("signed out" if working is False else f"not working ({auth or 'no status'})"))
     fix(f"{BOX_PY} agents login {alias} {c} --mcp {MCP}  (relay its sign-in link to the user)")
-    return f", {MCP} configured, " + ("signed out" if working is False else f"not working ({auth or 'no status'})")
+    return f", {MCP} configured{other}, " + ("signed out" if working is False else f"not working ({auth or 'no status'})")
 
 
 def _mcp_add(cli: str) -> str:
@@ -226,25 +224,15 @@ def _mcp_add(cli: str) -> str:
     return f'$TA "$b" mcp add {MCP} --url "$G" </dev/null >/dev/null 2>&1; '
 
 
-def _mcp_remove(cli: str) -> str:
-    """Shell: back up the CLI's config file once per run, then remove its `glean` server."""
-    if cli == "claude":
-        f, rm = '"$HOME/.claude.json"', f'(cd "$HOME" && $T "$b" mcp remove {MCP} -s user </dev/null >/dev/null 2>&1); '
-    else:
-        f, rm = '"${CODEX_HOME:-$HOME/.codex}/config.toml"', f'$T "$b" mcp remove {MCP} </dev/null >/dev/null 2>&1; '
-    return (f'cf={f}; if [ -f "$cf" ]; then cp -p "$cf" "$cf.ttp-bak-$STAMP"; echo "mcpbak_{cli}=$cf.ttp-bak-$STAMP"; fi; '
-            + rm)
-
-
 def mcp_install_script(clis: Sequence[str], url: str) -> str:
-    """Shell: the `glean` server at `url` for each CLI; left alone when right, else (re)added after a backup."""
-    s = (f'G={shlex.quote(url)}; STAMP=$(date +%Y%m%d-%H%M%S); '
+    """Shell: the `glean` server at `url` for each CLI; an existing `glean` entry is kept as it is."""
+    s = (f'G={shlex.quote(url)}; '
          'TA=; command -v timeout >/dev/null 2>&1 && TA="timeout 20"; ')
     for c in clis:
         s += (_find(c) + f'if [ -z "$b" ]; then echo "mcp_{c}=failed (no {c})"; fail=1; else '
-              + _mcp_read(c) + f'if [ "$u" = "$G" ]; then echo "mcp_{c}=present"; else st=added; '
-              'if [ -n "$g" ]; then st=fixed; ' + _mcp_remove(c) + 'fi; ' + _mcp_add(c) + _mcp_read(c)
-              + f'if [ "$u" = "$G" ]; then echo "mcp_{c}=$st"; else echo "mcp_{c}=failed"; fail=1; fi; fi; fi; ')
+              + _mcp_read(c) + f'if [ "$u" = "$G" ]; then echo "mcp_{c}=present"; '
+              f'elif [ -n "$g" ]; then echo "mcp_{c}=kept (on another URL: ${{u:-none}})"; else ' + _mcp_add(c) + _mcp_read(c)
+              + f'if [ "$u" = "$G" ]; then echo "mcp_{c}=added"; else echo "mcp_{c}=failed"; fail=1; fi; fi; fi; ')
     return s
 
 
@@ -299,8 +287,9 @@ def read_install(out: str) -> "tuple[List[str], bool]":
         elif k.startswith("mcp_"):
             lines.append(f"{k[4:]}: {MCP} {v}")
             ok = ok and not v.startswith("failed")
-        elif k.startswith("mcpbak_"):
-            lines.append(f"  {k[7:]}: {MCP} was on another URL; config backed up to {v}")
+            if k == "mcp_claude" and v == "added":
+                lines.append(f"  claude: sessions already open (an editor's Claude panel too) load {MCP} only after a "
+                             "reload: restart `claude`, or run `Developer: Reload Window` in the editor")
         elif k == "ext" and v == "none":
             lines.append("editor servers: none on the box yet (an editor's first Remote-SSH connect installs one)")
         elif k == "ext":
@@ -338,7 +327,9 @@ def login_script(cli: str, mcp: Optional[str] = None) -> str:
         cmd = f'$TL env TERM=dumb script -qefc \\"$b mcp login {mcp} --no-browser\\" /dev/null'
     else:
         cmd = f'$TL $b mcp login {mcp} --no-browser'
-    return (_TIMEOUT + f'umask 077; d={LOGIN_DIR}; mkdir -p "$d"; chmod 700 "$d"; ' + _login_ready(cli, mcp)
+    has = (f'if ! $T "$b" mcp login --help </dev/null >/dev/null 2>&1; then echo state=no-login-cmd; exit 0; fi; '
+           if mcp else "")
+    return (_TIMEOUT + f'umask 077; d={LOGIN_DIR}; mkdir -p "$d"; chmod 700 "$d"; ' + _login_ready(cli, mcp) + has
             + f'pid=$(cat "$d/{c}.pid" 2>/dev/null); '
             'if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo state=pending; else '
             f'rm -f "$d/{c}.in" "$d/{c}.log"; mkfifo "$d/{c}.in" || {{ echo state=failed; exit 0; }}; '
@@ -501,8 +492,8 @@ def cmd_install(args) -> int:
             print("- ~/.local/bin on PATH for ssh commands (first line of ~/.bashrc; ~/.zshenv for zsh) and login "
                   "shells (~/.bash_profile or ~/.profile), each file backed up once to <file>.ttp-bak")
         if clis and url:
-            print(f"- the {MCP} MCP server ({url}, from {where}) in each CLI: left alone when right, else re-added "
-                  "after a backup of its config; then `agents login <box-alias> <cli> --mcp glean`")
+            print(f"- the {MCP} MCP server ({url}, from {where}) in each CLI that has no `glean` entry; an "
+                  "existing one is kept; then `agents login <box-alias> <cli> --mcp glean`")
         if exts:
             print(f"- {', '.join(exts)} on every Cursor and VS Code server build there, checked with --list-extensions")
         print("\n".join(skip + ["rerun with --run"]))
@@ -560,6 +551,11 @@ def cmd_login(args) -> int:
     if st == "no-mcp":
         print(f"{cli} on {args.alias} has no {mcp} server: `{BOX_PY} agents install {args.alias} --cli {cli} --run` "
               f"first ({MCP_URL_HINT})")
+        return 1
+    if st == "no-login-cmd":
+        print(f"{cli} on {args.alias} is too old for `{cli} mcp login`: update it on the box"
+              + (f" (`claude update`), or the user signs in once by hand: ssh to the box, run `claude`, type `/mcp`, "
+                 f"pick {mcp} and choose Authenticate" if cli == "claude" else ""))
         return 1
     shown = relay_lines(r.stdout)
     if st not in ("started", "pending") or not any("https://" in ln for ln in shown):

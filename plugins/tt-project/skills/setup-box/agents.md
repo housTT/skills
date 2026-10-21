@@ -76,13 +76,23 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
 - A site's MCP endpoints (device broker, other services) come from the site file
   (`mcp` in `site.md`), never from a repo or this skill.
 - Glean: `install` adds an HTTP MCP server named `glean` to each CLI it sets up (Claude Code
-  `claude mcp add --scope user --transport http glean <url>`, Codex `[mcp_servers.glean]`). A
-  correct entry is left alone; a wrong one is fixed after a backup (`<file>.ttp-bak-<time>`). The
-  URL comes from `--glean-url`, the site file's `mcp.glean`, or a `glean` server already in this
+  `claude mcp add --scope user --transport http glean <url>`, Codex `[mcp_servers.glean]`). An
+  existing `glean` entry is always kept, even on another URL (the user may have added it by hand);
+  `check` only notes the other URL. The URL comes from `--glean-url`, the site file's `mcp.glean`, or a `glean` server already in this
   machine's Claude Code, Codex or Cursor config. With none, it skips Glean with one line saying so.
 - Sign-in: `login <box-alias> <cli> --mcp glean` starts the agent's own sign-in on the box and
   prints its link. The user opens it; the browser then ends on a `localhost` address that does not
   load. The user copies that address and the agent passes it on with `--code-stdin`. Or the user
   runs the printed `ssh -N -L <port>:<host>:<port> <box-alias>` first and the page completes by
-  itself. Tokens stay on the box.
+  itself. Tokens stay on the box and are never copied between boxes or users. This is the headless
+  path for both agents: `claude mcp login <name> --no-browser` and
+  `codex mcp login <name> --no-browser`. A Claude Code too old for `mcp login` gets one step
+  instead: update it, or the user runs `claude` on the box, types `/mcp`, picks `glean` and
+  chooses Authenticate.
+- Reload: Claude Code reads MCP servers when a session starts. A session open before `glean` was
+  added, an editor's Claude panel too, does not show it until restarted (`Developer: Reload
+  Window` in the editor). `install` says so when it adds the server.
+- Claude Code also lists the account's own connectors, such as `claude.ai Glean`, beside the
+  `glean` server. That connector is separate and needs its own sign-in (`/mcp` in Claude Code, or
+  the connector settings on claude.ai). A `Needs authentication` on it says nothing about `glean`.
 - `check` reports Glean per agent: missing, configured but signed out, or working.
