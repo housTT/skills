@@ -512,25 +512,30 @@ def ask_tasks(db: DB, ask: dict) -> list[int]:
 
 
 def close_landed(db: DB, landed, now: float | None = None) -> list[int]:
-    """Close each open ask whose work landed: it is for at least one task (ask_tasks), and every such
-    task is done, finished after the ask was sent, and in `landed` (the done tasks whose every claimed
-    push the push audit confirmed on its remote, pushclaim.audit). An ask for no task, or for a task
-    not confirmed landed, stays open. Each is recorded resolved with its tasks (record_resolve), which
-    asks() and the daily audit report as "resolved: its work landed". Returns the asks closed."""
-    now = time.time() if now is None else now
+    """Close each open ask whose work landed after it was sent: it is for at least one task (ask_tasks),
+    and every such task, or a task carrying its change on (landed.carriers: its review, review fixes,
+    re-reviews, continuations), is done and in `landed` (the done tasks whose every claimed push the
+    push audit confirmed on its remote, pushclaim.audit), with that landing after the ask (landed_at).
+    An ask for no task, for a task not confirmed landed, or for one that landed before it (named only
+    as context) stays open. Each is recorded resolved with its tasks (record_resolve), which asks()
+    and the daily audit report as "resolved: its work landed". Returns the asks closed."""
+    from .landed import carriers
     landed = {int(t) for t in landed or ()}
     if not landed:
         return []
+    when: dict[int, float | None] = {}
+
+    def landed_when(tid: int) -> float | None:
+        if tid not in when:
+            ids = [c for c in carriers(db, tid) if c in landed]
+            rows = db.q(f"SELECT id FROM tasks WHERE status='done' AND id IN ({','.join('?' * len(ids))})", ids) if ids else []
+            when[tid] = max((landed_at(db, r["id"]) for r in rows), default=None)
+        return when[tid]
     closed = []
     for a in db.q("SELECT id, ts, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0 ORDER BY id"):
         tasks = ask_tasks(db, a)
-        if not tasks or not set(tasks) <= landed:
-            continue
-        rows = db.q(f"SELECT t.id, t.status, t.updated, (SELECT MAX(ts) FROM events e WHERE e.task=t.id AND "
-                    f"e.kind='task_done') AS done_at FROM tasks t WHERE t.id IN ({','.join('?' * len(tasks))})", tasks)
-        # A task named only as context (done before the ask was sent) is not the work the ask was for.
-        if len(rows) != len(tasks) or any(r["status"] != "done" or float(r["done_at"] or r["updated"] or 0) <= float(a["ts"])
-                                          for r in rows):
+        # A task whose work landed before the ask was sent is named only as context, not the work it was for.
+        if not tasks or any((landed_when(t) or 0) <= float(a["ts"]) for t in tasks):
             continue
         with db.tx():
             if db.one("SELECT id FROM messages WHERE id=? AND kind='ask' AND handled=0", (a["id"],)):
@@ -538,6 +543,17 @@ def close_landed(db: DB, landed, now: float | None = None) -> list[int]:
                 record_resolve(db, a["id"], [], landed=tasks)
                 closed.append(a["id"])
     return closed
+
+
+def landed_at(db: DB, tid: int) -> float:
+    """When task `tid`'s confirmed push landed: its push queue landing's last update, else (a push of
+    its own) when it finished (task_done event, else its last update)."""
+    r = db.one("SELECT MAX(updated) AS ts FROM push_queue WHERE task=? AND status IN ('pushed','landed')", (tid,))
+    if r and r["ts"]:
+        return float(r["ts"])
+    r = db.one("SELECT (SELECT MAX(ts) FROM events e WHERE e.task=t.id AND e.kind='task_done') AS done_at, "
+               "t.updated FROM tasks t WHERE t.id=?", (tid,))
+    return float((r["done_at"] or r["updated"] or 0) if r else 0)
 
 
 def inventory_line(rows: list[dict]) -> str:

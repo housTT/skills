@@ -8158,6 +8158,50 @@ def test_close_landed_never_closes_an_ask_without_a_confirmed_landed_task(env):
     assert unblock.close_landed(p.db, [tid]) == [a]
 
 
+def test_an_ask_closes_when_the_push_queue_lands_the_named_task_through_its_review(env, monkeypatch):
+    """In a push-queue project the queue row belongs to the review that approved the head and the code
+    task claims no push: the ask naming only the code task closes once the review's landing is on the
+    remote, even though the code task finished before the ask (a push-time ask). A task whose review
+    landed before the ask (named as context) and one whose approval has not landed keep theirs open."""
+    from ttp import audit, daemon as dmod, pushclaim, unblock
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    now = time.time()
+    _commit(repo, "a.txt", "a\n")
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+
+    def code(title, done_ago, landed_ago, status="landed"):
+        tid = p.db.add_task(title, "s", kind="code", origin="user", branch=f"ttp/t-{title}")
+        p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": f"Commits {sha[:8]} on ttp/t-{title}"}))
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now - done_ago, tid))
+        rev = p.db.add_task(f"Review #{tid}: {title}", "r", kind="review", origin="coordinator")
+        p.db.update_task(rev, status="done", result=json.dumps({"status": "done", "summary": "approved"}))
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, pushed_sha, landed_sha) "
+               "VALUES(?,?,?,'origin/proj',?,?,?,?,?)", (rev, f"ttp/t-{title}", sha, status, now - landed_ago - 60,
+                                                         now - landed_ago, sha if status == "landed" else None,
+                                                         sha if status == "landed" else None))
+        return tid, rev
+
+    def ask(text, ago=3600):
+        return p.db.x("INSERT INTO messages(ts,direction,kind,text,ref) VALUES(?,?,?,?,?)",
+                      (now - ago, "out", "ask", text, "blocking:access"))
+    ci, ci_rev = code("ci", 7200, 600)
+    early, early_rev = code("early", 9000, 7200)
+    queued, _ = code("queued", 7200, 600, status="approved")
+    a_ci = ask(f"The token needs the workflow scope before #{ci}'s CI job can be pushed.")
+    a_early = ask(f"Like #{early}, may this change too?")
+    a_queued = ask(f"Grant the scope so #{queued} can push?")
+    assert ci not in pushclaim.audit(p)["landed"] and ci_rev in pushclaim.audit(p)["landed"]
+    dmod.Daemon(p.base).audit_pushes()
+    open_ = {r["id"] for r in p.db.q("SELECT id FROM messages WHERE kind='ask' AND handled=0")}
+    assert a_ci not in open_ and {a_early, a_queued} <= open_
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400)}
+    assert rows[a_ci]["landed"]["tasks"] == [ci]
+    assert f"resolved: its work landed (#{ci})" in "\n".join(audit.lines(p.db))
+    assert unblock.landed_at(p.db, ci_rev) == pytest.approx(now - 600)
+    assert unblock.landed_at(p.db, early_rev) == pytest.approx(now - 7200)
+
+
 def test_review_rules_do_not_tell_reviews_to_publish_another_tasks_branch():
     """The review template never invites --own onto a branch another task carries (the push refuses it)."""
     import re
