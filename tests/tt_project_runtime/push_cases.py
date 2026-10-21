@@ -9361,3 +9361,14 @@ def test_the_push_queue_status_names_the_held_rows(env, monkeypatch):
     [h] = pushq.summary(s.p)["held"]
     assert h["task"] == s.review and h["scope"] == "workflow"
     assert "held for the token scope `workflow`" in pushq.status_line(s.p)
+
+
+def test_a_held_push_row_shows_in_the_start_gate_and_counts_as_delivered(env, monkeypatch):
+    from ttp import reviewreuse, startgate
+    p = _pq(env, monkeypatch).p
+    t = p.db.add_task("Producer", "x", kind="code", tier="light", origin="coordinator", provider="claude",
+                      budget_usd=1.0)
+    p.db.x("INSERT INTO push_queue(task,run,branch,head,target,status,detail,created,updated) "
+           "VALUES(?,1,'b','abc123','origin/proj','held',?,0,0)", (t, json.dumps({"scope": "workflow"})))
+    assert startgate.push_state(p.db, f"ttp landed --task {t}") == "held for the token scope workflow"
+    assert reviewreuse.delivered(p, "abc123")

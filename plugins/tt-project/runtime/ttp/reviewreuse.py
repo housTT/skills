@@ -55,7 +55,7 @@ def delivered(p, sha: str) -> bool:
     """Whether head `sha` is on its way or already there: a live push_queue row for it, or the push
     target's tip as last fetched contains it."""
     from . import pushq
-    if p.db.one("SELECT 1 FROM push_queue WHERE head=? AND status IN ('approved','batched','pushed',"
+    if p.db.one("SELECT 1 FROM push_queue WHERE head=? AND status IN ('approved','batched','held','pushed',"
                 "'landed') LIMIT 1", (sha,)):
         return True
     tgt = pushq.target(p)

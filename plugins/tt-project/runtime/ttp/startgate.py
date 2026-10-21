@@ -8,6 +8,8 @@ gate passes), never a 'needs you' item. A `landed:#<id>` gate whose producer is 
 batch in the push queue names that instead: it is waiting, not stale. Model-free."""
 from __future__ import annotations
 
+import json
+
 from . import landed
 from .db import deferral
 
@@ -87,8 +89,15 @@ def push_state(db, when: str) -> str | None:
             ids |= set(landed.carriers(db, int(ref)))
     if not ids:
         return None
-    rows = db.q(f"SELECT status, batch FROM push_queue WHERE status IN ('approved','batched') "
+    rows = db.q(f"SELECT status, batch, detail FROM push_queue WHERE status IN ('approved','batched','held') "
                 f"AND task IN ({','.join('?' * len(ids))}) ORDER BY id", tuple(sorted(ids)))
+    held = next((r for r in rows if r["status"] == "held"), None)
+    if held:
+        try:
+            scope = (json.loads(held.get("detail") or "{}") or {}).get("scope")
+        except (TypeError, ValueError, AttributeError):
+            scope = None
+        return f"held for the token scope {scope}" if scope else "held for a missing token scope"
     batch = next((r["batch"] for r in rows if r["status"] == "batched" and r["batch"]), None)
     return f"waiting on push batch {batch}" if batch else "approved, waiting on the next push batch" if rows else None
 
