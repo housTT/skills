@@ -5849,10 +5849,11 @@ def test_doctor_loop_lands_one_code_task_on_a_local_bare_remote_through_review(e
 
 def test_doctor_loop_fails_a_change_that_lands_outside_the_review_and_push_queue(env, monkeypatch):
     """A worker that pushes its commit straight to the remote is a FAIL, not a pass: the loop must
-    show the review and the push queue doing the landing."""
+    show the review and the push queue doing the landing. The run's git wrapper refuses that push
+    (delivery.code_tasks_may_push is off), so the worker here goes around it, outside the run's task."""
     from ttp import loopcheck
     monkeypatch.setenv("TTP_FAKE_SHELL", LOOP_FAKE_SHELL.replace(
-        'commit -qm "notes: $w"', 'commit -qm "notes: $w" && git push -q origin HEAD:loop-check'))
+        'commit -qm "notes: $w"', 'commit -qm "notes: $w" && env -u TTP_TASK git push -q origin HEAD:loop-check'))
     lines = []
     r = loopcheck.run("fake", tick_s=0.05, cap_s=120, emit=lines.append)
     assert r["outcome"] == "landed without the review and push queue", (r, lines)
