@@ -15954,7 +15954,7 @@ def test_worker_memory_puts_entries_naming_the_tasks_paths_and_resources_first(e
               + [("fact", "OLD-PATH: src/widget/cache.py holds the warm-up switch; " + "a" * 300),
                  ("fact", "OLD-BOX: bench-box-7 needs its fan profile reset after each run; " + "b" * 300),
                  ("fact", "OLD-TASK: #4711 left a stale lock file behind; " + "c" * 300)]
-              + [("fact", f"NEW-FACT-{i:02} unrelated news " + "n" * 300) for i in range(12)])
+              + [("fact", f"NEW-FACT-{i:02} unrelated news, see notes/log.txt; " + "n" * 300) for i in range(12)])
     pins = p.worker_memory_select(0)[1]["pinned_chars"]
     limit = pins + 2 * max(len(e["line"]) + 1 for e in p._memory_entries())   # room for two more
     names = lambda sel: [e["line"].split("] ", 1)[1].split(":")[0].split(" ")[0] for e in sel[0]]
@@ -15974,10 +15974,13 @@ def test_worker_memory_puts_entries_naming_the_tasks_paths_and_resources_first(e
         assert want in worker_system(p, task)
     unrelated = {"title": "code: docs", "spec": "Fix a typo in the readme.", "kind": "code"}
     assert names(p.worker_memory_select(limit, unrelated)) == names(plain)
-    # An entry's words count less the more entries share them: a path part every entry names ties
-    # the task to none of them, the specific path still wins.
-    both = {"title": "code task", "spec": "Unrelated news about src/widget/cache.py.", "kind": "code"}
-    assert "OLD-PATH" in names(p.worker_memory_select(limit, both))
+    # Plain words tie nothing; a name counts less the more entries share it, so a path every new
+    # entry names does not outweigh the one only the old entry names.
+    plain_words = {"title": "code task", "spec": "Unrelated news about the fan profile and lock file.",
+                   "kind": "code"}
+    assert names(p.worker_memory_select(limit, plain_words)) == names(plain)
+    both = {"title": "code task", "spec": "Compare notes/log.txt with src/widget/cache.py.", "kind": "code"}
+    assert names(p.worker_memory_select(limit, both))[2:] == ["OLD-PATH", "NEW-FACT-11"]
 
 _BIG_CHARTER = """# demo — charter
 

@@ -820,26 +820,23 @@ def worker_memory(e: dict) -> int:
     return 2 if _WORKER_WORD.search(e["line"]) else 3 if e["kind"] == "fact" else 0
 
 
-# Words too common in specs and memory to tie an entry to a task (see task_words).
-_COMMON_WORDS = frozenset("""
-about after again against also and any are because been before being both but can could did does
-done each else every few for from had has have here how into its just keep more most must need never
-new not now off once only other our out over own same should since some still such than that the
-their them then there these they this those through too under until upon very was were what when
-where which while who why will with within without would yes you your task tasks run runs worker
-workers change changes test tests use used using make made one two""".split())
-_TOKEN = re.compile(r"[a-z0-9][a-z0-9_./#:-]*[a-z0-9]")
+_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./#:-]*[A-Za-z0-9]")
+# A word that names something: a digit, an inner _ / . : # or -, camelCase, or ALL CAPS.
+_NAMING = re.compile(r"\d|[_/.:#-]|[a-z][A-Z]|^[A-Z]{3,}$")
+_NOT_NAMES = frozenset(("e.g", "i.e", "etc", "and/or", "vs"))
 
 
 def task_words(text: str) -> set[str]:
-    """The words of `text` that can tie a memory entry to a task: identifiers, paths and their
-    parts, resource names, task and message numbers; lower-cased, 3+ characters, common words out."""
+    """The words of `text` that can tie a memory entry to a task: those that name something
+    (identifiers, paths and their parts, resource names, task and message numbers, and anything in
+    backticks), lower-cased, 3+ characters. Plain words never count: they tie every entry to every task."""
     out = set()
-    for tok in _TOKEN.findall(text.lower()):
-        out.add(tok)
-        if "/" in tok or "." in tok:
-            out.update(re.split(r"[/.]", tok))
-    return {w for w in out if len(w) >= 3 and w not in _COMMON_WORDS}
+    ticked = {w for span in re.findall(r"`([^`\n]+)`", text) for w in _TOKEN.findall(span)}
+    for tok in _TOKEN.findall(text):
+        for w in {tok, *tok.split("/")}:
+            if len(w) >= 3 and (w in ticked or _NAMING.search(w)) and w.lower() not in _NOT_NAMES:
+                out.add(w.lower())
+    return out
 
 
 class Project:
