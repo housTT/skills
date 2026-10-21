@@ -60,11 +60,24 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
 
    | Run | Items | Command |
    |---|---|---|
-   | capture | `source:graph`, `source:cache` | `TT_METAL_CACHE=<cache dir> TT_METAL_RISCV_DEBUG_INFO=1 OPA_GRAPH_CAPTURE=<capture file> PYTHONPATH=<plugin-root>/pytest_plugins:$PYTHONPATH pytest -p opa_graph_capture <node id>` |
-   | profile | `source:tracy` | `python -m tracy -p -r -v -m "pytest <node id>"` (needs a profiler build) |
+   | capture | `source:graph`, `source:cache` | `TT_METAL_CACHE=<cache dir> TT_METAL_RISCV_DEBUG_INFO=1 OPA_GRAPH_CAPTURE=<capture file> PYTHONPATH=<plugin-root>/pytest_plugins:$PYTHONPATH pytest -p opa_graph_capture --timeout <s> <node id>` |
+   | profile | `source:tracy` | `python -m tracy -p -r -v -m "pytest --timeout <s> <node id>"` (needs a profiler build) |
 
    With only `source:cache`, drop `OPA_GRAPH_CAPTURE`, `PYTHONPATH` and `-p opa_graph_capture`;
    with only `source:graph`, drop `TT_METAL_CACHE` and `TT_METAL_RISCV_DEBUG_INFO`.
+
+   Run both from the tt-metal checkout with `TT_METAL_HOME` set to it in the job's environment:
+   the broker does not set it, and without it `tracy` looks for its capture tools under the wrong
+   root and exits with "Tracy tools were not found" before the test starts.
+
+   Always pass `--timeout <s>`. Without it pytest-timeout applies tt-metal's `pytest.ini` default
+   (300 s), and both runs compile every kernel from nothing: the capture run into the empty cache
+   with debug info and graph capture on every call, the profile run because the device profiler
+   changes every kernel. A whole model can spend more than 300 s in its first forward; RT-DETR on a
+   P100 timed out inside the backbone. Use 1400, or `ci_pytest_timeout_s` when it is larger but
+   still below the broker's 1500 s job limit, so pytest reports where it stopped instead of the
+   broker killing it. A capture run that times out leaves a partial cache and capture file:
+   ask the user before deleting them, then rerun into an empty directory.
 
    The empty cache directory makes every kernel compile in the capture run, so the cache holds
    this test's kernels only. Debug info adds DWARF to the ELFs and does not change the kernel
