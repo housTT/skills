@@ -1079,9 +1079,20 @@ reaches the coordinator once as a normal observation, not once per deploy.
 
 ## Notifications
 
-Alerts go to every attached chat, to the web app (one-click browser notifications), and, if you
+Alerts go to every attached chat, to the web app, and, if you
 install it, to a desktop notifier on your workstation that covers all your projects
 (`ttp notifier install`; asked once per user, recorded with `ttp consent notifier yes|no`). Only decisions, reviews, merges, funds and outages notify by default.
+
+- Web app: the Notifications card on the Overview tab shows the browser's state (on, not allowed yet,
+  blocked, unavailable on this address, unsupported), an Allow button and Send test. While the page
+  is open in any tab, each new ask, problem and task ready for review pops up once. Browsers allow
+  notifications only on https or localhost: open the `http://127.0.0.1:…` link `ttp web` prints
+  (through its tunnel from another machine), not the box's own hostname.
+- Slack (optional): `ttp secret slack --email <your Slack email>` saves a bot token for your user,
+  `ttp config <name> notify.slack true` turns it on for a project, and `ttp notifier test --slack`
+  sends a test message or prints Slack's exact error. The web app and `ttp doctor` say when Slack is
+  not configured or its last send failed.
+
 Workers can read Slack links you paste, using your Slack connector if you have one.
 
 ## Security
