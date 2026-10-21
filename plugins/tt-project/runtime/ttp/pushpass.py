@@ -80,7 +80,7 @@ def env_id(wt: Path, cmd: str, env: dict, tip: str) -> str:
     if host := push.remote_host(cmd):
         parts = {"host": host, "cmd": str(cmd), "env": dict(getattr(cmd, "env", ()) or ()), "tip": tip or ""}
         return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
-    argv = push.check_argv(cmd, wt, env)
+    argv = push.check_argv(cmd, wt, env, isolate=False)   # sandboxed or not, the same tests
     which = shutil.which("python3", path=env.get("PATH"))
     parts = {"argv": argv, "venv": _python(push.venv_python(wt, env)), "python3": _python(which),
              "active": env.get("VIRTUAL_ENV") or "", "tip": tip or ""}

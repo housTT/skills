@@ -2456,6 +2456,9 @@ def cmd_checks(a) -> None:
         handover = bool(todo) and not hit and slot is None
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
         run_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
+        for line in [] if hit or handover else push.sandbox_lines(todo):
+            print(f"ttp checks: {line}", flush=True)
+            out.write(f"ttp checks: {line}\n")
         for c in [] if hit or handover else todo:
             executed.append(c)
             # A progress line per check: the commands' own output goes only to checks.log.
@@ -3288,6 +3291,17 @@ def cmd_broker_released(a) -> None:
     ok, why = brokerhold.released(text)
     print(f"ttp broker-released: {'released' if ok else 'not released'} ({why})")
     sys.exit(0 if ok else 1)
+
+
+def cmd_sandbox(a) -> None:
+    """Run one command in a process sandbox (sandbox.py): its own PID namespace and /proc, so it
+    cannot see or signal any other process on the host, and nothing it started outlives it. Where
+    the host allows no sandbox it runs as it is and says why. Exits with the command's code."""
+    from . import sandbox
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        die("usage: ttp sandbox -- <command...>")
+    sys.exit(sandbox.run(cmd))
 
 
 def cmd_killscan(a) -> None:
@@ -6592,6 +6606,8 @@ def cmd_doctor(a) -> None:
     print(web_line(p))
     from .service import service_line
     print(service_line(p))
+    from . import sandbox
+    print(f"process sandbox for checks: {sandbox.notice() or 'on (own PID namespace per check command)'}")
     from .project import config_problems
     for line in config_problems(p.raw_config(), p.root):
         print(f"project.json: {line}")
@@ -6624,8 +6640,8 @@ COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
-    ("inside a run", ("note", "notify", "checks", "lock", "detach", "devq", "push", "clip", "skill",
-                      "killscan", "svcscan")),
+    ("inside a run", ("note", "notify", "checks", "lock", "detach", "devq", "push", "clip", "sandbox",
+                      "skill", "killscan", "svcscan")),
     ("probes (retry_when, start_when)", ("landed", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
@@ -6944,6 +6960,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--lines", type=int, default=40, help="at most this many lines of an ordinary excerpt")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
     s.set_defaults(fn=cmd_clip)
+
+    s = sub.add_parser("sandbox", help="run a command (a test suite) in its own PID namespace, where it cannot see "
+                                       "or signal other processes; nothing it starts outlives it")
+    s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
+    s.set_defaults(fn=cmd_sandbox)
 
     s = sub.add_parser("skill", help="print the path of an installed tt-project skill's SKILL.md (no name: list them)")
     s.add_argument("name", nargs="?", help="e.g. tt-project-harness")

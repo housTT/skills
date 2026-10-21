@@ -398,7 +398,7 @@ def _strip_prefix(argv: list[str]) -> list[str]:
         elif re.match(r"^\w+=", w) or w.startswith("-") or re.fullmatch(r"\d+[smhd]?", w) \
                 or os.path.basename(w) in WRAPPERS or w in RESERVED:
             i += 1
-        elif w == "ttp" and argv[i + 1:i + 2] in (["lock"], ["clip"], ["detach"]) and "--" in argv[i:]:
+        elif w == "ttp" and argv[i + 1:i + 2] in (["lock"], ["clip"], ["detach"], ["sandbox"]) and "--" in argv[i:]:
             i = argv.index("--", i) + 1
         else:
             break

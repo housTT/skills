@@ -33,8 +33,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, envfault, landed, locks, machines, prguard, remotecheck, runner, settinghold, timefmt,
-               worktree)
+from . import (checkcap, checkdirs, envfault, landed, locks, machines, prguard, remotecheck, runner, sandbox, settinghold,
+               timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_creates_pr_branch,
@@ -69,17 +69,20 @@ class Check(str):
     `ttp checks --purpose` runs it (untagged: both; `ttp push --own` is candidate); `ttp push` and the
     push queue run every entry. `"host": "<ssh alias>"` runs it on that machine (remotecheck), with
     `"env": {...}` exported where it runs; `"host": "local"` keeps it here when `delivery.checks_host` sets a
-    default host (`default_host`, never part of the config form)."""
+    default host (`default_host`, never part of the config form). A local check runs in a process
+    sandbox (sandbox.py); `"sandbox": false` runs it without, for a check that needs the host's
+    process table."""
     if_exists = ""
     if_changed: tuple[str, ...] = ()
     purpose = ""
     host = ""
     env: tuple[tuple[str, str], ...] = ()
     default_host = ""
+    sandbox = True
 
     def config(self) -> str | dict:
         """The form project.json keeps."""
-        if not (self.if_exists or self.if_changed or self.purpose or self.host or self.env):
+        if not (self.if_exists or self.if_changed or self.purpose or self.host or self.env or not self.sandbox):
             return str(self)
         out: dict = {"run": str(self)}
         if self.if_exists:
@@ -92,10 +95,12 @@ class Check(str):
             out["host"] = self.host
         if self.env:
             out["env"] = dict(self.env)
+        if not self.sandbox:
+            out["sandbox"] = False
         return out
 
 
-CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env"}
+CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandbox"}
 PURPOSES = ("candidate", "harness")   # `ttp checks --purpose`; candidate is the default and publication evidence
 
 
@@ -128,6 +133,7 @@ def _check(c: Any) -> Check | None:
         out.purpose = c.get("purpose") or ""
         out.host = str(c.get("host") or "").strip()
         out.env = tuple(sorted((c.get("env") or {}).items()))
+        out.sandbox = c.get("sandbox") is not False
     return out
 
 
@@ -322,19 +328,32 @@ def outside_scope(checks: list[Check], skipped: list[str]) -> bool:
             and all(getattr(s, "scoped", False) for s in own))
 
 
-def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None) -> list[str]:
+def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None, isolate: bool = True) -> list[str]:
     """How a check command runs: first-failure semantics, so `a; b` fails when `a` fails and a
     pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing).
     With `top` (the worktree it runs in), a bare pytest runs with the repository's venv, else the one
     `env` (the check's environment; default this process's) has active (venv_cmd). A check with a host
-    (remote_host) runs there instead, on a copy of the checkout's HEAD (remotecheck)."""
+    (remote_host) runs there instead, on a copy of the checkout's HEAD (remotecheck). A local check runs
+    in a process sandbox (sandbox.wrap) unless it opts out or `isolate` is false; sandbox_lines says
+    when one cannot."""
     exports = dict(getattr(cmd, "env", ()) or ())
+    isolate = isolate and getattr(cmd, "sandbox", True) is not False
     if host := remote_host(cmd):
         return remotecheck.argv(str(cmd), host, exports)
     cmd = venv_cmd(cmd, top, env) if top else cmd
     cmd = remotecheck.exports(exports) + cmd
     bash = shutil.which("bash")
-    return [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
+    argv = [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
+    return sandbox.wrap(argv, isolate)
+
+
+def sandbox_lines(checks: list) -> list[str]:
+    """What a run of `checks` says about its process sandbox: why there is none (once), and each
+    local check that opted out. Nothing when every local check runs in one."""
+    local = [c for c in checks if not remote_host(c)]
+    off = [c for c in local if getattr(c, "sandbox", True) is False]
+    lines = [notice for notice in [sandbox.notice()] if notice and len(off) < len(local)]
+    return lines + [f"{c}: {sandbox.notice(False)}" for c in off]
 
 
 VENV_DIRS = (".venv", "venv")
@@ -1003,7 +1022,7 @@ def _form_problem(c: dict) -> str | None:
     extra = sorted(set(map(str, c)) - CHECK_KEYS)
     if extra:
         return (f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed, "
-                "purpose, host and env")
+                "purpose, host, env and sandbox")
     cond = c.get("if_exists")
     if cond is not None and not _inside(cond):
         return f"{c!r}: if_exists must be a path or glob inside the repository"
@@ -1017,6 +1036,8 @@ def _form_problem(c: dict) -> str | None:
         return f"{c!r}: {why}"
     if "env" in c and (why := remotecheck.env_problem(c["env"])):
         return f"{c!r}: {why}"
+    if "sandbox" in c and not isinstance(c["sandbox"], bool):
+        return f"{c!r}: sandbox must be true or false"
     if purpose == "harness":
         return harness_plan_problem(cmd.strip())
     return None
@@ -2839,6 +2860,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         with slot:
             started = time.time()
             env = {**check_env("own", tip, check_run_dir), **slot.env()}
+            for line in sandbox_lines(todo):
+                say(line)
             for cmd in todo:
                 if (rc := _run_one(cmd, repo, env, say)) != 0:
                     if rc != BUSY:
@@ -3036,6 +3059,8 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         with slot:
             started = time.time()
             env = {**check_env("target", tip, check_run_dir), **slot.env()}
+            for line in sandbox_lines(todo):
+                say(line)
             for cmd in todo:
                 if (rc := _run_one(cmd, repo, env, say)) != 0:
                     if rc != BUSY:

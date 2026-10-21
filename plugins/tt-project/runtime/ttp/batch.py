@@ -1120,6 +1120,8 @@ class Batch:
                                priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
         started = time.time()   # a wait for the host-wide slot is not check time
         try:
+            for line in push.sandbox_lines([cmd for cmd, _ in run]):
+                say(line)
             for cmd, eid in run:
                 resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and pushpass.resumable(str(cmd)) else None
                 extra = pushpass.resume_env(resume, env) if resume else {}
