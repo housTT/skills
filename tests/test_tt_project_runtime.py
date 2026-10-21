@@ -7493,7 +7493,7 @@ def test_explicit_clear_receipts_stay_pending_through_the_quiet_sweep_downtime_a
     # The tick sweeps quiet issues before it runs the day's commands.
     import inspect
     body = inspect.getsource(dmod.Daemon.tick)
-    assert body.index("self.sweep_watcher_issues()") < body.index("self.run_schedules")
+    assert body.index("self._run_step(self.sweep_watcher_issues)") < body.index("self.run_schedules")
     a, b = "job7: done; evidence_" + "a1" * 20, "job8: done; evidence_" + "c3" * 20
     assert tick(_line(a) + _line(b)) == ("ok (2 observations)", 2), "each new receipt line wakes once"
     pending = r["open_titles"]()
