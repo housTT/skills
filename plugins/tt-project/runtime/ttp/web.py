@@ -637,28 +637,28 @@ class Handler(BaseHTTPRequestHandler):
     def _proj(self) -> Project:
         return self.daemon_ref.p
 
-    def _auth(self, cookie: bool = True) -> bool:
-        want = token(self._proj())
-        got = self.headers.get("X-TTP-Token") or ""
-        if not got and cookie:
-            for part in (self.headers.get("Cookie") or "").split(";"):
-                k, _, v = part.strip().partition("=")
-                if k == "ttp_token":
-                    got = v
-        return secrets.compare_digest(got, want)
+    def _auth(self) -> bool:
+        """Only the X-TTP-Token header counts, never a cookie: browsers do not scope cookies by
+        port, so one would reach every service on 127.0.0.1 and other projects' apps."""
+        return secrets.compare_digest(self.headers.get("X-TTP-Token") or "", token(self._proj()))
 
     def _post_refusal(self) -> tuple[int, str] | None:
-        """A change needs the token header, a JSON body and no foreign Origin. The cookie alone is
-        not enough: a page on another localhost port counts as same-site, so it carries the cookie
-        and could post a plain form."""
+        """A change needs the token header, a JSON body and no foreign Origin: a page on another
+        localhost port counts as same-site and could post a plain form."""
         origin = self.headers.get("Origin")
         if origin is not None and origin.rstrip("/") not in {f"{s}://{self.headers.get('Host') or ''}" for s in ("http", "https")}:
             return 403, "foreign origin"
-        if not self._auth(cookie=False):
+        if not self._auth():
             return 401, "token header required"
         if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
             return 415, "application/json required"
         return None
+
+    def end_headers(self) -> None:
+        # Every response, send_error's included: no other site may frame the app (clickjacking).
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        super().end_headers()
 
     def _send(self, code: int, body, ctype: str = "application/json") -> None:
         data = body if isinstance(body, bytes) else json.dumps(body, default=str).encode()
@@ -718,8 +718,10 @@ class Handler(BaseHTTPRequestHandler):
         refused = self._post_refusal()
         if refused:
             return self._send(refused[0], {"error": refused[1]})
-        length = int(self.headers.get("Content-Length") or 0)
         try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length < 0:
+                raise ValueError("negative length")
             body = json.loads(self.rfile.read(length) or b"{}")
         except ValueError:
             return self._send(400, {"error": "bad json"})
@@ -762,7 +764,9 @@ class Handler(BaseHTTPRequestHandler):
                     if why:
                         return self._send(409, {"error": why})
                 elif body.get("status") == "cancelled":
-                    db.update_task(tid, status="cancelled")
+                    why = db.cancel(tid)
+                    if why:
+                        return self._send(409, {"error": why})
                     stop_runs(db, p.runs, tid)
                 if body.get("priority"):
                     db.update_task(tid, priority=int(body["priority"]))

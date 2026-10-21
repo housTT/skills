@@ -186,8 +186,36 @@ def test_install_doc_pins_the_release_ref_with_each_hosts_ref_syntax():
     assert '"${XDG_CACHE_HOME:-$HOME/.cache}/ttp"' in section
 
 
+def _is_stdlib(name):
+    """sys.stdlib_module_names is 3.10+; on 3.9 a module is standard library when it is built in or
+    found under the interpreter's own stdlib directories, never under site-packages."""
+    names = getattr(sys, "stdlib_module_names", None)
+    if names is not None:
+        return name in names
+    import importlib.util
+    import sysconfig
+    if name in sys.builtin_module_names:
+        return True
+    spec = importlib.util.find_spec(name)
+    if spec is None or not spec.origin:
+        return False
+    if spec.origin in ("built-in", "frozen"):
+        return True
+    origin = pathlib.Path(spec.origin).resolve()
+    roots = {pathlib.Path(sysconfig.get_paths()[k]).resolve() for k in ("stdlib", "platstdlib")}
+    site = {pathlib.Path(sysconfig.get_paths()[k]).resolve() for k in ("purelib", "platlib")}
+    return (any(r in origin.parents for r in roots)
+            and not any(s in origin.parents or "site-packages" in origin.parts for s in site))
+
+
+def test_stdlib_check_tells_standard_library_from_installed_packages():
+    for name in ("json", "sys", "sqlite3", "concurrent", "importlib"):
+        assert _is_stdlib(name), name
+    for name in ("pytest", "yaml", "ttp_no_such_module"):
+        assert not _is_stdlib(name), name
+
+
 def test_runtime_is_standard_library_only_and_python39_compatible():
-    stdlib = set(sys.stdlib_module_names)
     for py in RUNTIME.rglob("*.py"):
         src = py.read_text(encoding="utf-8")
         tree = ast.parse(src, feature_version=(3, 9))   # rejects syntax newer than 3.9
@@ -201,7 +229,7 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
             # The resume plugin is loaded only into the checked repo's own pytest, never by the runtime.
             plugin = py.parent.name == "pytest_resume" and names == ["pytest"]
             for n in names:
-                assert n in stdlib or n == "ttp" or plugin, f"{py}: imports non-stdlib module {n}"
+                assert _is_stdlib(n) or n == "ttp" or plugin, f"{py}: imports non-stdlib module {n}"
         if re.search(r"\w\]?\s*\|\s*None\b", src):
             assert "from __future__ import annotations" in src, f"{py}: PEP 604 unions need the future import on 3.9"
 
@@ -343,8 +371,11 @@ def test_coordinator_stores_pointers_not_figures_when_data_stays_out_of_git():
                    "carry pointers (the work file's path, what it holds), never the figures",
                    "`Forbidden data` patterns is refused"):
         assert phrase in coordinator, phrase
-    harness = (PLUGIN / "skills" / "tt-project-harness" / "SKILL.md").read_text(encoding="utf-8")
-    assert "`memory.forbidden_patterns_file`" in harness and "never the text" in harness
+    skill = PLUGIN / "skills" / "tt-project-harness"
+    harness = (skill / "SKILL.md").read_text(encoding="utf-8")
+    assert "`memory.forbidden_patterns_file`" in harness and "](references/forbidden-data.md)" in harness
+    ref = (skill / "references" / "forbidden-data.md").read_text(encoding="utf-8")
+    assert "`memory.forbidden_patterns_file`" in ref and "never the text" in ref
 
 
 def test_harness_tasks_deliver_by_a_local_commit_not_a_push():
@@ -728,8 +759,10 @@ def test_worker_prompt_driver_chain_fails_fast_and_shared_watchers_lock():
     root = PLUGIN
     worker = (root / "template" / "prompts" / "worker.md").read_text()
     assert "pipefail" in worker and "first non-zero" in worker
-    harness = (root / "skills" / "tt-project-harness" / "SKILL.md").read_text()
-    assert "flock -n" in harness and "condition key" in harness
+    skill = root / "skills" / "tt-project-harness"
+    assert "](references/shared-watchers.md)" in (skill / "SKILL.md").read_text()
+    shared = (skill / "references" / "shared-watchers.md").read_text()
+    assert "flock -n" in shared and "condition key" in shared
 
 
 
@@ -739,8 +772,10 @@ def test_shared_watcher_git_scan_is_bounded_and_still_catches_changes(tmp_path):
     tracked edits and new untracked files."""
     import subprocess
     import time
-    harness = (PLUGIN / "skills" / "tt-project-harness" / "SKILL.md").read_text()
-    row = next(ln for ln in harness.splitlines() if ln.startswith("| Shared watchers |"))
+    skill = PLUGIN / "skills" / "tt-project-harness"
+    row = next(ln for ln in (skill / "SKILL.md").read_text().splitlines() if ln.startswith("| Shared watchers |"))
+    assert "](references/shared-watchers.md)" in row
+    row = " ".join((skill / "references" / "shared-watchers.md").read_text().split())
     for want in ("--untracked-files=no --ignore-submodules=all", "--untracked-files=normal",
                  "never `--untracked-files=all`", "timeout 20 git", "GIT_TERMINAL_PROMPT=0",
                  "skipped: <step> timed out", '"error": true'):
@@ -810,6 +845,101 @@ def test_docs_and_prompts_name_only_real_ttp_subcommands():
                   for f in files for m in re.findall(r"`ttp ([a-z][a-z-]*)", f.read_text(encoding="utf-8", errors="replace"))
                   if m not in commands})
     assert not bad, bad
+
+
+def _ttp_parser():
+    """The top-level `ttp` parser, built as `ttp` builds it, without running a command."""
+    import argparse
+    sys.path.insert(0, str(RUNTIME.parent))
+    try:
+        from ttp import cli
+        seen: list = []
+        real = argparse.ArgumentParser.parse_args
+
+        def grab(self, args=None, namespace=None):
+            seen.append(self)
+            raise SystemExit(0)
+        argparse.ArgumentParser.parse_args = grab
+        try:
+            cli.main(["status"])
+        except SystemExit:
+            pass
+        finally:
+            argparse.ArgumentParser.parse_args = real
+    finally:
+        sys.path.remove(str(RUNTIME.parent))
+    return seen[0], cli
+
+
+def test_ttp_help_groups_commands_and_hides_internal_ones():
+    import argparse
+    ap, cli = _ttp_parser()
+    text = ap.format_help()
+    assert "==SUPPRESS==" not in text
+    assert "{new," not in text, "the usage line names COMMAND, not every choice"
+    headings = [h for h, _ in cli.COMMAND_GROUPS]
+    assert headings == ["everyday", "inside a run", "probes (retry_when, start_when)", "admin"]
+    assert [text.index(f"\n{h}:\n") for h in headings] == sorted(text.index(f"\n{h}:\n") for h in headings)
+    assert "\nother:\n" not in text, "every command belongs to a group"
+    sub = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction))
+    grouped = [n for _, names in cli.COMMAND_GROUPS for n in names]
+    assert len(grouped) == len(set(grouped)), "a command is in one group only"
+    listed = [c.dest for c in sub._choices_actions]
+    assert sorted(grouped) == sorted(listed) and "daemon" not in listed and "daemon" in sub.choices
+    assert not re.search(r"^\s+daemon\b", text, re.M)
+    # A word with a hyphen is never split across lines.
+    assert "--start-when" in text and not re.search(r"-\n", text)
+
+
+def test_every_ttp_flag_and_argument_has_help():
+    import argparse
+    ap, _ = _ttp_parser()
+    missing = []
+
+    def walk(p, path):
+        for a in p._actions:
+            if isinstance(a, argparse._HelpAction):
+                continue
+            if not a.help:
+                missing.append(f"{path} {'/'.join(a.option_strings) or a.dest}")
+            if isinstance(a, argparse._SubParsersAction):
+                named = {id(a.choices[c.dest]) for c in a._choices_actions if c.help}   # aliases share a parser
+                missing.extend(f"{path} {n} (command)" for n, sp in a.choices.items()
+                               if id(sp) not in named and n != "daemon")
+                for n, sp in a.choices.items():
+                    walk(sp, f"{path} {n}")
+    walk(ap, "ttp")
+    assert not missing, missing
+
+
+def test_task_help_lists_valid_values_kept_in_step_with_their_sources():
+    ap, cli = _ttp_parser()
+    sys.path.insert(0, str(RUNTIME.parent))
+    try:
+        from ttp import chaincap, coordinator
+    finally:
+        sys.path.remove(str(RUNTIME.parent))
+    assert cli.TASK_KINDS == coordinator.TASK_KINDS and cli.TASK_TIERS == chaincap.TIERS
+    import argparse
+    sub = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction))
+    task = " ".join(sub.choices["task"].format_help().split())
+    for v in (*cli.TASK_KINDS, *cli.TASK_TIERS, "1 (most urgent) to 5"):
+        assert v in task, v
+
+
+def test_fake_provider_is_listed_in_help_only_with_the_test_variable(monkeypatch):
+    import argparse
+    for env, shown in ((None, False), ("1", True)):
+        if env:
+            monkeypatch.setenv("TTP_TEST_FAKE_PROVIDER", env)
+        else:
+            monkeypatch.delenv("TTP_TEST_FAKE_PROVIDER", raising=False)
+        ap, _ = _ttp_parser()
+        sub = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction))
+        new = sub.choices["new"]
+        assert ("fake" in new.format_help()) is shown
+        # Accepted either way: a remote `ttp new` passes the provider on (behaviour unchanged).
+        assert new.parse_args(["x", "--provider", "fake"]).provider == "fake"
 
 
 def test_worker_prompt_covers_pattern_kills_in_scripts_it_runs():
@@ -901,7 +1031,11 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     assert forked.returncode == 1, forked.stdout
     assert "2 failed, 63 passed, 1 skipped, 1 warning" in forked.stdout, forked.stdout
     assert "FAILED test_tt_project_sample.py::test_fail - AssertionError: boom" in forked.stdout
-    assert "test_tt_project_sample.py::test_crash - the test worker process" in forked.stdout
+    # pytest < 9 leaves a plain-text reason out of the short summary line: match the full report.
+    assert "FAILED test_tt_project_sample.py::test_crash" in forked.stdout
+    crash = forked.stdout.split(" test_crash ", 1)[1]
+    assert re.match(r"_+\nthe test worker process \d+ ended \(wait status \d+\) before this test finished",
+                    crash), forked.stdout
     assert "SKIPPED [1] test_tt_project_sample.py:" in forked.stdout and "UserWarning: careful" in forked.stdout
     pids = {(out / f"ok-{i}").read_text() for i in range(60)}
     assert len(pids) > 1 and str(os.getpid()) not in pids, "the tests did not run in forked workers"
@@ -946,8 +1080,16 @@ def test_the_suite_declares_the_oldest_pytest_it_supports():
     assert minimum >= (7, 3)
     assert _version(pytest.__version__) >= minimum
     ci = (root / ".github" / "workflows" / "validate.yml").read_text()
-    (pin,) = re.findall(r"\bpytest==([\d.]+)", ci)
-    assert _version(pin) >= minimum, "CI's pinned pytest meets the suite's minimum"
+    pins = re.findall(r"\bpytest==([\d.]+)", ci)
+    assert len(pins) == 2   # the main job's and the Python 3.9 job's
+    for pin in pins:
+        assert _version(pin) >= minimum, "CI's pinned pytest meets the suite's minimum"
+    # The runtime's stated minimum Python runs the required suite on CI too.
+    job = yaml.safe_load(ci)["jobs"]["tt-project-python39"]
+    steps = json.dumps(job["steps"])
+    assert 'python-version": "3.9"' in steps
+    assert all(f in steps for f in ("tests/test_tt_project_plugin.py", "tests/test_tt_project_runtime.py",
+                                    "tests/test_plugin_catalogue.py"))
 
 
 def test_the_test_runner_summary_line_is_stable_and_greppable():
@@ -1925,6 +2067,7 @@ def _mount_box(tmp_path, monkeypatch, answers=None, replies=None, alias="<box-al
     import subprocess
     bs, st = _storage(monkeypatch)
     import box
+    monkeypatch.setenv("TTP_HOME", str(tmp_path / "ttp-home"))   # no stable copy unless a test makes one
     site = tmp_path / "boxes.json"
     if not site.exists():
         site.write_text(json.dumps({"version": 1, "boxes": {alias: {
@@ -2061,6 +2204,68 @@ def test_setup_box_mount_ledger_probe_fits_the_change_ledger_contract(tmp_path, 
     site.write_text(json.dumps(data))
     rc, err = daemon_run()
     assert rc == 2 and "no first check" in err
+
+
+def test_setup_box_mount_probe_survives_a_plugin_upgrade_and_names_the_site_file(tmp_path, monkeypatch, capsys):
+    """The until-probe names the stable copy `ttp setup` installs (lib/current, unresolved), so an upgrade that
+    prunes the old version keeps it working (not exit 127), and the site file chosen through $TTP_BOXES_FILE by
+    its full path, so the daemon's environment does not change which box it reads. No stable copy: a note."""
+    import shutil
+    import subprocess
+    replies = [(0, _probe_out("b1", fstab=""), "")] * 3
+    run, _, site = _mount_box(tmp_path, monkeypatch, replies=replies, alias="box-a")
+    import box
+
+    def until_probe():
+        monkeypatch.setenv("TTP_BOXES_FILE", str(site))
+        assert box.main(["setup", "mount", "box-a"]) == 0       # no --site: the site file comes from the env
+        out = capsys.readouterr().out
+        argv = shlex.split(next(ln for ln in out.splitlines() if "ttp machines change add" in ln).split(": ", 1)[1])
+        return shlex.split(argv[9]), out
+    probe, out = until_probe()
+    assert probe[0] == str(BOX_PY.resolve()) and probe[1:3] == ["--site", str(site)]
+    assert "a plugin upgrade may remove" in out and "ttp machines change edit <id> --until-probe" in out
+    lib = tmp_path / "ttp-home" / "lib"
+    shutil.copytree(BOX_PY.parent.parent, lib / "0.0.1" / "skills" / "setup-box")
+    (lib / "current").symlink_to(lib / "0.0.1")
+    probe, out = until_probe()
+    assert probe[0] == str(lib / "current" / "skills" / "setup-box" / "scripts" / "box.py")
+    assert "may remove" not in out and probe[1:3] == ["--site", str(site)]
+    data = json.loads(site.read_text())
+    data["boxes"]["box-a"]["setup"]["storage_verify"] = {"where": "/path/to/mount", "boot_id": "b1"}
+    site.write_text(json.dumps(data))
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "ssh").write_text("#!/bin/bash\necho b1\n")
+    (bin_ / "ssh").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k not in ("TTP_BOXES_FILE", "TTP_HOME")}
+    env["PATH"] = f"{bin_}:/usr/bin:/bin"
+
+    def daemon_run():
+        return subprocess.run(shlex.join(probe), shell=True, capture_output=True, text=True, timeout=60,
+                              env=env).returncode
+    assert daemon_run() == 1
+    # An upgrade installs 0.0.2, re-points current and prunes 0.0.1: the same probe still answers.
+    shutil.copytree(lib / "0.0.1", lib / "0.0.2")
+    (lib / "current").unlink()
+    (lib / "current").symlink_to(lib / "0.0.2")
+    shutil.rmtree(lib / "0.0.1")
+    assert daemon_run() == 1
+
+
+def test_setup_box_rebooted_probe_reads_a_mid_boot_timeout_as_not_yet(tmp_path, monkeypatch, capsys):
+    """sshd accepting but stalling mid-boot past the probe's timeout (124) is not over and not a broken probe."""
+    replies = [(124, "", "timed out after 40s")]
+    run, calls, site = _mount_box(tmp_path, monkeypatch, replies=replies)
+    data = json.loads(site.read_text())
+    data["boxes"]["<box-alias>"]["setup"]["storage_verify"] = {"where": "/path/to/mount", "boot_id": "b1"}
+    site.write_text(json.dumps(data))
+    assert run("mountcheck", "<box-alias>", "--rebooted") == 1
+    out, err = capsys.readouterr()
+    assert "pending" in out and "no answer" in out and not err and len(calls) == 1
+    replies.append((255, "", "ssh: connect: no route"))       # ssh failing stays 255, named on stderr
+    assert run("mountcheck", "<box-alias>", "--rebooted") == 255
+    assert "connection to <box-alias>" in capsys.readouterr().err
 
 
 def test_setup_box_mount_dry_run_live_values_sudo_refusal_and_the_ledger_line(tmp_path, monkeypatch, capsys):

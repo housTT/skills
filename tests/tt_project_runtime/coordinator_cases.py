@@ -432,7 +432,7 @@ def test_a_watcher_opening_many_issues_on_one_subject_is_warned_about_without_a_
     # Watcher authors are told to key changing text, in the skill and the coordinator's schedule_set notes.
     skill = " ".join((RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "watchers.md").read_text().split())
     prompt = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
-    assert '"whole", "key", "episode"}' in skill and "Give every line whose text changes from run to run a key" in skill
+    assert '"whole", "key", "episode", "pin_severity"}' in skill and "Give every line whose text changes from run to run a key" in skill
     assert "`screen.same_subject_warn`" in skill
     assert "also carries `\"key\"`, a short stable name of the condition" in prompt
     assert "Noisy command watchers" in prompt
@@ -5467,8 +5467,10 @@ def test_ttp_lock_help_carries_the_shared_and_nested_lock_rules_the_skills_point
     # The worker prompt has no room for them under its size budget: the harness skill carries them and
     # the command reference points here.
     skills = TTP.parents[1] / "skills"
-    harness = next(line for line in (skills / "tt-project-harness" / "SKILL.md").read_text().splitlines()
-                   if line.startswith("| Resource locks |"))
+    row = next(line for line in (skills / "tt-project-harness" / "SKILL.md").read_text().splitlines()
+               if line.startswith("| Resource locks |"))
+    assert "`--shared`" in row and "](references/resource-locks.md)" in row, row
+    harness = " ".join((skills / "tt-project-harness" / "references" / "resource-locks.md").read_text().split())
     for rule in ("`--shared`", "Never on a device lock", "A nested `ttp lock`", "exits 2 at once", "`ttp lock --help`"):
         assert rule in harness, rule
     operate = next(line for line in (skills / "tt-project" / "operate.md").read_text().splitlines()

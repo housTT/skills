@@ -3322,8 +3322,8 @@ def test_web_api_requires_the_token(env):
 
 @needs_sockets
 def test_web_post_needs_the_token_header_json_and_its_own_origin(env):
-    """A page on another localhost port is same-site, so it carries the token cookie and can post a
-    plain form: a change needs the X-TTP-Token header, a JSON body and no foreign Origin."""
+    """A page on another localhost port is same-site and can post a plain form: a change needs the
+    X-TTP-Token header, a JSON body and no foreign Origin."""
     p = make(env)
     from ttp import web
     port = _start_web(p)
@@ -3359,10 +3359,47 @@ def test_web_post_needs_the_token_header_json_and_its_own_origin(env):
     assert post({"X-TTP-Token": tok, "Content-Type": "application/json; charset=utf-8"}) == 200
     assert post({"X-TTP-Token": tok, "Content-Type": "application/json", "Origin": base}) == 200
     assert said() == 2
-    get = urllib.request.Request(base + "/api/state", headers=cookie)
-    assert json.loads(urllib.request.urlopen(get, timeout=5).read())["project"]["name"] == p.name
     app = (web.STATIC / "app.js").read_text()
     assert '"X-TTP-Token": TOKEN, "Content-Type": "application/json"' in app
+
+
+@needs_sockets
+def test_web_token_is_never_a_cookie_and_no_page_may_frame_the_app(env):
+    """Browsers do not scope cookies by port, so a token cookie would reach every service on
+    127.0.0.1: only the header counts, app.js writes no token cookie, and every response
+    (static, API, refusals, send_error) forbids framing."""
+    p = make(env)
+    from ttp import web
+    port = _start_web(p)
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(base + "/", timeout=1)
+            break
+        except OSError:
+            time.sleep(0.1)
+    tok = web.token(p)
+
+    def call(path, headers=None, method="GET"):
+        req = urllib.request.Request(base + path, method=method, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.headers
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers
+
+    assert call("/api/state", {"Cookie": f"ttp_token={tok}"})[0] == 401
+    assert call("/api/state", {"Cookie": f"other=1; ttp_token={tok}"})[0] == 401
+    seen = [call("/"), call("/app.js"), call("/nope.txt"), call("/api/state"),
+            call("/api/state", {"X-TTP-Token": tok}), call("/api/nope", {"X-TTP-Token": tok}),
+            call("/api/" + "say", method="POST"), call("/", method="PUT")]
+    assert [c for c, _ in seen] == [200, 200, 404, 401, 200, 404, 401, 501]
+    for _, h in seen:
+        assert h["X-Frame-Options"] == "DENY"
+        assert h["Content-Security-Policy"] == "frame-ancestors 'none'"
+    app = (web.STATIC / "app.js").read_text()
+    writes = re.findall(r"document\.cookie\s*=\s*(.+)", app)
+    assert writes and all("Max-Age=0" in w and "${" not in w and "TOKEN" not in w for w in writes)
 
 
 def test_broken_config_keeps_the_last_good_one(env):
@@ -4103,6 +4140,65 @@ def test_the_slow_tx_log_names_the_slowest_subprocess_of_the_transaction(tmp_pat
     assert "2 subprocess(es), slowest step" in first and "time.sleep(0.5)" in first, first
     assert float(first.split("slowest step ")[1].split(" s")[0]) >= 0.5, first
     assert second.endswith("; no subprocess"), second
+
+
+def test_a_transaction_sqlite_already_rolled_back_raises_the_original_error(tmp_path):
+    """SQLITE_FULL or IOERR roll the transaction back themselves: a second ROLLBACK would raise
+    'no transaction is active' and hide the error that mattered."""
+    from ttp import db as dbm
+    d = dbm.DB(tmp_path / "x.db")
+    ran = []
+    with pytest.raises(RuntimeError, match="disk full"):
+        with d.tx():
+            d.set_kv("a", 1)
+            d.after_commit(lambda: ran.append(1))
+            d.conn.execute("ROLLBACK")      # what SQLite does on its own after SQLITE_FULL
+            raise RuntimeError("disk full")
+    assert not d.conn.in_transaction and ran == [] and d.kv("a") is None
+    with d.tx():
+        d.set_kv("b", 2)
+    assert d.kv("b") == 2 and ran == [], "a dropped after-commit hook ran with the next commit"
+
+
+def test_a_failed_commit_rolls_back_and_drops_its_after_commit_hooks(tmp_path):
+    import sqlite3
+    from ttp import db as dbm
+    d = dbm.DB(tmp_path / "x.db")
+    d.conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+    d.conn.execute("CREATE TABLE child (p INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+    ran = []
+    with pytest.raises(sqlite3.IntegrityError):    # a deferred constraint fails only at COMMIT
+        with d.tx():
+            d.conn.execute("INSERT INTO child VALUES (7)")
+            d.after_commit(lambda: ran.append(1))
+    assert not d.conn.in_transaction, "a failed COMMIT left the transaction open"
+    assert d.conn.execute("SELECT COUNT(*) FROM child").fetchone()[0] == 0
+    with d.tx():
+        d.set_kv("b", 2)
+    assert d.kv("b") == 2 and ran == [], "the failed transaction's hook ran with the next commit"
+
+
+def test_concurrent_registry_updates_lose_no_entry(tmp_path, monkeypatch):
+    """register and unregister read, change and write registry.json under one lock: two commands
+    at once both keep their change."""
+    import threading
+    from ttp import project
+    monkeypatch.setattr(project, "HOME_DIR", tmp_path)
+    real = project.load_registry
+
+    def slow_load():                      # widen the read-to-write gap a race needs
+        reg = real()
+        time.sleep(0.2)
+        return reg
+    monkeypatch.setattr(project, "load_registry", slow_load)
+    project.register("gone", {"dir": "/g"})
+    threads = [threading.Thread(target=project.register, args=(n, {"dir": f"/{n}"})) for n in ("a", "b")]
+    threads.append(threading.Thread(target=project.unregister, args=("gone",)))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(real()["projects"]) == ["a", "b"]
 
 
 def test_the_tx_guard_refuses_a_git_network_command_inside_a_write_transaction(tmp_path, monkeypatch):
@@ -5551,6 +5647,14 @@ def test_claude_workers_get_the_stable_prompt_as_a_cacheable_system_prompt(env, 
     assert "Go fast." in system and "MEMORY-MARKER" in system and "TASK-SPEC-MARKER" not in system
     assert "TASK-SPEC-MARKER" in prompt and "Go fast." not in prompt and "MEMORY-MARKER" not in prompt
     assert prompt.rstrip().endswith("Never merge to main."), "the restrictions must close the prompt"
+
+
+def test_start_run_refuses_both_system_prompts_as_they_share_one_file(env):
+    from ttp import daemon as dmod
+    p = make(env)
+    with pytest.raises(ValueError, match="not both"):
+        dmod.Daemon(p.base).start_run("worker", "hi", "claude", "light", str(p.base), system="A", append_system="B")
+    assert not p.db.q("SELECT id FROM runs")
 
 
 def test_every_worker_gets_the_same_system_prompt_so_its_cache_is_shared(env, monkeypatch):
@@ -7493,7 +7597,7 @@ def test_explicit_clear_receipts_stay_pending_through_the_quiet_sweep_downtime_a
     # The tick sweeps quiet issues before it runs the day's commands.
     import inspect
     body = inspect.getsource(dmod.Daemon.tick)
-    assert body.index("self.sweep_watcher_issues()") < body.index("self.run_schedules")
+    assert body.index("self._run_step(self.sweep_watcher_issues)") < body.index("self.run_schedules")
     a, b = "job7: done; evidence_" + "a1" * 20, "job8: done; evidence_" + "c3" * 20
     assert tick(_line(a) + _line(b)) == ("ok (2 observations)", 2), "each new receipt line wakes once"
     pending = r["open_titles"]()
@@ -8179,6 +8283,102 @@ def test_stop_file_appears_whole_so_a_kill_is_never_read_as_a_cancel(env, tmp_pa
     assert runner.stop_reason(run_dir) == "shutdown" and [f.name for f in run_dir.iterdir()] == ["STOP"]
 
 
+def test_task_cancel_refuses_unknown_and_finished_tasks_and_changes_nothing(env, capsys):
+    p = make(env)
+    from ttp import cli
+    ids = {}
+    for status in ("done", "failed", "cancelled"):
+        ids[status] = p.db.add_task(status, "s", kind="work", tier="light", origin="user")
+        p.db.update_task(ids[status], status=status)
+    for status, tid in ids.items():
+        with pytest.raises(SystemExit) as e:
+            cli.main(["task", "demo", "cancel", str(tid)])
+        assert e.value.code == 2 and f"already {status}" in capsys.readouterr().err
+        assert p.db.task(tid)["status"] == status
+    for bad, said in (("x1", "cancel needs a task id"), ("9999", "no task #9999")):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["task", "demo", "cancel", bad])
+        assert e.value.code == 2 and said in capsys.readouterr().err
+    assert p.db.cancel(9999) == "no task #9999"
+    queued = p.db.add_task("queued", "s", kind="work", tier="light", origin="user")
+    cli.main(["task", "demo", "cancel", str(queued)])
+    assert p.db.task(queued)["status"] == "cancelled" and capsys.readouterr().out.startswith("cancelled")
+
+
+def test_project_name_is_optional_from_the_run_or_the_current_folder(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli
+    tid = p.db.add_task("from here", "s", kind="work", tier="light", origin="user")
+    outside = env["tmp"] / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    with pytest.raises(SystemExit) as e:   # no project here: the name is still required
+        cli.main(["task", "list"])
+    assert e.value.code == 2
+    capsys.readouterr()
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))   # a run's project
+    cli.main(["task", "list"])
+    assert f"#{tid}" in capsys.readouterr().out
+    cli.main(["task", "show", str(tid)])
+    assert "from here" in capsys.readouterr().out
+    monkeypatch.delenv("TTP_PROJECT")
+    monkeypatch.chdir(p.root)   # the current folder's project
+    cli.main(["task", "cancel", str(tid)])
+    assert p.db.task(tid)["status"] == "cancelled"
+    cli.main(["config", "budget.daily_usd"])
+    assert capsys.readouterr().out.strip()
+    cli.main(["schedules"])
+    cli.main(["memory", "--search", "nothing-matches-this"])
+    capsys.readouterr()
+    sub = p.root / "sub" / "dir"   # a folder under the project's git top level
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    cli.main(["task", "list"])
+    assert f"#{tid}" in capsys.readouterr().out
+    # A given name still wins, and the slot is not filled when the first word names a known project.
+    cli.main(["task", "demo", "list"])
+    assert f"#{tid}" in capsys.readouterr().out
+    with pytest.raises(SystemExit):   # an unknown first word that is no action stays the name
+        cli.main(["task", "nosuch", "list"])
+    assert "no project named 'nosuch'" in capsys.readouterr().err
+    cli.main(["say", "hello from here", "--chat", "c1"])
+    assert p.db.one("SELECT text FROM messages ORDER BY id DESC LIMIT 1")["text"] == "hello from here"
+
+
+def test_status_cuts_long_lines_at_words_and_keeps_diagnostics_for_verbose(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import budget, checkcap, cli, upstream
+    words = " ".join(f"word{i}" for i in range(80))
+    p.db.post("out", words, kind="ask")
+    monkeypatch.setattr(budget, "coordinator_cache", lambda db, now: {"24h": {"turns": 3}})
+    monkeypatch.setattr(budget, "coordinator_cache_line", lambda s: "coordinator cache: 50% token hit")
+    monkeypatch.setattr(checkcap, "wait_line", lambda state, now=None: "checks slot waits (24 h): 2 taken")
+    monkeypatch.setattr(upstream, "fixes_line", lambda name, cfg, now=None: f"1 upstream fix {upstream.SHIPPED}: abc123")
+    monkeypatch.setattr(upstream, "forward_line", lambda now=None: "sending upstream notes on to x has failed")
+    moved = ("coordinator cache:", "checks slot waits", "upstream fix")
+    plain = cli.status_text(p)
+    assert not any(m in plain for m in moved) and "sending upstream notes on to x has failed" in plain
+    ask = next(ln for ln in plain.splitlines() if "word0 " in ln)
+    assert len(ask) < 340 and re.search(r" word\d+…$", ask), ask
+    p.db.post("out", "note " + words, kind="alert")   # the recent feed's quoted texts end at a word too
+    recent = [ln for ln in cli.status_text(p).splitlines() if "note word0 " in ln]
+    assert recent and all(re.search(r" word\d+…$", ln) for ln in recent), recent
+    assert all(len(ln) <= cli.STATUS_WIDTH for ln in cli.status_text(p).splitlines())
+    cli.main(["status", "demo", "--verbose"])
+    out = capsys.readouterr().out
+    assert all(m in out for m in moved), out
+    assert cli.clip("short") == "short" and cli.clip("aaa bbb ccc", 9) == "aaa bbb…"
+
+
+def test_unknown_project_name_suggests_close_registered_names(env, capsys):
+    make(env)
+    from ttp import cli
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demp", "list"])
+    err = capsys.readouterr().err
+    assert "did you mean demo?" in err and "ttp find" not in err
+
+
 def test_cancel_and_stop_kill_end_running_workers_but_stop_keeps_them(env, monkeypatch):
     p = make(env)
     from ttp import cli, service
@@ -8556,6 +8756,169 @@ def test_harness_skill_documents_until_reboot_pauses_and_fsync():
 
 def test_operate_doc_names_ttp_skill():
     assert "`ttp skill [<name>]`" in (TTP.parents[1] / "skills" / "tt-project" / "operate.md").read_text()
+
+
+def test_the_setup_shim_survives_a_removed_interpreter(tmp_path):
+    """The `ttp` on PATH runs the interpreter setup ran under; once that venv or conda env is removed it
+    falls back to python3 on PATH and says to rerun setup, instead of failing to exec."""
+    from ttp import cli
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    (fake / "python3").write_text('#!/bin/sh\necho "fallback python3 $*"\n')
+    pinned = tmp_path / "venv" / "bin" / "python"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_text('#!/bin/sh\necho "pinned $*"\n')
+    for x in (fake / "python3", pinned):
+        x.chmod(0o755)
+    shim = tmp_path / "ttp"
+    shim.write_text(cli.shim_text(str(pinned), tmp_path / "lib current" / "bin" / "ttp"))
+    shim.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake}:/usr/bin:/bin"}
+    r = subprocess.run([str(shim), "status", "a b"], capture_output=True, text=True, env=env, timeout=30)
+    assert (r.returncode, r.stdout, r.stderr) == (0, f"pinned {tmp_path}/lib current/bin/ttp status a b\n", "")
+    pinned.unlink()       # the venv is gone
+    r = subprocess.run([str(shim), "status", "a b"], capture_output=True, text=True, env=env, timeout=30)
+    assert r.returncode == 0 and r.stdout == f"fallback python3 {tmp_path}/lib current/bin/ttp status a b\n"
+    assert r.stderr.count("\n") == 1 and str(pinned) in r.stderr and "rerun `ttp setup`" in r.stderr
+
+
+def test_new_with_no_service_skips_the_daemon_wait_and_says_how_to_start_it(env, monkeypatch, capsys):
+    """Nothing starts the daemon of a --no-service project: `ttp new` does not wait for it or check its
+    web app (which failed with exit 3), and prints the command that starts it by hand."""
+    from ttp import cli, weblink
+    from ttp.project import Project
+
+    def never(*a, **k):
+        raise AssertionError("waited for a daemon nothing starts")
+    monkeypatch.setattr(cli, "_wait_for_daemon", never)
+    monkeypatch.setattr(weblink, "local", never)
+    cli.main(["new", "solo", "--dir", str(env["repo"]), "--provider", "fake", "--no-service"])   # no SystemExit
+    out = capsys.readouterr().out
+    p = Project(env["repo"])
+    assert cli.hand_start_cmd(p) in out and "`ttp start solo`" in out, out
+    assert f"nohup {p.harness / 'bin' / 'ttp'} daemon {p.base} >> {p.logs / 'daemon.out'} 2>&1 &" in out
+    assert (p.harness / "bin" / "ttp").exists()
+    # Made on another machine: its start line is shown, and no web app is looked for there.
+    from ttp import machines
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: "~/.tt-project/lib/current/bin/ttp")
+    monkeypatch.setattr(cli, "load_secrets", lambda: {})
+    monkeypatch.setattr(machines, "push", lambda host: "machines: none")
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k: subprocess.CompletedProcess(
+        argv, 0, "created far\ndaemon: not started (--no-service). Start it by hand with `x`\n", None))
+    monkeypatch.setattr(cli, "remote_web", never)
+    cli.main(["new", "far", "--host", "host-a", "--dir", "/srv/far", "--no-service"])
+    assert "daemon: not started (--no-service)" in capsys.readouterr().out
+
+
+def test_a_cron_fallback_is_named_by_new_doctor_and_setup(env, monkeypatch, capsys, tmp_path):
+    """When systemd --user cannot start the unit, install() still falls back to a crontab watchdog, but
+    `ttp new` and `ttp doctor` say so and why; setup names what new projects would get. Stubbed
+    systemctl and crontab: the real crontab is never read or written."""
+    from ttp import cli, service, weblink
+    from ttp.project import Project
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(service.shutil, "which", lambda name: f"/usr/bin/{name}" if name in ("systemctl", "crontab") else None)
+    tab = {"text": "0 1 * * * other job\n"}
+    calls = []
+
+    def run(*argv):
+        calls.append(argv)
+        if argv[:2] == ("crontab", "-l"):
+            return subprocess.CompletedProcess(argv, 0, tab["text"], "")
+        if argv[:4] == ("systemctl", "--user", "enable", "--now"):
+            return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    real_run = subprocess.run
+
+    def sub_run(argv, *a, input=None, **k):
+        if argv[0] == "crontab":
+            assert argv == ["crontab", "-"], argv
+            tab["text"] = input
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return real_run(argv, *a, input=input, **k)
+    monkeypatch.setattr(service, "_run", run)
+    monkeypatch.setattr(service.subprocess, "run", sub_run)
+    monkeypatch.setattr(service, "_spawn", lambda p: None)
+    monkeypatch.setattr(cli, "_wait_for_daemon", lambda p, timeout=20: None)
+    monkeypatch.setattr(weblink, "local", lambda p, url: ("web app: ok", 0))
+    service._WATCHDOG_SEEN.clear()
+    cli.main(["new", "solo", "--dir", str(env["repo"]), "--provider", "fake"])
+    out = capsys.readouterr().out
+    assert "systemd failed (Failed to connect to bus)" in out, out
+    assert "Fallback: a crontab watchdog" in out and "because systemd --user could not start the unit" in out
+    p = Project(env["repo"])
+    assert tab["text"].startswith("0 1 * * * other job\n") and tab["text"].count(f"{service.CRON_TAG}{p.base}") == 2
+    assert not any(c[:2] == ("loginctl", "enable-linger") for c in calls)     # the choice is unchanged
+    cli.cmd_doctor(types.SimpleNamespace(name="solo"))
+    line = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("service: ")]
+    assert line == ["service: a crontab watchdog (entries tagged `# tt-project:` in your crontab, see `crontab -l`), "
+                    "a fallback because systemd --user could not start the unit"], line
+    # Without systemd --user at all, the reason says so; linger refused is a fallback too.
+    for absent, why in ((True, "systemd --user is not available here"), (False, "loginctl enable-linger was refused")):
+        monkeypatch.setattr(service.shutil, "which",
+                            lambda name, absent=absent: None if absent and name == "systemctl" else f"/usr/bin/{name}")
+
+        def run2(*argv):
+            if argv[:2] == ("crontab", "-l"):
+                return subprocess.CompletedProcess(argv, 0, tab["text"], "")
+            return subprocess.CompletedProcess(argv, 1 if argv[:2] == ("loginctl", "enable-linger") else 0,
+                                               "Linger=no" if "show-user" in argv else "", "")
+        monkeypatch.setattr(service, "_run", run2)
+        assert f"Fallback: a crontab watchdog (entries tagged `# tt-project:` in your crontab, see `crontab -l`), because {why}" \
+            in service.install(p)
+        assert why in service.service_line(p)
+        assert ("because systemd --user is not available here" in service.plan()) == absent
+        if not absent:
+            assert "also adds a crontab watchdog" in service.plan()
+    # A crontab that refuses the entry: no fallback is claimed, the failure shows instead.
+    monkeypatch.setattr(service.subprocess, "run", lambda argv, *a, **k: subprocess.CompletedProcess(argv, 1, "", "no crontab for you"))
+    monkeypatch.setattr(service.shutil, "which", lambda name: None if name == "systemctl" else f"/usr/bin/{name}")
+    msg = service.install(p)
+    assert msg == "crontab install failed: no crontab for you" and not service.recorded(p)["fallback"]
+
+
+def test_a_failed_systemd_enable_leaves_no_unit_so_the_cron_fallback_is_the_service(env, monkeypatch, tmp_path):
+    """systemctl --user enable --now fails: install() falls back to cron and removes the unit it wrote, so
+    installed(), down_note() and restart_service() see the crontab watchdog, not a systemd unit that never
+    ran. Stubbed systemctl and crontab in a temp HOME."""
+    from ttp import service
+    p = make(env)
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(service.shutil, "which", lambda name: f"/usr/bin/{name}" if name in ("systemctl", "crontab") else None)
+    tab = {"text": ""}
+    calls, spawned = [], []
+
+    def run(*argv):
+        calls.append(argv)
+        if argv[:2] == ("crontab", "-l"):
+            return subprocess.CompletedProcess(argv, 0, tab["text"], "")
+        if argv[:4] == ("systemctl", "--user", "enable", "--now"):
+            return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    real_run = subprocess.run
+
+    def sub_run(argv, *a, input=None, **k):
+        if argv[0] == "crontab":
+            tab["text"] = input
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return real_run(argv, *a, input=input, **k)
+    monkeypatch.setattr(service, "_run", run)
+    monkeypatch.setattr(service.subprocess, "run", sub_run)
+    monkeypatch.setattr(service, "_spawn", lambda p: spawned.append(p.base))
+    service._WATCHDOG_SEEN.clear()
+    assert "because systemd --user could not start the unit" in service.install(p)
+    assert service.recorded(p)["fallback"]
+    assert not service._unit(p).exists()
+    assert not any(service._watchdog_unit(p, ext).exists() for ext in ("service", "timer"))
+    assert ("systemctl", "--user", "disable", f"{service.unit_name(p)}.service") in calls
+    assert service.installed(p) == {"kind": "cron", "watchdog": True}
+    assert service.down_note(p).startswith("its cron service restarts it by itself")
+    calls.clear(), spawned.clear()
+    assert service.restart_service(p) == "restarted"
+    assert spawned == [p.base] and not any(c[:3] == ("systemctl", "--user", "restart") for c in calls)
+    assert service.uninstall(p) == "cron"
 
 
 def test_setup_from_a_harness_copy_refuses(env, tmp_path):
@@ -14251,6 +14614,23 @@ def test_cursor_read_only_run_does_not_force_writes(env, monkeypatch):
     assert "--force" not in argv and run["status"] == "ok"
 
 
+def test_cursor_worker_gets_no_config_file_or_env_for_the_web_token(env, monkeypatch):
+    """Cursor takes deny rules only from a config file, never per run: a worker run writes none into
+    the user's worktree and its argv does not name the token; the limit is documented."""
+    from ttp.providers import get_provider
+    from ttp.providers.cursor import Cursor
+    _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _cursor_result("all done"),
+                                  result={"status": "done", "summary": "ok"})
+    assert run["status"] == "ok" and not any("web.token" in a for a in argv)
+    assert not (env["repo"] / ".cursor").exists(), "wrote a Cursor config into the worktree"
+    monkeypatch.setattr(Cursor, "binary", lambda self: "/nonexistent/agent")
+    kw = dict(role="worker", model="auto", effort="low", cwd=str(env["repo"]), budget_usd=None, schema=None,
+              restrictions={}, read_only=False)
+    assert get_provider("cursor").build(denied_reads=["/x/state/web.token"], **kw) == get_provider("cursor").build(**kw)
+    notes = (TTP.parents[1] / "skills" / "tt-project" / "operate.md").read_text()
+    assert "Cursor gets neither" in notes and "global" in notes
+
+
 CURSOR_HELP = """Usage: agent [options] [command] [prompt...]
   -p, --print                Print responses to console (for scripts or non-interactive use)
   --output-format <format>   Output format (only works with --print): text | json | stream-json
@@ -14658,6 +15038,27 @@ def test_a_workspace_on_another_branch_without_commits_keeps_its_files_and_is_ma
     moved = list((p.state / worktree.LEFTOVERS_DIR).glob(f"t{task['id']}-*/work.txt"))
     assert [f.read_text() for f in moved] == ["mine"], "the worktree's file was not kept"
     assert _git_out(p.root, "rev-parse", "--verify", "elsewhere"), "the other branch was deleted"
+
+
+def test_a_dangling_worktrees_symlink_gives_a_clear_error_and_is_flagged_by_the_integrity_check(env, tmp_path):
+    p = make(env)
+    from ttp import integrity, worktree
+    import shutil
+    if p.worktrees.exists():
+        shutil.rmtree(p.worktrees)
+    gone = tmp_path / "moved-away" / "worktrees"
+    p.worktrees.symlink_to(gone)
+    task = p.db.task(p.db.add_task("dangling", "s", kind="code", tier="light", origin="user"))
+    # Not a bare "[Errno 17] File exists": the link and its missing target, and no retries.
+    with pytest.raises(worktree.WorkspaceStuck, match=f"symlink to {gone}, which does not exist"):
+        worktree.ensure(p, task)
+    res = integrity.check(p)
+    assert any(str(p.worktrees) in b and str(gone) in b for b in res["bad"]), res["bad"]
+    assert str(gone) in integrity.problem_text(res)
+    gone.mkdir(parents=True)
+    path, _ = worktree.ensure(p, task)
+    assert path.is_dir() and worktree.dangling_root(p) is None
+    assert not any(str(gone) in b for b in integrity.check(p)["bad"])
 
 
 def test_a_carried_branch_workspace_is_reused_when_its_branch_was_never_stored(env, monkeypatch):
@@ -19216,7 +19617,7 @@ def test_a_waiting_hand_offs_top_level_followups_survive_its_on_pass(env, monkey
     p = make(env)
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     d = dmod.Daemon(p.base)
-    note = {"title": "upstream: waits lose their followups", "spec": "keep them"}
+    note = {"title": "upstream: waits lose their followups", "spec": "the daemon should keep them"}
     later = {"title": "tidy the parser", "spec": "later"}
     tid, _ = _checks_wait_task(p, tmp_path, {**DONE_ON_PASS, "followups": [later]}, on_pass_cmd=cmd)
     run_dir = tmp_path / f"run-{tid}"
@@ -23194,9 +23595,9 @@ def _upstream_inbox(env):
 def test_upstream_notes_are_filed_once_in_the_users_inbox(env):
     p = make(env)
     from ttp import upstream
-    note = {"title": "upstream: status hides waits", "spec": "Show waiting tasks in status."}
+    note = {"title": "upstream: status hides waits", "spec": "Show waiting tasks in ttp status."}
     tid, _, ids = _hand_off(env, p, {"status": "done", "summary": "ok", "followups": [
-        note, {"title": "Upstream:  STATUS hides waits", "spec": "show waiting tasks  in status."},
+        note, {"title": "Upstream:  STATUS hides waits", "spec": "show waiting tasks  in ttp status."},
         {"title": "next step here", "spec": "local work"}]})
     inbox = _upstream_inbox(env)
     assert len(inbox) == 1, "the same note in other case and spacing was filed twice"
@@ -23280,7 +23681,8 @@ def test_an_upstream_fix_wakes_the_project_that_filed_it_once_its_daemon_runs_it
     assert upstream.fixes_line("demo", {"upstream": {"ingest": True}}, later).startswith(f"2 upstream fixes {upstream.SHIPPED}")
     with monkeypatch.context() as m:
         m.setattr(upstream.time, "time", lambda: later)
-        assert "shipped, not confirmed" in cli.status_text(p)
+        assert "shipped, not confirmed" in cli.status_text(p, verbose=True)
+        assert "shipped, not confirmed" not in cli.status_text(p), "unacked fixes are a --verbose line"
     # An ack closes it; an ack needs evidence and a resolution.
     assert _upstream_cli(cli, "--ack", fp, " ") == 2
     assert _upstream_cli(cli, "--ack", "0" * 16, "works") == 2
@@ -23906,11 +24308,11 @@ def test_an_upstream_note_or_page_past_the_limit_is_cut_saying_so(env):
     daemon's page to another project."""
     from ttp import upstream
     p = make(env)
-    spec = "do this first. " + "detail " * 700
+    spec = "the daemon does this first. " + "detail " * 700
     _hand_off(env, p, {"status": "done", "summary": "ok", "followups": [{"title": "upstream: big", "spec": spec}]})
     (n,) = _upstream_inbox(env)
     kept = len(n["spec"]) - len(n["spec"].split(" … [cut: ")[1]) - len(" … [cut: ")
-    assert len(n["spec"]) <= upstream.SPEC_CHARS and n["spec"].startswith("do this first.")
+    assert len(n["spec"]) <= upstream.SPEC_CHARS and n["spec"].startswith("the daemon does this first.")
     assert f"[cut: {kept} of {len(spec.strip())} characters kept; the whole text is in the hand-off of demo #" in n["spec"]
     assert upstream.send("demo", None, "other", "page " * 1000, sender="daemon") == "sent"
     m = _upstream_inbox(env)[-1]
@@ -24481,7 +24883,7 @@ def test_coordinators_pass_upstream_notes_on_only_while_no_project_reads_them(en
     p = make(env)
     from ttp import upstream, coordinator as coord
     _, _, ids = _hand_off(env, p, {"status": "done", "summary": "ok",
-                                   "followups": [{"title": "upstream: a lesson", "spec": "s"}]})
+                                   "followups": [{"title": "upstream: a lesson", "spec": "the worker prompt could say so"}]})
     assert "no project reads the user's upstream inbox. Pass" in coord.digest(p, {}, ids, [])
     upstream.reader_path().write_text(json.dumps({"project": "dev", "host": "box", "ts": time.time()}))
     dig = coord.digest(p, {}, ids, [])
@@ -27181,7 +27583,7 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert "private snapshot taken at launch" in rules["code"]
     assert "private snapshot taken at launch" not in rules["question"]
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
-    assert len(every) <= 18_000, len(every)
+    assert len(every) <= 18_100, len(every)  # room for the upstream-note scope rule
     for t in (None, code, question):
         system = worker_system(p, t)
         assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system
@@ -28535,6 +28937,10 @@ def test_web_api_paths_use_their_own_connection_after_a_coordinator_turn(env):
     assert call("/api/pause", {"resource": "board", "paused": False})[0] == 200
     assert call("/api/schedule/pr-watch", {"enabled": False})[0] == 200
     assert call(f"/api/task/{other}", {"status": "cancelled"})[0] == 200
+    finished = p.db.add_task("finished", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(finished, status="done")
+    code, why = call(f"/api/task/{finished}", {"status": "cancelled"})
+    assert code == 409 and "already done" in why and p.db.task(finished)["status"] == "done"
     assert call("/api/config", {"key": "budget.daily_usd", "value": 7})[0] == 200
     assert p.db.task(other)["status"] == "cancelled" and p.config()["budget"]["daily_usd"] == 7
 
@@ -45326,3 +45732,27 @@ def test_guide_says_own_push_may_reuse_checks_pass():
     text = (pathlib.Path(__file__).resolve().parents[1] / "plugins/tt-project/docs/guide.md").read_text()
     bullet = text.split("- Checks run with `TTP_PUSH_MODE`", 1)[1].split("\n- ", 1)[0]
     assert "may instead reuse" in bullet and "cannot count on running" in bullet
+
+
+@needs_sockets
+def test_web_post_with_a_bad_content_length_answers_400(env):
+    p = make(env)
+    from ttp import web
+    import http.client
+    port = _start_web(p)
+    tok = web.token(p)
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1)
+            break
+        except OSError:
+            time.sleep(0.1)
+    for bad in ("abc", "-5"):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.putrequest("POST", "/api/schedule/none")
+        c.putheader("X-TTP-Token", tok)
+        c.putheader("Content-Type", "application/json")
+        c.putheader("Content-Length", bad)
+        c.endheaders()
+        assert c.getresponse().status == 400, bad
+        c.close()

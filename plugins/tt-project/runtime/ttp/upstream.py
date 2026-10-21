@@ -5,7 +5,9 @@
 A worker hand-off's follow-ups titled `upstream: ...` are not work for its own project. Each
 project's daemon appends them to the user's inbox ~/.tt-project/upstream.jsonl, one JSON line per
 note with its project, host, task, title, spec and a fingerprint of title and spec, so the same
-note proposed twice (by a retry, or by two projects) is kept once.
+note proposed twice (by a retry, or by two projects) is kept once. A note is for defects or missing
+features of the tt-project plugin itself: one that names nothing of it (PLUGIN_WORDS) is about the
+project's own code, machines or models, so the daemon keeps it as that project's follow-up (`reroute`).
 
 A project with `upstream.ingest: true` (off by default) reads the inbox: each note it has not seen
 becomes an `upstream_note` event for its coordinator. Its read cursor (a byte offset per inbox, and
@@ -111,6 +113,30 @@ def reader_path() -> Path:
 
 def is_note(f) -> bool:
     return isinstance(f, dict) and str(f.get("title") or "").strip().lower().startswith("upstream:")
+
+
+# What an `upstream:` follow-up must name to be about tt-project itself (a word starting with one of
+# these). One that names none of them (a project's own box, model, test setup or scripts) is filed as
+# a follow-up of its own project instead (`reroute`): the maintainers need not triage it, and the
+# work stays on the list of the project that has to do it.
+PLUGIN_WORDS = re.compile(
+    r"\b(?:tt[-_ ]?project|ttp\b|daemon|harness|coordinator|worker|schedul|push|review|runtime|plugin|"
+    r"skill|prompt|template|hand-?off|result\.json|retry_when|on_pass|digest|dispatch|relay|web ?app|"
+    r"inbox|changeset|hook|provider|wake|upstream note)", re.I)
+
+
+def reroute(followups: list) -> tuple[list, list[str]]:
+    """`followups` with each `upstream:` note that names nothing of tt-project (PLUGIN_WORDS) retitled
+    without its prefix, so it stays this project's follow-up; and the titles moved."""
+    out, moved = [], []
+    for f in followups:
+        if is_note(f):
+            title = str(f["title"]).strip()[len("upstream:"):].strip()
+            if not PLUGIN_WORDS.search(title + "\n" + str(f.get("spec") or "")):
+                f = dict(f, title=title or cut_title(str(f.get("spec") or "")) or "follow-up")
+                moved.append(f["title"])
+        out.append(f)
+    return out, moved
 
 
 MAINTAINERS = "tt-project"   # `ttp note --to` this name (no project of it here): an `upstream: ...` note

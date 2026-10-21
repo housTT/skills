@@ -33,7 +33,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import checkcap, checkdirs, envfault, landed, locks, machines, prguard, runner, settinghold, timefmt, worktree
+from . import (checkcap, checkdirs, envfault, landed, locks, machines, prguard, remotecheck, runner, settinghold, timefmt,
+               worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, durable_append, durable_write, git_fsync_env, nice_level, own_creates_pr_branch,
@@ -66,14 +67,19 @@ class Check(str):
     target touches no matching path, and a head where every check is skipped that way changes
     nothing any check covers (`outside_scope`). `"purpose": "candidate"` or `"harness"` says which
     `ttp checks --purpose` runs it (untagged: both; `ttp push --own` is candidate); `ttp push` and the
-    push queue run every entry."""
+    push queue run every entry. `"host": "<ssh alias>"` runs it on that machine (remotecheck), with
+    `"env": {...}` exported where it runs; `"host": "local"` keeps it here when `delivery.checks_host` sets a
+    default host (`default_host`, never part of the config form)."""
     if_exists = ""
     if_changed: tuple[str, ...] = ()
     purpose = ""
+    host = ""
+    env: tuple[tuple[str, str], ...] = ()
+    default_host = ""
 
     def config(self) -> str | dict:
         """The form project.json keeps."""
-        if not (self.if_exists or self.if_changed or self.purpose):
+        if not (self.if_exists or self.if_changed or self.purpose or self.host or self.env):
             return str(self)
         out: dict = {"run": str(self)}
         if self.if_exists:
@@ -82,10 +88,14 @@ class Check(str):
             out["if_changed"] = self.if_changed[0] if len(self.if_changed) == 1 else list(self.if_changed)
         if self.purpose:
             out["purpose"] = self.purpose
+        if self.host:
+            out["host"] = self.host
+        if self.env:
+            out["env"] = dict(self.env)
         return out
 
 
-CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose"}
+CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env"}
 PURPOSES = ("candidate", "harness")   # `ttp checks --purpose`; candidate is the default and publication evidence
 
 
@@ -116,7 +126,60 @@ def _check(c: Any) -> Check | None:
         out.if_exists = _if_exists(c)
         out.if_changed = _if_changed(c)
         out.purpose = c.get("purpose") or ""
+        out.host = str(c.get("host") or "").strip()
+        out.env = tuple(sorted((c.get("env") or {}).items()))
     return out
+
+
+def with_host(checks: list, default: Any) -> list:
+    """`checks` (Checks or plain commands) with `delivery.checks_host` as the host of those that name
+    none; a malformed or empty default changes nothing (config_problems names it)."""
+    default = default.strip() if isinstance(default, str) else ""
+    if not default or remotecheck.host_problem(default):
+        return list(checks)
+    out = []
+    for c in checks:
+        if not isinstance(c, Check):
+            c = Check(str(c))
+        elif not c.host:
+            c2 = Check(str(c))
+            c2.__dict__.update(c.__dict__)
+            c = c2
+        if not c.host:
+            c.default_host = default
+        out.append(c)
+    return out
+
+
+def checks_host_of(v: Any) -> str:
+    """A `delivery.checks_host` value: an ssh alias, or "" for this machine."""
+    v = "" if v is None else str(v).strip()
+    if v and (why := remotecheck.host_problem(v)):
+        raise ValueError(why)
+    return v
+
+
+def remote_host(c: Any) -> str:
+    """The machine check `c` runs on, or "" for this one."""
+    host = getattr(c, "host", "") or getattr(c, "default_host", "")
+    return "" if host == remotecheck.LOCAL else host
+
+
+def where(c: Any) -> str:
+    """" (on <host>)" for a remote check, else ""."""
+    return f" (on {h})" if (h := remote_host(c)) else ""
+
+
+def hosts_of(cmds: list) -> dict[str, str]:
+    """{command: host} of the remote checks in `cmds`, for the records that name where each ran."""
+    return {str(c): h for c in cmds if (h := remote_host(c))}
+
+
+def remote_fault(c: Any, rc: int | None, cwd: str | Path) -> dict | None:
+    """The envfault record when remote check `c` exited remotecheck.FAULT_RC (ssh or the host failed)."""
+    if rc != remotecheck.FAULT_RC or not (h := remote_host(c)):
+        return None
+    return remotecheck.fault(h, str(c), str(cwd))
 
 
 def harness_plan_problem(cmd: str) -> str | None:
@@ -263,8 +326,13 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None)
     """How a check command runs: first-failure semantics, so `a; b` fails when `a` fails and a
     pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing).
     With `top` (the worktree it runs in), a bare pytest runs with the repository's venv, else the one
-    `env` (the check's environment; default this process's) has active (venv_cmd)."""
+    `env` (the check's environment; default this process's) has active (venv_cmd). A check with a host
+    (remote_host) runs there instead, on a copy of the checkout's HEAD (remotecheck)."""
+    exports = dict(getattr(cmd, "env", ()) or ())
+    if host := remote_host(cmd):
+        return remotecheck.argv(str(cmd), host, exports)
     cmd = venv_cmd(cmd, top, env) if top else cmd
+    cmd = remotecheck.exports(exports) + cmd
     bash = shutil.which("bash")
     return [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
 
@@ -934,7 +1002,8 @@ def _form_problem(c: dict) -> str | None:
         return f"{c!r}: a check object needs \"run\": the command"
     extra = sorted(set(map(str, c)) - CHECK_KEYS)
     if extra:
-        return f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed and purpose"
+        return (f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed, "
+                "purpose, host and env")
     cond = c.get("if_exists")
     if cond is not None and not _inside(cond):
         return f"{c!r}: if_exists must be a path or glob inside the repository"
@@ -944,6 +1013,10 @@ def _form_problem(c: dict) -> str | None:
     purpose = c.get("purpose")
     if purpose is not None and purpose not in PURPOSES:
         return f"{c!r}: purpose must be one of {', '.join(PURPOSES)} (leave it out to run it for both)"
+    if "host" in c and (why := remotecheck.host_problem(c["host"])):
+        return f"{c!r}: {why}"
+    if "env" in c and (why := remotecheck.env_problem(c["env"])):
+        return f"{c!r}: {why}"
     if purpose == "harness":
         return harness_plan_problem(cmd.strip())
     return None
@@ -2695,7 +2768,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
             hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None,
             base: str | None = None, ff_only: bool = False, recorded: dict | None = None,
-            check_run_dir: str | None = None, reuse: Callable[[str, list, list], str] | None = None) -> int:
+            check_run_dir: str | None = None, reuse: Callable[[str, list, list], str] | None = None,
+            host: str = "") -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
@@ -2706,7 +2780,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     exactly HEAD run instead, and must pass again (or be reused); with none, nothing checked it and it is refused,
     unless every check was skipped by its `if_changed` scope (`outside_scope`, compared with `base`).
     `reuse(tree, commands, envs)` names a pass `ttp checks` recorded of exactly those commands on HEAD's
-    tree under the same environment (pushpass.check_envs), or gives "": with one, nothing runs again."""
+    tree under the same environment (pushpass.check_envs), or gives "": with one, nothing runs again.
+    `host` (delivery.checks_host) is where those recorded commands run, as the project's checks do."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -2739,7 +2814,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             return CHECKS_FAILED
         extras = False
         if checks and not todo:
-            todo = extras = recorded_extras(recorded, head, checks)
+            todo = extras = with_host(recorded_extras(recorded, head, checks), host)
             if not todo and outside_scope(checks, skipped):
                 say(f"{head[:10]}: {OUT_OF_SCOPE}")
             elif not todo:
@@ -2765,9 +2840,10 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             started = time.time()
             env = {**check_env("own", tip, check_run_dir), **slot.env()}
             for cmd in todo:
-                if subprocess.run(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
-                    say(f"check failed on {head[:10]}: {cmd}; not pushing")
-                    return CHECKS_FAILED
+                if (rc := _run_one(cmd, repo, env, say)) != 0:
+                    if rc != BUSY:
+                        say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
+                    return rc
         if todo and timed:
             timed(time.time() - started)
         if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
@@ -2961,9 +3037,10 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             started = time.time()
             env = {**check_env("target", tip, check_run_dir), **slot.env()}
             for cmd in todo:
-                if subprocess.run(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode != 0:
-                    say(f"check failed on {head[:10]}: {cmd}; not pushing")
-                    return CHECKS_FAILED
+                if (rc := _run_one(cmd, repo, env, say)) != 0:
+                    if rc != BUSY:
+                        say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
+                    return rc
         if todo and timed:
             timed(time.time() - started)
         if _fetch(repo, remote, branch) != tip:
@@ -2980,6 +3057,25 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         say(f"{upstream} moved before the push; round {rnd + 1}")
     say(f"{upstream} kept moving for {rounds} rounds; not pushing")
     return KEPT_MOVING
+
+
+def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int:
+    """Run one push check: 0 when it passes, CHECKS_FAILED when it fails, BUSY when its check host
+    could not run it (an environment fault, recorded as runner_wait records a missing runner)."""
+    if remote_host(cmd):
+        say(f"running {cmd}{where(cmd)}")
+    rc = subprocess.run(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode
+    if rc == 0:
+        return 0
+    if fault := remote_fault(cmd, rc, repo):
+        p = None
+        if base := os.environ.get("TTP_PROJECT"):
+            p = Project(base)
+            p = p if p.exists() else None
+        envfault.record(p, fault, os.environ.get("TTP_TASK"))
+        say(f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
+        return BUSY
+    return CHECKS_FAILED
 
 
 def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None, after: bool = True) -> int:
@@ -3042,7 +3138,8 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     except OSError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return CHECKS_FAILED
-    checks = check_list(d.get("push_checks"))   # none: only a docs-only change may go (_rounds)
+    # none: only a docs-only change may go (_rounds)
+    checks = with_host(check_list(d.get("push_checks")), d.get("checks_host"))
     try:
         remote, branch, own = resolve(p, repo, own)
         rounds = rounds_of(d.get("push_rounds"))
@@ -3065,7 +3162,7 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
                      timed=lambda s: record_check_s(p, s), base=base,
                      ff_only=own_ff_only(branch),
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
-                     reuse=lambda tree, cmds, envs: _own_pass(p, tree, cmds, envs))
+                     reuse=lambda tree, cmds, envs: _own_pass(p, tree, cmds, envs), host=d.get("checks_host") or "")
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),

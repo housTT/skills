@@ -13,7 +13,11 @@ fallback of, and those its own heal checks name. A machine is down while any of 
 - a known outage recorded for it (`ttp machines outage`), from when it was recorded.
 The earliest of these is the incident's start, and its kind (down, held or outage) and cause. Its end
 is the first daemon tick (every OBSERVE_S) that finds none of them; a later tick that finds one again
-starts a new incident, never before the last one ended.
+starts a new incident, never before the last one ended. When the open incident's source recovers but
+another of a different kind and cause (say a known outage after a heal check) keeps the machine down,
+the incident hands over: it ends when the new source began (no earlier than it started) and a new one
+opens from there with the new kind and cause, so each source's incident keeps its own start and
+cause. A source changing only its kind (a heal check's down to held) or only its cause keeps it.
 
 Records live in this project's database (ttr_incidents): rows are only added, and each row's end is
 written once. A unique index allows one open incident per machine and every step is one transaction,
@@ -103,10 +107,19 @@ def observe(p, now: float | None = None) -> tuple[list[str], list[str]]:
     opened, ended = [], []
     with db.tx():
         open_rows = {r["alias"]: r for r in db.q("SELECT * FROM ttr_incidents WHERE ended IS NULL")}
-        for alias, r in open_rows.items():
-            if alias not in down and db.conn.execute(
-                    "UPDATE ttr_incidents SET ended=? WHERE id=? AND ended IS NULL", (now, r["id"])).rowcount:
+        for alias, r in list(open_rows.items()):
+            d = down.get(alias)
+            if d is None:
+                end = now
+            elif d["kind"] != r["kind"] and d["cause"] != r["cause"]:
+                end = min(max(d["since"], float(r["started"])), now)   # handover to another source
+            else:
+                continue
+            if db.conn.execute("UPDATE ttr_incidents SET ended=? WHERE id=? AND ended IS NULL",
+                               (end, r["id"])).rowcount:
                 ended.append(alias)
+                if d is not None:
+                    del open_rows[alias]
         for alias, d in sorted(down.items()):
             if alias in open_rows:
                 continue

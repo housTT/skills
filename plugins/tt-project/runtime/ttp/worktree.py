@@ -240,6 +240,27 @@ class WorkspaceStuck(RuntimeError):
     final = True
 
 
+def dangling_root(p: Project) -> str | None:
+    """Why the worktrees folder cannot be made, or None: it is a symlink whose target is gone (the
+    project moved hosts or a mount went away), where mkdir(exist_ok=True) fails with a bare
+    [Errno 17] File exists."""
+    w = p.worktrees
+    if not w.is_symlink() or w.exists():
+        return None
+    try:
+        target = os.readlink(w)
+    except OSError:
+        target = "?"
+    return (f"the worktrees folder {w} is a symlink to {target}, which does not exist; create that folder "
+            f"or point the link at an existing one")
+
+
+def _make_root(p: Project) -> None:
+    if (why := dangling_root(p)):
+        raise WorkspaceStuck(why)
+    p.worktrees.mkdir(parents=True, exist_ok=True)
+
+
 RECOVERED_EVENT = "worktree_recovered"   # the task's event when ensure fixed a worktree on another branch or moved a folder aside
 
 
@@ -424,7 +445,7 @@ def checkout_env(p: Project) -> dict | None:
 
 
 def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeout: float) -> None:
-    p.worktrees.mkdir(parents=True, exist_ok=True)
+    _make_root(p)
     env = checkout_env(p)
     exists = _git(p.root, "rev-parse", "--verify", "--quiet", branch, check=False)
     if exists and carried:
@@ -707,7 +728,7 @@ def review_workdir(p: Project, review: dict, prefer: str = "") -> Path | None:
     head = reviewed_head(p, review)
     if not head:
         return None
-    p.worktrees.mkdir(parents=True, exist_ok=True)
+    _make_root(p)
     if own.exists() or rec:
         _clear_partial(p, own, rec)
     _git(p.root, "worktree", "add", "--detach", str(own), head, timeout=git_timeout(p), env=checkout_env(p))
@@ -888,7 +909,7 @@ def ensure_in(p: Project, task: dict, repo: Path) -> tuple[Path, str]:
     _git(repo, "worktree", "prune", check=False, timeout=t)
     held = {r["branch"] for r in _records(p, repo).values() if not r["prunable"]}
     want = task.get("branch") or carried_branch(task)
-    p.worktrees.mkdir(parents=True, exist_ok=True)
+    _make_root(p)
     if want and want not in held and (start := ref(want)):
         branch = want
         if start == want:

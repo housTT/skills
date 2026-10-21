@@ -48,7 +48,12 @@ def die(msg: str, code: int = 2) -> None:
 
 
 # locating projects --------------------------------------------------------------------------------
+_HERE: Project | None = None   # the project _project_name_argv put in a command's empty name slot
+
+
 def local_project(name: str) -> Project | None:
+    if _HERE is not None and _HERE.name == name:
+        return _HERE
     entry = load_registry().get("projects", {}).get(name)
     if entry and entry.get("host") in (None, hostname()) and Path(entry["dir"]).is_dir():
         return Project(entry["dir"])
@@ -419,7 +424,10 @@ def need(name: str, argv: list[str]) -> Project:
             print(f"{n} message(s) queued here for {name}; they go out once it is reachable")
         sys.exit(rc)
     if not p:
-        die(f"no project named {name!r} on this machine or in the registry; try `ttp find {name}`")
+        import difflib
+        close = difflib.get_close_matches(name, list(load_registry().get("projects", {})), n=3)
+        die(f"no project named {name!r} on this machine or in the registry"
+            + (f"; did you mean {', '.join(close)}?" if close else ""))
     return p
 
 
@@ -635,16 +643,28 @@ def cmd_new(a) -> None:
     if not a.no_service:
         from .service import install
         how = install(p)
-    _wait_for_daemon(p)
+        _wait_for_daemon(p)    # with no service nothing starts it: no wait
     print(MARKER.format(name=a.name, host=hostname(), dir=p.root))
     print(f"created {a.name} in {p.base} · daemon via {how}")
     for ln in defaults_lines(p.config()["budget"], bool((load_secrets().get("jev") or {}).get("key")), a.name):
         print(ln)
+    if a.no_service:
+        print(f"daemon: not started (--no-service). Start it by hand with `{hand_start_cmd(p)}`, "
+              f"or `ttp start {a.name}` installs a service that keeps it running")
+        return
     from . import weblink
     line, rc = weblink.local(p, weblink.link(p))
     print(line)
     if rc:
         sys.exit(rc)
+
+
+def hand_start_cmd(p: Project) -> str:
+    """The shell command that starts a project's daemon without a service, as its service would: the
+    harness's own runtime, from the project folder, logging to daemon.out, surviving the shell's exit."""
+    q = shlex.quote
+    return (f"cd {q(str(p.base))} && nohup {q(str(p.harness / 'bin' / 'ttp'))} daemon {q(str(p.base))} "
+            f">> {q(str(p.logs / 'daemon.out'))} 2>&1 &")
 
 
 def _default_root() -> Path:
@@ -724,6 +744,8 @@ def new_remote(a, brief: str) -> None:
         die(f"remote creation on {host} failed", r.returncode)
     entry = {"host": host, "dir": a.dir}
     register(a.name, entry)
+    if a.no_service:        # no daemon there, so no web app yet: its output said how to start one
+        return
     line, rc = remote_web(a.name, entry, r.stdout)
     print(line)
     if rc:
@@ -1079,8 +1101,22 @@ def _listen_write(db, sql: str, args: tuple, what: str) -> None:
               file=sys.stderr, flush=True)
 
 
-def status_text(p: Project) -> str:
-    """One screen: what needs the user now first, then the budget and the work, then information."""
+STATUS_WIDTH = 400   # `ttp status` lines end by here, at a word (quoted texts end sooner)
+
+
+def clip(text: str, width: int = STATUS_WIDTH) -> str:
+    """`text` cut at the last word boundary within `width`, with an ellipsis when cut."""
+    if len(text) <= width:
+        return text
+    cut = text[:width - 1]
+    if (sp := cut.rfind(" ")) > width // 2:
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:—-") + "…"
+
+
+def status_text(p: Project, verbose: bool = False) -> str:
+    """One screen: what needs the user now first, then the budget and the work, then information.
+    `verbose` adds the diagnostic lines (coordinator cache, checks slot waits, unacked upstream fixes)."""
     from .alerts import feed
     from .web import at, attention, health, since
     db = p.db
@@ -1106,7 +1142,7 @@ def status_text(p: Project) -> str:
     for m in attention(db, now)[:6]:
         text = " ".join(m["text"].split())
         what = f"ask {m['id']}" if m["kind"] == "ask" else "alert"
-        lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text[:300]}")
+        lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {clip(text, 300)}")
     # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
     from . import waits
     you, stuck = waits.blocked(db, now, tz)
@@ -1128,8 +1164,8 @@ def status_text(p: Project) -> str:
         coord += f" · idle check {c['idle_held']}"
     lines.append(coord)
     from . import budget
-    cache = budget.coordinator_cache(db, now)["24h"]
-    if cache["turns"]:
+    cache = budget.coordinator_cache(db, now)["24h"] if verbose else {}
+    if cache.get("turns"):
         lines.append(budget.coordinator_cache_line(cache))
     from . import pushq
     pq = pushq.status_line(p, now)
@@ -1156,7 +1192,7 @@ def status_text(p: Project) -> str:
     from . import checkcap, locks, shared
     if host := checkcap.line():
         lines.append(host)
-    if slot_waits := checkcap.wait_line(p.state, now):
+    if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
         who = locks.held(shared.root() / res, p)
@@ -1206,8 +1242,12 @@ def status_text(p: Project) -> str:
         lines.append(h["local_only"])
     if h.get("uncommitted"):
         lines.append(h["uncommitted"])
-    if h.get("upstream"):
-        lines.append(h["upstream"])
+    from . import upstream
+    cfg = p.config()
+    ups = "; ".join(x for x in (upstream.status_line(db, cfg), verbose and upstream.fixes_line(p.name, cfg, now),
+                                upstream.forward_line(now)) if x)
+    if ups:
+        lines.append(ups)
     disk = db.kv("disk_low")
     if disk:
         lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "
@@ -1238,8 +1278,8 @@ def status_text(p: Project) -> str:
     for m in recent:
         text = " ".join(m["text"].split())
         tag = f"cleared {at(m['cleared_at'], now, tz)}" if m.get("cleared_at") else m["state"]
-        lines.append(f"  {at(m['ts'], now, tz)} ({tag}) {text[:160]}")
-    return "\n".join(lines)
+        lines.append(f"  {at(m['ts'], now, tz)} ({tag}) {clip(text, 160)}")
+    return "\n".join(clip(ln) for ln in lines)
 
 
 def daemon_state(p: Project) -> str:
@@ -1256,10 +1296,76 @@ def daemon_state(p: Project) -> str:
 
 
 def here() -> Project | None:
-    """The project this process runs in: its run's project, else the folder it was started in."""
+    """The project this process runs in: its run's project, else the one at the folder it was started
+    in or above it (its git top level included), else, in a git worktree, the one at its main checkout."""
     if os.environ.get("TTP_PROJECT") and Project(os.environ["TTP_PROJECT"]).exists():
         return Project(os.environ["TTP_PROJECT"])
-    return next((c for d in [Path.cwd(), *Path.cwd().parents] if (c := Project(d)).exists()), None)
+    if p := next((c for d in [Path.cwd(), *Path.cwd().parents] if (c := Project(d)).exists()), None):
+        return p
+    try:
+        r = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    common = (Path.cwd() / r.stdout.strip()).resolve() if r.returncode == 0 and r.stdout.strip() else None
+    if common and common.name == ".git" and (c := Project(common.parent)).exists():
+        return c
+    return None
+
+
+# Commands whose first positional is the project: with none given, it is the one here().
+PROJECT_CMDS = frozenset({"web", "connect", "logs", "prune", "say", "listen", "task", "memory", "schedules", "pause",
+                          "resume", "drain", "start", "stop", "restart", "config", "upgrade", "alerts"})
+
+
+def _positionals(sp: argparse.ArgumentParser, args: list[str]) -> list[str]:
+    """The positional words of `args` for subcommand parser `sp`, skipping its options and their values."""
+    out, i = [], 0
+    while i < len(args):
+        t = args[i]
+        i += 1
+        if t == "--":
+            return out + args[i:]
+        if not t.startswith("-") or t == "-":
+            out.append(t)
+            continue
+        act = sp._option_string_actions.get(t)
+        if act is None or act.nargs == 0:
+            continue
+        if act.nargs in ("*", "+"):
+            while i < len(args) and not args[i].startswith("-"):
+                i += 1
+        elif act.nargs == "?":
+            i += i < len(args) and not args[i].startswith("-")
+        else:
+            i += act.nargs if isinstance(act.nargs, int) else 1
+    return out
+
+
+def _project_name_argv(sub, argv: list[str]) -> list[str]:
+    """`ttp <command>` without its project name: put the project here() (the run's, else the current
+    folder's) in the name slot. The slot counts as empty when no positional is given, or when the first
+    is no known project, a later slot is free and the word fits the next slot's choices (`task list`).
+    With no project here, argv is unchanged and argparse asks for the name as before."""
+    global _HERE
+    _HERE = None
+    if not argv or argv[0] not in PROJECT_CMDS or argv[0] not in sub.choices:
+        return argv
+    if argv[0] == "config" and "--account" in argv:   # its first word is the account key
+        return argv
+    sp = sub.choices[argv[0]]
+    slots = [x for x in sp._actions if not x.option_strings]
+    if not slots or slots[0].dest != "name":
+        return argv
+    room = sum(1 if x.nargs in (None, "?") else x.nargs if isinstance(x.nargs, int) else 99 for x in slots)
+    pos = _positionals(sp, argv[1:])
+    if pos and (len(pos) >= room or local_project(pos[0]) or remote_entry(pos[0])
+                or (slots[1].choices and pos[0] not in slots[1].choices)):
+        return argv
+    p = here()
+    if not p:
+        return argv
+    _HERE = p
+    return [argv[0], p.name, *argv[1:]]
 
 
 def cmd_status(a) -> None:
@@ -1273,7 +1379,7 @@ def cmd_status(a) -> None:
         from .web import state_payload
         print(json.dumps(state_payload(p, p.db), default=str, indent=1))
     else:
-        print(status_text(p))
+        print(status_text(p, verbose=a.verbose))
     from . import upstream
     upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this shell
 
@@ -1822,6 +1928,11 @@ def _command_key(c) -> str:
     structured check, is compared as written."""
     if not isinstance(c, str):
         return str(c)
+    from . import push
+    if host := push.remote_host(c):   # another machine's pass is not this one's, nor one with other env
+        return json.dumps([str(c), host, dict(getattr(c, "env", ()) or ())])
+    if getattr(c, "env", ()):
+        return json.dumps([str(c), dict(c.env)])
     try:
         words = shlex.split(c)
     except ValueError:
@@ -2049,7 +2160,8 @@ def cmd_checks(a) -> None:
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
     purpose = getattr(a, "purpose", None) or "candidate"
-    own = push.check_list((cfg.get("delivery") or {}).get("push_checks"))
+    checks_host = (cfg.get("delivery") or {}).get("checks_host")   # where checks without a host run
+    own = push.with_host(push.check_list((cfg.get("delivery") or {}).get("push_checks")), checks_host)
     not_run: list[str] = []
     default_harness = False
     if purpose == "harness":
@@ -2083,6 +2195,7 @@ def cmd_checks(a) -> None:
     # The python a bare pytest runs with (push.venv_cmd): an extra spelled with it runs the same tests.
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy)
+    mine = push.with_host(mine, checks_host)
     if dropped:
         print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
               f"delivery.push_checks already runs it")
@@ -2248,8 +2361,8 @@ def cmd_checks(a) -> None:
         for c in [] if hit or handover else todo:
             executed.append(c)
             # A progress line per check: the commands' own output goes only to checks.log.
-            print(f"ttp checks: running {len(executed)}/{len(todo)}: {c}", flush=True)
-            out.write(f"$ {c}\n")
+            print(f"ttp checks: running {len(executed)}/{len(todo)}: {c}{push.where(c)}", flush=True)
+            out.write(f"$ {c}{push.where(c)}\n")
             out.flush()
             check_start = out.tell()
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
@@ -2262,6 +2375,19 @@ def cmd_checks(a) -> None:
                 break
         if slot and not passed:
             slot.close()
+        # A check host ssh could not reach (or that could not take the tree) is the environment, as a
+        # missing runner is: wait for it, counting nothing against the change (envfault).
+        if not passed and (fault := push.remote_fault(failed, rc, top)):
+            envfault.record(p, fault, os.environ.get("TTP_TASK"))
+            envfault.write_marker(run_dir, fault)
+            said = f"{envfault.line(fault)}. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}"
+            out.write(f"ttp checks: {said}\n")
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "env_fault": fault["sig"],
+                                                             "hosts": push.hosts_of(todo)})
+            print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
     if handover:
         try:
             _checks_detach(a, Path(run_dir), p, top, head, arrived)
@@ -2311,7 +2437,8 @@ def cmd_checks(a) -> None:
                                                         if fast_cmds else {}),
                                                      **({"not_run": not_run} if not_run else {}),
                                                      **({"not_executed": not_executed} if not passed else {}),
-                                                     **({"env_problem": env_problem} if env_problem else {})})
+                                                     **({"env_problem": env_problem} if env_problem else {}),
+                                                     **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {})})
     source = ("the default harness plan" if any(str(c) == str(failed) for c in defaults)
               else "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --")
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
@@ -4125,8 +4252,12 @@ def cmd_task(a) -> None:
         print(json.dumps(t, indent=2, default=str) if a.json else show_task(t))
     elif a.action == "cancel":
         from .runner import stop_runs
+        if not a.title.strip().isdigit():
+            die(f"cancel needs a task id, not {a.title!r}")
         tid = int(a.title)
-        p.db.update_task(tid, status="cancelled")
+        why = p.db.cancel(tid)
+        if why:
+            die(why)
         runs = stop_runs(p.db, p.runs, tid)
         print("cancelled" + (f"; ending its running run{'s' if len(runs) > 1 else ''} "
                              f"{', '.join(map(str, runs))}" if runs else ""))
@@ -5195,6 +5326,16 @@ def new_project_defaults_lines() -> list[str]:
     return defaults_lines(budget, bool((load_secrets().get("jev") or {}).get("key")))
 
 
+def shim_text(python: str, launcher: Path) -> str:
+    """The `ttp` on PATH: the interpreter setup ran under, else (its venv or conda env removed) python3 from
+    PATH, with a hint on stderr."""
+    py, hint = shlex.quote(python), shlex.quote(f"ttp: {python} is gone; using python3 from PATH "
+                                                "(rerun `ttp setup` to pin an interpreter)")
+    return (f"#!/bin/sh\npy={py}\n"
+            f"if [ ! -x \"$py\" ]; then echo {hint} >&2; py=python3; fi\n"
+            f"exec \"$py\" {shlex.quote(str(launcher))} \"$@\"\n")
+
+
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update), and the plain
     `/tt-project` command for Claude Code (shortcut.py)."""
@@ -5231,10 +5372,12 @@ def cmd_setup(a) -> None:
     bindir = Path(a.bin_dir).expanduser()
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "ttp"
-    shim.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(cur / 'bin' / 'ttp'))} \"$@\"\n")
+    shim.write_text(shim_text(sys.executable, cur / "bin" / "ttp"))
     shim.chmod(0o755)
     on_path = str(bindir) in os.environ.get("PATH", "").split(":")
     print(f"ttp {__version__} ({commit}) installed: {shim}" + ("" if on_path else f" (add {bindir} to PATH)"))
+    from .service import plan
+    print(f"daemon service for new projects here: {plan()}")
     if before and before != commit:
         print(f"replaced ttp {__version__} from commit {before} with commit {commit}")
     from . import shortcut
@@ -6320,6 +6463,8 @@ def cmd_doctor(a) -> None:
     print(f"slack: {'bot saved' if (sec.get('slack') or {}).get('bot_token') else 'not configured'}"
           f" · enabled in project: {p.config()['notify'].get('slack')}")
     print(web_line(p))
+    from .service import service_line
+    print(service_line(p))
     from .project import config_problems
     for line in config_problems(p.raw_config(), p.root):
         print(f"project.json: {line}")
@@ -6343,6 +6488,55 @@ def cmd_doctor(a) -> None:
               f"trailing whitespace; add the pathspec `-- . {_push.LOG_EXCLUDE}`")
 
 
+PROVIDER_CHOICES = ("claude", "codex", "cursor")
+TASK_KINDS = ("question", "code", "review", "plan", "harness", "work")   # as coordinator.TASK_KINDS (not imported: slow)
+TASK_TIERS = ("light", "standard", "deep")                              # as chaincap.TIERS
+
+# `ttp --help` lists the commands in these groups; a command in none is listed under "other".
+COMMAND_GROUPS = (
+    ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
+                  "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
+                  "machines", "logs", "doctor")),
+    ("inside a run", ("note", "notify", "checks", "lock", "detach", "devq", "push", "clip", "skill",
+                      "killscan", "svcscan")),
+    ("probes (retry_when, start_when)", ("landed", "ci", "ack-wait", "ssh-preflight", "broker-released",
+                                         "deployed", "goal")),
+    ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
+               "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
+               "push-audit", "ttr", "spend-today")),
+)
+
+
+class _TopHelp(argparse.HelpFormatter):
+    def _split_lines(self, text, width):   # never wrap inside a hyphenated word (--start-after)
+        import textwrap
+        return textwrap.wrap(self._whitespace_matcher.sub(" ", text).strip(), width, break_on_hyphens=False)
+
+
+class _TopParser(argparse.ArgumentParser):
+    """The top-level parser: its help lists the commands by COMMAND_GROUPS instead of one long block."""
+    def __init__(self, **kw):
+        super().__init__(formatter_class=_TopHelp, **kw)
+
+    def format_help(self) -> str:
+        f = self._get_formatter()
+        f.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
+        f.add_text(self.description)
+        sub = next(a for a in self._actions if isinstance(a, argparse._SubParsersAction))
+        rows = {c.dest: c for c in sub._choices_actions}   # commands added without help (daemon) have none
+        for heading, names in (*COMMAND_GROUPS, ("other", tuple(rows))):
+            listed = [rows.pop(n) for n in names if n in rows]
+            if listed:
+                f.start_section(heading)
+                f.add_arguments(listed)
+                f.end_section()
+        f.start_section(self._optionals.title)
+        f.add_arguments(self._optionals._group_actions)
+        f.end_section()
+        f.add_text(self.epilog)
+        return f.format_help()
+
+
 class _Version(argparse.Action):
     """`ttp --version`: the source commit is looked up only when asked for (it may run git)."""
     def __call__(self, parser, namespace, values, option_string=None):
@@ -6351,18 +6545,23 @@ class _Version(argparse.Action):
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(prog="ttp", description="tt-project: long-running, self-driving projects")
+    ap = _TopParser(prog="ttp", description="tt-project: long-running, self-driving projects",
+                    epilog="`ttp COMMAND --help` shows a command's options.")
     ap.add_argument("--version", action=_Version, nargs=0, help="show the version and source commit, then exit")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="COMMAND", help="the command to run",
+                            parser_class=argparse.ArgumentParser)   # not _TopParser: commands have no groups
 
     s = sub.add_parser("new", help="create a project; ends with its checked web app link (exit 3: the link "
                        "did not answer and the line says what is broken)")
-    s.add_argument("name")
+    s.add_argument("name", help="the project's name")
     s.add_argument("--dir", help="project root (default: git top level of the current directory)")
     s.add_argument("--host", help="machine to run on (default: this one)")
     s.add_argument("--describe", help="the brief, inline")
     s.add_argument("--describe-file", help="the brief, from a file ('-' for stdin)")
-    s.add_argument("--provider", choices=["claude", "codex", "cursor", "fake"])
+    # "fake" (the test stand-in agent) is accepted but listed only when TTP_TEST_FAKE_PROVIDER is set.
+    shown = [*PROVIDER_CHOICES, *(["fake"] if os.environ.get("TTP_TEST_FAKE_PROVIDER") else [])]
+    s.add_argument("--provider", choices=[*PROVIDER_CHOICES, "fake"], metavar="{" + ",".join(shown) + "}",
+                   help="the agent CLI that runs the project (default: the one found on this machine)")
     s.add_argument("--no-service", action="store_true", help="do not install a boot-time service")
     s.add_argument("--no-secrets", action="store_true", help="with --host: do not copy your saved keys there")
     s.add_argument("--home-tz", help=argparse.SUPPRESS)     # with --host there: the workstation's zone
@@ -6370,7 +6569,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
-    s.add_argument("name")
+    s.add_argument("name", help="the project")
     s.add_argument("--tunnel", action="store_true", help="open the local forward now (it only lets this machine "
                    "view the web app; asked once per user: `ttp consent tunnel`)")
     s.add_argument("--keep", action="store_true", help="with --tunnel: keep it up as a user service across drops "
@@ -6384,14 +6583,18 @@ def main(argv: list[str] | None = None) -> None:
                           ("prune", cmd_prune, "tidy finished tasks' worktrees now (branches are kept)")):
         s = sub.add_parser(name, help=hlp)
         # `ttp status` alone, inside a project's folder (or a run), is that project's status.
-        s.add_argument("name", nargs="?" if name in ("status", "doctor") else None)
+        s.add_argument("name", nargs="?" if name in ("status", "doctor") else None,
+                       help="the project" + (" (default: the one this folder or run belongs to)"
+                                             if name in ("status", "doctor") else ""))
         if name == "connect":
-            s.add_argument("--chat")
-            s.add_argument("--label")
+            s.add_argument("--chat", help="reuse this chat id (default: a new one)")
+            s.add_argument("--label", help="a name for the chat, shown in the web app")
             s.add_argument("--home-tz", help=argparse.SUPPRESS)     # the connecting workstation's zone
             s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
         if name == "status":
-            s.add_argument("--json", action="store_true")
+            s.add_argument("--json", action="store_true", help="print the status as JSON")
+            s.add_argument("--verbose", action="store_true",
+                           help="also the coordinator cache, checks slot waits and unacked upstream fix lines")
         if name == "prune":
             s.add_argument("--dry-run", action="store_true", help="change nothing; list what a sweep would do")
             s.add_argument("--archived", type=int, metavar="TASK",
@@ -6401,7 +6604,7 @@ def main(argv: list[str] | None = None) -> None:
                            help="also free done or cancelled tasks' worktrees with uncommitted tracked changes, "
                                 "saving them as a verified patch in the archive")
         if name == "logs":
-            s.add_argument("--bytes", type=int, default=6000)
+            s.add_argument("--bytes", type=int, default=6000, help="how much of the log's end to print (default 6000)")
         if name == "doctor":
             s.add_argument("--live", choices=["claude", "codex", "cursor"], metavar="PROVIDER",
                            help="measure one agent CLI with real runs in a scratch project (spends up to "
@@ -6415,7 +6618,7 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("say", help="send a message to the coordinator")
     s.add_argument("name", help="the project (none with --all)")
     s.add_argument("text", help="the user's words, verbatim, or '-' for stdin")
-    s.add_argument("--chat")
+    s.add_argument("--chat", help="the chat it comes from (replies go there)")
     s.add_argument("--context", default="", help="a relayer's own context (data, never the user's word); "
                    "kept apart from the user's words")
     s.add_argument("--all", action="store_true", help="send to every project `ttp list` shows, once each: "
@@ -6433,8 +6636,8 @@ def main(argv: list[str] | None = None) -> None:
         "(unknown chat or project); 3 a newer listener for the chat replaced this one (not retried); "
         "75 the project stayed unreachable until --timeout ran out; "
         "any other code is the project's own ttp failing."))
-    s.add_argument("name")
-    s.add_argument("--chat", required=True)
+    s.add_argument("name", help="the project")
+    s.add_argument("--chat", required=True, help="the chat id `ttp connect` printed")
     s.add_argument("--once", action="store_true", help="exit after the first batch")
     s.add_argument("--timeout", type=float, default=0,
                    help="stop after this many seconds (0: never); also bounds reconnecting")
@@ -6442,8 +6645,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="mark messages up to ID read; later ones stay unread until acknowledged")
     s.set_defaults(fn=cmd_listen)
 
-    s = sub.add_parser("note", help="(inside a run) append a progress note, or send one to another project")
-    s.add_argument("text")
+    s = sub.add_parser("note", help="append a progress note, or send one to another project")
+    s.add_argument("text", help="the note, one line")
     s.add_argument("--to", metavar="PROJECT",
                    help="also file the note in the inbox of another project, as this worker's; tt-project: an "
                         "`upstream: ...` note for its maintainers")
@@ -6451,8 +6654,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="with --to: the severity of the event the other project's coordinator gets")
     s.set_defaults(fn=cmd_note)
 
-    s = sub.add_parser("notify", help="(inside a run) tell the user something; sent when the run ends")
-    s.add_argument("text")
+    s = sub.add_parser("notify", help="tell the user something; sent when the run ends")
+    s.add_argument("text", help="the message")
     s.add_argument("--severity", choices=["low", "normal", "high", "critical"], default="normal",
                    help="high: an urgent report for the coordinator, relayed while the run lives; "
                         "critical is refused")
@@ -6512,17 +6715,20 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_push)
 
     from . import checkplan
-    s = sub.add_parser("check-plan", help="run committed coverage independently of candidate publication identity")
+    s = sub.add_parser("check-plan", help="run the checks a reviewed definition file lists and verify their inputs "
+                                          "against its recorded digests (no skips, no cached passes)")
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--definition-commit", help="full commit ID of the independently reviewed definition")
     g.add_argument("--definition-at-head", action="store_true",
                    help="harness only: read the definition from HEAD's commit, so covered inputs and their "
                         "digests change in one commit")
     s.add_argument("--definition-path", required=True, help="exact repository path of its JSON file")
-    s.add_argument("--purpose", required=True, choices=["harness", "candidate"])
+    s.add_argument("--purpose", required=True, choices=["harness", "candidate"],
+                   help="harness: checks for the project's own harness; candidate: checks for a change "
+                        "to deliver (needs --definition-commit)")
     s.set_defaults(fn=checkplan.command)
 
-    s = sub.add_parser("checks", help="(inside a run) run the local checks on HEAD and record the result")
+    s = sub.add_parser("checks", help="run the local checks on HEAD and record the result")
     s.add_argument("--gap", metavar="SIG", help="read-only probe: exit 0 when a missing check's config changed")
     s.add_argument("--gap-config", metavar="FINGERPRINT",
                    help="with --gap: the push_checks fingerprint the waiter failed under")
@@ -6549,56 +6755,58 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_checks)
 
     s = sub.add_parser("stats", help="context re-read (cache-read) tokens per run and per $, by kind and tier")
-    s.add_argument("name", nargs="?")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.add_argument("--days", type=float, default=7, help="the window, or each side's span with --split-at")
     s.add_argument("--since", help="start: epoch seconds or ISO date/time (home zone unless it has an offset)")
     s.add_argument("--until", help="end, the same way (default now)")
     s.add_argument("--split-at", help="compare runs before and after this time (a change landing)")
-    s.add_argument("--top", type=int, default=10)
+    s.add_argument("--top", type=int, default=10, help="how many of the costliest runs to list (default 10)")
     s.add_argument("--tools", action="store_true", help="tool output by category instead: the file-read share")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_stats)
 
     s = sub.add_parser("audit", help="the daily review's self-efficiency audit: asks, wasted runs, idle wakes, "
                                      "$ per outcome, review loops, stuck work and overrides held past their end")
-    s.add_argument("name", nargs="?")
-    s.add_argument("--hours", type=float, default=24)
-    s.add_argument("--json", action="store_true")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--hours", type=float, default=24, help="the window to audit, in hours (default 24)")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_audit)
 
-    s = sub.add_parser("replicate", help="standby state snapshots (failover.standby): status, take one now, "
-                                         "verify them, or restore one into a project folder", description=(
+    s = sub.add_parser("replicate", help="backup copies of the project's state on a standby machine "
+                                         "(failover.standby): status, take one now, verify them, or restore one "
+                                         "into a project folder", description=(
         "Without flags: the snapshot status. --now: take and ship one now. --verify: check every snapshot at "
         "the standby (checksums and chains). --restore DIR --into PATH: on the standby, make PATH/tt-project "
         "from the newest complete snapshot in DIR (or --seq N)."))
-    s.add_argument("name", nargs="?")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
     g = s.add_mutually_exclusive_group()
-    g.add_argument("--now", action="store_true")
-    g.add_argument("--verify", action="store_true")
-    g.add_argument("--restore", metavar="DIR")
-    s.add_argument("--into", metavar="PATH")
-    s.add_argument("--seq", type=int)
-    s.add_argument("--json", action="store_true")
+    g.add_argument("--now", action="store_true", help="take a snapshot and send it to the standby now")
+    g.add_argument("--verify", action="store_true", help="check every snapshot at the standby (checksums and chains)")
+    g.add_argument("--restore", metavar="DIR", help="on the standby: restore from the snapshots in DIR")
+    s.add_argument("--into", metavar="PATH", help="with --restore: make the project folder PATH/tt-project")
+    s.add_argument("--seq", type=int, help="with --restore: this snapshot number instead of the newest complete one")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_replicate)
 
-    s = sub.add_parser("push-audit", help="done tasks whose claimed pushes are not on the remote, with counts")
-    s.add_argument("name", nargs="?")
+    s = sub.add_parser("push-audit", help="find done tasks that say they pushed a commit the remote does not have")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.add_argument("--days", type=float, default=2, help="done tasks updated within this many days")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_push_audit)
 
-    s = sub.add_parser("ttr", help="time to recover per machine: incidents, median, p90 and max TTR, open ones")
-    s.add_argument("name", nargs="?")
+    s = sub.add_parser("ttr", help="how long each machine took to recover from problems: incidents, median, "
+                                   "90th percentile and longest time, and the ones still open")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.add_argument("alias", nargs="?", help="only this machine")
     s.add_argument("--days", type=float, default=30, help="the window: incidents open now or ended within it")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_ttr)
 
     s = sub.add_parser("spend-today", help="this machine's tt-project spend today, by provider and account "
                                            "(for the global daily cap)")
     s.add_argument("--since", type=float, help="from this Unix time (default: the budget day's start)")
-    s.add_argument("--until", type=float)
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--until", type=float, help="up to this Unix time (default: the budget day's end)")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.add_argument("--receive", action="store_true",
                    help="keep the spend another machine pushes on stdin (it runs this over ssh)")
     s.add_argument("--via", help="with --receive: the sending machine's alias")
@@ -6614,7 +6822,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name", nargs="?", help="e.g. tt-project-harness")
     s.set_defaults(fn=cmd_skill)
 
-    s = sub.add_parser("broker-released", help="probe: exit 0 once a device broker's hold is released (/health "
+    s = sub.add_parser("broker-released", help="exit 0 once a device broker's hold is released (/health "
                                                "held false with a healthy fsm, or a 'hold released' or "
                                                "device_released log line), 1 while not")
     s.add_argument("files", nargs="*", help="/health JSON and log text to read (default: stdin)")
@@ -6645,7 +6853,7 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("goal", help="stock goal checks, one JSON line per observation; exit 0 met, 1 not, "
                                     "75 could not check")
-    gs = s.add_subparsers(dest="goal", required=True)
+    gs = s.add_subparsers(dest="goal", required=True, help="the goal to check")
     g = gs.add_parser("suite_green", help="a test command exits 0 at the current head")
     g.add_argument("--name", help="the suite's name (its key; default: the command)")
     g.add_argument("--cwd", default=".", help="run in this folder (its HEAD is reported)")
@@ -6672,7 +6880,7 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--timeout", type=float, default=30, help="seconds per probe")
     s.set_defaults(fn=cmd_goal)
 
-    s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs", description=(
+    s = sub.add_parser("lock", help="hold a shared resource while one command runs", description=(
         "Hold a shared resource while one command runs; waiters are served in arrival order, and exit 75 "
         "means busy or paused (retry_when `ttp lock --probe <resource>`). --shared is for read-only "
         "commands: shared holders run together, while an exclusive holder (a plain `ttp lock`, or an "
@@ -6687,14 +6895,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--shared", action="store_true",
                    help="read mode: run alongside other shared holders; exclusive holders and these exclude each other "
                         "(not for device locks)")
-    s.add_argument("resource")
+    s.add_argument("resource", help="the resource's name (a device, machine or build folder)")
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after this many seconds (exit 75); 0 waits as long as it takes; "
                         "inside a run: at most half its stall limit")
     s.add_argument("--disruptive", action="store_true",
                    help="the command may reset, power-cycle or reboot what it holds: `ttp machines activity` "
                         "and the resume note after a reboot list it first")
-    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.add_argument("command", nargs=argparse.REMAINDER, help="the command to run while holding it (after --)")
     s.set_defaults(fn=cmd_lock)
 
     s = sub.add_parser("ssh-preflight", help="exit 0 once a host answers over ssh, 255 while not (for "
@@ -6718,14 +6926,14 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
                                         "(a retry_when: 0 once replied, 1 while not, 2 if it cannot tell) or settle "
                                         "(an on_pass_cmd: writes the hand-off quoting the reply to $TTP_RESULT)")
-    s.add_argument("action", choices=["probe", "settle"])
+    s.add_argument("action", choices=["probe", "settle"], help="probe: check for the reply; settle: write the hand-off")
     s.add_argument("--from", dest="frm", required=True, metavar="PROJECT", help="the project that replies")
     s.add_argument("--hash", required=True, help="the note's id or sha256 prefix, as `ttp note --to` printed it; "
                                                  "the reply names it")
     s.add_argument("--status", choices=["done", "needs_review"], default="done", help="settle: the hand-off's status")
     s.set_defaults(fn=cmd_ack_wait)
 
-    s = sub.add_parser("detach", help="(inside a run) start a job that outlives the run; writes <name>.rc")
+    s = sub.add_parser("detach", help="start a job that outlives the run; writes <name>.rc")
     s.add_argument("--check", nargs="*", metavar="RC",
                    help="exit 0 once every job of these .rc paths ended with exit 0, 4 once all ended or are "
                    "gone but one failed or left no exit code, else 1 (for retry_when)")
@@ -6763,8 +6971,8 @@ def main(argv: list[str] | None = None) -> None:
                    "--jobs/--threads/--workers N, OMP_NUM_THREADS); the daemon flags sustained under-use")
     s.add_argument("--devices", type=int, help="devices the job is meant to use")
     s.add_argument("--mem-gb", type=float, help="memory the job asked for (recorded only)")
-    s.add_argument("name", nargs="?")
-    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.add_argument("name", nargs="?", help="the job's name (its .log and .rc files are named after it)")
+    s.add_argument("command", nargs=argparse.REMAINDER, help="the command to run (after --)")
     s.set_defaults(fn=cmd_detach)
 
     from . import ciwait
@@ -6783,8 +6991,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_ci)
 
     s = sub.add_parser("devq", help="queue jobs on the project's serial device-job runner (config device.runners)")
-    s.add_argument("op", choices=["submit", "probe", "start", "status", "clear", "list"])
-    s.add_argument("runner", nargs="?")
+    s.add_argument("op", choices=["submit", "probe", "start", "status", "clear", "list"], help="what to do")
+    s.add_argument("runner", nargs="?", help="the runner's name in config device.runners")
     s.add_argument("rest", nargs=argparse.REMAINDER,
                    help="submit: --id <unique id> [--config <drop-rule key; default the id>] [--timeout <s>] "
                         "[--workdir <dir on the host>] [--no-lint] -- <command>; probe: <id>; status: [<id>]; clear: <config>")
@@ -6792,11 +7000,11 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("list", help="projects registered on this machine")
     s.add_argument("--status", action="store_true", help="one status line per project, as `ttp overview`")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_list)
     s = sub.add_parser("overview", help="every project on this machine: daemon, version, asks, waiting, running, "
                                         "spend today; other projects are only read")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_overview)
     s = sub.add_parser("deployed", help="exit 0 once every project on this machine runs a release by its daemon's "
                                         "own receipt, 1 while any is pending (with owner and resume time), 2 if "
@@ -6805,25 +7013,27 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--commit", help="its commit (default: the installed one's, when the versions match)")
     s.add_argument("--projects", help="only these projects, comma-separated (default: every one `ttp list` shows here)")
     s.add_argument("--fresh-s", type=float, default=300, help="a completed tick at most this old (default 300)")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.add_argument("--after-push", action="store_true",
                    help="accept owned merges with takeover times, record follow-ups in this project, "
                         "and alert on failures; exit 0 for done/pending, 1 for failed")
     s.set_defaults(fn=cmd_deployed)
     s = sub.add_parser("find", help="locate a project by name (registry, then chat logs)")
-    s.add_argument("name")
+    s.add_argument("name", help="the project")
     s.set_defaults(fn=cmd_find)
     s = sub.add_parser("adopt", help="record where a project lives")
-    s.add_argument("name")
-    s.add_argument("--host")
-    s.add_argument("--dir", required=True)
+    s.add_argument("name", help="the project")
+    s.add_argument("--host", help="the machine it runs on (default: this one)")
+    s.add_argument("--dir", required=True, help="its project root on that machine")
     s.set_defaults(fn=cmd_adopt)
 
-    s = sub.add_parser("task", help="add (deferred with --start-when/--start-after)/list/cancel/requeue tasks "
-                                       "by hand (requeue: a blocked or stopped task runs again), re-point a not-yet-started task's probe, "
-                                       "or record a done task's work as re-landed under another commit")
-    s.add_argument("name")
-    s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "set-when", "superseded"])
+    s = sub.add_parser("task", help="add, list, show, cancel or requeue tasks by hand (requeue: a blocked or "
+                                    "stopped task runs again; add may wait for --start-when or --start-after); "
+                                    "set-when re-points a task not yet started; superseded records a done task's "
+                                    "work as landed under another commit")
+    s.add_argument("name", help="the project")
+    s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "set-when", "superseded"],
+                   help="what to do")
     s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/set-when/superseded: the task id")
     s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work")
@@ -6834,10 +7044,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--repo", help="superseded: a repository path to search first for the branch and the commit "
                    "(then the repository of the current directory, the repositories the task's runs worked in, the project root)")
     s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record")
-    s.add_argument("--spec")
-    s.add_argument("--kind", default="work")
-    s.add_argument("--tier", default="standard")
-    s.add_argument("--priority", type=int, default=3)
+    s.add_argument("--spec", help="add: what the task should do, in full (the worker reads only this)")
+    s.add_argument("--kind", default="work",
+                   help="add: one of " + ", ".join(TASK_KINDS) + " (default work)")
+    s.add_argument("--tier", default="standard",
+                   help="add: one of " + ", ".join(TASK_TIERS) + ", the model's effort (default standard)")
+    s.add_argument("--priority", type=int, default=3, help="add: 1 (most urgent) to 5 (default 3)")
     s.add_argument("--budget", type=float, help="add: its per-run dollar cap (default: budget.task_default_usd for its tier)")
     s.add_argument("--start-when", help="add: a probe; the task starts only once it exits 0 (e.g. landed:#<id>)")
     s.add_argument("--start-after", help="add: a delay (2h, 3d) or ISO time before which it does not start")
@@ -6848,20 +7060,21 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("obligation", help="urgent deliverables owed to the user: add, attach owner tasks, "
                                           "record progress and receipts, drop one recorded by mistake, list")
-    s.add_argument("action", choices=["add", "attach", "progress", "receipt", "drop", "list"])
+    s.add_argument("action", choices=["add", "attach", "progress", "receipt", "drop", "list"], help="what to do")
     s.add_argument("args", nargs="*", help="add: the text; attach: <id> <task>...; progress/receipt: <id> <evidence>; "
                                            "drop: <id> <why>")
     s.add_argument("--owner", type=int, action="append", help="add: a required owner task (repeatable)")
     s.add_argument("--milestone", help="receipt: the milestone key; leaves the obligation open")
     s.add_argument("--task", type=int, help="progress/receipt outside a run: the owner task it is for")
     s.add_argument("--project", help="the project (default: the one here)")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true", help="list: print JSON")
     s.set_defaults(fn=cmd_obligation)
 
     s = sub.add_parser("memory", help="add a memory, retire one with --forget, merge with --supersedes, or --search")
-    s.add_argument("name")
-    s.add_argument("text", nargs="?")
-    s.add_argument("--kind", default="fact")
+    s.add_argument("name", help="the project")
+    s.add_argument("text", nargs="?", help="the memory to add, one entry")
+    s.add_argument("--kind", default="fact",
+                   help="restriction, preference, resource, decision or fact (default fact)")
     s.add_argument("--forget", action="extend", nargs="+", metavar="ENTRY",
                    help="retire entries (names in [brackets]) to memory/archive/: several names after one "
                         "--forget, or the flag repeated, make one harness commit; an unknown name is "
@@ -6889,7 +7102,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_memory)
 
     s = sub.add_parser("schedules", help="list or show schedules (read-only); --export moves them into the harness")
-    s.add_argument("name")
+    s.add_argument("name", help="the project")
     s.add_argument("action", nargs="?", choices=["list", "show"], default="list",
                    help="list (default) or show <schedule>: read-only, writes nothing")
     s.add_argument("schedule", nargs="?", help="the schedule to show")
@@ -6900,7 +7113,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_schedules)
 
     s = sub.add_parser("heal", help="heal checks: list them, or test one's check (dry run)")
-    s.add_argument("action", choices=("list", "test"))
+    s.add_argument("action", choices=("list", "test"), help="list the heal checks, or test one")
     s.add_argument("check", nargs="?", help="test: the heal check (its schedule's name)")
     s.add_argument("--project", help="the project (default: the one this folder or run belongs to)")
     s.set_defaults(fn=cmd_heal)
@@ -6911,12 +7124,12 @@ def main(argv: list[str] | None = None) -> None:
         "watcher:<name> and the rest). `close` ends one whose condition is over but that nothing closes by "
         "itself (say a schedule gap after a host move); the reason and time go in its history and the "
         "activity feed. A condition that is still live is seen again at its next detection and reopens."))
-    iss = s.add_subparsers(dest="action", required=True)
+    iss = s.add_subparsers(dest="action", required=True, help="what to do")
     m = iss.add_parser("list", help="the project's open issues (--all: closed ones too), newest first")
     m.add_argument("--project", help="the project (default: the one this folder or run belongs to)")
     m.add_argument("--all", action="store_true", help="include closed and ignored issues")
-    m.add_argument("--limit", type=int, default=50)
-    m.add_argument("--json", action="store_true")
+    m.add_argument("--limit", type=int, default=50, help="at most this many (default 50)")
+    m.add_argument("--json", action="store_true", help="print JSON")
     m = iss.add_parser("close", help="close an issue with a reason; its condition, if still live, reopens it")
     m.add_argument("issue", metavar="ID-OR-KEY", help="the issue's id (as `ttp issues list` shows), fingerprint or key")
     m.add_argument("--why", help="the reason (required, non-empty)")
@@ -6924,17 +7137,17 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_issues)
 
     s = sub.add_parser("mute", help="a project's observation mutes: list them, or end one now (list/end)")
-    ms = s.add_subparsers(dest="action", required=True)
+    ms = s.add_subparsers(dest="action", required=True, help="what to do")
     m = ms.add_parser("list", help="the project's active mutes")
-    m.add_argument("project")
+    m.add_argument("project", help="the project")
     m = ms.add_parser("end", help="end a mute now, without a coordinator turn; its end summary still comes")
-    m.add_argument("project")
+    m.add_argument("project", help="the project")
     m.add_argument("source", help="the mute's source as `ttp mute list` shows it (e.g. watcher:<name>)")
     m.add_argument("match", help="the mute's match text (any case)")
     s.set_defaults(fn=cmd_mute)
 
     s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/status/remove/push)")
-    ms = s.add_subparsers(dest="action", required=True)
+    ms = s.add_subparsers(dest="action", required=True, help="what to do")
     m = ms.add_parser("add", aliases=["set"], help="add a machine, or change its tags, note or recovery owner")
     m.add_argument("alias", help="a short name, also used as the resource name in tasks (e.g. box-a)")
     m.add_argument("--tags", help="what it offers, comma-separated (e.g. device,x86)")
@@ -6952,18 +7165,18 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--owner", help="the project that recovers it when it stays down or held (\"\" = none)")
     m.add_argument("--fallback", help="the project that takes over when the owner cannot act (\"\" = none)")
     m = ms.add_parser("list", help="list your machines")
-    m.add_argument("--json", action="store_true")
+    m.add_argument("--json", action="store_true", help="print JSON")
     m = ms.add_parser("status", help="per machine: the projects using it, its recovery owner, pauses, open changes, "
                                      "heal checks and problems in 24 h (read only)")
     m.add_argument("alias", nargs="?", help="only this machine")
-    m.add_argument("--json", action="store_true")
+    m.add_argument("--json", action="store_true", help="print JSON")
     m = ms.add_parser("activity", help="who holds, waits for or runs on a machine now, and the locks and detached "
                                        "jobs logged on it, from all your projects here (read only)")
-    m.add_argument("alias")
+    m.add_argument("alias", help="the machine")
     m.add_argument("--since", help="window start: a delay back (30m, 6h, 2d) or an ISO time (default 24h)")
-    m.add_argument("--json", action="store_true")
+    m.add_argument("--json", action="store_true", help="print JSON")
     m = ms.add_parser("remove", help="remove a machine")
-    m.add_argument("alias")
+    m.add_argument("alias", help="the machine")
     m = ms.add_parser("push", help="copy the list to the machines your --host projects run on, merged")
     m.add_argument("--host", help="only this machine")
     m.add_argument("--to", action="append", help=argparse.SUPPRESS)    # the background copy's hosts
@@ -6987,9 +7200,9 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--clear", action="store_true", help="the outage is over: ends only this project's (or --by's) "
                                                          "entry; the machine stays out while another's is open")
     m = ms.add_parser("change", help="the ledger of live changes to shared machines, seen by every co-tenant")
-    cs = m.add_subparsers(dest="change", required=True)
+    cs = m.add_subparsers(dest="change", required=True, help="what to do")
     c = cs.add_parser("add", help="record a live change: what, how to undo it and when it ends")
-    c.add_argument("alias")
+    c.add_argument("alias", help="the machine")
     c.add_argument("what", help="what changed and why, one line")
     c.add_argument("--undo", help="the command that undoes it (required, except for --power-cycle-at)")
     end = c.add_mutually_exclusive_group()
@@ -7008,15 +7221,15 @@ def main(argv: list[str] | None = None) -> None:
                    help="an alert the change is known to cause (an event fingerprint, or down/held on this "
                         "machine): it keeps the coordinator's turn routine while the change is open; repeatable")
     c = cs.add_parser("list", help="the open changes")
-    c.add_argument("alias", nargs="?")
+    c.add_argument("alias", nargs="?", help="only this machine")
     c.add_argument("--all", action="store_true", help="closed ones too")
-    c.add_argument("--json", action="store_true")
+    c.add_argument("--json", action="store_true", help="print JSON")
     c = cs.add_parser("close", help="the change was undone")
-    c.add_argument("id", type=int)
-    c.add_argument("--why")
-    c.add_argument("--by")
+    c.add_argument("id", type=int, help="the change's id, as `ttp machines change list` shows it")
+    c.add_argument("--why", help="how it ended")
+    c.add_argument("--by", help="who closes it (default: the project you are in)")
     c = cs.add_parser("edit", help="correct an open change in place (same id): its text, undo command or end")
-    c.add_argument("id", type=int)
+    c.add_argument("id", type=int, help="the change's id, as `ttp machines change list` shows it")
     c.add_argument("--what", help="the new text: what changed and why, one line")
     c.add_argument("--undo", help="the new command that undoes it")
     end = c.add_mutually_exclusive_group()
@@ -7031,7 +7244,7 @@ def main(argv: list[str] | None = None) -> None:
 
     for name in ("pause", "resume"):
         s = sub.add_parser(name, help=f"{name} the project, or with --resource one shared resource")
-        s.add_argument("name")
+        s.add_argument("name", help="the project")
         s.add_argument("--resource", help=f"{name} only this resource: tasks using it wait, `ttp lock` refuses it"
                        if name == "pause" else f"{name} only this resource")
         s.add_argument("--machine", metavar="ALIAS",
@@ -7052,12 +7265,14 @@ def main(argv: list[str] | None = None) -> None:
                            help="the whole project until this host reboots: the daemon lifts it on its first tick "
                                 "on a new boot")
         s.set_defaults(fn=cmd_pause)
-    s = sub.add_parser("lease", help="the project lease across hosts: check its store, or show this host's view")
-    s.add_argument("action", choices=["check", "show"])
-    s.add_argument("name", nargs="?")
+    s = sub.add_parser("lease", help="the lock that keeps a project running on one machine at a time (failover): "
+                                     "check where it is kept, or show this machine's view of it")
+    s.add_argument("action", choices=["check", "show"],
+                   help="check: whether the lease store answers; show: this machine's last view")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.set_defaults(fn=cmd_lease)
     s = sub.add_parser("drain", help="pause the project and wait until its runs in flight end (they are not killed)")
-    s.add_argument("name")
+    s.add_argument("name", help="the project")
     s.add_argument("--wait", type=float, default=0, metavar="S",
                    help="seconds to wait; exits 0 once no run or push is in flight, 1 at the timeout (default 0: check once)")
     s.add_argument("--jobs", action="store_true",
@@ -7069,7 +7284,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_drain)
     for name in ("start", "stop", "restart"):
         s = sub.add_parser(name, help=f"{name} the project's daemon service (running workers are kept)")
-        s.add_argument("name")
+        s.add_argument("name", help="the project")
         if name == "stop":
             s.add_argument("--kill", action="store_true", help="also end running workers; their tasks resume on start")
         s.set_defaults(fn=cmd_service)
@@ -7077,33 +7292,37 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("config", help="read or set a config key (dotted); NAME defaults to the run's project; "
                                       "a section or no key prints the effective values, defaults included; with --account, the account-level "
                                       "value every project on this machine reads: ttp config --account KEY [VALUE]")
-    s.add_argument("name")
-    s.add_argument("key", nargs="?")
-    s.add_argument("value", nargs="?")
+    s.add_argument("name", help="the project (inside a run: may be left out)")
+    s.add_argument("key", nargs="?", help="the dotted key or section (none: every value)")
+    s.add_argument("value", nargs="?", help="the new value (none: print the current one)")
     s.add_argument("--account", action="store_true",
                    help="the account-level setting (" + ", ".join(
                        f"{sec}.{k}" for sec, ks in ACCOUNT_KEYS.items() for k in sorted(ks)) + "); '' removes it")
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")
-    s.add_argument("kind", choices=["jev", "slack", "show", "push"])
+    s.add_argument("kind", choices=["jev", "slack", "show", "push"],
+                   help="jev: a key for Jev, the optional add-on that sends log and alert text to an "
+                        "outside paid service; slack: a Slack bot token; "
+                        "show: list what is saved; push: copy your saved keys to --host")
     s.add_argument("--host", help="with push: the machine to copy your saved keys to")
-    s.add_argument("--via", default="typesafe", choices=["typesafe", "openrouter"])
-    s.add_argument("--url")
-    s.add_argument("--email")
-    s.add_argument("--user-id")
-    s.add_argument("--force", action="store_true")
+    s.add_argument("--via", default="typesafe", choices=["typesafe", "openrouter"],
+                   help="with jev: the service the key is for (default typesafe)")
+    s.add_argument("--url", help="with jev: the service's address, if not its usual one")
+    s.add_argument("--email", help="with slack: your Slack email, to find your user")
+    s.add_argument("--user-id", help="with slack: your Slack user id (instead of --email)")
+    s.add_argument("--force", action="store_true", help="with jev: save the key even if the check fails")
     s.set_defaults(fn=cmd_secret)
 
     s = sub.add_parser("setup", help="install ttp for this user (stable copy + shim on PATH)")
-    s.add_argument("--bin-dir", default="~/.local/bin")
+    s.add_argument("--bin-dir", default="~/.local/bin", help="where the ttp command goes (default ~/.local/bin)")
     s.add_argument("--force", action="store_true", help="install even over a newer installed ttp")
     s.add_argument("--no-shortcut", action="store_true",
                    help="remove (and do not install) the plain /tt-project command for Claude Code")
     s.set_defaults(fn=cmd_setup)
 
     s = sub.add_parser("upgrade", help="merge the installed tt-project template into a project's harness")
-    s.add_argument("name")
+    s.add_argument("name", help="the project")
     s.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)          # the daemon's own upgrade
     s.add_argument("--apply", metavar="COMMIT",
                    help="an upgrade task's last step: fast-forward main to its checked merge and restart")
@@ -7114,10 +7333,11 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_upgrade)
 
     s = sub.add_parser("alerts", help="list broadcast alerts or acknowledge a keyed alert")
-    s.add_argument("name")
-    s.add_argument("--after", type=int, default=0)
-    s.add_argument("--floor", default="high")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("name", help="the project")
+    s.add_argument("--after", type=int, default=0, help="only alerts after this message id (default 0: all)")
+    s.add_argument("--floor", default="high", help="the lowest severity listed: low, normal, high or critical "
+                                                   "(default high)")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s.add_argument("--health", action="store_true", help="with --json: {alerts, health: {heartbeat_age_s, service, "
                    "paused}}, the heartbeat's age taken on this host (the desktop notifier's daemon-down check)")
     s.add_argument("--ack", type=int, metavar="ID", help="acknowledge the keyed alert of this message id: it closes, or moves to the feed while it holds")
@@ -7126,19 +7346,20 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("consent", help="the user's one answer per question asked once (desktop notifier, local "
                        "view tunnels): show it, or record it")
-    s.add_argument("topic", nargs="?", choices=["notifier", "tunnel"])
-    s.add_argument("answer", nargs="?", choices=["yes", "no"])
+    s.add_argument("topic", nargs="?", choices=["notifier", "tunnel"], help="the question (none: show every answer)")
+    s.add_argument("answer", nargs="?", choices=["yes", "no"], help="record this answer (none: show it)")
     s.set_defaults(fn=cmd_consent)
 
     s = sub.add_parser("notifier", help="desktop notifications on this machine for all your projects")
-    s.add_argument("action", choices=["install", "run", "test"])
+    s.add_argument("action", choices=["install", "run", "test"],
+                   help="install: start it at login; run: run it here; test: show one test notification")
     s.set_defaults(fn=cmd_notifier)
 
-    s = sub.add_parser("daemon", help=argparse.SUPPRESS)
-    s.add_argument("dir")
+    s = sub.add_parser("daemon")   # the service runs it; no help, so --help does not list it
+    s.add_argument("dir", help="the project's tt-project folder")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(_say_all_argv(sys.argv[1:] if argv is None else list(argv)))
+    a = ap.parse_args(_project_name_argv(sub, _say_all_argv(sys.argv[1:] if argv is None else list(argv))))
     a.fn(a)
 
 

@@ -18,7 +18,8 @@
   or branch in, the tt-project plugin's source repo or another project's harness. Upgrading
   another project to the installed release (`ttp upgrade <name>`) is not editing its harness; hand edits to its charter, memory, config, state or code are.
 <!-- /ttp:if harness -->
-- Lessons for tt-project go in the hand-off as upstream notes (`followups` titled `upstream: ...`).
+- `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
+  code, boxes, models or scripts get plain follow-ups (a missing tool, a numerics bug).
   A note to another of the user's projects: `ttp note --to <project> "<text>"` (`ttp say` is
   refused in a run); its coordinator reads it as data. Put the question or request first: a note
   over 4,000 characters is refused, not cut. Check the stored length and hash it prints.

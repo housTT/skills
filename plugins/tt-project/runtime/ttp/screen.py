@@ -72,7 +72,8 @@ class Verdict:
 
 def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, jev=None,
            rewake_after_s: float | None = None, repeat: bool = False, lifecycle: str | None = None,
-           whole: bool = False, key: str | None = None, episode: str | None = None) -> Verdict:
+           whole: bool = False, key: str | None = None, episode: str | None = None,
+           pin: bool = False) -> Verdict:
     """Record the observation as an issue and say whether the coordinator should wake for it.
 
     A known open issue wakes again when `repeat` is set (the watcher says each report is a new
@@ -87,8 +88,13 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     closed and wakes nobody (a watcher re-sending a known line each wake). A higher severity reopens and wakes.
     `episode` (a keyed line's "episode" field) names one occurrence of the keyed condition: a keyed issue
     that recorded another episode is closed as superseded and a new issue opens, judged as any new one
-    (no reraise dedupe). The same episode, or none, changes nothing; an issue without one adopts it."""
-    v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle, whole, key, episode)
+    (no reraise dedupe). The same episode, or none, changes nothing; an issue without one adopts it.
+    `pin` (a watcher line's "pin_severity": true, with a valid `hint`) keeps the hint as the severity:
+    Jev is not asked (it could only lower it) and no mute covers the observation."""
+    pin = pin and hint in SEVERITY_RANK
+    v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle, whole, key, episode, pin)
+    if pin:
+        return v
     m = count_muted(db, source, text, v.severity, whole=whole, key=key)
     if m and v.wake:
         v.wake, v.reason = False, f"muted ({v.reason})"
@@ -97,14 +103,14 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
 
 def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
             rewake_after_s: float | None, repeat: bool, lifecycle: str | None = None, whole: bool = False,
-            key: str | None = None, episode: str | None = None) -> Verdict:
+            key: str | None = None, episode: str | None = None, pin: bool = False) -> Verdict:
     now = time.time()
     floor = SEVERITY_RANK.get(cfg.get("screen", {}).get("wake_min_severity", "normal"), 1)
     judged: list[tuple[str, str, str, dict]] = []
 
     def judge() -> tuple[str, str, str, dict]:   # once per observation, and only when an issue is new
         if not judged:
-            judged.append(_judge(db, cfg, source, text, hint, jev, floor))
+            judged.append(_judge(db, cfg, source, text, hint, jev, floor, pin))
         return judged[0]
 
     if key:
@@ -265,12 +271,14 @@ def settle_jev(db: DB, now: float | None = None) -> int:
 
 
 def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
-           floor: int) -> tuple[str, str, str, dict]:
+           floor: int, pin: bool = False) -> tuple[str, str, str, dict]:
     """Severity of a new issue: the watcher's hint, else rules, refined by Jev when configured and
-    its screening use is on (see jevuse). Jev may lower a hinted severity but never raise it. Each Jev call is logged with the coordinator wake it skipped,
+    its screening use is on (see jevuse). Jev may lower a hinted severity but never raise it, nor judge a pinned one. Each Jev call is logged with the coordinator wake it skipped,
     priced at a low-effort coordinator turn, and settled later (settle_jev)."""
     rules = severity = hint or rule_severity(text)
     verdict_src, reason, info = "rules", f"rule severity {severity}", {}
+    if pin:   # the watcher pinned its hint: Jev could only lower it, so it is not asked
+        return severity, verdict_src, f"pinned severity {severity}", info
     if jev is not None and jev.enabled() and jevuse.allowed(db, cfg, JEV_USE):
         try:
             ans = jev.decide(state=f"source: {source}\nobservation:\n{text[:6000]}", questions={

@@ -695,6 +695,17 @@ def _verify_now(args, site: dict, entry: dict, mnt: dict, fresh: bool = False) -
     return 0
 
 
+def _stable_box_py() -> "tuple[str, bool]":
+    """The box.py a long-lived until-probe names, and whether that path may move. The plugin cache this
+    runs from is versioned and pruned on upgrades; `ttp setup` keeps a copy at $TTP_HOME/lib/current,
+    a link it re-points on every install, so that path (unresolved) survives upgrades."""
+    home = os.environ.get("TTP_HOME") or os.path.join(os.path.expanduser("~"), ".tt-project")
+    stable = os.path.join(os.path.abspath(home), "lib", "current", "skills", "setup-box", "scripts", "box.py")
+    if os.path.isfile(stable):
+        return stable, False
+    return str(pathlib.Path(__file__).resolve().parent / "box.py"), True
+
+
 def cmd_mount(args) -> int:
     try:
         site, entry, mnt = _mount_spec(args)
@@ -710,11 +721,15 @@ def cmd_mount(args) -> int:
         return 1
     script = box_storage.apply_script(mnt)
     undo = box_storage.undo_command(args.alias, mnt)
-    box_py = str(pathlib.Path(__file__).resolve().parent / "box.py")
+    box_py, moves = _stable_box_py()
+    until = shlex.join([box_py, "--site", str(box.site_path(args.site).absolute()),
+                        "setup", "mountcheck", args.alias, "--rebooted"])
     ledger = shlex.join(["ttp", "machines", "change", "add", args.alias, box_storage.change_what(args.alias, mnt),
-                         "--undo", undo, "--until-probe", shlex.join(
-                             [box_py, *(["--site", args.site] if args.site else []),
-                              "setup", "mountcheck", args.alias, "--rebooted"])])
+                         "--undo", undo, "--until-probe", until])
+    if moves:    # no stable copy (not installed with `ttp setup`): say how to re-point it later
+        ledger += (f"\nnote: the probe names {box_py}, a copy a plugin upgrade may remove (the probe then exits "
+                   "127): `<plugin-root>/bin/ttp setup` installs the stable copy; then re-point the entry with "
+                   "`ttp machines change edit <id> --until-probe ...` and the stable path")
     if not args.run:
         print("dry run; the root script (`--run` runs it with sudo -n):")
         print(script)
@@ -755,6 +770,10 @@ def cmd_mountcheck(args) -> int:
     if args.rebooted:
         # The change entry's until-probe: only the boot id, so it never touches (or hangs on) the mount.
         r = box.ssh_run(args.alias, box_storage.BOOT_ID_SCRIPT, timeout=40)
+        if r.returncode == 124:
+            # sshd can accept a login and stall mid-boot: not an answer yet, so not over and not broken.
+            print(f"pending: no answer from {args.alias} in 40 s (still booting?): not yet")
+            return 1
         if r.returncode != 0:
             return _ssh_failed(args.alias, r)
         boot = r.stdout.strip()
@@ -832,5 +851,6 @@ def register(sub) -> None:
                           "baseline), 124 no answer in time, 255 ssh failed")
     how.add_argument("--rebooted", action="store_true",
                      help="the change entry's until-probe, read-only: 0 rebooted since the baseline (whatever the "
-                          "result: run --after-reboot), 1 not yet, 255 ssh failed (named on stderr)")
+                          "result: run --after-reboot), 1 not yet (also no answer in time, as mid-boot), 255 ssh failed "
+                          "(named on stderr)")
     c.set_defaults(func=cmd_mountcheck)

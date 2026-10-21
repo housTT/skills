@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, push, runner, sharedchecks, timefmt, upstream
+from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, push, runner, scopehold, sharedchecks, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -57,7 +57,7 @@ ABSENT_TTL_S = 300              # _absent's answer, asked before a transaction, 
 AFTER_PUSH_OFF = "after_push_off"   # kv: true while after_push is unset (alerts.holds)
 AFTER_PUSH_OK = "after_push_ok_at"  # kv: when an ordinary push's after_push last succeeded (alerts.holds)
 TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is reported once
-ROW_RESULTS = ("pushed", "landed", "conflict", "check_failed", "requeued", "refused")
+ROW_RESULTS = ("pushed", "landed", "conflict", "check_failed", "requeued", "refused", "scope_held")
 AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
 STATS_S = 7 * 86400            # the conflict counts `ttp push --queue` and the web app show cover this long
 INHERIT_WINDOW_S = 30 * 86400  # reviews finished this long ago at most tell which branches were rejected
@@ -491,7 +491,7 @@ def _requeue(db, task: dict, woke: str, extra: dict | None = None) -> None:
 
 def _cancel(db, ids: list[int]) -> None:
     if ids:
-        db.x(f"UPDATE push_queue SET status='cancelled', updated=? WHERE status='approved' AND id IN "
+        db.x(f"UPDATE push_queue SET status='cancelled', updated=? WHERE status IN ('approved','held') AND id IN "
              f"({','.join('?' * len(ids))})", (time.time(), *ids))
 
 
@@ -501,7 +501,7 @@ def cancel_orphans(p: Project) -> int:
     Rows already in a batch cannot be withdrawn: the batch reports them."""
     db = p.db
     rows = db.q("SELECT q.id, q.task, t.status FROM push_queue q LEFT JOIN tasks t ON t.id=q.task "
-                "WHERE q.status='approved' AND (t.status IS NULL OR t.status!='pushing')")
+                "WHERE q.status IN ('approved','held') AND (t.status IS NULL OR t.status!='pushing')")
     if not rows:
         return 0
     with db.tx():
@@ -525,12 +525,12 @@ def queue_off(p: Project, cfg: dict | None = None) -> int:
         return 0
     db = p.db
     tasks = db.q("SELECT DISTINCT t.* FROM push_queue q JOIN tasks t ON t.id=q.task "
-                 "WHERE q.status='approved' AND t.status='pushing'")
+                 "WHERE q.status IN ('approved','held') AND t.status='pushing'")
     if not tasks:
         return 0
     with db.tx():
         for t in tasks:
-            _cancel(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status='approved'",
+            _cancel(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status IN ('approved','held')",
                                                 (t["id"],))])
             _requeue(db, t, "push queue turned off: push with ttp push")
             _event(db, t, "task_requeued", f"#{t['id']} {t['title']}: the push queue was turned off; its review "
@@ -542,14 +542,14 @@ def retarget(p: Project, name: str) -> int:
     """Approvals for another target (delivery.push_branch changed) send their reviews back."""
     db = p.db
     rows = db.q("SELECT q.id, q.task, q.target FROM push_queue q JOIN tasks t ON t.id=q.task "
-                "WHERE q.status='approved' AND t.status='pushing' AND q.target!=?", (name,))
+                "WHERE q.status IN ('approved','held') AND t.status='pushing' AND q.target!=?", (name,))
     if not rows:
         return 0
     with db.tx():
         for tid in dict.fromkeys(r["task"] for r in rows):
             task = db.task(tid)
             old = next(r["target"] for r in rows if r["task"] == tid)
-            _cancel(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status='approved'",
+            _cancel(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status IN ('approved','held')",
                                                 (tid,))])
             woke = f"push target changed: approved for {old}, the target is now {name}"
             _requeue(db, task, woke)
@@ -1323,6 +1323,8 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                      "WHERE id=?", (status, sha or tip, own or sha or tip, version, text, now, r["id"]))
             elif status in ("conflict", "check_failed", "refused"):
                 db.x("UPDATE push_queue SET status=?, detail=?, updated=? WHERE id=?", (status, text, now, r["id"]))
+            elif status == "scope_held":   # its push needs a token scope the credential lacks (scopehold)
+                db.x("UPDATE push_queue SET status='held', detail=?, updated=? WHERE id=?", (text, now, r["id"]))
             else:   # requeued, or the batch did not get to it (busy, moved, rejected, tip_failed)
                 db.x("UPDATE push_queue SET status='approved', tries=tries+?, detail=?, updated=? WHERE id=?",
                      (1 if outcome == "moved" else 0, text, now, r["id"]))
@@ -1374,6 +1376,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                                            f"{str(m.get('message') or _tail_of(m, None, 5))[:1500]}. "
                                            f"The approvals stay queued and are retried in {BACKOFF_MAX_S // 60} min.", "high"))
         db.set_kv(KV, st)
+        later += _hold_scoped(p, b, m, now)
         for tid in dict.fromkeys(r["task"] for r in rows):
             _settle(p, tid, b, m, now)
         # In the transaction that finalizes the batch: a crash before it commits records them again.
@@ -1383,6 +1386,108 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                                               f"{'s' if len(back) != 1 else ''} back in the queue", queued=False)
     for key, text, sev in later:
         alert(key, text, severity=sev)
+
+
+def _hold_scoped(p: Project, b: dict, m: dict, now: float) -> list[tuple]:
+    """Rows the batch held because their push needs a token scope the credential lacks (batch
+    _hold_scoped): record them under their scope (scopehold.KV) and tell their reviews. Returns the
+    alert for each scope not held already: one per condition, until the held changes push."""
+    db = p.db
+    held = db.q("SELECT q.*, t.title FROM push_queue q LEFT JOIN tasks t ON t.id=q.task WHERE q.batch=? "
+                "AND q.status='held' ORDER BY q.id", (b["id"],))
+    if not held:
+        return []
+    rec = db.kv(scopehold.KV) or {}
+    d = _delivery(p)
+    others = db.one("SELECT COUNT(*) n FROM push_queue WHERE batch=? AND status!='held'", (b["id"],))["n"]
+    outcome, sha, msg = str(m.get("outcome")), m.get("pushed_sha"), str(m.get("message") or "")
+    if not others:
+        rest = "Nothing else was in the batch."
+    elif outcome == "pushed":
+        rest = f"The rest of the batch was pushed as {_short(sha)}."
+    elif outcome == "landed":
+        rest = "The rest of the batch was already on the branch."
+    else:
+        rest = (f"The rest of the batch was not pushed: {OUTCOME_WORDS.get(outcome, outcome)}"
+                + (f" ({msg[:300]})" if msg else "") + ".")
+    later = []
+    for scope in dict.fromkeys(_detail(r).get("scope") or "?" for r in held):
+        rows = [r for r in held if (_detail(r).get("scope") or "?") == scope]
+        files = list(dict.fromkeys(f for r in rows for f in _detail(r).get("files") or []))
+        check = str(_detail(rows[0]).get("check") or scopehold.check_cmd(d, scope))
+        prev = rec.get(scope)
+        rec[scope] = {"rows": sorted(set((prev or {}).get("rows") or []) | {r["id"] for r in rows}),
+                      "since": (prev or {}).get("since") or now, "probe_at": now,
+                      "holds": int((prev or {}).get("holds") or 0) + (1 if not prev or prev.get("released") else 0)}
+        need = f"needs the token scope `{scope}` for {', '.join(files[:5]) or 'its files'}"
+        for r in rows:
+            task = db.task(r["task"])
+            if task and task["status"] == "pushing":
+                db.update_task(r["task"], blocked_reason=f"push held: {need}; back in the queue once `{check}` "
+                                                         f"passes"[:500])
+            _event(db, task, "push_held", f"#{r['task']} {r['title'] or ''}: push held in batch {b['id']}, "
+                                          f"{r['branch'] or '?'} at {_short(r['head'])} {need}", queued=False)
+        if prev:
+            continue   # the condition's alert is out already
+        n = len(rows)
+        tasks = "; ".join(f"#{r['task']} {r['title'] or ''} ({r['branch'] or '?'} at {_short(r['head'])})" for r in rows)
+        every = scopehold.probe_s(d) / 60
+        later.append((f"{scopehold.ALERT}:{scope}",
+                      f"The push to {b['target']} was refused: the token it pushes with lacks the `{scope}` scope, "
+                      f"needed to change {', '.join(files[:10]) or 'the files it names'}. Held: {tasks}. {rest} "
+                      f"A user with the account must grant the scope (on GitHub: {scopehold.grant_hint(scope)}); "
+                      f"the held change{'s go' if n != 1 else ' goes'} back into the queue by itself once `{check}` "
+                      f"passes (checked every {every:.0f} min).", "high"))
+    db.set_kv(scopehold.KV, rec)
+    return later
+
+
+def tend_scope_holds(p: Project, cfg: dict | None = None, now: float | None = None) -> list[int]:
+    """Model-free: check each token scope held changes wait for (scopehold.probe, at most every
+    delivery.push_scope_probe_s) and put its rows back in the queue once it passes. A scope is over
+    (its alert clears, alerts.holds) once none of its rows waits: they pushed, failed or were withdrawn.
+    Returns the rows put back."""
+    db = p.db
+    rec = db.kv(scopehold.KV) or {}
+    held = db.q("SELECT * FROM push_queue WHERE status='held' ORDER BY id")
+    if not rec and not held:
+        return []
+    now = time.time() if now is None else now
+    d = _delivery(p, cfg)
+    before = json.dumps(rec, sort_keys=True)
+    by_scope: dict[str, list[dict]] = {}
+    for r in held:
+        by_scope.setdefault(_detail(r).get("scope") or "?", []).append(r)
+    live = {r["id"] for r in db.q("SELECT id FROM push_queue WHERE status IN ('held','approved','batched')")}
+    for scope in list(rec):
+        rec[scope]["rows"] = [i for i in rec[scope].get("rows") or [] if i in live]
+        if not rec[scope]["rows"] and scope not in by_scope:
+            del rec[scope]
+    back: list[int] = []
+    for scope, rows in by_scope.items():
+        e = rec.setdefault(scope, {"rows": [r["id"] for r in rows], "since": now, "probe_at": now, "holds": 1})
+        if now - float(e.get("probe_at") or 0) < scopehold.probe_s(d, int(e.get("holds") or 1)):
+            continue
+        ok, out = scopehold.probe(p.root, d, scope)
+        e["probe_at"], e["probe"] = now, out
+        if not ok:
+            continue
+        e["released"] = now
+        check = scopehold.check_cmd(d, scope)
+        with db.tx():
+            for r in rows:
+                db.x("UPDATE push_queue SET status='approved', detail=?, updated=? WHERE id=? AND status='held'",
+                     (json.dumps({**_detail(r), "released": now}), now, r["id"]))
+            for tid in dict.fromkeys(r["task"] for r in rows):
+                task = db.task(tid)
+                if task and task["status"] == "pushing":
+                    db.update_task(tid, blocked_reason=None)
+                _event(db, task, "push_released", f"#{tid}: the token scope `{scope}` check passed (`{check}`); "
+                                                  f"its held push is back in the queue", queued=False)
+        back += [r["id"] for r in rows]
+    if json.dumps(rec, sort_keys=True) != before:
+        db.set_kv(scopehold.KV, rec)
+    return back
 
 
 def resolves_of(p: Project, review_id: int) -> list[tuple[str, dict]]:
@@ -1657,14 +1762,15 @@ def tend(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: 
     db = p.db
     if may_requeue:
         _note_after_push(p, cfg)
-    if not db.one("SELECT id FROM push_queue WHERE status IN ('approved','batched') LIMIT 1") and not db.one(
-            "SELECT id FROM push_batches WHERE after_finalized IS NULL LIMIT 1"):
+    if not db.one("SELECT id FROM push_queue WHERE status IN ('approved','batched','held') LIMIT 1") and not db.one(
+            "SELECT id FROM push_batches WHERE after_finalized IS NULL LIMIT 1") and not db.kv(scopehold.KV):
         return []
     cancel_orphans(p)
     if may_requeue:
         queue_off(p, cfg)
     changed = finalize(p, cfg, alert)
     check_landing(p, cfg, alert)
+    tend_scope_holds(p, cfg)
     return changed
 
 
@@ -1742,6 +1848,9 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
     approved = [{"id": r["id"], "task": r["task"], "branch": r["branch"], "head": r["head"], "target": r["target"],
                  "tries": r["tries"], "age_s": round(now - r["created"], 1)}
                 for r in db.q("SELECT * FROM push_queue WHERE status='approved' ORDER BY id")]
+    held = [{"id": r["id"], "task": r["task"], "branch": r["branch"], "scope": _detail(r).get("scope"),
+             "age_s": round(now - r["updated"], 1)}
+            for r in db.q("SELECT * FROM push_queue WHERE status='held' ORDER BY id")]
     live = None
     b = db.one("SELECT * FROM push_batches WHERE after_finalized IS NULL ORDER BY started DESC LIMIT 1")
     if b:
@@ -1764,7 +1873,7 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
     if pushed:
         pushed["reach"] = known[pushed["id"]] if pushed["id"] in known else _reach(db, pushed["id"])
     st = _state(db)
-    return {"on": enabled(p), "approved": approved, "live": live, "last": batches, "last_pushed": pushed,
+    return {"on": enabled(p), "approved": approved, "held": held, "live": live, "last": batches, "last_pushed": pushed,
             "backoff_until": st.get("backoff_until"), "bad_tip": st.get("bad_tip"), "deaths": int(st.get("deaths") or 0),
             "conflicts": conflict_stats(db, now - STATS_S), "conflict_fixes": conflictfix.stats(db, now - 86400)}
 
@@ -1810,7 +1919,10 @@ def status_line(p: Project, now: float | None = None, sm: dict | None = None, db
         k = live["rows"]
         parts.append(f"batch {PHASE_WORDS.get(live['phase'], live['phase'])} since {_age(live['age_s'])} "
                      f"({k} change{'s' if k != 1 else ''})")
-    if not n and not live:
+    if held := sm.get("held"):
+        scopes = ", ".join(f"`{x}`" for x in dict.fromkeys(h["scope"] or "?" for h in held))
+        parts.append(f"{len(held)} held for the token scope {scopes}")
+    if not n and not live and not held:
         parts.append("empty")
     last = sm["last"][0] if sm["last"] else None
     if last and last["outcome"] != "pushed" and not (live and live["id"] == last["id"]):
@@ -1835,7 +1947,7 @@ def entries(p: Project, sm: dict, now: float, limit: int = 50, db=None) -> list[
     """The rows still in the queue and those of the batches in `sm` (a summary), newest first."""
     ids = [b["id"] for b in sm["last"]] + ([sm["live"]["id"]] if sm["live"] else [])
     rows = (db or p.db).q("SELECT q.*, t.title FROM push_queue q LEFT JOIN tasks t ON t.id=q.task WHERE q.status IN "
-                  f"('approved','batched') OR q.batch IN ({','.join('?' * len(ids)) or 'NULL'}) "
+                  f"('approved','batched','held') OR q.batch IN ({','.join('?' * len(ids)) or 'NULL'}) "
                   "ORDER BY q.id DESC LIMIT ?", (*ids, limit))
     return [{"id": r["id"], "task": r["task"], "title": r["title"], "branch": r["branch"], "head": _short(r["head"]),
              "status": r["status"], "batch": r["batch"], "tries": r["tries"], "age_s": round(now - r["created"], 1),

@@ -13,7 +13,11 @@ A fault counts against no change or branch: `ttp checks` and `ttp push` exit 75 
 retry_when (`ttp checks --env-ok <sig>`, its own fault only), and the push queue requeues the batch and holds until the
 runner is back, on a fault its own batch found only. Each fault is recorded once in the project's
 state, with one coordinator observation per fault however many tasks hit it; it clears once its
-command, run again where it was found, no longer hits it, or once that checkout is gone."""
+command, run again where it was found, no longer hits it, or once that checkout is gone.
+
+A check with a host (push.remote_host, remotecheck) needs no local runner: its fault is the host,
+env:check-host:<host>, when ssh cannot reach it or it lacks git or tar (probed before the checks,
+or the check exits remotecheck.FAULT_RC mid-run). It clears once ssh reaches the host again."""
 from __future__ import annotations
 
 import os
@@ -182,6 +186,10 @@ def runners(cmd: str, top: str | Path, env: dict | None = None) -> list[dict]:
 def probe(r: dict, env: dict | None = None) -> dict | None:
     """The fault of one runner (runners()), or None when it is there. A probe that cannot tell (a
     timeout, an interpreter that crashes) is no fault: the check runs and says what it says."""
+    if r.get("kind") == "host":
+        from . import remotecheck
+        why = remotecheck.reachable(str(r.get("host") or ""))
+        return {**r, "why": why} if why else None
     path = str(r.get("path") or os.defpath)
     if r.get("kind") == "program":
         name = str(r.get("name") or "")
@@ -209,8 +217,17 @@ def probe(r: dict, env: dict | None = None) -> dict | None:
 
 
 def precheck(cmds: list, top: str | Path, env: dict | None = None) -> dict | None:
-    """The first runner fault of the check commands `cmds` run in `top` with `env`, or None."""
+    """The first runner fault of the check commands `cmds` run in `top` with `env`, or None. A check
+    with a host is probed there (reachable), once per host."""
+    from . import push, remotecheck
+    seen = set()
     for c in cmds:
+        if host := push.remote_host(c):
+            if host not in seen:
+                seen.add(host)
+                if f := probe(remotecheck.fault(host, str(c), str(top)), env):
+                    return f
+            continue
         for r in runners(str(c), top, env):
             if f := probe(r, env):
                 return f
@@ -221,6 +238,8 @@ def line(f: dict) -> str:
     what = (f"{f['python']} has {f['runner']} {f['version']}, below the repository's minversion {f.get('min')}"
             if f.get("version") else
             f"{f['python']} cannot import {f['runner']}" if f.get("kind") == "module" and f.get("python")
+            else f"check host {f.get('host')} cannot run checks over ssh"
+            + (f" ({f['why']})" if f.get("why") else "") if f.get("kind") == "host"
             else f"{f.get('runner')} is not on PATH or not executable")
     return (f"environment fault {f.get('sig')}: {what} (needed by {f.get('cmd')!r}). This is the host, "
             "not the change: nothing is counted against it")
@@ -244,7 +263,7 @@ def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
             if task and task not in tasks:
                 tasks = (tasks + [task])[-20:]
             keep = {k: f.get(k) for k in ("kind", "name", "python", "module", "path", "cwd", "cmd", "runner",
-                                          "min", "version") if f.get(k) is not None}
+                                          "min", "version", "host", "why") if f.get(k) is not None}
             if old and old.get("queue") and not queue:
                 keep = {k: old[k] for k in keep.keys() | old.keys() if k in old}
             faults[sig] = {**keep, "since": (old or {}).get("since") or now, "last": now, "tasks": tasks,
@@ -254,13 +273,19 @@ def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
                 return False
             fp = f"{sig}:{now:.0f}"
             py = f" with {f['python']}" if f.get("python") else ""
+            what, fix = ((f"the check host {f.get('host')} cannot run checks over ssh"
+                          + (f" ({f['why']})" if f.get("why") else ""),
+                          "Make the host reachable by ssh without a prompt, with git and tar, or change "
+                          "delivery.checks_host or the check's host")
+                         if f.get("kind") == "host" else
+                         (f"the check runner {f.get('runner')} cannot be found or imported{py}",
+                          "Restore the runner on the host (reinstall it for that python, or point the checks "
+                          "at a venv)"))
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                  (now, "checks", "observation", fp, "high",
-                  f"Environment fault {sig}: the check runner {f.get('runner')} cannot be found or imported"
-                  f"{py} (first seen in {f.get('cmd')!r}). Check runs wait instead of failing and nothing "
-                  "is counted against any change; the push queue holds its batch. Restore the runner on "
-                  "the host (reinstall it for that python, or point the checks at a venv). Waiting tasks "
-                  "and the queue resume once `ttp checks --env-ok` passes.", "queued"))
+                  f"Environment fault {sig}: {what} (first seen in {f.get('cmd')!r}). Check runs wait instead "
+                  "of failing and nothing is counted against any change; the push queue holds its batch. "
+                  f"{fix}. Waiting tasks and the queue resume once `ttp checks --env-ok` passes.", "queued"))
         return True
     except Exception:   # a note about the host never stops the caller from waiting
         return False
@@ -278,6 +303,8 @@ def _still(f: dict) -> dict | None:
     """The fault `f` as its command, looked at again in the checkout it was found in, still hits it;
     None once it does not (the runner is back, or the command now resolves another one) or once that
     checkout is gone (a removed worktree and its venv: nothing there to wait for)."""
+    if f.get("kind") == "host":   # the host, wherever the check was started
+        return probe(f)
     cwd = str(f.get("cwd") or "")
     if not cwd or not Path(cwd).is_dir():
         return None
@@ -343,7 +370,7 @@ def held(p, now: float | None = None) -> str:
                         "(`ttp checks --env-ok` passes).", "queued"))
         except Exception:
             pass
-    return "held: environment fault " + ", ".join(sorted(still)) + " (a check runner is missing on this host)"
+    return "held: environment fault " + ", ".join(sorted(still)) + " (a check runner or check host is missing)"
 
 
 def retry_when(p, f: dict | None = None) -> str:

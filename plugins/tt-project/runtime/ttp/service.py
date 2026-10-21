@@ -70,17 +70,77 @@ def _run(*argv: str) -> subprocess.CompletedProcess:
 
 def install(p: Project) -> str:
     if sys.platform == "darwin":
-        return _install_launchd(p)
+        return _installed_as(p, _install_launchd(p))
     if shutil.which("systemctl") and _run("systemctl", "--user", "is-system-running").returncode in (0, 1):
         msg = _install_systemd(p)
+        if msg.startswith(SYSTEMD_FAILED):
+            return _installed_as(p, msg, "systemd --user could not start the unit")
         linger = _run("loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger").stdout.strip()
         if linger != "Linger=yes":
             r = _run("loginctl", "enable-linger")
             if r.returncode != 0:
-                return msg + "; linger refused, adding crontab watchdog: " + _install_cron(p)
+                return _installed_as(p, msg + "; linger refused, adding crontab watchdog: " + _install_cron(p),
+                                     "loginctl enable-linger was refused, so the systemd unit stops at logout "
+                                     "and does not start at boot")
             msg += "; linger enabled"
-        return msg
-    return _install_cron(p)
+        return _installed_as(p, msg)
+    return _installed_as(p, _install_cron(p), "systemd --user is not available here")
+
+
+def _record(p: Project) -> Path:
+    return p.state / "service.json"
+
+
+def _installed_as(p: Project, msg: str, fallback: str = "") -> str:
+    """Record what install() put in place, and why a crontab watchdog was added: `ttp doctor` reports it.
+    The message gains a note when it edited the user's crontab, so that never happens silently."""
+    if CRON_FAILED in msg:      # no crontab entry was added: the message already says why
+        fallback = ""
+    durable_write(_record(p), json.dumps({"text": msg, "fallback": fallback, "at": time.time()}) + "\n")
+    _WATCHDOG_SEEN.pop(str(p.base), None)
+    return msg + (f". Fallback: {CRON_NOTE}, because {fallback}" if fallback else "")
+
+
+CRON_NOTE = "a crontab watchdog (entries tagged `# tt-project:` in your crontab, see `crontab -l`)"
+
+
+def recorded(p: Project) -> dict:
+    """What the last install() recorded ({} when none: --no-service, or a project older than the record)."""
+    try:
+        rec = json.loads(_record(p).read_text())
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def _cron_present(p: Project) -> bool:
+    return bool(shutil.which("crontab")) and f"{CRON_TAG}{p.base}" in _run("crontab", "-l").stdout
+
+
+def service_line(p: Project) -> str:
+    """`ttp doctor`: which mechanism keeps the daemon running, and why, when it is a crontab fallback."""
+    fallback = recorded(p).get("fallback")
+    if fallback and _cron_present(p):
+        return f"service: {CRON_NOTE}, a fallback because {fallback}"
+    svc = installed(p)
+    if not svc:
+        return f"service: none keeps the daemon running; `ttp start {p.name}` installs one"
+    return f"service: {svc['kind']}" + (" with the stuck-daemon watchdog" if svc["watchdog"] else
+                                        f" without the stuck-daemon watchdog (`ttp restart {p.name}` adds it)")
+
+
+def plan() -> str:
+    """`ttp setup`: the mechanism `ttp new` would install on this machine, and why, read-only (it changes
+    nothing; install() makes the actual choice)."""
+    if sys.platform == "darwin":
+        return "launchd agents"
+    if shutil.which("systemctl") and _run("systemctl", "--user", "is-system-running").returncode in (0, 1):
+        linger = _run("loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger").stdout.strip()
+        if linger == "Linger=yes":
+            return "systemd user units (linger is on)"
+        return ("systemd user units; linger is off, so `ttp new` asks `loginctl enable-linger` and, if that is "
+                f"refused, also adds {CRON_NOTE}")
+    return f"{CRON_NOTE}, because systemd --user is not available here"
 
 
 def _watchdog_unit(p: Project, ext: str) -> Path:
@@ -151,6 +211,9 @@ WantedBy=default.target
 """
 
 
+SYSTEMD_FAILED = "systemd failed"
+
+
 def _install_systemd(p: Project) -> str:
     _unit(p).parent.mkdir(parents=True, exist_ok=True)
     durable_write(_unit(p), _unit_text(p))
@@ -158,7 +221,13 @@ def _install_systemd(p: Project) -> str:
     _run("systemctl", "--user", "daemon-reload")
     r = _run("systemctl", "--user", "enable", "--now", f"{unit_name(p)}.service")
     if r.returncode != 0:
-        return "systemd failed (" + r.stderr.strip()[:200] + "); " + _install_cron(p)
+        # Remove the unit that never ran: installed(), refresh() and restart_service() go by its file,
+        # and would treat the crontab watchdog that takes over as a systemd service.
+        _run("systemctl", "--user", "disable", f"{unit_name(p)}.service")
+        for path in (_unit(p), *_watchdog_units(p)):
+            path.unlink(missing_ok=True)
+        _run("systemctl", "--user", "daemon-reload")
+        return SYSTEMD_FAILED + " (" + r.stderr.strip()[:200] + "); " + _install_cron(p)
     w = _run("systemctl", "--user", "enable", "--now", _watchdog_unit(p, "timer").name)
     return f"systemd user unit {unit_name(p)}" + (" with a watchdog timer" if w.returncode == 0 else
                                                    f" (watchdog timer failed: {w.stderr.strip()[:200]})")
@@ -199,6 +268,7 @@ def _install_launchd_watchdog(p: Project) -> str:
 
 
 CRON_TAG = "# tt-project:"
+CRON_FAILED = "crontab install failed"
 
 
 def _install_cron(p: Project) -> str:
@@ -208,7 +278,7 @@ def _install_cron(p: Project) -> str:
     keep += _cron_lines(p)
     r = subprocess.run(["crontab", "-"], input="\n".join(keep) + "\n", text=True, capture_output=True)
     if r.returncode != 0:
-        return "crontab install failed: " + r.stderr.strip()[:200]
+        return CRON_FAILED + ": " + r.stderr.strip()[:200]
     # The daemon refuses to start twice (lock file), so the 5-minute entry is a no-op while it runs.
     _spawn(p)
     return "crontab watchdog"

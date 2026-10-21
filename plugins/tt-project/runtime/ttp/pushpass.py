@@ -75,7 +75,11 @@ def _python(py: str | Path | None) -> list:
 
 def env_id(wt: Path, cmd: str, env: dict, tip: str) -> str:
     """The environment part of a pass's key: the command as it runs (with the venv python it is
-    given), that venv's identity, the python3 on the check's PATH, the active venv and the tip."""
+    given), that venv's identity, the python3 on the check's PATH, the active venv and the tip. A
+    check that runs on another machine (push.remote_host) is told by that host, its env and the tip."""
+    if host := push.remote_host(cmd):
+        parts = {"host": host, "cmd": str(cmd), "env": dict(getattr(cmd, "env", ()) or ()), "tip": tip or ""}
+        return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
     argv = push.check_argv(cmd, wt, env)
     which = shutil.which("python3", path=env.get("PATH"))
     parts = {"argv": argv, "venv": _python(push.venv_python(wt, env)), "python3": _python(which),
@@ -93,7 +97,7 @@ def check_envs(wt: Path, cmds: list, env: dict) -> list[str]:
     before it reuses that pass: env_id without a tip (`ttp checks` checks against none), plus
     CHECK_ENV_VARS as `env` sets them."""
     own = {k: env.get(k, "") for k in CHECK_ENV_VARS}
-    return [hashlib.sha256(json.dumps([env_id(wt, str(c), env, ""), own]).encode()).hexdigest() for c in cmds]
+    return [hashlib.sha256(json.dumps([env_id(wt, c, env, ""), own]).encode()).hexdigest() for c in cmds]
 
 
 def key(tree: str, cmd: str, eid: str) -> str:

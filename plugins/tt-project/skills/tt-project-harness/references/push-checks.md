@@ -1,0 +1,31 @@
+# Push checks
+
+## Fast path
+
+Opt-in, off by default: with no `delivery.checks_fast_globs`, every diff runs the full checks.
+A project that lists globs there gets it: a diff whose paths all match them (never code, tests, templates, skills: `delivery.checks_fast_exclude`) runs only the whitespace and CRLF checks; the pass is not a full pass and never counts for a PR or `on_pass`.
+`ttp checks --full` runs everything, also when queued or relaunched; a recorded full pass is reused.
+Known gap: the project owns its globs; one covering installed or test-asserted content (such as a plugin README that tests read) skips the checks those changes need.
+
+## Priority
+
+`ttp checks` and push checks share a host-wide slot cap (`checks.host_max`), waited for by project in turn, then task priority, then arrival; a required owner of an open obligation goes first in its project.
+Checks gating a push to the push branch (push-queue batches, `ttp push`) skip that queue: each push branch has one priority slot beyond the cap, host-wide, so approved changes never wait behind task checks.
+Task checks keep their cap and order, except that priority-1 task checks (live-impact work) and obligation owners go ahead of other projects' waiters for at most `checks.priority_turns` (default 3) turns in a row while others wait.
+`ttp push --own` queues like them.
+The batch log and `ttp status` show `push priority slot: <holder>`; slots are OS file locks, so a killed holder frees its slot.
+
+## Outputs
+
+`delivery.push_checks` receive a writable absolute `TTP_RUN_DIR`, never empty or `/`.
+Foreground `ttp checks` uses the worker's run directory; detached checks, detached pushes and push-queue batches get unique directories under project `state/check-runs/`, outside the checked worktree.
+Use `"$TTP_RUN_DIR/report.json"` for durable outputs.
+`checks.pid` and queue markers record `check_run_dir`; a restarted daemon rebuilds queued directories and a rebooted check invocation gets a fresh one.
+Outputs survive worker cleanup and completion; only detached checks' temporary scratch is reclaimed once its lifetime lock is free.
+Symlinked directories or locks are refused.
+Missing, invalid or unwritable output storage fails before checks; never skip a check or substitute `/`.
+Detached launches strip `TTP_PIDNS` and `TTP_CGROUP`.
+
+## Checks on another host
+
+`delivery.checks_host: "test-box"` (an ssh alias or machines-list alias) runs every check there; a check object's own `"host"` overrides it (`"local"` keeps that check here) and its `"env"` exports variables first, e.g. `{"run": "pytest -q", "host": "build-host", "env": {"PATH": "$HOME/.local/bin:$PATH"}}`. The exact head is copied with `git archive` over ssh into a fresh temporary directory, made a git checkout (one commit), and the command's output and exit code come back; the directory is always removed. ssh failing or a host without git or tar is an environment fault (`env:check-host:<host>`): the check waits (exit 75), never counts as failed or passed. `ttp checks` records and log lines name the host.

@@ -981,14 +981,17 @@ class Daemon:
         except OSError:
             pass
 
-    def _run_step(self, step) -> None:
+    def _run_step(self, step, name: str = "", default=None):
         """Run one tick step so that its exception never skips the steps after it (dispatch, Slack,
         outbound delivery, pushes): log it and count it. A step that fails STEP_FAILS_ALERT ticks
         in a row is alerted, normal at first and high once it has failed STEP_FAILS_HIGH_S; its next
-        success clears the count and the alert. The watchdogs still hear of progress either way."""
-        name = self._step_name = step.__name__
+        success clears the count and the alert. The watchdogs still hear of progress either way.
+        Returns the step's result, or `default` when it raised; `name` labels a step that is not a
+        method of this daemon (a lambda)."""
+        name = self._step_name = name or step.__name__
+        result = default
         try:
-            step()
+            result = step()
         except Exception as e:  # one bad step must not stop the rest of the tick
             log(self.p, f"tick step {name} error: " + traceback.format_exc().replace("\n", " | ")[:2000])
             n, since = self._step_fails.get(name, (0, time.time()))
@@ -1005,6 +1008,7 @@ class Daemon:
                 except Exception:
                     log(self.p, "tick step clear error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         self._progress()
+        return result
 
     def _alert_step(self, name: str, fails: int, since: float, err: Exception) -> None:
         db = self.p.db
@@ -1053,19 +1057,20 @@ class Daemon:
         self._idle.update(self.cfg, self._has_work)
         if self.p.db.kv("paused", False):
             if not lease_off:
-                self.deliver_outbound()   # the long-pause alert, and what was posted before, still reach Slack
+                self._run_step(self.deliver_outbound)   # the long-pause alert, and what was posted before, still reach Slack
             return
-        self._refresh_meters()
-        self.update_gates()
-        coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
-        scr.expire_mutes(self.p.db, where=self.p)
-        self.check_mute_ends()
-        self.sweep_watcher_issues()
-        self.review_jev()
-        settling = self.settling()
+        self._run_step(self._refresh_meters)
+        self._run_step(self.update_gates)
+        self._run_step(lambda: coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values())),
+                       "expire_asks")
+        self._run_step(lambda: scr.expire_mutes(self.p.db, where=self.p), "expire_mutes")
+        self._run_step(self.check_mute_ends)
+        self._run_step(self.sweep_watcher_issues)
+        self._run_step(self.review_jev)
+        settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
-        core_held = self.net_held(core) and not self._net_may_probe(core)
-        cycle = self.host_cycle_held(now)
+        core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
+        cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
                      self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
@@ -1837,6 +1842,8 @@ class Daemon:
         its own with a cache breakpoint after it where the provider can mark one (else it ends the
         system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime; `auto`
         picks it per coordinator turn (cachettl.py)."""
+        if system is not None and append_system is not None:   # both would be run_dir/system.md
+            raise ValueError("start_run takes `system` or `append_system`, not both")
         if self.cfg_status == "unavailable":
             raise RuntimeError("project.json is unreadable with no last good copy: no model work starts")
         if not self.lease_held():
@@ -3779,6 +3786,13 @@ class Daemon:
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
+        # An `upstream:` note that names nothing of tt-project is this project's own follow-up.
+        before = fups
+        fups, local = upstream.reroute(fups)
+        rerouted = {id(g) for f, g in zip(before, fups) if f is not g}   # never a failed review's fix
+        for t in local:
+            log(self.p, f"task {task['id']}: `upstream:` follow-up names nothing of tt-project; "
+                        f"kept as this project's follow-up: {t[:200]}")
         try:
             upstream.append(self.p.name, task["id"], fups)   # the user's inbox of notes for tt-project
         except OSError as e:
@@ -3789,7 +3803,8 @@ class Daemon:
         head = (f"#{task['id']} {task['title']} → {outcome} (run {ended or status}, {'~' if usage.estimated else ''}"
                 f"${usage.cost_usd:.2f}): ")
         text = ""   # the daemon's own lines after the summary, which the digest must show whole
-        notes = ""
+        notes = "".join(f"\nNot an upstream note (names nothing of tt-project), so proposed as this project's "
+                        f"follow-up: {t[:200]}" for t in local)
         if len(fups) > MAX_FOLLOWUPS:
             notes += (f"\nMore proposed follow-ups (their specs are in {where}): "
                       + "; ".join(str(f["title"])[:120] for f in fups[MAX_FOLLOWUPS:]))
@@ -3831,8 +3846,10 @@ class Daemon:
                                                  known["status"] == "done" else "was already queued.")
         # A review that failed with fix specs gets its fix and re-review from the daemon, and what waited
         # on it waits on the re-review instead of being blocked. A failure without them still blocks.
-        # Upstream notes and deferred follow-ups are not fixes: they stay with the coordinator.
-        fixes = [f for f in fups if not upstream.is_note(f) and not f.get("start_after") and not f.get("start_when")]
+        # Upstream notes (also those rerouted to this project) and deferred follow-ups are not fixes:
+        # they stay with the coordinator.
+        fixes = [f for f in fups if not upstream.is_note(f) and id(f) not in rerouted
+                 and not f.get("start_after") and not f.get("start_when")]
         # Across stacks, an area whose reviews keep failing gets no more automatic fixes: the
         # coordinator re-plans it (reviewcap).
         # A check-only failure stays failed: the coordinator routes the missing check to its owner,
@@ -4572,7 +4589,8 @@ class Daemon:
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
                          repeat=obs.get("repeat") is True, lifecycle=kind, whole=whole,
                          key=obs.get("key") if isinstance(obs.get("key"), str) and obs["key"].strip() else None,
-                         episode=obs.get("episode") if isinstance(obs.get("episode"), str) else None)
+                         episode=obs.get("episode") if isinstance(obs.get("episode"), str) else None,
+                         pin=not error and obs.get("pin_severity") is True)
             if kind == scr.RECEIPT:
                 subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body, whole) or ()
                                 if not cleared)
@@ -4769,11 +4787,11 @@ class Daemon:
 
     def observe(self, source: str, text: str, hint: str | None = None, rewake_after_s: float | None = None,
                 repeat: bool = False, lifecycle: str | None = None, whole: bool = False,
-                key: str | None = None, episode: str | None = None) -> None:
+                key: str | None = None, episode: str | None = None, pin: bool = False) -> None:
         if not text.strip():
             return
         again = {"rewake_after_s": rewake_after_s, "repeat": repeat, "lifecycle": lifecycle, "whole": whole,
-                 "key": key, "episode": episode}
+                 "key": key, "episode": episode, "pin": pin}
         v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev, **again)
         if v.jev_out_of_funds:
             self.alert("jev-funds", JEV_FUNDS_TEXT, "high")

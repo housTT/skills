@@ -3140,7 +3140,8 @@ def test_coordinator_cache_distinguishes_zero_partial_full_and_unknown(env):
     assert s['miss_turns'] == 1 and s['hit_pct'] == 50
     assert s['raw_tokens'] == {'input_tokens': 350, 'cache_read_tokens': 150, 'cache_write_tokens': 0}
     assert s['requests_unknown_turns'] == 2
-    for text in (status_text(p), '\n'.join(audit.lines(p.db, now, p=p))):
+    assert 'zero 1' not in status_text(p), "the coordinator cache is a --verbose line"
+    for text in (status_text(p, verbose=True), '\n'.join(audit.lines(p.db, now, p=p))):
         assert 'zero 1' in text and 'partial 1' in text and 'full 1' in text
         assert 'missing 2 (unknown), legacy 1 (before telemetry)' in text
         assert 'request count unknown for 2 turns' in text, "some turns carry a request count"

@@ -2577,6 +2577,42 @@ def test_ttr_ignores_a_frozen_heal_report_while_the_project_is_paused(env):
     assert ttr.observe(p, late + 60) == (["box-b"], [])
 
 
+def test_ttr_incident_hands_over_to_the_source_that_keeps_the_machine_down(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    from ttp import ttr
+    p = make(env, "alpha")
+    mm.add("box-b")
+    t0 = 1_800_000_000.0
+    sched.upsert(p.db, "box-b-up", "command", "10m", payload={"heal": {"check": "true", "machine": "box-b"}})
+    p.db.set_kv(heal.STATE_KEY + "box-b-up", {"status": "unhealthy", "since": t0, "last_check": t0,
+                                               "machine_reported": ["box-b", "down"]})
+    assert ttr.observe(p, t0 + 60) == (["box-b"], [])
+    # A known outage recorded while the check still fails: the heal check stays the incident's source.
+    ml.set_outage("box-b", "board swap", "other", expires="7d", now=t0 + 300)
+    assert ttr.observe(p, t0 + 360) == ([], [])
+    # The same check turning held keeps the incident (same source).
+    p.db.set_kv(heal.STATE_KEY + "box-b-up", {"status": "unhealthy", "since": t0, "last_check": t0 + 400,
+                                               "machine_reported": ["box-b", "held"]})
+    assert ttr.observe(p, t0 + 420) == ([], [])
+    # The check recovers while the outage keeps the machine down: the heal incident ends when the outage
+    # began and an outage incident opens from its own since, with its own cause.
+    p.db.set_kv(heal.STATE_KEY + "box-b-up", {"status": "healthy", "last_check": t0 + 600})
+    assert ttr.observe(p, t0 + 660) == (["box-b"], ["box-b"])
+    rows = p.db.q("SELECT * FROM ttr_incidents ORDER BY id")
+    assert [(r["kind"], r["cause"], r["started"], r["ended"]) for r in rows] == [
+        ("down", "heal check box-b-up", t0, t0 + 300),
+        ("outage", "known outage: board swap", t0 + 300, None)]
+    assert ttr.observe(p, t0 + 720) == ([], []), "no further handover while the outage holds"
+    text = ttr.lines(p.db, "UTC", now=t0 + 720)[0]
+    assert "open: outage since" in text and "board swap" in text
+    ml.clear_outage("box-b")
+    assert ttr.observe(p, t0 + 780) == ([], ["box-b"])
+    assert p.db.one("SELECT ended FROM ttr_incidents WHERE kind='outage'")["ended"] == t0 + 780
+
+
 def test_goal_service_up_passes_fails_and_reports_could_not_run(env, tmp_path, monkeypatch):
     import http.server
     from ttp import goalchecks as gc, heal

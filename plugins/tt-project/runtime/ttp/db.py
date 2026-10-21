@@ -569,10 +569,17 @@ END""")
         except BaseException:
             _tx_local.spawns = outer
             self._after_commit.clear()
-            self.conn.execute("ROLLBACK")
+            if self.conn.in_transaction:   # SQLite may have rolled back already (SQLITE_FULL, IOERR)
+                self.conn.execute("ROLLBACK")
             raise
         _tx_local.spawns = outer
-        self.conn.execute("COMMIT")
+        try:
+            self.conn.execute("COMMIT")
+        except BaseException:
+            self._after_commit.clear()
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
         ended = time.monotonic()
         held = ended - began
         if held > SLOW_TX_S:
@@ -773,6 +780,20 @@ END""")
             if str(task_id) in tries:
                 tries.pop(str(task_id))
                 self.set_kv(WORKSPACE_TRIES_KEY, tries)
+        return ""
+
+    def cancel(self, task_id: int) -> str:
+        """Cancel a task that has not finished (`ttp task cancel`, the web app). Returns "" when done,
+        else why not; an unknown or finished (done, failed, cancelled) task is left as it is."""
+        with self.tx():
+            t = self.task(task_id)
+            if not t:
+                return f"no task #{task_id}"
+            # One statement, so a run finishing between a check and the write keeps its outcome.
+            if not self.conn.execute("UPDATE tasks SET status='cancelled', updated=? WHERE id=? "
+                                     "AND status NOT IN ('done','failed','cancelled')",
+                                     (time.time(), task_id)).rowcount:
+                return f"task #{task_id} is already {t['status']}"
         return ""
 
     def task(self, task_id: int) -> dict | None:

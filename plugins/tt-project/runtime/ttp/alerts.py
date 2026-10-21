@@ -66,6 +66,7 @@ CLEARED_TEXT = {
     "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push is off.",
     "push_queue_dying": "Push batches finish again.",
     "push_not_landing": "A push batch landed on the push branch again.",
+    "push_scope": "The changes held for the token scope `{arg}` pushed or left the push queue.",
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
     "heal": "Heal check {arg} passes again.",
     "heal-hold": "The device hold heal check {arg} reported has a tenant again or ended.",
@@ -235,6 +236,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return arg.isdigit() and machine_ledger.change_overdue(int(arg), now)
     if kind == "network":   # Daemon.check_unreachable keeps the outage until reachability is back
         return bool((db.kv("network_outage") or {}).get("alerted"))
+    if kind == "push_scope":   # pushq.tend_scope_holds keeps the scope while a change held for it waits
+        return arg in (db.kv("push_scope_held") or {})
     if key == "push_tip_failing":   # pushq keeps the failing tip until it passes or the branch moves
         return bool(((db.kv("push_queue") or {}).get("bad_tip") or {}).get("alerted"))
     if kind == "paused":   # the same project pause still lasts (projpause)
@@ -276,7 +279,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
-                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "heal",
+                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
                                          "coord-budget", "account-mismatch", "linger-off", "tick-step")
 
