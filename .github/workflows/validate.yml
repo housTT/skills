@@ -42,7 +42,8 @@ jobs:
   # The tt-project runtime supports Python 3.9: run its required suite on that minimum too.
   tt-project-python39:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Twice the measured wall time: 23 min on 4 CPUs with CI=true (a loaded workstation).
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
