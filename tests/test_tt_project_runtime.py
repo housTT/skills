@@ -20359,6 +20359,7 @@ def test_a_failed_detached_job_wakes_its_task_at_once_with_its_rc_never_as_a_pas
 def test_a_failed_detached_job_pages_a_machine_change_s_undo_at_once(env):
     """A ledger entry `--until-probe "ttp detach --check <rc>"` is overdue once the job ended, even when
     it failed (exit 4), not only after PROBE_END_S; its overdue reason says the job failed."""
+    from ttp import ends
     from ttp import machine_ledger as ml
     from ttp import machines as mm
     p = make(env)
@@ -20369,13 +20370,16 @@ def test_a_failed_detached_job_pages_a_machine_change_s_undo_at_once(env):
     now = time.time()
     c = ml.add_change("box-a", "paused the queue for the bench", "resume it", p.name,
                       until_probe=f"ttp detach --check {jobs / 'bench.rc'}", now=now)
-    probes = ml.Probes(p)
-    probes.tick(now)
-    assert probes._procs[c["id"]][0].wait(timeout=30) == 4
-    probes.tick(now + 1)
+    probes = ml.Probes(p, log=lambda s: None)
+    at = now + ml.PROBE_GRACE_S
+    for n in range(ml.PROBE_PASSES):
+        probes._probed.clear()
+        probes.tick(at + n * ends.PROBE_EVERY_S)
+        assert probes._procs[c["id"]][0].wait(timeout=30) == 4
+        probes.tick(at + n * ends.PROBE_EVERY_S + 1)
     [got] = ml.changes()
     assert got["probe_passed"] and got["probe_job_failed"] == "job rc=3", got
-    assert ml.overdue(got, now + 1).startswith("the detached job its until-probe waits on ended but failed")
+    assert ml.overdue(got, at + ends.PROBE_EVERY_S).startswith("the detached job its until-probe waits on ended but failed")
 
 
 def test_a_failed_detached_job_lets_the_on_pass_cmd_decide_model_free(env, monkeypatch, tmp_path):
@@ -37229,12 +37233,10 @@ def test_machine_change_ledger_add_list_overdue_and_close(env, capsys):
     other = ml.Probes(type("P", (), {"name": "else", "root": p.root})())
     other.tick(now)
     assert not other._procs, "another project's daemon runs only its own entries' probes"
-    probes = ml.Probes(p)
-    probes.tick(now)
-    proc = probes._procs[2][0]
-    proc.wait(timeout=10)
-    probes.tick(now + 1)
-    assert ml.overdue(ml.changes()[1], now + 1) == "its until-probe passed"
+    probes = ml.Probes(p, log=lambda s: None)
+    for n in range(ml.PROBE_PASSES):
+        _change_probe_round(probes, 2, now + ml.PROBE_GRACE_S + n * 600)
+    assert ml.overdue(ml.changes()[1], now + ml.PROBE_GRACE_S + 601) == "its until-probe passed"
     main(["machines", "change", "close", "2", "--why", "resumed", "--by", "demo"])
     assert [c["id"] for c in ml.changes()] == [1]
     assert ml.changes(open_only=False)[1]["closed_why"] == "resumed"
@@ -37323,12 +37325,14 @@ def test_an_edited_machine_change_overdue_again_pages_afresh_and_a_stale_probe_p
     # A probe still running from before an edit to another probe: its pass is not the new probe's.
     ml.edit_change(1, "alpha", until_probe="true", now=now + 3700)
     probes = ml.Probes(alpha, log=lambda s: None)
-    probes.tick(now + 3800)
+    _change_probe_round(probes, 1, now + 3700 + ml.PROBE_GRACE_S)   # the first of two passes
+    probes._probed.clear()
+    probes.tick(now + 4600)
     assert 1 in probes._procs
-    ml.edit_change(1, "alpha", until_probe="test -e /nonexistent-ttp-probe", now=now + 3801)
+    ml.edit_change(1, "alpha", until_probe="test -e /nonexistent-ttp-probe", now=now + 4601)
     probes._procs[1][0].wait(10)
-    probes._probed[1] = now + 3900   # not due again yet
-    probes.tick(now + 3900)
+    probes._probed[1] = now + 4700   # not due again yet
+    probes.tick(now + 4700)
     assert "probe_passed" not in ml.changes()[0], "the old probe's pass does not end the edited probe"
 
 
@@ -45366,15 +45370,12 @@ def test_machine_change_until_probe_exit_codes(env, code, passed, reported):
     c = ml.add_change("box-a", "paused", "resume", p.name, until_probe=f"exit {code}", now=now)
     logs = []
     probes = ml.Probes(p, log=logs.append)
-    probes.tick(now)
-    probes._procs[c["id"]][0].wait(30)
-    probes.tick(now + 1)
+    for n in range(ml.PROBE_PASSES):
+        _change_probe_round(probes, c["id"], now + ml.PROBE_GRACE_S + n * 1000)
     [got] = ml.changes()
     assert bool(got.get("probe_passed")) is passed
-    assert bool(logs) is reported
+    assert any("broken" in l for l in logs) is reported
     if reported:
-        probes._procs.clear(); probes._probed.clear()
-        probes.tick(now + 1000); probes._procs[c["id"]][0].wait(30); probes.tick(now + 1001)
         assert len(logs) == 1, "reported once"
 
 
@@ -45390,6 +45391,7 @@ def test_machine_change_until_probe_255_needs_ssh_confirmation(env, monkeypatch)
     monkeypatch.setattr(netwait, "confirm", lambda *a, **k: seen.append(a) or "ssh reaches h1")
     logs = []
     probes = ml.Probes(p, log=logs.append)
+    now += ml.PROBE_GRACE_S
     probes.tick(now)
     probes._procs[c["id"]][0].wait(30)
     probes.tick(now + 1)
@@ -45408,6 +45410,66 @@ def _change_probe_round(probes, cid, at):
     probes.tick(at + 1)
 
 
+def test_machine_change_until_probe_true_at_add_time_does_not_page_during_its_grace(env):
+    """An until-probe already true when its entry is made (an 'until X is not set' probe) is not run
+    before PROBE_GRACE_S, so the entry is not overdue and pages nobody meanwhile."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe="true", now=now)
+    probes = ml.Probes(p, log=lambda s: None)
+    for at in (now, now + 60, now + ml.PROBE_GRACE_S - 1):
+        probes._probed.clear()
+        probes.tick(at)
+        assert c["id"] not in probes._procs, at
+    assert not ml.overdue(ml.changes()[0], now + ml.PROBE_GRACE_S - 1)
+    assert not [x for x in ml.route(now + ml.PROBE_GRACE_S - 1, able=lambda n: (True, ""))
+                if x["kind"] == "machine_change_overdue"]
+
+
+def test_machine_change_until_probe_passes_twice_in_a_row_and_a_later_not_yet_clears_it(env, tmp_path):
+    """An until-probe counts as passed only after PROBE_PASSES passes in a row, each logged with its output's
+    tail; it keeps running while the entry is open, and a later 'not yet' clears the pass and its pages."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    code = tmp_path / "code"
+    code.write_text("0")
+    now = time.time()
+    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe=f"echo probe-said-done; exit $(cat {code})",
+                      now=now)
+    logs = []
+    probes = ml.Probes(p, log=logs.append)
+    at = now + ml.PROBE_GRACE_S
+    _change_probe_round(probes, c["id"], at)
+    assert not ml.changes()[0].get("probe_passed"), "one pass is not enough"
+    assert "1 of 2 in a row" in logs[-1] and "probe-said-done" in logs[-1], logs
+    code.write_text("1")   # one pass then a fail: the streak starts over
+    _change_probe_round(probes, c["id"], at + 1000)
+    code.write_text("0")
+    _change_probe_round(probes, c["id"], at + 2000)
+    assert not ml.changes()[0].get("probe_passed") and "1 of 2 in a row" in logs[-1], logs
+    _change_probe_round(probes, c["id"], at + 3000)
+    got = ml.changes()[0]
+    assert got["probe_passed"] and "probe-said-done" in got["probe_out"], got
+    assert ml.overdue(got, at + 3001) == "its until-probe passed"
+    with ml._locked():   # it was paged meanwhile
+        doc = ml._read(ml.LEDGER, {})
+        doc["changes"][0]["page"] = {"stage": 1}
+        ml._write(ml.LEDGER, doc)
+    _change_probe_round(probes, c["id"], at + 4000)   # still passing: still probed, the pass kept
+    assert ml.changes()[0]["probe_passed"] == got["probe_passed"]
+    code.write_text("1")   # what it waited for is back: no longer overdue, the pages dropped
+    _change_probe_round(probes, c["id"], at + 5000)
+    got = ml.changes()[0]
+    assert not got.get("probe_passed") and "probe_out" not in got and "page" not in got, got
+    assert got["page_from"] == at + 5001 and not ml.overdue(got, at + 5001)
+    assert "no longer overdue" in logs[-1], logs
+
+
 def test_machine_change_until_probe_timeout_is_broken_and_queued_once(env):
     from ttp import ends
     from ttp import machine_ledger as ml
@@ -45418,7 +45480,7 @@ def test_machine_change_until_probe_timeout_is_broken_and_queued_once(env):
     c = ml.add_change("box-a", "paused", "resume", p.name, until_probe="sleep 30", now=now)
     logs = []
     probes = ml.Probes(p, log=logs.append)
-    for at in (now, now + 1000):   # two rounds: each runs past the timeout and is killed
+    for at in (now + ml.PROBE_GRACE_S, now + 1000):   # two rounds: each runs past the timeout and is killed
         probes._probed.clear()
         probes.tick(at)
         probes.tick(at + ends.PROBE_TIMEOUT_S + 1)
@@ -45443,7 +45505,7 @@ def test_machine_change_broken_probe_reported_once_per_kind_not_per_stderr(env, 
     c = ml.add_change("box-a", "paused", "resume", p.name, until_probe=probe, now=now)
     logs = []
     probes = ml.Probes(p, log=logs.append)
-    _change_probe_round(probes, c["id"], now)
+    _change_probe_round(probes, c["id"], now + ml.PROBE_GRACE_S)
     _change_probe_round(probes, c["id"], now + 1000)
     assert len(logs) == 1, logs
     _change_probe_round(ml.Probes(p, log=logs.append), c["id"], now + 2000)   # a daemon restart

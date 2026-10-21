@@ -46,7 +46,9 @@ project's open entries whose task is over (task_lines). An overdue entry pages t
 owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S or let REPAGE_S pass,
 then the user. Nothing is undone automatically: whoever is paged runs the undo and closes the entry
 (`ttp machines change close <id>`). Probes run only in the daemon of the project that made the entry,
-from its root, as end probes do; a broken one (an exit code other than 0, 1, 75 or ssh's own 255, or a
+from its root, as end probes do, starting PROBE_GRACE_S after the entry; a probe counts as passed only after
+PROBE_PASSES passes in a row (each logged with its output's tail), keeps running while the entry is open, and a
+later "not yet" (1 or 75) clears the pass and its pages; a broken one (an exit code other than 0, 1, 75 or ssh's own 255, or a
 timeout) queues one low `change_probe_broken` event per kind of breakage; the same daemon reads its until-tasks'
 states. `ttp machines change edit <id> [--what] [--undo] [--expires | --until-probe | --until-task]`
 corrects an open entry in place (same id), with an edit trail in the entry.
@@ -93,7 +95,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import detach, ends, machines, outagetask, project
+from . import detach, ends, machines, netwait, outagetask, project
 from .db import TERMINAL_TASK_STATES
 
 LEDGER = "machine-changes.json"
@@ -107,6 +109,8 @@ REPAGE_S = 86400             # an item still open this long after its page is pa
 GRACE_S = 1800               # default: how long a condition lasts before it is routed
 CONDITION_GONE_S = 3 * 3600  # a condition nobody reported this long is over
 PROBE_END_S = 7 * 86400      # an entry with only an until-probe or until-task is overdue after this anyway
+PROBE_GRACE_S = 300          # an until-probe first runs this long after its entry (or its new probe) was made
+PROBE_PASSES = 2             # passes in a row before an until-probe counts as passed
 CLOSED_KEPT_S = 30 * 86400   # closed entries kept this long
 TEXT_CHARS = 300
 CONDITIONS = ("down", "held")
@@ -489,7 +493,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         for k in was:
             c[k] = new[k]
         if "expires" in was:
-            for k in ("probe_passed", "probe_job_failed", "task_ended", "page"):
+            for k in ("probe_passed", "probe_job_failed", "probe_out", "task_ended", "page"):
                 c.pop(k, None)
             c["page_from"] = now   # a new page episode: its pages get ids of their own, not the delivered ones'
         c.setdefault("edits", []).append({"at": now, "by": by, "was": was})
@@ -1226,6 +1230,7 @@ class Probes:
         self._probed: dict[int, float] = {}
         self._errs: dict[int, Any] = {}   # id(proc) -> its stderr file
         self._reported: dict[int, str] = {}   # change id -> the broken kind ("exit 2", "timeout") already reported
+        self._passes: dict[int, tuple[str, int]] = {}   # change id -> (probe, its passes in a row)
 
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -1234,39 +1239,71 @@ class Probes:
                 apply_requests(self.p.state, self.log)
         except OSError as e:   # kept queued for the next tick
             self.log(f"queued machine-ledger requests not applied yet: {e}")
-        passed = []
+        passed, unpassed = {}, set()
         for cid, (rc, probe, err) in ends.reap_probes(self._procs, self._errs, now, self.p).items():
-            if rc in ends.NOT_YET_RCS:   # 255 only once ssh cannot reach the host it names
+            if rc == 0 or (rc not in ends.NOT_YET_RCS and detach.failed_check(probe, rc)):   # the jobs it waits on ended, even if one failed
                 self._reported.pop(cid, None)
-            elif rc == 0 or detach.failed_check(probe, rc):   # the jobs it waits on ended, even if one failed
-                passed.append((cid, probe, rc))
+                n = self._passes[cid][1] + 1 if self._passes.get(cid, ("", 0))[0] == probe else 1
+                self._passes[cid] = (probe, n)
+                if n <= PROBE_PASSES:   # not every round while the entry stays open overdue
+                    self.log(f"machine change #{cid}: its until-probe passed ({n} of {PROBE_PASSES} in a row; "
+                             f"exit {rc}): {(err or 'no output')[-300:]}")
+                if n >= PROBE_PASSES:
+                    passed[(cid, probe)] = (rc, err)
+                continue
+            self._passes.pop(cid, None)
+            if rc in ends.NOT_YET_RCS:   # 255 only once ssh cannot reach the host it names: says nothing either way
+                self._reported.pop(cid, None)
+                if rc != netwait.UNREACHABLE_RC:
+                    unpassed.add((cid, probe))
             else:   # broken, a timeout too (as ends.EndProbes reads it): said once per kind, not every round
                 self._broken(cid, probe, rc, err, now)
-        if passed:
-            ids = {(cid, probe): rc for cid, probe, rc in passed}
-            with _locked():
-                doc = _read(LEDGER, {"next": 1, "changes": []})
-                for c in doc.get("changes", []):
-                    if (c.get("id"), c.get("probe")) in ids and not c.get("closed"):   # not a probe an edit replaced
-                        c["probe_passed"] = now
-                        if ids[(c["id"], c["probe"])]:
-                            c["probe_job_failed"] = detach.failed_why(c["probe"], ids[(c["id"], c["probe"])], self.p.root)
-                _write(LEDGER, doc)
+        if passed or any((c.get("id"), c.get("probe")) in unpassed and c.get("probe_passed") for c in changes()):
+            self._mark(passed, unpassed, now)
         self._tasks(now)
         for c in changes():
             if c.get("kind") == POWER_CYCLE and float(c.get("expires") or 0) <= now:   # any daemon: the maker's may be gone
                 with contextlib.suppress(ValueError):   # another daemon closed it first
                     close_change(int(c["id"]), "the planned power cycle is past", self.p.name, now)
+        open_ids = set()
         for c in changes():
             cid = c.get("id")
-            if c.get("by") != self.p.name or not c.get("probe") or c.get("probe_passed") or cid in self._procs \
+            open_ids.add(cid)
+            if c.get("by") != self.p.name or not c.get("probe") or cid in self._procs \
+                    or now - float(c.get("page_from") or c.get("added") or 0) < PROBE_GRACE_S \
                     or now - self._probed.get(cid, 0) < ends.PROBE_EVERY_S:
                 continue
             self._probed[cid] = now
             try:
-                self._procs[cid] = (ends.spawn_probe(self.p, c["probe"], self._errs), now, c["probe"])
+                self._procs[cid] = (ends.spawn_probe(self.p, c["probe"], self._errs, stdout=True), now, c["probe"])
             except OSError as e:
                 self.log(f"machine change #{cid}: until-probe could not start: {e}")
+        for cid in set(self._passes) - open_ids:   # closed: its streak is over
+            del self._passes[cid]
+
+    def _mark(self, passed: dict, unpassed: set, now: float) -> None:
+        """Record the until-probes that passed PROBE_PASSES times in a row ({(id, probe): (rc, output tail)}),
+        and clear the pass and its pages of those that said "not yet" since (`unpassed`): a pass an edit's
+        probe replaced is not the entry's."""
+        with _locked():
+            doc = _read(LEDGER, {"next": 1, "changes": []})
+            for c in doc.get("changes", []):
+                key = (c.get("id"), c.get("probe"))
+                if c.get("closed"):
+                    continue
+                if key in passed and not c.get("probe_passed"):
+                    rc, out = passed[key]
+                    c.update(probe_passed=now, probe_out=out[-300:])
+                    if rc:
+                        c["probe_job_failed"] = detach.failed_why(c["probe"], rc, self.p.root)
+                elif key in unpassed and c.get("probe_passed"):
+                    self.log(f"machine change #{c['id']}: its until-probe passed before but says not yet now: "
+                             f"no longer overdue")
+                    for k in ("probe_passed", "probe_job_failed", "probe_out"):
+                        c.pop(k, None)
+                    if c.pop("page", None) is not None:
+                        c["page_from"] = now   # a later pass starts a new page episode
+            _write(LEDGER, doc)
 
     def _tasks(self, now: float) -> None:
         """Mark this project's open entries whose until-task is over (task_ended), so any daemon's route

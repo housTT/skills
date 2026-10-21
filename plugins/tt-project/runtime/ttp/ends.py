@@ -317,13 +317,14 @@ class Ends:
         stop_probes(self._procs, self._errs)
 
 
-def spawn_probe(p: Project, probe: str, errs: dict[int, Any]) -> subprocess.Popen:
+def spawn_probe(p: Project, probe: str, errs: dict[int, Any], stdout: bool = False) -> subprocess.Popen:
     """Start shell probe `probe` in a session of its own, in its project's context (cwd p.root,
-    project.command_env). Its stderr goes to a file in `errs` (a pipe nobody reads could fill)."""
+    project.command_env). Its stderr (with `stdout`, its stdout too) goes to a file in `errs` (a pipe
+    nobody reads could fill)."""
     err = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(probe, shell=True, cwd=str(p.root), env=command_env(p), stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=err, start_new_session=True)
+                                stdout=err if stdout else subprocess.DEVNULL, stderr=err, start_new_session=True)
     except OSError:
         err.close()
         raise
