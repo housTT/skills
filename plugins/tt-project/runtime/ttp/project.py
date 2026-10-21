@@ -796,6 +796,9 @@ PINNED_MEMORY_KINDS = ("restriction", "preference", "resource")
 # Memory each prompt carries, in characters of whole entries (see Project.memory_select). A worker's
 # charter digest and memory share theirs (see prompts.worker_context); its Restrictions come on top.
 COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS = 12000, 8000
+# Memory pinned for workers gets what the charter digest leaves of WORKER_MEMORY_CHARS, never less
+# than this: a long charter neither crowds it out nor is crowded out by it.
+WORKER_PINNED_MIN_CHARS = WORKER_MEMORY_CHARS // 2
 # Memory kinds archive_hidden_memory may retire once no prompt shows them (never a standing entry).
 ARCHIVABLE_MEMORY_KINDS = ("decision", "fact")
 # An entry that cites the user's word (`user msg #N`, `(user, <date>)`, "the user's words"): the
@@ -809,7 +812,7 @@ _WORKER_WORD = re.compile(r"\bworkers?\b", re.I)
 
 
 def worker_memory(e: dict) -> int:
-    """Where memory entry `e` stands in a worker's prompt: 1, always shown (tagged for workers,
+    """Where memory entry `e` stands in a worker's prompt: 1, pinned (tagged for workers,
     restrictions, resources); 2, shown first while they fit (entries that speak of workers); 3, then
     the newest facts that fit; 0, never (the rest, written for the coordinator: decisions,
     preferences and standing duties)."""
@@ -1212,6 +1215,7 @@ class Project:
             ends = (" (standing)" if standing else "") + (f" ({describe(end, self)})" if end else "")
             created = c.group(1) if c else _stamp(p.stat().st_mtime)
             out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
+                        "body": body.strip(),
                         "standing": standing, "audience": aud.group(1) if aud else "", "created": created,
                         "order": (created, p.stem)})
         out.sort(key=lambda e: e.pop("order"))
@@ -1238,17 +1242,28 @@ class Project:
                         "chars": sum(len(e["line"]) + 1 for e in entries), "pinned_chars": pinned_chars,
                         "limit": limit_chars, "pinned_over": pinned_chars > limit_chars}
 
-    def worker_memory_select(self, limit_chars: int, task: dict | None = None) -> tuple[list[dict], dict]:
-        """The entries a worker's prompt gets, whole, oldest first: those worker_memory always shows
-        (even past the budget); then, for `task`, the others that share words with its title and spec
-        (task_words; a word few entries share weighs more), most shared first, then newest, each that
-        fits; then those that speak of workers and then the facts, newest first while they fit
-        `limit_chars`. Usage numbers as memory_select's, counting only the entries meant for workers."""
+    def worker_memory_select(self, limit_chars: int, task: dict | None = None, pinned_limit: int | None = None,
+                             restated=None) -> tuple[list[dict], dict]:
+        """The entries a worker's prompt gets, whole, oldest first: those worker_memory pins, while
+        they fit `pinned_limit` (None: all); then, only if every pinned one fits: for `task`, the
+        others that share words with its title and spec (task_words; a word few entries share weighs
+        more), most shared first, then newest, each that fits; then those that speak of workers and
+        then the facts, newest first while all fit `limit_chars`. An entry whose text `restated(text)`
+        says the prompt already states (the charter's restrictions) is left out. Usage numbers as
+        memory_select's, counting only the entries meant for workers, plus `duplicates` (left out as
+        restated) and `pinned_dropped` (pinned ones past `pinned_limit`)."""
         entries = [e for e in self._memory_entries() if worker_memory(e)]
-        pinned = [e for e in entries if worker_memory(e) == 1]
-        used = pinned_chars = sum(len(e["line"]) + 1 for e in pinned)
-        chosen = {e["name"] for e in pinned}
-        rest = [e for e in entries if e["name"] not in chosen]
+        dup = {e["name"] for e in entries if restated and restated(e.get("body", ""))}
+        pinned = [e for e in entries if worker_memory(e) == 1 and e["name"] not in dup]
+        pinned_chars = sum(len(e["line"]) + 1 for e in pinned)
+        used, chosen = 0, set()
+        for e in pinned:
+            if pinned_limit is None or used + len(e["line"]) + 1 <= pinned_limit:
+                chosen.add(e["name"])
+                used += len(e["line"]) + 1
+        # None of the others while a pinned one is left out.
+        rest = [e for e in entries if worker_memory(e) != 1 and e["name"] not in dup] \
+            if len(chosen) == len(pinned) else []
         if task:
             want = task_words(f"{task.get('title') or ''}\n{task.get('spec') or ''}")
             words = {e["name"]: task_words(e["line"]) & want for e in rest}
@@ -1272,7 +1287,9 @@ class Project:
         shown = [e for e in entries if e["name"] in chosen]
         return shown, {"entries": len(entries), "shown": len(shown), "pinned": len(pinned),
                        "chars": sum(len(e["line"]) + 1 for e in entries), "pinned_chars": pinned_chars,
-                       "limit": limit_chars, "pinned_over": pinned_chars > limit_chars}
+                       "limit": limit_chars, "duplicates": len(dup),
+                       "pinned_over": pinned_chars > (limit_chars if pinned_limit is None else pinned_limit),
+                       "pinned_dropped": len([e for e in pinned if e["name"] not in chosen])}
 
     def memory_text(self, limit_chars: int = COORDINATOR_MEMORY_CHARS) -> str:
         """Pinned entries, then the newest others (newest last), whole and bounded so they never

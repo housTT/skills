@@ -14,7 +14,7 @@ from . import budget as bud
 from . import chaincap, conflictfix, settinghold, settled, taskfacts, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
-from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, own_push, push_allowed,
+from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, Project, code_tasks_may_push, own_push, push_allowed,
                       push_queue_on)
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch, recovery_note
 
@@ -349,22 +349,53 @@ def _worker_heads(p: Project, dropped: int, n: int) -> tuple[str, str]:
     return _CHARTER_HEAD.format(more=more, path=p.charter_path), _MEMORY_HEAD.format(n=n, path=p.memory_index)
 
 
+_PINNED_MORE = "({n} more pinned memory entries for workers did not fit this prompt: read them in {path}/)"
+
+
+def _norm(text: str) -> str:
+    """`text` lower-cased with its list markers dropped and its whitespace collapsed."""
+    return " ".join(re.sub(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+", "", text).lower().split())
+
+
+def restated_in(block: str):
+    """A test of whether a memory entry's text is already stated by `block` (the charter's
+    restrictions): it is one of its items, or whole sentences of one, ignoring case, list markers and
+    spacing. "Never push." is not restated by "Never push to main.": a match ends where a sentence does."""
+    items = [_norm(x) for x in _items(block.splitlines())]
+
+    def test(text: str) -> bool:
+        t = _norm(text)
+        for item in items if t else ():
+            i = item.find(t)
+            while i >= 0:
+                j = i + len(t)
+                if (i == 0 or item[:i].rstrip()[-1:] in ".;!?") and (
+                        j == len(item) or t[-1] in ".;!?" or item[j] in ".;!?"):
+                    return True
+                i = item.find(t, i + 1)
+        return False
+    return test
+
+
 def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict], dict]:
-    """A worker's digest of the charter and memory, within WORKER_MEMORY_CHARS together: the Goals
-    and Resources whole (the Brief only when no Goals are stated), memory entries pinned for workers
-    (see worker_memory) whatever the budget, then the policies and other charter items meant for
-    workers (see for_workers) and the facts that fit, those sharing words with `task` first (see
-    worker_memory_select). The Restrictions are not in it: the
-    prompt states them whole in their own block. Returns (charter text, memory entries, usage)."""
+    """A worker's digest of the charter and memory: the Goals and Resources whole (the Brief only when
+    no Goals are stated) and the policies and other charter items meant for workers (see
+    for_workers) within WORKER_MEMORY_CHARS; then memory pinned for workers (see worker_memory) in
+    what is left of it, never less than WORKER_PINNED_MIN_CHARS, and the entries that share words with
+    `task`, those that speak of workers and the newest facts while all still fit WORKER_MEMORY_CHARS
+    (see worker_memory_select).
+    Memory never pushes out a policy. Memory entries that restate the charter's restrictions are left
+    out: the prompt states those whole in their own block. Pinned entries past their budget are
+    counted in `pinned_dropped` (worker_system says where to read them). Returns (charter text,
+    memory entries, usage)."""
     raw = p.charter_path.read_text() if p.charter_path.exists() else ""
     secs = [(h, b) for h, b in charter_sections(charter_without_placeholders(raw))
             if h and not h[3:].strip().lower().startswith("restriction")]
     name = lambda h: h[3:].strip().lower()
     goals = any(name(h).startswith("goal") for h, _ in secs)
     whole = lambda h: name(h).startswith(("goal", "resource")) or (not goals and name(h).startswith("brief"))
-    pins = p.worker_memory_select(0)[1]["pinned_chars"]
     heads = sum(len(x) + 2 for x in _worker_heads(p, 999, 99999))   # their longest
-    used = heads + pins + sum(len(h) + len("\n".join(b).strip()) + 3 for h, b in secs if whole(h))
+    used = heads + sum(len(h) + len("\n".join(b).strip()) + 3 for h, b in secs if whole(h))
     out, dropped = [], 0
     for h, b in secs:
         if whole(h):
@@ -386,8 +417,15 @@ def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict
         else:
             used -= len(h) + 3
     text = "\n\n".join(out)
-    mem, use = p.worker_memory_select(max(0, WORKER_MEMORY_CHARS - heads - len(text)), task)
-    return text, mem, dict(use, charter_chars=heads + len(text), charter_dropped=dropped, limit=WORKER_MEMORY_CHARS)
+    rest = max(0, WORKER_MEMORY_CHARS - heads - len(text))
+    room = max(rest, WORKER_PINNED_MIN_CHARS)   # for pinned entries; the others only fill `rest`
+    restated = restated_in(charter_restrictions(raw))
+    mem, use = p.worker_memory_select(rest, task, room, restated)
+    if use["pinned_dropped"]:   # make room for the line saying so
+        room -= len(_PINNED_MORE.format(n=999, path=p.memory_dir)) + 1
+        mem, use = p.worker_memory_select(min(rest, room), task, room, restated)
+    return text, mem, dict(use, charter_chars=heads + len(text), charter_dropped=dropped, limit=WORKER_MEMORY_CHARS,
+                           memory_limit=room)
 
 
 # Task kinds whose workers never hand off `waiting` on a job of their own, so their prompt leaves out
@@ -471,8 +509,9 @@ def worker_system(p: Project, task: dict | None = None) -> str:
     p.note_memory_shown([e["name"] for e in mem])
     head, mem_head = _worker_heads(p, use["charter_dropped"], len(p._memory_entries()))
     parts.append(head + (charter or "(none)"))
-    if mem:
-        parts.append(mem_head + "\n".join(e["line"] for e in mem))
+    more = [_PINNED_MORE.format(n=use["pinned_dropped"], path=p.memory_dir)] if use["pinned_dropped"] else []
+    if mem or more:
+        parts.append(mem_head + "\n".join([e["line"] for e in mem] + more))
     return "\n\n".join(x for x in parts if x.strip())
 
 

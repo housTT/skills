@@ -6701,6 +6701,9 @@ def cmd_doctor(a) -> None:
     from . import upstream
     for line in upstream.doctor_lines(p):
         print(line)
+    from .coordinator import worker_pinned_line
+    if line := worker_pinned_line(p):
+        print(line)
     for c in _push.unexcluded_log_checks(checks):
         print(f"delivery.push_checks: {c!r} also checks committed *.log output, whose captured lines keep "
               f"trailing whitespace; add the pathspec `-- . {_push.LOG_EXCLUDE}`")

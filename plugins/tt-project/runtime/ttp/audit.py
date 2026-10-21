@@ -377,6 +377,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             q = 0
         if q:
             out.append(f"upstream fixes confirmed by quiet: {q}")
+        from .coordinator import worker_pinned_line
+        if pinned := worker_pinned_line(p):
+            out.append(pinned)
     return out or [NOTHING]
 
 

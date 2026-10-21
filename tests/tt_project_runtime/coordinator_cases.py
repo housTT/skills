@@ -5891,22 +5891,27 @@ def test_the_same_update_from_a_later_turn_is_still_written(env, tmp_path):
 
 
 
-def test_pinned_memory_survives_an_overflow_and_alerts_the_coordinator_once(env):
+def test_pinned_memory_overflow_is_marked_in_the_prompt_and_alerts_the_coordinator_once(env):
     p = make(env)
     from ttp import coordinator as coord
-    from ttp.prompts import worker_system
+    from ttp.prompts import worker_context, worker_system
     big = [("restriction" if i % 2 else "resource", f"RULE-{i} " + "y" * 900) for i in range(10)]
     _memories(p, [("fact", "OLD-FACT")] + big)
     assert coord.apply(p, [{"type": "memory_add", "text": "NEW-FACT"}], turn=1) == []
     system = worker_system(p)
-    assert all(f"RULE-{i} " in system for i in range(10)), "pinned entries were dropped"
+    use = worker_context(p)[2]
+    n = use["pinned_dropped"]
+    shown = [i for i in range(10) if f"RULE-{i} " in system]
+    assert 0 < n < 10 and shown == list(range(10 - n)), (n, shown)   # the oldest that fit, whole
+    assert f"({n} more pinned memory entries for workers did not fit this prompt: read them in {p.memory_dir}/)" \
+        in system
     assert "NEW-FACT" not in system and "OLD-FACT" not in system
     alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
-    assert len(alerts()) == 1 and "exceeds the workers' 8000-char budget" in alerts()[0]["text"]
+    assert len(alerts()) == 1 and f"so {n} of them reach workers only as a pointer" in alerts()[0]["text"]
     assert coord.apply(p, [{"type": "memory_add", "text": "ANOTHER-FACT"}], turn=2) == []
     assert len(alerts()) == 1, "the alert repeats"
     digest = coord.digest(p, {}, [], [])
-    assert "## Memory over budget: 13 entries" in digest and "workers see 10" in digest
+    assert "## Memory over budget: 13 entries" in digest and f"workers see {10 - n}" in digest
 
 
 
@@ -13550,3 +13555,52 @@ def test_a_spec_that_states_another_tasks_status_gets_its_live_record_at_dispatc
     assert "machine change #1 on box-a (closed: switched back)" in worker_task(p, p.db.task(tid), str(p.root), None)
     plain = p.db.add_task("plain", "Nothing named here; see user msg #3.", kind="code")
     assert "## Facts at send time" not in worker_task(p, p.db.task(plain), str(p.root), None)
+
+
+_LONG_GOALS_CHARTER = ("# demo — charter\n\n## Goals\n"
+                       + "".join(f"Goal {i}: make the widget faster on every board it runs on. " + "g" * 140 + "\n\n"
+                                 for i in range(34))
+                       + "## Restrictions\n- Push only to branch dev/widget. Never push to main.\n"
+                       "- Keep content generic: no hostnames or credentials.\n\n"
+                       "## Policies\n- Delivery: workers commit on their own branch and run the tests first.\n"
+                       "- Style: workers keep answers short and plain.\n\n"
+                       "## Resources\n- Box A (alias box-a): the only machine for benchmark jobs.\n")
+
+
+def test_worker_memory_keeps_charter_policies_drops_restated_restrictions_and_marks_overflow(env, capsys):
+    """A charter whose Goals take most of the workers' budget, memory restrictions that restate the
+    charter's, and pinned memory several times the budget: every worker policy stays, restated
+    restrictions are left out (the binding block has them), and the pinned entries that do not fit
+    are counted in a marker naming where to read them, with a doctor and daily-review line."""
+    p = make(env)
+    from ttp import audit, coordinator as coord
+    from ttp.prompts import WORKER_MEMORY_CHARS, worker_context, worker_system
+    p.charter_path.write_text(_LONG_GOALS_CHARTER)
+    assert len(_LONG_GOALS_CHARTER.split("## Restrictions")[0]) > 6500
+    _memories(p, [("restriction", "Push only to branch dev/widget."),
+                  ("restriction", "keep content   GENERIC: no hostnames or credentials"),
+                  ("restriction", "Never push."),   # not what the charter says: kept
+                  ("fact", "FACT-NEWEST workers may reuse the build cache.")]
+              + [("restriction", f"RULE-{i:02} " + "r" * 900) for i in range(30)])
+    system = worker_system(p)
+    block = system[system.index("# CHARTER"):]
+    text, mem, use = worker_context(p)
+    for policy in ("- Delivery: workers commit on their own branch", "- Style: workers keep answers short"):
+        assert policy in block, policy
+    assert use["charter_dropped"] == 0
+    names = [e["line"] for e in mem]
+    assert not any("Push only to branch dev/widget." in x or "GENERIC" in x for x in names), names
+    assert any(x.endswith("] Never push.") for x in names) and use["duplicates"] == 2
+    assert 0 < use["pinned_dropped"] < 30 and use["shown"] == len(mem)
+    n = use["pinned_dropped"]
+    assert f"{n} more pinned memory entries for workers did not fit" in block and str(p.memory_dir) in block
+    assert len(block) <= WORKER_MEMORY_CHARS + WORKER_MEMORY_CHARS // 2, len(block)
+    line = coord.worker_pinned_line(p)
+    assert f"leaves {n} of 31 pinned entries out of worker prompts" in line, line
+    assert line in audit.lines(p.db, p=p)
+    from ttp import cli
+    cli.main(["doctor", p.name])
+    assert line in capsys.readouterr().out
+    coord.memory_budget_check(p)
+    alerts = p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
+    assert len(alerts) == 1 and f"{n} of them" in alerts[0]["text"]
