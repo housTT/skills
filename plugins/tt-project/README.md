@@ -57,7 +57,9 @@ Needs Python 3.9+, `git`, and Claude Code, Codex or Cursor. In a terminal:
 curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/smartonTT/tt-project/plugins/tt-project/install.sh | TT_PROJECT_REF=smartonTT/tt-project sh
 ```
 Or just tell your agent "install tt-project from https://github.com/tenstorrent/skills".
+
 Then reload your agent session. 
+
 Rerun the above to get the latest version. 
 
 If you're starting to work on a remote box you haven't worked on before (not project specific), you can say in the chat "/tt-project setup box box-a" and it will ask you a few questions and set up what you like: claude, claude cursor plugin, tt-device-mcp, and other options. You can also tell it to set up things that are not part of the skill. 
