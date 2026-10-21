@@ -46,6 +46,57 @@ HOST_OPS_COLUMNS = ("id", "host_work", "when", "counts_as_host_op", "reason")
 HOST_OP_VALUES = ("yes", "no")
 MATCH_KEY = ("stage", "ttnn_api", "device_op", "program_factory")
 
+# The four ways a run learns what the model launches, least to most exact. A graph capture names
+# every launch's device op and program factory with the call's real arguments; a kernel cache holds
+# the compiled kernels themselves. Tracy sees op codes, not factories; the static trace sees code.
+SOURCE_METHODS = ("static", "tracy", "graph", "cache")
+METHOD_LABELS = {
+    "static": "Static trace of the model code",
+    "tracy": "Tracy profile of the entry test",
+    "graph": "ttnn graph capture of the entry test",
+    "cache": "Kernel cache of the entry test (elfray)",
+}
+GRAPH_OPS_COLUMNS = ("id", "op_code", "device_op", "program_factory", "program_factory_type", "ttnn_apis",
+                     "launches", "launches_per_inference", "cache_misses")
+GRAPH_HOST_TRANSFERS_COLUMNS = ("id", "transfer", "after_op_code", "before_op_code", "count")
+# Same columns as the elfray Cache API Analyzer's compute and data-movement tables, so a sheet and
+# the extension's view of one cache can be compared cell by cell. "TTNN Ops" is elfray's name for
+# the enclosing compute-API call (for example pack_tile), not a ttnn operation.
+CACHE_COMPUTE_COLUMNS = ("id", "API", "Kernels", "TTNN Ops", "Op Args", "Input Data Formats",
+                         "Output Data Formats", "Tile Dims", "Math Fidelity", "Math Approx", "FP32 Dest Accum",
+                         "Dst Sync Mode")
+CACHE_DATAFLOW_COLUMNS = ("id", "API", "Kernels", "Layer", "Processor(s)", "Op Args", "Enclosing Dataflow API")
+CACHE_KERNELS_COLUMNS = ("id", "kernel", "kind", "compile_hash", "api_calls", "errors")
+LLK_GAP_VERDICTS = ("gap", "renamed", "not a gap")
+LLK_GAPS_COLUMNS = ("id", "kind", "name", "quasar_status", "review", "review_note", "template_args",
+                    "missing_template_args",
+                    "quasar_template_args", "missing_runtime_args", "similar_quasar_apis", "quasar_definitions",
+                    "configs", "cache_rows", "kernels")
+
+
+# The source measurement item of each measured method and the run.json key its script records.
+METHOD_ITEMS = {"tracy": ("source:tracy", "measured_ops"), "graph": ("source:graph", "graph_capture"),
+                "cache": ("source:cache", "kernel_cache")}
+
+
+def methods_used(run: dict) -> list[str]:
+    """Methods with results in this run, in SOURCE_METHODS order."""
+    done = {"static": run.get("kind") == "static"} | {m: bool(run.get(key)) for m, (_, key) in METHOD_ITEMS.items()}
+    return [m for m in SOURCE_METHODS if done[m]]
+
+
+def confidence(methods: list[str]) -> str:
+    """Run-level confidence in the kernel-op list (device op and program factory per launch).
+
+    Only a graph capture names the factory each launch used. Tracy confirms op codes and the kernel
+    cache confirms compiled kernels, neither per factory; the static trace is code read, not run.
+    """
+    if "graph" in methods:
+        return "high"
+    if "tracy" in methods or "cache" in methods:
+        return "medium"
+    return "low"
+
 # kernel_tests.py prefixes a row's evidence with its TTsim result; the written evidence follows the
 # separator. Only that prefix is split off, so a quoted C++ `||` in the evidence stays intact.
 TTSIM_PREFIX = "TTsim run: "
@@ -86,8 +137,8 @@ def op_table_columns(source: str, destinations: list[str]) -> list[str]:
 
 
 def kernel_ops_columns(source: str, destinations: list[str]) -> list[str]:
-    columns = ["id", "device_op", "program_factory", "op_code", "origin", "op_table_ids",
-               "static_launches", "static_launches_op_code", "measured_launches_op_code"]
+    columns = ["id", "device_op", "program_factory", "op_code", "origin", "sources", "op_table_ids",
+               "static_launches", "static_launches_op_code", "measured_launches_op_code", "graph_launches"]
     for target in [source, *destinations]:
         columns.append(f"{target}:statuses")
         if target in TEST_TARGETS:
@@ -100,7 +151,10 @@ SHEET_TABS = (
     ("op_table", "Op table"), ("kernel_ops", "Kernel ops"), ("kernel_test_results", "Kernel tests"),
     ("call_trace", "Call trace"), ("port_blockers", "Port blockers"),
     ("host_ops", "Host ops"), ("measured_ops", "Measured ops"), ("host_fallback", "Host fallback"),
-    ("footprint", "Footprint"), ("diff", "Static vs measured"),
+    ("footprint", "Footprint"), ("diff", "Static vs measured"), ("graph_ops", "Graph capture"),
+    ("graph_host_transfers", "Graph host transfers"), ("cache_compute", "Cache: compute APIs"),
+    ("cache_dataflow", "Cache: dataflow APIs"), ("cache_kernels", "Cache: kernels"),
+    ("llk_gaps_quasar", "LLK gaps (Quasar)"),
 )
 FIELD_LABELS = {
     "id": "#", "stage": "Stage", "origin": "Origin (static / measured)", "ttnn_api": "ttnn API", "op_code": "Op code (Tracy)",
@@ -112,6 +166,15 @@ FIELD_LABELS = {
     "static_launches": "Static launches",
     "static_launches_op_code": "Static launches (all factories of this op code)",
     "measured_launches_op_code": "Measured launches (op code)", "host_work": "Host work", "counts_as_host_op": "Counts as host op",
+    "sources": "Seen by", "graph_launches": "Graph launches per inference",
+    "program_factory_type": "Program factory (full type)", "ttnn_apis": "ttnn API",
+    "launches_per_inference": "Launches per inference", "cache_misses": "Program cache misses",
+    "after_op_code": "After op code", "before_op_code": "Before op code", "compile_hash": "Compile hash",
+    "api_calls": "API calls", "quasar_status": "Quasar (by name)", "review": "Review",
+    "review_note": "Review note", "template_args": "Template args (cache)",
+    "missing_template_args": "Not taken on Quasar", "quasar_template_args": "Quasar template args",
+    "missing_runtime_args": "Runtime args not taken on Quasar", "similar_quasar_apis": "Similar Quasar APIs",
+    "quasar_definitions": "Quasar definitions", "cache_rows": "Cache rows",
 }
 TARGET_FIELD_LABELS = {
     "shapes": "shapes and dtypes", "launches": "launches per inference",
@@ -124,6 +187,8 @@ FIELD_WIDTHS = {
     "grid_dependency": 220, "shapes": 260, "launches": 90, "status": 80, "evidence": 360,
     "ops": 220, "notes": 300, "blocker": 260, "required_change": 300, "host_work": 260, "reason": 320,
     "profile": 70, "repeats": 70, "launches_per_repeat": 90,
+    "program_factory_type": 360, "ttnn_apis": 220, "API": 420, "Kernels": 260, "Op Args": 300,
+    "TTNN Ops": 200, "errors": 300,
 }
 DEFAULT_WIDTH = 160
 
@@ -132,6 +197,9 @@ def display_header(column: str) -> str:
     if ":" in column:
         target, field = column.split(":", 1)
         return f"{TARGET_LABELS.get(target, target)}: {TARGET_FIELD_LABELS.get(field, field.replace('_', ' '))}"
+    if column != column.lower():
+        # Already a display name (the elfray cache columns).
+        return column
     return FIELD_LABELS.get(column, column.replace("_", " ").capitalize())
 
 

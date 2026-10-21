@@ -80,13 +80,70 @@ Written by `tracy_report.py` for the `source:tracy` item; `merge_measured.py` re
 
 ## kernel_ops.csv (one row per kernel op)
 
-`id`, `device_op`, `program_factory`, `op_code`, `origin`, `op_table_ids` (the op_table rows of this
-kernel op), `static_launches` (traced launches of these rows), `static_launches_op_code` and
-`measured_launches_op_code` (all launches of this op code, traced and measured; Tracy reports op
-codes, not factories, so the measured count is per op code and repeats on every kernel op that
-shares it), then per target (source, then destinations) `<t>:statuses` (count of each status over
+`id`, `device_op`, `program_factory`, `op_code`, `origin` (`static`, `measured`, `static+measured`,
+or `graph` for a kernel op only the graph capture saw), `sources` (the methods that saw it, from
+`static`, `tracy`, `graph`; `tracy (op code)` when several kernel ops share the op code Tracy
+saw), `op_table_ids` (the op_table rows of this kernel op), `static_launches`
+(traced launches of these rows), `static_launches_op_code` and `measured_launches_op_code` (all
+launches of this op code, traced and measured; Tracy reports op codes, not factories, so the
+measured count is per op code and repeats on every kernel op that shares it), `graph_launches`
+(launches per inference of this device op and factory in the graph capture), then per target (source, then destinations) `<t>:statuses` (count of each status over
 its rows), and for Quasar targets `<t>:tests` and `<t>:test_results`. Written by `kernel_ops.py`;
 `summary.md` starts with this table and the spreadsheet shows it as the Kernel ops tab.
+
+## graph_ops.csv and graph_host_transfers.csv (graph capture)
+
+Written by `graph_report.py` for the `source:graph` item. `graph_ops.csv`: `id`, `op_code` (the
+device-operation class, as Tracy names it), `device_op` (`ttnn::prim::` name), `program_factory`
+(the factory type without leading namespaces, as op_table.csv names it), `program_factory_type`
+(the full C++ type), `ttnn_apis` (top-level ttnn calls that launched it), `launches` (in the whole
+capture), `launches_per_inference`, `cache_misses` (launches that built a new program).
+
+`graph_host_transfers.csv`: `id`, `transfer` (`to_torch`, `from_torch`, `from_device`, `to_device`,
+`copy_host_to_device`, `copy_device_to_host`; a transfer inside another counts once, as the outer
+one), `after_op_code` and `before_op_code` (the launches around it), `count`. Only transfers between
+the first and the last launch are listed.
+
+## cache_compute.csv, cache_dataflow.csv and cache_kernels.csv (kernel cache)
+
+Written by `cache_report.py` for the `source:cache` item, with the columns of the elfray VS Code
+extension's Cache API Analyzer tables so the two can be compared cell by cell.
+
+`cache_compute.csv`, one row per distinct compute API call across kernels: `id`, `API` (name and
+template arguments), `Kernels`, `TTNN Ops` (elfray's name for the enclosing compute-API call, such
+as `pack_tile`; not a ttnn operation), `Op Args` (constant runtime arguments; `=?` when dynamic),
+`Input Data Formats` and `Output Data Formats` (per circular buffer), `Tile Dims`, `Math Fidelity`,
+`Math Approx`, `FP32 Dest Accum`, `Dst Sync Mode`.
+
+`cache_dataflow.csv`, one row per distinct data-movement call: `id`, `API`, `Kernels`, `Layer`,
+`Processor(s)` (`brisc`, `ncrisc`), `Op Args`, `Enclosing Dataflow API`.
+
+`cache_kernels.csv`, one row per kernel build: `id`, `kernel`, `kind` (`compute`,
+`data_movement`), `compile_hash`, `api_calls` (calls collected in the selected layers), `errors`.
+
+## llk_gaps_quasar.csv (Quasar LLK gap check)
+
+Written by `llk_gaps.py check` from a compute table; `llk_gaps.py review` sets the verdicts. One row
+per LLK API and per data format: `id`, `kind` (`llk_api`, `data_format`), `name`, `quasar_status`
+(`present`, `signature differs`, `missing`, or `not an LLK` for a non-LLK call), `review` (`gap`,
+`renamed`, `not a gap`; empty until read), `review_note` (the Quasar source that decides it),
+`template_args` (template argument names the kernels instantiated), `missing_template_args` (those
+the closest Quasar overload does not take), `quasar_template_args` (that overload's),
+`missing_runtime_args`, `similar_quasar_apis` (Quasar LLK names sharing the longest prefix, for a
+missing API), `quasar_definitions` (`file:line` of each Quasar definition), `configs` (distinct
+template configurations), `cache_rows`, `kernels`.
+
+## Analysis methods and confidence
+
+Four methods tell a run what the model launches, from least to most exact: the static trace (code
+read at the pinned commit), Tracy (op codes the entry test launched), the graph capture (device op
+and program factory of every launch, with the call's real arguments) and the kernel cache (the
+compiled kernels and the APIs inside them). `opa_schema.methods_used` lists the ones a run has;
+`opa_schema.confidence` gives the run's confidence in its list of kernel ops (device op and program
+factory per launch): `high` with a graph capture, the only method that names the factory of each
+launch; `medium` with Tracy or the kernel cache, which confirm op codes or compiled kernels but not
+factories; `low` with the static trace only. The
+spreadsheet's Info tab and `summary.md` both state the methods and the confidence.
 
 ## kernel_tests_plan_<target>.csv and kernel_test_results_<target>.csv (TTsim)
 

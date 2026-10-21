@@ -27,7 +27,7 @@ def test_plugin_skills_and_phase_references():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.6.3"
+    assert claude["version"] == codex["version"] == "0.7.0"
 
 
 def test_shared_setup_is_step_by_step():
@@ -623,7 +623,11 @@ def test_schemas_doc_lists_every_column():
              | set(tracy_report.MEASURED_COLUMNS) | set(tracy_report.HOST_FALLBACK_COLUMNS)
              | set(tracy_report.FOOTPRINT_COLUMNS) | set(diff_reports.DIFF_COLUMNS)
              | set(compare_runs.CHANGE_COLUMNS) | set(kernel_tests.KERNEL_TEST_COLUMNS)
-             | {"op_table_ids", "static_launches", "static_launches_op_code", "measured_launches_op_code"})
+             | set(opa_schema.GRAPH_OPS_COLUMNS) | set(opa_schema.GRAPH_HOST_TRANSFERS_COLUMNS)
+             | set(opa_schema.CACHE_COMPUTE_COLUMNS) | set(opa_schema.CACHE_DATAFLOW_COLUMNS)
+             | set(opa_schema.CACHE_KERNELS_COLUMNS)
+             | {"op_table_ids", "static_launches", "static_launches_op_code", "measured_launches_op_code",
+                "sources", "graph_launches"})
     missing = sorted(n for n in names if f"`{n}`" not in doc)
     assert not missing, f"schemas.md does not document {missing}"
 
@@ -635,7 +639,7 @@ def test_skill_flow_and_gates():
     for phrase in ("runs.py list", "measurements.py list", "add a destination"):
         assert phrase in text
     for gate in ("validate_static.py", "same_commit.py", "merge_measured.py", "kernel_tests.py",
-                 "kernel_ops.py", "runs.py", "measurements.py"):
+                 "kernel_ops.py", "runs.py", "measurements.py", "graph_report.py", "cache_report.py"):
         assert f"<plugin-root>/scripts/{gate}" in text
     assert "`<plugin-root>` is the `tt-model-op-analysis` plugin directory" in text
 
@@ -1420,7 +1424,7 @@ def test_marked_items_and_pending_filter(tmp_path):
     (run / "run.json").write_text(json.dumps(data))
     pending = [i["item"] for i in json.loads(run_script("measurements.py", "list", str(run), "--json",
                                                         "--pending").stdout)]
-    assert pending == ["quasar-bf16:kernel-tests ⚠️"]
+    assert pending == ["source:graph", "source:cache", "quasar-bf16:kernel-tests ⚠️"]
     assert run_script("measurements.py", "mark", str(run), "bogus", "done").returncode == 2
 
 
@@ -1592,9 +1596,479 @@ def test_skill_asks_output_root_before_listing_runs():
 def test_skill_reprobes_device_before_offering_tracy():
     step = _skill_step(6)
     assert "probe the source device again" in step
-    assert "measurements.py mark <run dir> source:tracy failed" in step
+    assert "measurements.py mark <run dir> <item> failed" in step
+    assert "`source:tracy`, `source:graph` and `source:cache` come from" in step
 
 
 def test_skill_destination_step_names_quasar_code_modes():
     step = _skill_step(5)
     assert "`quasar`" in step and "`quasar-bf16`" in step
+
+
+# Graph capture and kernel cache (0.7.0)
+
+
+def _graph_node(counter, kind, **params):
+    return {"connections": [], "counter": counter, "node_type": kind, "params": params}
+
+
+def graph_capture(path: pathlib.Path, launches: list[tuple], sha: str = "", transfers_at: tuple = (),
+                  uploads_at: tuple = ()) -> pathlib.Path:
+    """launches: (ttnn api, prim, op code, factory type); transfers_at / uploads_at: launch indices to put
+    a to_torch / copy_host_to_device_tensor before."""
+    nodes = [_graph_node(0, "capture_start")]
+
+    def add(kind, **params):
+        nodes.append(_graph_node(len(nodes), kind, **params))
+
+    def transfer():
+        # ttnn.to_torch reads the tensor back (from_device) and then converts it, as two sibling calls.
+        add("function_start", name="ttnn.to_torch")
+        add("function_start", name="ttnn.from_device")
+        add("function_start", name="Tensor::cpu")
+        add("function_end", name="Tensor::cpu")
+        add("function_end", name="ttnn.from_device")
+        add("function_start", name="tt::tt_metal::detail::convert_tt_tensor_to_framework_tensor")
+        add("function_end", name="tt::tt_metal::detail::convert_tt_tensor_to_framework_tensor")
+        add("function_end", name="ttnn.to_torch")
+
+    def upload():
+        add("function_start", name="ttnn.copy_host_to_device_tensor")
+        add("function_start", name="tt::tt_metal::copy_to_device")
+        add("function_end", name="tt::tt_metal::copy_to_device")
+        add("function_end", name="ttnn.copy_host_to_device_tensor")
+
+    transfer()
+    for n, (api, prim, code, factory) in enumerate(launches):
+        if n in transfers_at:
+            transfer()
+        if n in uploads_at:
+            upload()
+        add("function_start", name=api)
+        add("function_start", name=prim)
+        add("function_start", name=code, program_cache_hit=n > 0, program_factory_index=0,
+            program_factory_type=factory)
+        for name in (code, prim, api):
+            add("function_end", name=name)
+    transfer()
+    path.write_text(json.dumps({"version": 1, "graph": nodes, "metadata": {"git_sha": sha, "dirty": False}}))
+    return path
+
+
+def test_short_factory_keeps_nested_class_and_templates():
+    sys.path.insert(0, str(SCRIPTS))
+    import graph_report
+    assert graph_report.short_factory("ttnn::operations::pool::Pool2D::MultiCore") == "Pool2D::MultiCore"
+    assert graph_report.short_factory("ttnn::prim::ReshardSameWidthFactory<true>") == "ReshardSameWidthFactory<true>"
+    assert graph_report.short_factory("ttnn::a::F<ttnn::b::X>") == "F<ttnn::b::X>"
+
+
+def test_graph_report_counts_launches_per_factory_and_inside_transfers(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    one = [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "ttnn::operations::op1::Op1Factory"),
+           ("ttnn.foo", "ttnn::prim::foo", "FooDeviceOperation", "ttnn::operations::foo::FooFactory")]
+    capture = graph_capture(tmp_path / "g.json", one * 2, transfers_at=(1,), uploads_at=(2,))
+    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "2", "--date", "2026-10-21")
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = read(run / "graph_ops.csv")
+    assert [(x["op_code"], x["program_factory"], x["launches"], x["launches_per_inference"], x["cache_misses"])
+            for x in rows] == [("Op1DeviceOperation", "Op1Factory", "2", "1", "1"),
+                               ("FooDeviceOperation", "FooFactory", "2", "1", "0")]
+    assert rows[0]["device_op"] == "ttnn::prim::op1" and rows[0]["ttnn_apis"] == "ttnn.op1"
+    # Transfers between launches count once each, as the outer ttnn call; the leading and trailing
+    # to_torch are outside the forward.
+    moves = read(run / "graph_host_transfers.csv")
+    assert [(m["transfer"], m["after_op_code"], m["before_op_code"], m["count"]) for m in moves] == [
+        ("to_torch", "Op1DeviceOperation", "FooDeviceOperation", "1"),
+        ("copy_host_to_device", "FooDeviceOperation", "Op1DeviceOperation", "1")]
+    recorded = json.loads((run / "run.json").read_text())["graph_capture"]
+    assert (recorded["launches"], recorded["kernel_ops"], recorded["host_transfers_inside"]) == (4, 2, 2)
+
+
+def test_graph_report_refuses_other_commit_and_factoryless_capture(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["tt_metal_commit"] = "a" * 40
+    (run / "run.json").write_text(json.dumps(data))
+    other = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::F")],
+                          sha="b" * 40)
+    r = run_script("graph_report.py", str(other), str(run), "--inferences", "1")
+    assert r.returncode == 2 and "pinned" in r.stdout and not (run / "graph_ops.csv").exists()
+    (tmp_path / "empty.json").write_text(json.dumps({"graph": [_graph_node(0, "capture_start")]}))
+    r = run_script("graph_report.py", str(tmp_path / "empty.json"), str(run), "--inferences", "1")
+    assert r.returncode == 2 and "program factory" in r.stdout
+
+
+def test_kernel_ops_adds_graph_launches_and_graph_only_rows(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1, device_op="ttnn::prim::op1")], [trace_row(1, 1, 1)])
+    capture = graph_capture(tmp_path / "g.json", [
+        ("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "ttnn::operations::op1::Op1Factory"),
+        ("ttnn.foo", "ttnn::prim::foo", "FooDeviceOperation", "ttnn::operations::foo::FooFactory")])
+    assert run_script("graph_report.py", str(capture), str(run), "--inferences", "1").returncode == 0
+    assert run_script("kernel_ops.py", str(run)).returncode == 0
+    rows = read(run / "kernel_ops.csv")
+    assert [(r["op_code"], r["origin"], r["graph_launches"], r["sources"]) for r in rows] == [
+        ("Op1DeviceOperation", "static", "1", "static, graph"),
+        ("FooDeviceOperation", "graph", "1", "graph")]
+    kernel = tab(sheet(run), "Kernel ops")
+    header = kernel[0]
+    assert "Graph launches per inference" in header and "Seen by" in header
+    assert dict(zip(header, kernel[2]))["Device op / program factory"] == "prim::foo / FooFactory"
+
+
+FAKE_ELFRAY = """#!{python}
+import json, pathlib, sys
+a = sys.argv[1:]
+if "--help" in a:
+    print("  --inlined-calls every inlined call"); sys.exit(0)
+side = json.loads(pathlib.Path(a[-1] + ".json").read_text())
+if a[0] == "--inlined-calls":
+    print(json.dumps(side)); sys.exit(0)
+print(json.dumps({{"kind": "enum", "name": a[1], "values": [{{"value": 5, "name": "Float16_b"}},
+                                                         {{"value": 6, "name": "Bfp8_b"}}]}}))
+"""
+
+
+def _elf(path: pathlib.Path, calls: list[dict], dwarf: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x7fELF")
+    doc = {"elfray_schema": 2, "kind": "inlined_calls", "machine": "riscv", "dwarf": dwarf,
+           "functions": [{"name": "kernel_main", "low_pc": "0x0", "calls": calls}]}
+    pathlib.Path(str(path) + ".json").write_text(json.dumps(doc))
+
+
+def _call(name, depth, template=(), runtime=(), source=None):
+    call = {"name": name, "qualified_name": name, "depth": depth, "call_line": 1, "call_column": 1,
+            "template_args": [{"name": n, "value": v, "type": None, "enum": None, "display": v} for n, v in template],
+            "runtime_args": [{"name": n, "is_static": v is not None, "static_values": v or []} for n, v in runtime]}
+    if source:
+        call["source_file"] = source
+    return call
+
+
+def kernel_cache(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    engine = tmp_path / "elfray"
+    engine.write_text(FAKE_ELFRAY.format(python=sys.executable))
+    engine.chmod(0o755)
+    kernels = tmp_path / "cache" / "key" / "4097" / "kernels"
+    for compile_hash in ("111", "222"):
+        build = kernels / "eltwise" / compile_hash
+        _elf(build / "trisc0" / "trisc0.elf", [_call("add_tiles", 1, source="hw/inc/api/compute/eltwise.h"),
+                                               _call("llk_unpack_AB", 2, [("BType", "NONE")],
+                                                     [("operandA", [0]), ("operandB", [1]), ("idx", None)])])
+        _elf(build / "trisc1" / "trisc1.elf", [_call("llk_math_eltwise_binary", 1, [("type", "ELWADD")],
+                                                     [("dst_index", [0, 1, 2, 5])])])
+        _elf(build / "trisc2" / "trisc2.elf", [_call("pack_tile", 1, source="hw/inc/api/compute/pack.h"),
+                                               _call("llk_pack", 2, runtime=[("output", [16])])])
+        (build / "chlkc_descriptors.h").write_text(
+            "constexpr std::int32_t unpack_src_format[32] = {5,6,255};\n"
+            "constexpr std::int32_t pack_dst_format[32] = {255,255,255,255,255,255,255,255,255,255,255,255,255,"
+            "255,255,255,5};\n"
+            "constexpr bool DST_ACCUM_MODE = false;\n#define DST_SYNC_MODE DstSync::SyncHalf\n"
+            "constexpr ckernel::MathFidelity MATH_FIDELITY = static_cast<ckernel::MathFidelity>(4);\n")
+    _elf(kernels / "reader" / "333" / "brisc" / "brisc.elf",
+         [_call("noc_async_read_tile", 1, source="hw/inc/api/dataflow/dataflow_api.h"),
+          _call("cb_push_back", 1, runtime=[("cb_id", [0]), ("pages", None)])])
+    _elf(kernels / "nodebug" / "444" / "ncrisc" / "ncrisc.elf", [], dwarf=False)
+    _elf(tmp_path / "cache" / "key" / "4097" / "firmware" / "trisc0" / "trisc0.elf", [_call("llk_firmware", 1)])
+    return tmp_path / "cache", engine
+
+
+def test_cache_report_builds_elfray_tables(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    cache, engine = kernel_cache(tmp_path)
+    r = run_script("cache_report.py", str(cache), str(run), "--elfray", str(engine), "--date", "2026-10-21")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "WARNING: nodebug 444" in r.stdout and "TT_METAL_RISCV_DEBUG_INFO=1" in r.stdout
+    compute = {row["API"]: row for row in read(run / "cache_compute.csv")}
+    assert set(compute) == {"llk_unpack_AB<BType=NONE>", "llk_math_eltwise_binary<type=ELWADD>", "llk_pack"}
+    unpack = compute["llk_unpack_AB<BType=NONE>"]
+    # Two compile hashes of one kernel collapse into one row naming the kernel once.
+    assert unpack["Kernels"] == "eltwise" and unpack["TTNN Ops"] == "add_tiles"
+    assert unpack["Op Args"] == "operandA=0, operandB=1, idx=?"
+    assert unpack["Input Data Formats"] == "cb0=Float16_b, cb1=Bfp8_b" and unpack["Output Data Formats"] == "-"
+    assert compute["llk_math_eltwise_binary<type=ELWADD>"]["Op Args"] == "dst_index={0..2,5}"
+    assert compute["llk_pack"]["Output Data Formats"] == "cb16=Float16_b"
+    assert (unpack["Math Fidelity"], unpack["FP32 Dest Accum"], unpack["Dst Sync Mode"]) == ("HiFi4", "false", "SyncHalf")
+    dataflow = [(row["API"], row["Processor(s)"], row["Op Args"]) for row in read(run / "cache_dataflow.csv")]
+    assert dataflow == [("cb_push_back", "brisc", "cb_id=0, pages=?"), ("noc_async_read_tile", "brisc", "-")]
+    kernels = read(run / "cache_kernels.csv")
+    assert sorted(k["kernel"] for k in kernels) == ["eltwise", "eltwise", "nodebug", "reader"]
+    recorded = json.loads((run / "run.json").read_text())["kernel_cache"]
+    assert (recorded["kernel_builds"], recorded["compute_rows"], recorded["builds_with_errors"]) == (4, 3, 1)
+
+
+def test_cache_report_without_engine_or_with_bad_layers(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    cache, engine = kernel_cache(tmp_path)
+    r = run_script("cache_report.py", str(cache), str(run), "--elfray", str(tmp_path / "missing"))
+    assert r.returncode == 3 and "install.sh" in r.stdout
+    r = run_script("cache_report.py", str(cache), str(run), "--elfray", str(engine), "--layers", "llk_api,bogus")
+    assert r.returncode == 2 and "bogus" in r.stdout
+    r = run_script("cache_report.py", str(cache), str(run), "--elfray", str(engine), "--layers", "noc_api")
+    assert r.returncode == 2 and "no API call" in r.stdout
+    assert "kernel_cache" not in json.loads((run / "run.json").read_text())
+
+
+def test_source_items_and_confidence_follow_the_methods_run(tmp_path):
+    sys.path.insert(0, str(SCRIPTS))
+    import opa_schema
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    items = {i["item"]: i["state"] for i in json.loads(run_script("measurements.py", "list", str(run), "--json").stdout)}
+    assert [items[k] for k in ("source:tracy", "source:graph", "source:cache")] == ["pending"] * 3
+    info = tab(sheet(run), "Info")
+    assert ["Confidence", "low: read from the model code at the pinned commit; nothing was run"] in info
+    capture = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::Op1Factory")])
+    assert run_script("graph_report.py", str(capture), str(run), "--inferences", "1").returncode == 0
+    items = {i["item"]: i["state"] for i in json.loads(run_script("measurements.py", "list", str(run), "--json").stdout)}
+    assert items["source:graph"] == "done" and items["source:cache"] == "pending"
+    info = tab(sheet(run), "Info")
+    methods = info.index(["Analysis methods", "State"])
+    assert [r[0] for r in info[methods + 1:methods + 6]] == [
+        *(opa_schema.METHOD_LABELS[m] for m in opa_schema.SOURCE_METHODS), "Confidence"]
+    assert info[methods + 3][1].startswith("done") and info[methods + 4][1] == "not run"
+    assert info[methods + 5][1].startswith("high:")
+    assert opa_schema.confidence(["static", "tracy"]) == "medium"
+    assert opa_schema.confidence(["static", "cache"]) == "medium"
+    assert run_script("measurements.py", "mark", str(run), "source:cache", "failed", "--note", "no elfray").returncode == 0
+    info = tab(sheet(run), "Info")
+    assert info[methods + 4][1].startswith("failed") and info[methods + 4][1].endswith("no elfray")
+
+
+def test_kernel_ops_graph_names_measured_only_rows_and_tracy_is_per_op_code(tmp_path):
+    rows = [op_row(1, 1, op_code="MmDeviceOperation", device_op="prim::mm", program_factory="Mm1D",
+                   origin="static+measured"),
+            op_row(2, 1, op_code="MmDeviceOperation", device_op="prim::mm", program_factory="Mm2D",
+                   origin="static+measured"),
+            op_row(3, 1, op_code="FooDeviceOperation", device_op="", program_factory="", origin="measured",
+                   call_site="not traced", grid_dependency="not traced", stage="measured only FooDeviceOperation")]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 2)])
+    write_rows(run / "graph_ops.csv", [
+        {"id": "1", "op_code": "MmDeviceOperation", "device_op": "ttnn::prim::mm", "program_factory": "Mm1D",
+         "program_factory_type": "ttnn::prim::Mm1D", "ttnn_apis": "ttnn.linear", "launches": "1",
+         "launches_per_inference": "1", "cache_misses": "1"},
+        {"id": "2", "op_code": "FooDeviceOperation", "device_op": "ttnn::prim::foo", "program_factory": "FooF",
+         "program_factory_type": "ttnn::foo::FooF", "ttnn_apis": "ttnn.foo", "launches": "1",
+         "launches_per_inference": "1", "cache_misses": "1"}])
+    sys.path.insert(0, str(SCRIPTS))
+    import kernel_ops
+    out = kernel_ops.aggregate(read(run / "op_table.csv"), "p150", ["quasar-bf16"],
+                               {"MmDeviceOperation": 2, "FooDeviceOperation": 1}, graph=read(run / "graph_ops.csv"))
+    got = [(e["op_code"], e["program_factory"], e["origin"], e["graph_launches"], e["sources"]) for e in out]
+    assert got == [("MmDeviceOperation", "Mm1D", "static+measured", "1", "static, tracy (op code), graph"),
+                   ("MmDeviceOperation", "Mm2D", "static+measured", "0", "static, tracy (op code)"),
+                   ("FooDeviceOperation", "FooF", "measured", "1", "tracy, graph")]
+
+
+def test_graph_capture_plugin_is_inert_without_its_variable():
+    text = (PLUGIN / "pytest_plugins" / "opa_graph_capture.py").read_text(encoding="utf-8")
+    assert 'ENV = "OPA_GRAPH_CAPTURE"' in text and "if not os.environ.get(ENV)" in text
+    source = (PLUGIN / "references" / "measured-source.md").read_text(encoding="utf-8")
+    assert "PYTHONPATH=<plugin-root>/pytest_plugins" in source and "-p opa_graph_capture" in source
+
+
+# Source-method menu and Quasar LLK gap check (0.7.0)
+
+
+QUASAR_API = """// SPDX
+#pragma once
+template <BroadcastType BType, bool EN_32BIT_DEST>
+inline void llk_unpack_AB(const std::uint32_t operandA, const std::uint32_t operandB) {}
+
+template <bool is_fp32_dest_acc_en, /* note */ MathFidelity math_fidelity>
+inline void llk_math_eltwise_binary(std::uint32_t dst_index) {}
+
+inline void llk_math_matmul_tile(const std::uint32_t dst_index) { _llk_math_matmul_tile_(dst_index); }
+
+void caller() { return llk_math_eltwise_binary<false, 4>(0); }
+"""
+QUASAR_TYPES_H = "enum class DataFormat : std::uint8_t {\n    Float32 = 0,\n    Float16_b = 5, // E8M7\n    Invalid = 0xff\n};\n"
+
+
+def quasar_repo(tmp_path):
+    repo, _ = git_repo(tmp_path)
+    api = repo / "tt_metal/hw/ckernels/quasar/metal/llk_api/llk_api.h"
+    types = repo / "tt_metal/hw/inc/internal/tt-2xx/quasar/tensix_types.h"
+    core = repo / "tt_metal/tt-llk/tt_llk_quasar/llk_lib/llk_math_matmul.h"
+    for path, text in ((api, QUASAR_API), (types, QUASAR_TYPES_H),
+                       (core, "inline void _llk_math_matmul_tile_(const std::uint32_t dst_index) {}\n")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "quasar"], cwd=repo, check=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    return repo, sha
+
+
+def test_llk_gaps_check_and_review(tmp_path):
+    repo, sha = quasar_repo(tmp_path)
+    compute = tmp_path / "compute.csv"
+    # The elfray extension export: no id column, backticks around names.
+    write_rows(compute, [
+        {"API": "`llk_unpack_AB<BType=NONE, is_fp32_dest_acc_en=false>`", "Kernels": "eltwise",
+         "Op Args": "operandA=0, operandB=1", "Input Data Formats": "cb0=Float16_b, cb1=Bfp8_b",
+         "Output Data Formats": "-"},
+        {"API": "`llk_math_eltwise_binary<is_fp32_dest_acc_en=false, math_fidelity=HiFi4>`", "Kernels": "eltwise",
+         "Op Args": "dst_index={0..3}", "Input Data Formats": "-", "Output Data Formats": "cb16=Float16_b"},
+        {"API": "`llk_math_matmul<math_fidelity=LoFi>`", "Kernels": "mm", "Op Args": "dst_index=?",
+         "Input Data Formats": "-", "Output Data Formats": "-"},
+        {"API": "`pack_tile`", "Kernels": "mm", "Op Args": "-", "Input Data Formats": "-", "Output Data Formats": "-"},
+    ])
+    out = tmp_path / "gaps.csv"
+    r = run_script("llk_gaps.py", "check", str(compute), "--tt-metal", str(repo), "--ref", sha, "--out", str(out))
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = {(x["kind"], x["name"]): x for x in read(out)}
+    unpack = rows[("llk_api", "llk_unpack_AB")]
+    assert unpack["quasar_status"] == "signature differs"
+    assert unpack["missing_template_args"] == "is_fp32_dest_acc_en"
+    assert unpack["quasar_template_args"] == "BType, EN_32BIT_DEST"
+    assert unpack["quasar_definitions"] == "tt_metal/hw/ckernels/quasar/metal/llk_api/llk_api.h:4"
+    # The call inside caller() is not a definition; the commented template still parses.
+    binary = rows[("llk_api", "llk_math_eltwise_binary")]
+    assert binary["quasar_status"] == "present" and binary["quasar_definitions"].endswith("llk_api.h:7")
+    matmul = rows[("llk_api", "llk_math_matmul")]
+    assert matmul["quasar_status"] == "missing" and matmul["similar_quasar_apis"] == "llk_math_matmul_tile"
+    assert rows[("llk_api", "pack_tile")]["quasar_status"] == "not an LLK"
+    assert rows[("data_format", "Bfp8_b")]["quasar_status"] == "missing"
+    assert rows[("data_format", "Float16_b")]["quasar_status"] == "present"
+
+    r = run_script("llk_gaps.py", "review", str(out), matmul["id"], "renamed", "--note", "llk_api.h:9 llk_math_matmul_tile")
+    assert r.returncode == 0 and "candidates left" in r.stdout
+    assert run_script("llk_gaps.py", "review", str(out), binary["id"], "gap", "--note", "x").returncode == 2
+    assert run_script("llk_gaps.py", "review", str(out), unpack["id"], "gap", "--note", " ").returncode == 2
+    # A new check keeps the verdict.
+    assert run_script("llk_gaps.py", "check", str(compute), "--tt-metal", str(repo), "--ref", sha,
+                      "--out", str(out)).returncode == 0
+    again = {x["name"]: x for x in read(out)}
+    assert (again["llk_math_matmul"]["review"], again["llk_math_matmul"]["review_note"]) == (
+        "renamed", "llk_api.h:9 llk_math_matmul_tile")
+
+
+def test_llk_gaps_with_run_dir_records_counts(tmp_path):
+    repo, sha = quasar_repo(tmp_path)
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["tt_metal_commit"] = sha
+    (run / "run.json").write_text(json.dumps(data))
+    compute = run / "cache_compute.csv"
+    write_rows(compute, [{"id": "1", "API": "llk_math_matmul<math_fidelity=LoFi>", "Kernels": "mm", "Op Args": "-",
+                          "Input Data Formats": "-", "Output Data Formats": "-"}])
+    r = run_script("llk_gaps.py", "check", str(compute), "--tt-metal", str(repo), "--run-dir", str(run))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((run / "run.json").read_text())["llk_gaps"]["counts"] == {"llk_api missing": 1}
+    assert [t["title"] for t in sheet(run)["tabs"]][-1] == "LLK gaps (Quasar)"
+
+
+def test_source_methods_lists_all_four_with_reasons(tmp_path):
+    repo, sha = git_repo(tmp_path)
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["tt_metal_commit"] = sha
+    (run / "run.json").write_text(json.dumps(data))
+
+    def menu(*extra):
+        r = run_script("source_methods.py", str(run), "--tt-metal", str(repo), "--json", *extra)
+        assert r.returncode == 0, r.stdout + r.stderr
+        return {m["method"]: m for m in json.loads(r.stdout)}
+
+    got = menu("--device", "none", "--elfray", str(tmp_path / "missing"))
+    assert list(got) == ["static", "tracy", "graph", "cache"]
+    assert got["static"]["state"] == "done"
+    assert all(got[m]["state"] == "unavailable" and "no device" in got[m]["reason"] for m in ("tracy", "graph", "cache"))
+    got = menu("--device", "p100", "--elfray", str(tmp_path / "missing"))
+    assert "the device is p100" in got["tracy"]["reason"]
+    # Right device, but no build and no factory identity at this commit; no engine for the cache.
+    got = menu("--device", "p150", "--elfray", str(tmp_path / "missing"))
+    assert "no CMake build directory" in got["tracy"]["reason"]
+    assert "cannot read ttnn/api/ttnn/graph/graph_consts.hpp" in got["graph"]["reason"]
+    assert got["cache"]["state"] == "available, read later" and "install.sh" in got["cache"]["reason"]
+    (repo / "build").mkdir()
+    (repo / "build" / "CMakeCache.txt").write_text("ENABLE_TRACY:BOOL=ON\n")
+    consts = repo / "ttnn/api/ttnn/graph/graph_consts.hpp"
+    consts.parent.mkdir(parents=True)
+    consts.write_text('constexpr auto kProgramFactoryType = "program_factory_type";\n')
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "graph"], cwd=repo, check=True)
+    data["tt_metal_commit"] = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+                                             text=True).stdout.strip()
+    data["measured_ops"] = "m.csv"
+    (run / "run.json").write_text(json.dumps(data))
+    _, engine = kernel_cache(tmp_path)
+    got = menu("--device", "p150", "--elfray", str(engine))
+    assert [got[m]["state"] for m in ("tracy", "graph", "cache")] == ["done", "available", "available"]
+
+
+def test_skill_offers_the_method_menu():
+    step = _skill_step(6)
+    assert "<plugin-root>/scripts/source_methods.py" in step and "multi-select" in step
+    assert "<plugin-root>/scripts/llk_gaps.py" in step
+    source = (PLUGIN / "references" / "measured-source.md").read_text(encoding="utf-8")
+    assert "llk_gaps.py review" in source and "does not read DWARF itself" in source
+
+
+def test_llk_gaps_finds_macro_specified_definitions_and_refuses_commits_without_quasar(tmp_path):
+    repo, sha = quasar_repo(tmp_path)
+    api = repo / "tt_metal/hw/ckernels/quasar/metal/llk_api/llk_pack.h"
+    api.write_text("template <bool zero>\nTT_ALWAYS_INLINE void llk_pack_relu_config(const std::uint32_t config) {}\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "pack"], cwd=repo, check=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    compute = tmp_path / "compute.csv"
+    write_rows(compute, [{"API": "llk_pack_relu_config", "Kernels": "k", "Op Args": "config=0",
+                          "Input Data Formats": "cb0=Float32, cb1=Float32", "Output Data Formats": "cb16=Float32"}])
+    out = tmp_path / "gaps.csv"
+    assert run_script("llk_gaps.py", "check", str(compute), "--tt-metal", str(repo), "--ref", head,
+                      "--out", str(out)).returncode == 0
+    rows = {x["name"]: x for x in read(out)}
+    assert rows["llk_pack_relu_config"]["quasar_status"] == "present"
+    # One compute row counts once per format, however many CBs use it.
+    assert rows["Float32"]["cache_rows"] == "1"
+    (tmp_path / "old").mkdir()
+    _, old = git_repo(tmp_path / "old")
+    r = run_script("llk_gaps.py", "check", str(compute), "--tt-metal", str(tmp_path / "old" / "tt-metal"),
+                   "--ref", old, "--out", str(out))
+    assert r.returncode == 2 and "cannot be checked" in r.stdout
+
+
+def test_llk_gaps_drops_a_verdict_when_the_finding_changes(tmp_path):
+    repo, sha = quasar_repo(tmp_path)
+    compute = tmp_path / "compute.csv"
+    write_rows(compute, [{"API": "llk_unpack_AB<BType=NONE, is_fp32_dest_acc_en=false>", "Kernels": "k",
+                          "Op Args": "-", "Input Data Formats": "-", "Output Data Formats": "-"}])
+    out = tmp_path / "gaps.csv"
+    run_script("llk_gaps.py", "check", str(compute), "--tt-metal", str(repo), "--ref", sha, "--out", str(out))
+    row_id = read(out)[0]["id"]
+    assert run_script("llk_gaps.py", "review", str(out), row_id, "renamed", "--note", "EN_32BIT_DEST").returncode == 0
+    api = repo / "tt_metal/hw/ckernels/quasar/metal/llk_api/llk_api.h"
+    api.write_text("\n" + api.read_text())
+    subprocess.run(["git", "commit", "-qam", "move"], cwd=repo, check=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    run_script("llk_gaps.py", "check", str(compute), "--tt-metal", str(repo), "--ref", head, "--out", str(out))
+    assert read(out)[0]["review"] == ""
+
+
+def test_graph_entry_pass_decides_source_statuses(tmp_path):
+    rows = [op_row(1, 1, op_code="Op1DeviceOperation", **{"p150:status": "⚠️", "p150:evidence": "no passing run"}),
+            op_row(2, 1, op_code="Op2DeviceOperation", **{"p150:status": "⚠️", "p150:evidence": "no passing run"})]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 2)])
+    capture = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::Op1Factory")])
+    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-pass", "PCC 0.99",
+                   "--date", "2026-10-22")
+    assert r.returncode == 0, r.stdout + r.stderr
+    ops = read(run / "op_table.csv")
+    assert [o["p150:status"] for o in ops] == ["✅", "⚠️"]
+    assert "under a graph capture (PCC 0.99, 2026-10-22)" in ops[0]["p150:evidence"]
+    passes = json.loads((run / "run.json").read_text())["entry_test_passes"]
+    assert passes["by"] == "source:graph on a local p150 device"
+    assert validate(run).returncode == 0
+
+
+def test_source_methods_reads_an_existing_cache_without_a_device(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["measurements"] = {"source:cache": {"state": "failed", "date": "2026-10-21", "note": "no DWARF"}}
+    (run / "run.json").write_text(json.dumps(data))
+    _, engine = kernel_cache(tmp_path)
+    r = run_script("source_methods.py", str(run), "--device", "none", "--elfray", str(engine), "--json")
+    cache = next(m for m in json.loads(r.stdout) if m["method"] == "cache")
+    assert cache["state"] == "read an existing cache" and "failed earlier: no DWARF" in cache["reason"]

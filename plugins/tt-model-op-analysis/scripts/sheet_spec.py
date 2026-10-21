@@ -27,8 +27,9 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    ALWAYS, LAUNCH_PROFILES, ROW_PREFIX, SHEET_TABS, STATUS_VALUES, TARGET_LABELS, TEST_TARGETS,
-    column_width, display_header, read_csv, read_header, run_targets, split_evidence,
+    ALWAYS, LAUNCH_PROFILES, METHOD_ITEMS, METHOD_LABELS, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES, TARGET_LABELS,
+    TEST_TARGETS, column_width, confidence, display_header, methods_used, read_csv, read_header, run_targets,
+    split_evidence,
 )
 
 HEADER_GREY = {"red": 0.9, "green": 0.9, "blue": 0.9}
@@ -99,6 +100,40 @@ def describe(value) -> str:
     return str(value)
 
 
+CONFIDENCE_TEXT = {
+    "high": "a graph capture of the entry test names the device op and program factory of every launch",
+    "medium": ("a run of the entry test confirmed op codes (Tracy) or compiled kernels (kernel cache); "
+               "program factories come from the static trace"),
+    "low": "read from the model code at the pinned commit; nothing was run",
+}
+
+
+def method_state(run: dict, method: str) -> str:
+    if method in METHOD_ITEMS and not run.get(METHOD_ITEMS[method][1]):
+        mark = run.get("measurements", {}).get(METHOD_ITEMS[method][0], {})
+        if mark.get("state") == "failed":
+            return f"failed {mark.get('date', '')}: {mark.get('note', '')}".rstrip(": ")
+    if method == "static":
+        return f"done at {run.get('tt_metal_commit', '')[:7]}" if run.get("kind") == "static" else "not run"
+    if method == "tracy":
+        if not run.get("measured_ops"):
+            return "not run"
+        return f"done: {run.get('measured_inferences', 1)} inference(s) in the measured window"
+    if method == "graph":
+        g = run.get("graph_capture")
+        if not g:
+            return "not run"
+        return (f"done {g['date']}: {g['launches']} launches over {g['inferences']} inference(s), "
+                f"{g['kernel_ops']} (op code, program factory) pairs, {g['host_transfers_inside']} host transfers "
+                "between the first and the last launch")
+    c = run.get("kernel_cache")
+    if not c:
+        return "not run"
+    return (f"done {c['date']}: {c['kernel_builds']} kernel builds ({c['compute_builds']} compute, "
+            f"{c['dataflow_builds']} data movement), {c['compute_rows']} compute and {c['dataflow_rows']} dataflow "
+            f"API rows, layers {', '.join(c['layers'])}")
+
+
 def new_tab(title: str, source: str, values: list[list], widths: list[int], bold: list[int] | None = None,
             header: bool = True) -> dict:
     return {"title": title, "source": source, "values": values, "widths": widths,
@@ -150,6 +185,7 @@ def grouped_evidence(members: list[dict], column: str) -> str:
 def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str, ...], op_columns: list[str]):
     by_id = {r["id"]: r for r in ops}
     measured = any(k.get("measured_launches_op_code", "0") not in ("", "0") for k in kernel_ops)
+    graphed = any(k.get("graph_launches", "0") not in ("", "0") for k in kernel_ops)
     # Evidence that is the same in every op-table row is on Info, not repeated per kernel op.
     shown = {t: f"{t}:evidence" in op_columns for t in targets}
     headers = ["#", MERGED_HEADER, "Stages", "ttnn API", f"Launches ({label(targets[0])})"]
@@ -157,8 +193,11 @@ def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str,
     if measured:
         headers.append("Measured launches (op code)")
         widths.append(110)
-    headers.append("Op table rows")
-    widths.append(120)
+    if graphed:
+        headers.append("Graph launches per inference")
+        widths.append(110)
+    headers += ["Seen by", "Op table rows"]
+    widths += [140, 120]
     for t in targets:
         headers.append(f"{label(t)}: status (rows)")
         widths.append(110)
@@ -173,11 +212,16 @@ def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str,
         members = [by_id[i] for i in k["op_table_ids"].split(",") if i in by_id]
         stages = dict.fromkeys(m["stage"].split()[0] for m in members if m["stage"])
         apis = dict.fromkeys(m["ttnn_api"] for m in members if m["ttnn_api"])
-        name = f"{short_op(k['device_op'])} / {k['program_factory']}" if k["device_op"] else k["op_code"]
+        if k["program_factory"]:
+            name = f"{short_op(k['device_op']) or k['op_code']} / {k['program_factory']}"
+        else:
+            name = k["op_code"]
         row = [cell(k["id"]), name, ", ".join(stages), ", ".join(apis), cell(k["static_launches"])]
         if measured:
             row.append(cell(k["measured_launches_op_code"]))
-        row.append(cell(k["op_table_ids"].replace(",", ", ")))
+        if graphed:
+            row.append(cell(k.get("graph_launches", "")))
+        row += [k.get("sources", ""), cell(k["op_table_ids"].replace(",", ", "))]
         for t in targets:
             row.append(cell(k.get(f"{t}:statuses", "")))
             if shown[t]:
@@ -290,6 +334,15 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
             ("TTsim commit", run.get("ttsim_commit")),
             ("Entry test passes", describe(run["entry_test_passes"]) if run.get("entry_test_passes") else "")]
     rows += [[name, cell(str(v))] for name, v in meta if v]
+
+    used = methods_used(run)
+    level = confidence(used)
+    rows.append([])
+    bold.append(len(rows))
+    rows.append(["Analysis methods", "State"])
+    rows += [[METHOD_LABELS[m], cell(method_state(run, m))] for m in SOURCE_METHODS]
+    rows.append(["Confidence", cell(f"{level}: {CONFIDENCE_TEXT[level]}")])
+    bold.append(len(rows) - 1)
 
     # Counts: formulas over the Op table tab, so a reader can trace every number.
     expected: dict[str, int] = {}

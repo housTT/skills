@@ -2,11 +2,15 @@
 
 Items:
 - `source:tracy`: entry test under Tracy on a Blackhole or Wormhole source device.
+- `source:graph`: ttnn graph capture of the entry test on that device.
+- `source:cache`: the kernel cache of the entry test on that device, decomposed with elfray.
+  One run of the entry test can produce all three (measured-source.md).
 - `source:ttsim-e2e`: entry test on TTsim for a Quasar source.
 - `source:kernel-tests <status>`: kernel-op tests of a Quasar source's rows with that status.
 - `<dest>:kernel-tests <status>`: the same for a Quasar destination.
 
-State comes from the run's files: `measured_ops` in run.json for Tracy, recorded results for test
+State comes from the run's files: `measured_ops`, `graph_capture` and `kernel_cache` in run.json for
+the source items, recorded results for test
 nodes (an `error` or `timeout` result decides nothing, so its node stays to do). Without a plan
 file the nodes come from op_table.csv, as `kernel_tests.py plan` would write them. `mark` records `done` or `failed` (with a note) in run.json `measurements` for what files cannot
 show, such as a Tracy run that could not start. Files win over a mark once all nodes have results.
@@ -26,7 +30,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from kernel_tests import plan_rows  # noqa: E402
 from opa_schema import (  # noqa: E402
-    LAUNCH_PROFILES, TEST_TARGETS, UNDECIDED_RESULTS, read_csv, read_results, run_targets,
+    LAUNCH_PROFILES, METHOD_ITEMS, TEST_TARGETS, UNDECIDED_RESULTS, read_csv, read_results, run_targets,
 )
 
 STATUS_ORDER = ("❌", "⚠️", "✅")
@@ -56,10 +60,10 @@ def _derived(run_dir: pathlib.Path, run: dict) -> list[dict]:
     durations = [float(r["duration_s"]) for r in results.values() if r.get("duration_s")]
     out = []
     if source in LAUNCH_PROFILES:
-        done = bool(run.get("measured_ops"))
         timeout = run.get("ci_pytest_timeout_s")
-        out.append({"item": "source:tracy", "nodes": 1, "done_nodes": int(done),
-                    "estimate": f"<= {timeout} s" if timeout else "unknown"})
+        for item, key in METHOD_ITEMS.values():
+            out.append({"item": item, "nodes": 1, "done_nodes": int(bool(run.get(key))),
+                        "estimate": f"<= {timeout} s" if timeout else "unknown"})
     for target in (source, *destinations):
         if target not in TEST_TARGETS:
             continue

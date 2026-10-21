@@ -16,8 +16,11 @@ architecture? The skill answers it in two steps.
 1. **Whole model, on the source architecture.** The model's end-to-end entry test is analysed on
    the architecture it already runs on (for example P150). Every ttnn call is traced statically
    to the kernel op it launches: device op plus program factory, with its layout, dtype and launch
-   count. Optionally, a Tracy run of the same test on a source device confirms what actually ran.
-   The result is the list of kernel ops the model needs.
+   count. Optionally, runs of the same test on a source device confirm what actually ran, three
+   ways: a Tracy profile (op codes), a ttnn graph capture (the device op and program factory of
+   every launch) and the kernel cache it compiled, decomposed with the elfray engine into the LLK
+   and dataflow API calls of every kernel. Graph capture and cache share one run; Tracy has its own. The result is the list of kernel ops the
+   model needs, with the methods that saw each one and a confidence for the whole list.
 2. **Kernel op by kernel op, on the destination.** The model is not run end to end on the
    destination. Instead each kernel op from step 1 is checked on its own. For a Quasar
    destination, the Quasar kernel-op tests that exercise that op are run on TTsim, and the result
@@ -47,8 +50,10 @@ or starts a new one, and never repeats work a run already has.
 - **Destinations**, optional and added any time without re-tracing: another profile running the
   same code, or `quasar-bf16`, a Quasar projection with block-float dtypes as BF16 and mainline
   calls routed to their Quasar forks.
-- **Measurements**, as items picked one or more at a time and resumable across sessions: a Tracy
-  run of the entry test on a local source device (`source:tracy`), the entry test on TTsim for a
+- **Measurements**, as items picked one or more at a time and resumable across sessions: from one
+  run of the entry test on a local source device, its ttnn graph capture (`source:graph`) and its
+  kernel cache (`source:cache`, needs the elfray engine); from a second run, its Tracy profile
+  (`source:tracy`); the entry test on TTsim for a
   Quasar source (`source:ttsim-e2e`), and TTsim runs of Quasar kernel-op tests grouped by row
   status (`<target>:kernel-tests ❌`). Each item shows its state and a time estimate.
 
@@ -60,6 +65,10 @@ Outputs in the run directory:
   `static+measured`;
 - `call_trace.csv`, `port_blockers.csv`, `host_ops.csv`, `summary.md`;
 - Tracy: `measured_ops.csv`, `host_fallback.csv`, `footprint.csv`;
+- graph capture: `graph_ops.csv` (launches per device op and program factory), `graph_host_transfers.csv`;
+- kernel cache: `cache_compute.csv`, `cache_dataflow.csv` (the elfray Cache API Analyzer tables), `cache_kernels.csv`;
+- Quasar LLK gap check: `llk_gaps_quasar.csv`, every LLK API and data format of the cache compared
+  with the Quasar LLK sources at the run's commit, with a reviewed verdict per candidate;
 - TTsim: `kernel_test_results_<target>.csv` with pass, fail, xfail, timeout or error per kernel-op test.
 
 Comparing two implementations of one model (for example the Blackhole model and its Quasar port)
@@ -67,6 +76,7 @@ is a separate step on two runs.
 
 Setup asks one question at a time, using native choice controls when the host exposes them. Counts,
 totals, schema checks, merges and test runs come from the scripts in `scripts/`, not from the agent.
-Tracy needs a device of the source architecture (routed through `tt-device-mcp`); Quasar items need
+The source device run needs a device of the source architecture (routed through `tt-device-mcp`),
+Tracy a profiler build, and the kernel cache the elfray engine (Linux x86_64); Quasar items need
 a local TTsim build, which gives execution and correctness evidence, never performance. Upload needs
 the host's Google Drive and Google Sheets connectors.

@@ -1,6 +1,6 @@
 ---
 name: model-op-analysis
-description: Analyse the kernel ops one implementation of a tt-metal model runs on its architecture (P100, P150, N150, one chip of an N300, or Quasar) and how they would port to other architectures. Traces every ttnn call to its device op and program factory at a pinned commit, decides support per kernel op, optionally adds destinations (same code on another profile, or a Quasar BF16 projection) without re-tracing, and resumes measurements item by item - a Tracy run of the entry test on the source device and TTsim runs of Quasar kernel-op tests. Use for "op table", "which kernel ops does model X use", "can model X run on Quasar", or kernel-op support and porting analysis.
+description: Analyse the kernel ops one implementation of a tt-metal model runs on its architecture (P100, P150, N150, one chip of an N300, or Quasar) and how they would port to other architectures. Traces every ttnn call to its device op and program factory at a pinned commit, decides support per kernel op, optionally adds destinations (same code on another profile, or a Quasar BF16 projection) without re-tracing, and resumes measurements item by item - runs of the entry test on the source device that yield a Tracy profile, a ttnn graph capture (every launch's device op and program factory) and a kernel cache decomposed with elfray (LLK and dataflow APIs per kernel), and TTsim runs of Quasar kernel-op tests. Use for "op table", "which kernel ops does model X use", "can model X run on Quasar", or kernel-op support and porting analysis.
 ---
 
 # Model op analysis
@@ -20,8 +20,9 @@ resolve every `<plugin-root>/...` path against it.
    a new one. A run in an older format (plugin 0.3.0 or earlier) cannot be extended; offer a new
    run.
 2. **Preconditions, early.** Probe what measurements could use before asking anything that depends
-   on them: a local device of each candidate source architecture (through `tt-device-mcp`) and
-   TTsim readiness for Quasar (`<plugin-root>/references/ttsim.md`). Report what is available.
+   on them: a local device of each candidate source architecture (through `tt-device-mcp`), the
+   elfray engine for the kernel cache (`<plugin-root>/references/measured-source.md`, "Kernel cache")
+   and TTsim readiness for Quasar (`<plugin-root>/references/ttsim.md`). Report what is available.
 3. **New run.** Follow `<plugin-root>/references/run-setup.md`: ref, source profile,
    implementation, entry test. If the same identity exists, say so and continue that
    run instead of tracing again.
@@ -32,20 +33,30 @@ resolve every `<plugin-root>/...` path against it.
    profile (any but the source), and when it is Quasar and the source is not, whether the code is
    unchanged (`quasar`) or a BF16 projection (`quasar-bf16`). Each one is added to the same run
    from the existing source trace (static-phase.md, "Adding a destination").
-6. **Measurements.** Run `python3 <plugin-root>/scripts/measurements.py list <run dir> --pending`,
-   show only those items (never ones already done) with their state and estimate, and let the user
-   pick one or more. Before offering `source:tracy`, probe the source device again; if it is
-   missing or reports another profile, say so and offer to leave the item pending or record it with
-   `python3 <plugin-root>/scripts/measurements.py mark <run dir> source:tracy failed --note "<reason>"`.
-   Source items follow
-   `<plugin-root>/references/measured-source.md`
-   (`python3 <plugin-root>/scripts/same_commit.py` first, then Tracy and
-   `python3 <plugin-root>/scripts/merge_measured.py`); Quasar test items follow
+6. **Measurements.** First the source methods: probe the source device again, then run
+   `python3 <plugin-root>/scripts/source_methods.py <run dir> --device <probed profile or none> --tt-metal <checkout>`
+   and show all four analysis methods (static trace, Tracy, graph capture, kernel cache) with
+   their state: done, available, available to read later, read an existing cache, or unavailable
+   and why. Let the user pick
+   any number of the available ones in one multi-select question, all of them recommended. The
+   source items `source:tracy`, `source:graph` and `source:cache` come from two runs of the entry
+   test (graph and cache together, Tracy alone). For an unavailable item offer to leave it pending
+   or record it with
+   `python3 <plugin-root>/scripts/measurements.py mark <run dir> <item> failed --note "<reason>"`.
+   Then run `python3 <plugin-root>/scripts/measurements.py list <run dir> --pending` and offer the
+   destination items the same way, never ones already done.
+   Source items follow `<plugin-root>/references/measured-source.md`
+   (`python3 <plugin-root>/scripts/same_commit.py` first, then the device runs, then
+   `<plugin-root>/scripts/merge_measured.py`, `<plugin-root>/scripts/graph_report.py`,
+   `<plugin-root>/scripts/cache_report.py` and the Quasar LLK gap check
+   `<plugin-root>/scripts/llk_gaps.py` for the items picked); Quasar test items follow
    `<plugin-root>/references/measured-destination.md` (`python3 <plugin-root>/scripts/kernel_tests.py`).
    Unpicked items stay pending for a later session.
 7. **Report.** `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`, the validator again, and
-   `summary.md` with the per-kernel-op table first. Say where the results are; uploading them to
-   Google Drive is the `upload-op-analysis` skill, which the user starts when they want it.
+   `summary.md` with the per-kernel-op table first. `summary.md` names the methods the run used and
+   the confidence they give (`<plugin-root>/references/schemas.md`, "Analysis methods and
+   confidence"). Say where the results are; uploading them to Google Drive is the
+   `upload-op-analysis` skill, which the user starts when they want it.
 
 ## Rules
 
@@ -63,5 +74,6 @@ resolve every `<plugin-root>/...` path against it.
 - Output stands alone: a reader who knows no issue, ticket, tracker or earlier conversation must
   understand every file. Never refer to criteria, items or numbers defined elsewhere; state what
   is meant. A link may cite a source, never replace a definition.
-- Report what the validator checked, what stayed `unverified`, and which statuses rest on a TTsim
-  run versus test markers.
+- Report what the validator checked, what stayed `unverified`, which statuses rest on a TTsim
+  run versus test markers, and which kernel ops a graph capture or Tracy run saw that the static
+  trace did not.

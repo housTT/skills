@@ -89,15 +89,15 @@ def merge(rows: list[dict], measured: list[dict], source: str, destinations: lis
     return out
 
 
-def entry_pass_record(previous: dict, source: str, result: str, date: str) -> dict:
+def entry_pass_record(previous: dict, source: str, result: str, date: str, item: str = "source:tracy") -> dict:
     """entry_test_passes with this local run added; a CI record already there is kept."""
     record = {k: v for k, v in previous.items() if k == "ci"}
-    record.update({"by": f"source:tracy on a local {source} device", "date": date, "result": result})
+    record.update({"by": f"{item} on a local {source} device", "date": date, "result": result})
     return record
 
 
 def decide_source_statuses(rows: list[dict], measured: list[dict], source: str, inferences: int,
-                           entry_passes: dict) -> list[str]:
+                           entry_passes: dict, how: str = "under Tracy") -> list[str]:
     """Upgrade source `⚠️` rows the passing entry test covers; return warnings for `❌` rows it ran.
 
     Only `⚠️` is revisited: it is what a profile gets while no passing run is recorded. `✅`, `❌`
@@ -106,7 +106,7 @@ def decide_source_statuses(rows: list[dict], measured: list[dict], source: str, 
     label = TARGET_LABELS[source]
     where = (f"in CI ({entry_passes['ci']}) and " if "ci" in entry_passes
              else f"No CI workflow runs the entry test on {label}; it passed ")
-    passed = (f"{where}on a local {label} under Tracy ({entry_passes['result']}, {entry_passes['date']})")
+    passed = (f"{where}on a local {label} {how} ({entry_passes['result']}, {entry_passes['date']})")
     counts = collections.Counter(m["op_code"] for m in measured if m["op_type"] == "tt_dnn_device")
     static_launches: collections.Counter = collections.Counter()
     for row in rows:

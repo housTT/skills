@@ -38,7 +38,7 @@
     {
       "name": "tt-model-op-analysis",
       "source": "./plugins/tt-model-op-analysis",
-      "description": "Kernel-op analysis of one implementation of a tt-metal model on its architecture (Blackhole, Wormhole or Quasar), with destinations, resumable Tracy and TTsim measurements, CSV output and a separate Google Sheets upload skill."
+      "description": "Kernel-op analysis of one implementation of a tt-metal model on its architecture (Blackhole, Wormhole or Quasar), with destinations, resumable measurements (Tracy, ttnn graph capture, kernel cache via elfray, TTsim), CSV output and a separate Google Sheets upload skill."
     }
   ]
 }
