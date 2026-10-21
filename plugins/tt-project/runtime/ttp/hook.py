@@ -471,7 +471,7 @@ def _log_bypass(cmd: str) -> None:
 
 
 # The project's web app token (state/web.token), named in a command
-WEB_TOKEN_RE = re.compile(r"(?:^|[/\s'\"=:<>(,;|&])state/+web\.token\b")
+WEB_TOKEN_RE = re.compile(r"state/+web\.token\b")
 
 
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
