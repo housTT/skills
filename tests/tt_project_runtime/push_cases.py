@@ -3943,7 +3943,9 @@ def _nested_worktree(tmp_path):
     subprocess.run([*git, "commit", "-qm", "a"], check=True)
     shim = tmp_path / "shim"   # the python3 a check command names: this interpreter, which has pytest
     shim.mkdir()
-    (shim / "python3").symlink_to(sys.executable)
+    # A wrapper, not a symlink: a symlinked venv python finds no pyvenv.cfg beside it and loses the venv's pytest.
+    (shim / "python3").write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n")
+    (shim / "python3").chmod(0o755)
     return root, wt, shim
 
 
