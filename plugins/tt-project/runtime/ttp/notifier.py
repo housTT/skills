@@ -683,7 +683,8 @@ def fix_steps(res: dict) -> list[str]:
              "come from terminal-notifier (`brew install terminal-notifier`) or else osascript (Script Editor).")
     pending = [f"The {APP_NAME} app is not in System Settings > Notifications yet, so alerts come from {b} until "
                "it is: allow its first notification, then keep alerts on screen: System Settings > Notifications > "
-               f"{APP_NAME} > Allow notifications on, alert style Persistent (older macOS: Alerts).", other] if b in ("osascript", "terminal-notifier") and \
+               f"{APP_NAME} > Allow notifications on, alert style Persistent (older macOS: Alerts). "
+               "macOS lets no program set another app's alert style.", other] if b in ("osascript", "terminal-notifier") and \
         app_pending() else []
     if b == "osascript":
         return pending + ["macOS shows these as from Script Editor. If you saw nothing:",

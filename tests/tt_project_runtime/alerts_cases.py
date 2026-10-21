@@ -3933,7 +3933,7 @@ def test_setup_builds_the_macos_app_and_sends_its_first_test_even_on_a_tested_co
         "unreadable settings never prove the app registered: the test keeps the sender"
     step = [ln for ln in out if "System Settings > Notifications > tt-project > Allow notifications on, alert style "
             "Persistent" in ln]
-    assert len(step) == 1 and step[0].startswith("alerts still come from Script Editor") and \
+    assert len(step) == 1 and step[0].startswith("The tt-project app is not in System Settings") and \
         "macOS lets no program set another app's alert style" in step[0], "the one line naming what only the user can set"
     out = notifier.refresh(send_test=True)
     assert len(calls("open")) == 1 and len(calls("osacompile")) == 1 and "already went out" in out[-1], \
