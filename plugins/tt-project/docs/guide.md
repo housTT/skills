@@ -1085,7 +1085,8 @@ install it, to a desktop notifier on your workstation that covers all your proje
 
 - Web app: the Notifications card on the Overview tab shows the browser's state (on, not allowed yet,
   blocked, unavailable on this address, unsupported), an Allow button and Send test. While the page
-  is open in any tab, each new ask, problem and task ready for review pops up once. Browsers allow
+  is open in any tab, each new ask, problem and task ready for review pops up once and stays until
+  you close it (where the browser supports that). Browsers allow
   notifications only on https or localhost: open the `http://127.0.0.1:…` link `ttp web` prints
   (through its tunnel from another machine), not the box's own hostname.
 - Slack (optional): `ttp secret slack --email <your Slack email>` saves a bot token for your user,

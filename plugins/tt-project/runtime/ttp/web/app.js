@@ -152,9 +152,10 @@ const NOTIFY_TEXT = {
   unsupported: "not supported by this browser.",
 };
 const NOTIFY_PILL = { ask: "Turn on notifications", blocked: "Notifications blocked", insecure: "Notifications unavailable", unsupported: "Notifications unavailable" };
-// "" once shown, else why not (Chrome on Android shows them only from a service worker).
+// "" once shown, else why not (Chrome on Android shows them only from a service worker). Each stays
+// until the user closes it, where the browser supports that (requireInteraction).
 function popup(title, body, tag) {
-  try { const n = new Notification(title, { body: String(body || "").slice(0, 240), tag }); n.onclick = () => { window.focus(); n.close(); }; return ""; }
+  try { const n = new Notification(title, { body: String(body || "").slice(0, 240), tag, requireInteraction: true }); n.onclick = () => { window.focus(); n.close(); }; return ""; }
   catch (e) { return String((e && e.message) || e); }
 }
 let slackState = null;

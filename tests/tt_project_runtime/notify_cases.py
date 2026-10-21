@@ -140,7 +140,7 @@ def test_web_notify_test_endpoint_returns_the_notification_and_the_slack_outcome
 def test_web_app_notification_state_permission_and_announce(env):
     """The browser's state is told apart (on, ask, blocked, insecure address, unsupported), permission
     is asked only from a click, and each new ask, problem or task ready for review notifies once,
-    the first one after a quiet page load too, also from a hidden tab."""
+    the first one after a quiet page load too, also from a hidden tab, and stays until closed."""
     import shutil
     import subprocess
     web = RUNTIME / "ttp" / "web"
@@ -160,7 +160,7 @@ def test_web_app_notification_state_permission_and_announce(env):
 const els = {}; const $ = (s) => els[s] || (els[s] = { hidden: false, html: "", onclick: null, scrollIntoView() {} });
 const text = (el, s) => { el.html = s; }, put = text, codes = (s) => s, at = (t) => String(t), api = async () => ({});
 const store = {}; const sessionStorage = { getItem: (k) => k in store ? store[k] : null, setItem: (k, v) => { store[k] = String(v); } };
-const shown = []; class Notification { constructor(t, o) { shown.push(t + " | " + o.body); } }
+const shown = [], sticky = []; class Notification { constructor(t, o) { shown.push(t + " | " + o.body); sticky.push(o.requireInteraction); } }
 Notification.permission = "granted";
 const document = { hidden: true, querySelector: () => ({ click() {} }) };
 const window = { isSecureContext: true, Notification, focus() {} };
@@ -175,7 +175,7 @@ announce(st([], [{ id: 4, status: "running", title: "t4" }]));                  
 out.first = shown.length;
 announce(st([{ id: 10, kind: "alert", text: "disk low" }], [{ id: 4, status: "review", title: "t4" }]));
 announce(st([{ id: 10, kind: "alert", text: "disk low" }, { id: 11, kind: "ask", text: "merge?" }], [{ id: 4, status: "review", title: "t4" }]));
-out.shown = shown.slice(); out.unseen = unseen;
+out.shown = shown.slice(); out.sticky = sticky.slice(); out.unseen = unseen;
 Notification.permission = "denied"; notifyCard(); out.blocked = [els["#notifystate"].html, els["#notify"].hidden, els["#notifyask"].hidden];
 Notification.permission = "default"; notifyCard(); out.ask = [els["#notify"].hidden, els["#notifyask"].hidden];
 console.log(JSON.stringify(out));
@@ -187,5 +187,6 @@ console.log(JSON.stringify(out));
     assert out["first"] == 0
     assert out["shown"] == ["demo: problem | disk low", "demo: ready for review | #4 t4", "demo: needs you | merge?"]
     assert out["unseen"] == 3
+    assert out["sticky"] == [True, True, True]          # each stays until the user closes it
     assert "blocked by this browser" in out["blocked"][0] and "address bar" in out["blocked"][0]
     assert out["blocked"][1:] == [False, True] and out["ask"] == [False, False]
