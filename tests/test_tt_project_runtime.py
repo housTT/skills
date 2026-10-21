@@ -3322,8 +3322,8 @@ def test_web_api_requires_the_token(env):
 
 @needs_sockets
 def test_web_post_needs_the_token_header_json_and_its_own_origin(env):
-    """A page on another localhost port is same-site, so it carries the token cookie and can post a
-    plain form: a change needs the X-TTP-Token header, a JSON body and no foreign Origin."""
+    """A page on another localhost port is same-site and can post a plain form: a change needs the
+    X-TTP-Token header, a JSON body and no foreign Origin."""
     p = make(env)
     from ttp import web
     port = _start_web(p)
@@ -3359,10 +3359,47 @@ def test_web_post_needs_the_token_header_json_and_its_own_origin(env):
     assert post({"X-TTP-Token": tok, "Content-Type": "application/json; charset=utf-8"}) == 200
     assert post({"X-TTP-Token": tok, "Content-Type": "application/json", "Origin": base}) == 200
     assert said() == 2
-    get = urllib.request.Request(base + "/api/state", headers=cookie)
-    assert json.loads(urllib.request.urlopen(get, timeout=5).read())["project"]["name"] == p.name
     app = (web.STATIC / "app.js").read_text()
     assert '"X-TTP-Token": TOKEN, "Content-Type": "application/json"' in app
+
+
+@needs_sockets
+def test_web_token_is_never_a_cookie_and_no_page_may_frame_the_app(env):
+    """Browsers do not scope cookies by port, so a token cookie would reach every service on
+    127.0.0.1: only the header counts, app.js writes no token cookie, and every response
+    (static, API, refusals, send_error) forbids framing."""
+    p = make(env)
+    from ttp import web
+    port = _start_web(p)
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(base + "/", timeout=1)
+            break
+        except OSError:
+            time.sleep(0.1)
+    tok = web.token(p)
+
+    def call(path, headers=None, method="GET"):
+        req = urllib.request.Request(base + path, method=method, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.headers
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers
+
+    assert call("/api/state", {"Cookie": f"ttp_token={tok}"})[0] == 401
+    assert call("/api/state", {"Cookie": f"other=1; ttp_token={tok}"})[0] == 401
+    seen = [call("/"), call("/app.js"), call("/nope.txt"), call("/api/state"),
+            call("/api/state", {"X-TTP-Token": tok}), call("/api/nope", {"X-TTP-Token": tok}),
+            call("/api/" + "say", method="POST"), call("/", method="PUT")]
+    assert [c for c, _ in seen] == [200, 200, 404, 401, 200, 404, 401, 501]
+    for _, h in seen:
+        assert h["X-Frame-Options"] == "DENY"
+        assert h["Content-Security-Policy"] == "frame-ancestors 'none'"
+    app = (web.STATIC / "app.js").read_text()
+    writes = re.findall(r"document\.cookie\s*=\s*(.+)", app)
+    assert writes and all("Max-Age=0" in w and "${" not in w and "TOKEN" not in w for w in writes)
 
 
 def test_broken_config_keeps_the_last_good_one(env):

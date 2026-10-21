@@ -27,7 +27,10 @@ const zoneFmt = (day) => {
 const at = (ts) => ts ? zoneFmt(Math.abs(ts - Date.now() / 1000) >= 20 * 3600).format(new Date(ts * 1000)) : "—";
 
 let TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || sessionStorage.getItem("ttp_token") || "";
-if (TOKEN) { sessionStorage.setItem("ttp_token", TOKEN); document.cookie = `ttp_token=${TOKEN}; SameSite=Strict; path=/`; history.replaceState(null, "", location.pathname); }
+// The token lives only in this tab's sessionStorage and goes out as the X-TTP-Token header, never
+// in a cookie (cookies are not scoped by port). Expire the cookie older versions wrote.
+document.cookie = "ttp_token=; Max-Age=0; SameSite=Strict; path=/";
+if (TOKEN) { sessionStorage.setItem("ttp_token", TOKEN); history.replaceState(null, "", location.pathname); }
 const api = async (path, body) => {
   const r = await fetch(path, { method: body ? "POST" : "GET", headers: { "X-TTP-Token": TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
   if (r.status === 401) { document.body.innerHTML = "<main><p>Open this page with the link printed by <code>ttp web</code> (it carries the access token).</p></main>"; throw new Error("auth"); }
