@@ -3236,6 +3236,7 @@ def test_the_desktop_notifier_logs_and_records_a_refused_notification(monkeypatc
     monkeypatch.setattr(notifier.sys, "platform", platform)
     monkeypatch.setenv("DISPLAY", ":0")
     argv = _notifier_stubs(monkeypatch, tmp_path, [cmd], rc=3)
+    _agent(monkeypatch, tmp_path)
     res = notifier.show("tt-project · a", "alert one")
     assert argv(cmd), "the stub ran"
     assert res["ok"] is False and res["backend"] == cmd and res["error"] == "exited 3: stub refused"
@@ -3311,6 +3312,7 @@ def test_ttp_notifier_test_reports_the_backend_the_result_and_the_fix(env, monke
     monkeypatch.setattr(notifier.sys, "platform", platform)
     monkeypatch.setenv("DISPLAY", ":0")
     _notifier_stubs(monkeypatch, tmp_path, [cmd], rc=rc)
+    _agent(monkeypatch, tmp_path)
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: answer is not None, raising=False)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: answer is not None, raising=False)
     monkeypatch.setattr("builtins.input", lambda q: answer)
@@ -3327,16 +3329,29 @@ def test_ttp_notifier_test_reports_the_backend_the_result_and_the_fix(env, monke
     assert bool(notifier.failing()) == bool(exit_code)
 
 
-def _fake_agent(monkeypatch, tmp_path, running_code):
+def _agent(monkeypatch, tmp_path, on=True):
+    """This user's notifier agent installed (a systemd unit and a launchd plist in a test HOME), enabled
+    while `state["on"]` (systemctl is-enabled, launchctl print)."""
+    from ttp import notifier
+    monkeypatch.delenv("TTP_TEST_NO_NOTIFIER", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    for f in (tmp_path / "userhome" / ".config" / "systemd" / "user" / notifier.UNIT,
+              tmp_path / "userhome" / "Library" / "LaunchAgents" / f"{notifier.LABEL}.plist"):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("[Unit]\n")
+    state = {"on": on}
+    monkeypatch.setattr(notifier, "_service_on", lambda: state["on"])
+    monkeypatch.setattr(notifier, "_enabled_cache", {})
+    monkeypatch.setattr(notifier, "ENABLED_CACHE_S", 0)
+    return state
+
+
+def _fake_agent(monkeypatch, tmp_path, running_code, on=True):
     """An installed notifier agent whose running process reports `running_code` (None: no start record)."""
     from ttp import notifier
     _notifier_files(monkeypatch, tmp_path)
-    monkeypatch.delenv("TTP_TEST_NO_NOTIFIER")
-    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
     monkeypatch.setattr(notifier.sys, "platform", "linux")
-    unit = tmp_path / "userhome" / ".config" / "systemd" / "user" / notifier.UNIT
-    unit.parent.mkdir(parents=True)
-    unit.write_text("[Unit]\n")
+    _agent(monkeypatch, tmp_path, on)
     if running_code:
         notifier.write_json(notifier.RUNNING, {"pid": os.getpid(), "code": running_code})
     calls = []
@@ -3458,6 +3473,7 @@ def test_a_failing_desktop_notifier_raises_one_chat_alert_that_clears_once_a_del
     assert not p.db.one("SELECT id FROM messages WHERE ref='notifier'"), "nothing failed yet"
     monkeypatch.setattr(notifier.sys, "platform", "darwin")
     _notifier_stubs(monkeypatch, tmp_path, ["osascript"], rc=1)
+    _agent(monkeypatch, tmp_path)
     for _ in range(3):   # three alerts fail to show: one chat alert, not three
         notifier.show("tt-project · demo", "an alert")
         d.check_notifier()
@@ -3474,6 +3490,77 @@ def test_a_failing_desktop_notifier_raises_one_chat_alert_that_clears_once_a_del
     assert told and told["severity"] == "low"
     d.check_notifier()
     assert len(p.db.q("SELECT id FROM messages WHERE ref='notifier' AND kind='alert'")) == 1
+
+
+def test_a_failed_notifier_test_alerts_only_while_an_enabled_agent_is_installed(env, monkeypatch, tmp_path):
+    """A failed `ttp notifier test` on a box with no agent (headless, no notify-send) raises no alert; an
+    enabled agent's failure does, and disabling or removing the agent clears it."""
+    from ttp import alerts, notifier
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    monkeypatch.setattr(notifier.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    _notifier_stubs(monkeypatch, tmp_path, [])   # no notify-send
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.delenv("TTP_TEST_NO_NOTIFIER", raising=False)
+    ok, lines = notifier.test()
+    assert not ok and notifier.delivery()["ok"] is False
+    assert notifier.failing() is None and notifier.status_lines() == []
+    d.check_notifier()
+    assert not p.db.one("SELECT id FROM messages WHERE ref='notifier'"), "no agent here: nothing to alert"
+    state = _agent(monkeypatch, tmp_path)
+    d.check_notifier()
+    assert p.db.one("SELECT id FROM messages WHERE ref='notifier'"), "an enabled agent that cannot deliver alerts"
+    state["on"] = False   # `systemctl --user disable --now` or `launchctl bootout` by hand
+    assert notifier.failing() is None and notifier.status_lines() == []
+    (ep,) = alerts.sweep(p.db)
+    assert ep["key"] == notifier.ALERT_KEY
+    state["on"] = True
+    assert notifier.uninstall() == "removed"
+    assert notifier.agent_file() is None and notifier.delivery() == {} and notifier.failing() is None
+
+
+def test_the_no_desktop_session_fix_points_at_ttp_notifier_uninstall(monkeypatch, tmp_path):
+    from ttp import notifier
+    steps = " ".join(notifier.fix_steps({"backend": "notify-send", "error": "no desktop session (no DISPLAY)"}))
+    assert "`ttp notifier uninstall`" in steps and "systemctl" not in steps
+
+
+@pytest.mark.parametrize("always", [False, True])
+def test_setup_and_upgrade_never_restart_a_disabled_or_removed_notifier(env, monkeypatch, tmp_path, always):
+    """refresh() restarts only an agent the user keeps enabled: install() would enable a disabled one."""
+    from ttp import notifier
+    calls = _fake_agent(monkeypatch, tmp_path, None, on=False)
+    assert notifier.refresh(send_test=False, always=always) == [] and calls == []
+    assert notifier.status_lines() == []
+    assert notifier.refresh(send_test=True, always=always) == [] and calls == []
+    notifier.uninstall()
+    assert notifier.refresh(send_test=False, always=always) == [] and calls == []
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_ttp_notifier_uninstall_stops_and_removes_the_agent_and_its_records(env, monkeypatch, tmp_path, capsys,
+                                                                            platform):
+    from ttp import cli, notifier
+    argv = _notifier_stubs(monkeypatch, tmp_path, ["systemctl", "launchctl"])
+    monkeypatch.setattr(notifier.sys, "platform", platform)
+    _agent(monkeypatch, tmp_path)
+    notifier.write_json(notifier.DELIVERY, {"ok": False, "backend": "notify-send", "error": "x", "ts": 1})
+    notifier.write_json(notifier.RUNNING, {"pid": os.getpid(), "code": "0.0.1 (abc)"})
+    assert notifier.status_lines()
+    cli.main(["notifier", "uninstall"])
+    assert capsys.readouterr().out.strip() == "removed"
+    if platform == "linux":
+        assert argv("systemctl") == [b"--user", b"daemon-reload"]   # the last call, after `disable --now`
+    else:
+        assert argv("launchctl")[0] == b"bootout"
+    assert notifier.agent_file() is None
+    assert not notifier.DELIVERY.exists() and not notifier.RUNNING.exists()
+    assert notifier.status_lines() == [] and notifier.failing() is None
+    cli.main(["notifier", "uninstall"])
+    assert "no desktop notifier installed here" in capsys.readouterr().out
 
 
 def test_the_notifier_module_stays_python_3_9_syntax():

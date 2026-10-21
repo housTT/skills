@@ -19,10 +19,11 @@ Default channels need no accounts or setup.
 - `ttp notifier test` sends one through the same path and says whether it worked, with the fix
   if not; exit 1 = failed. macOS does not report display: in a terminal it asks if you saw it.
 - `ttp notifier install`, `ttp setup` and `ttp upgrade` send that test once per installed ttp version.
-  `ttp setup` and `ttp upgrade` also restart the notifier on the new code; `ttp status` says when it
-  runs older code (`ttp notifier restart`).
-- Each failed delivery goes to `~/.tt-project/notifier.log`; a failing stretch raises one chat
-  alert from the projects on that machine, cleared once a delivery works again.
+  `ttp setup` and `ttp upgrade` also restart an enabled notifier on the new code (never one turned
+  off); `ttp status` says when it runs older code (`ttp notifier restart`).
+- Each failed delivery goes to `~/.tt-project/notifier.log`; while an enabled notifier fails, the
+  projects on that machine raise one chat alert, cleared once a delivery works again or the notifier
+  is removed. `ttp notifier uninstall` stops and removes it (a machine with no desktop session).
 - Only `high` severity notifies by default: decisions, reviews, merges, funds, outages.
 - The user can ask the coordinator for more or fewer alerts.
 

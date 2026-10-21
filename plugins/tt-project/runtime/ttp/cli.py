@@ -6598,6 +6598,8 @@ def cmd_notifier(a) -> None:
         if not notifier.agent_file():
             die("no desktop notifier installed here; `ttp notifier install` installs one")
         print(notifier.install())
+    elif a.action == "uninstall":   # stays off: setup and upgrade restart only an installed, enabled agent
+        print(notifier.uninstall())
     elif a.action == "test" and a.slack:
         from .slack import send_test
         ok, text = send_test()
@@ -7574,8 +7576,9 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_consent)
 
     s = sub.add_parser("notifier", help="desktop notifications on this machine for all your projects")
-    s.add_argument("action", choices=["install", "restart", "run", "test"],
+    s.add_argument("action", choices=["install", "restart", "run", "test", "uninstall"],
                    help="install: start it at login and send a test notification; restart: on the installed code; "
+                        "uninstall: stop and remove it (setup and upgrade then leave it off); "
                         "run: run it here; test: send one test notification and say whether it got through "
                         "(exit 1 when not) and how to fix it")
     s.add_argument("--slack", action="store_true",

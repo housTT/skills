@@ -127,7 +127,7 @@ rm -rf ~/.tt-project "${XDG_DATA_HOME:-$HOME/.local/share}/tt-project"    # regi
 ```
 
 Each project keeps its files in `<project root>/tt-project/`; delete that folder too to drop its
-history. If you ran `ttp notifier install`, also remove its `tt-project-notifier` user service.
+history. If you ran `ttp notifier install`, run `ttp notifier uninstall` first to remove its user service.
 
 ## Known issues
 

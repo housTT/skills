@@ -35,6 +35,7 @@ STATE = HOME_DIR / "notifier-state.json"
 CONF = HOME_DIR / "notifier.json"
 HOSTS = "_hosts"   # state key for remote host reachability; no project name starts with '_'
 HOST_DOWN_AFTER_S = 20 * 60   # notifier.json `host_down_after_s` overrides
+ENABLED_CACHE_S = 60   # failing(): how long the agent's enabled state is reused between checks
 HOST_POLL_GAP_S = 5 * 60   # polls further apart (sleep, notifier stopped) do not continue a failing streak
 DAEMONS = "_daemons"   # state key for projects whose daemon is down
 DAEMON_DOWN_AFTER_S = 3 * 3600   # notifier.json `daemon_down_after_s` overrides (floor 2 * HEARTBEAT_STALE_S)
@@ -283,9 +284,11 @@ def record(res: dict) -> None:
 
 
 def failing() -> dict | None:
-    """The last delivery when it failed: the condition of the ALERT_KEY alert (alerts.holds)."""
+    """The last delivery when it failed while this machine's agent is installed and enabled: the
+    condition of the ALERT_KEY alert (alerts.holds). A failed `ttp notifier test` on a box with no agent
+    (headless, no notify-send) alerts nothing; disabling or removing the agent clears the alert."""
     d = delivery()
-    return d if d.get("ok") is False else None
+    return d if d.get("ok") is False and enabled(max_age_s=ENABLED_CACHE_S) else None
 
 
 def fix_steps(res: dict) -> list[str]:
@@ -309,8 +312,7 @@ def fix_steps(res: dict) -> list[str]:
                 "libnotify`). " + again]
     if b == "notify-send" and "no desktop session" in err:
         return ["This machine has no desktop session. Install the notifier on the computer you sit at "
-                "(`ttp notifier install` there), and remove it here: "
-                f"`systemctl --user disable --now {UNIT}`."]
+                "(`ttp notifier install` there), and remove it here: `ttp notifier uninstall`."]
     if b == "notify-send":
         return ["No notification server answered: check that a desktop session runs and Do Not Disturb is off. " + again]
     return ["This system has no desktop notifications; alerts still reach the chat and the web app."]
@@ -361,6 +363,57 @@ def agent_file() -> Path | None:
     return f if f.exists() else None
 
 
+_enabled_cache: dict = {}   # {"at": time, "on": bool}: failing() runs every daemon tick
+
+
+def _service_on() -> bool:
+    """launchd has the agent loaded, or systemd has the unit enabled: the user keeps it on."""
+    if sys.platform == "darwin":
+        cmd = ["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"]
+    else:
+        cmd = ["systemctl", "--user", "is-enabled", UNIT]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and (sys.platform == "darwin" or r.stdout.strip() == "enabled")
+
+
+def enabled(max_age_s: float = 0) -> bool:
+    """This user's agent is installed and enabled (not disabled or booted out by hand). `max_age_s`:
+    reuse an answer that recent."""
+    if not agent_file():
+        return False
+    now = time.time()
+    if max_age_s and now - _enabled_cache.get("at", 0) < max_age_s:
+        return _enabled_cache["on"]
+    on = _service_on()
+    _enabled_cache.update(at=now, on=on)
+    return on
+
+
+def uninstall() -> str:
+    """Stop and remove this user's agent and forget its delivery and start records, so no alert, status
+    line or `ttp setup`/`ttp upgrade` brings it back; `ttp notifier install` does."""
+    def quiet(*cmd):
+        try:
+            subprocess.run(list(cmd), capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    f = agent_file()
+    if f and sys.platform == "darwin":
+        quiet("launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}")
+    elif f:
+        quiet("systemctl", "--user", "disable", "--now", UNIT)
+    for g in (f, DELIVERY, RUNNING):
+        if g:
+            g.unlink(missing_ok=True)
+    if f and sys.platform != "darwin":
+        quiet("systemctl", "--user", "daemon-reload")
+    _enabled_cache.clear()
+    return "removed" if f else "no desktop notifier installed here"
+
+
 def running() -> dict | None:
     """The agent's start record (RUNNING) while its process lives; None when it is not running or
     started before agents wrote one (an unknown code version)."""
@@ -376,8 +429,8 @@ def running() -> dict | None:
 
 def status_lines() -> list[str]:
     """What `ttp status` says about this machine's notifier: nothing while it runs the installed code
-    and its last delivery went out."""
-    if not agent_file():
+    and its last delivery went out; nothing without an enabled agent (none, or disabled by hand)."""
+    if not enabled():
         return []
     out = []
     run, want = running(), installed_code()
@@ -396,8 +449,9 @@ def status_lines() -> list[str]:
 def refresh(send_test: bool, always: bool = False) -> list[str]:
     """`ttp setup`, `ttp upgrade`: restart an installed agent so it runs the installed code (`always`, or
     while it runs other code), then (`send_test`) send the test notification once per installed code
-    version: none once one went out on it. Lines to print; none without an installed agent."""
-    if not agent_file():
+    version: none once one went out on it. Lines to print; none without an installed agent, and none for
+    one the user disabled or booted out: install() would turn it back on."""
+    if not enabled():
         return []
     want = installed_code()
     run = running()
@@ -519,6 +573,7 @@ def install() -> str:
     """Background agent for this user on this machine (launchd or systemd user unit), (re)started on the
     installed runtime's stable path, so a later `ttp setup` or upgrade only needs a restart."""
     from .release import installed
+    _enabled_cache.clear()   # failing() asks launchd or systemd again
     runtime = installed() / "runtime"
     if not (runtime / "ttp" / "notifier.py").is_file():   # no `ttp setup` yet: this copy
         runtime = Path(__file__).resolve().parent.parent
