@@ -45756,3 +45756,17 @@ def test_web_post_with_a_bad_content_length_answers_400(env):
         c.endheaders()
         assert c.getresponse().status == 400, bad
         c.close()
+
+
+def test_project_name_is_optional_from_a_git_worktree_outside_the_project_folder(env, monkeypatch, capsys):
+    import subprocess
+    from ttp import cli
+    p = make(env)
+    tid = p.db.add_task("from a worktree", "s", kind="work", tier="light", origin="user")
+    wt = env["tmp"] / "elsewhere" / "wt"
+    subprocess.run(["git", "-C", str(p.root), "worktree", "add", "-q", "-b", "wt-branch", str(wt)], check=True,
+                   capture_output=True)
+    monkeypatch.delenv("TTP_PROJECT", raising=False)
+    monkeypatch.chdir(wt)
+    cli.main(["task", "list"])
+    assert f"#{tid}" in capsys.readouterr().out
