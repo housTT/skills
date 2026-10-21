@@ -64,6 +64,11 @@ The project chooses which plugin directories load, per provider, in
 Measured on 2026-10-09 with Claude Code 2.1.285 and Codex CLI 0.160.0; rerun
 `ttp doctor --live <provider>` after a CLI upgrade.
 
+- Any provider: only the prompt keeps a worker's raw `git push` off the push branch. On
+  2026-10-21 a Claude Code worker whose task said to land its change pushed it straight to the
+  remote, before any review; `ttp doctor --loop` fails such a landing.
+- A code task's plain `needs_review` hand-off gets its review from the daemon's review sweep,
+  `review.sweep_after_s` (default 30 min) after its run ended; a `done` hand-off gets it at once.
 - Claude Code: workers have no write fence. They run with `bypassPermissions`, and the Bash
   sandbox that would fence them needs bubblewrap.
 - Codex: the harness hook runs only where hooks are on and no other hook source exists.
