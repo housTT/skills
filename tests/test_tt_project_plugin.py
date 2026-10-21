@@ -4790,6 +4790,23 @@ def _bump(repo: pathlib.Path, version: str) -> None:
     _git(repo, "commit", "-qam", "tt-project " + version)
 
 
+def _real_git():
+    """The first git on PATH that is no tt-project git wrapper: a run puts its harness bin/ first on
+    PATH, and a wrapper linked alone into a test's PATH finds no git to exec."""
+    import os
+    import shutil
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        found = shutil.which("git", path=d) if d else None
+        if found:
+            try:
+                with open(found, errors="replace") as f:
+                    if "# tt-project git wrapper" not in f.read(4096):
+                        return found
+            except OSError:
+                continue
+    return shutil.which("git")
+
+
 @pytest.fixture
 def install_env(tmp_path):
     """A temp HOME and a PATH holding only the tools the installer needs plus the chosen fakes."""
@@ -4799,7 +4816,7 @@ def install_env(tmp_path):
         d.mkdir()
     for tool in ("git", "python3", "sh", "bash", "dash", "zsh", "mktemp", "rm", "cp", "mv", "mkdir", "sed", "head",
                  "dirname", "cat", "chmod"):
-        found = shutil.which(tool)
+        found = _real_git() if tool == "git" else shutil.which(tool)
         if found:
             (tools / tool).symlink_to(found)
     repo = _fixture_repo(tmp_path)

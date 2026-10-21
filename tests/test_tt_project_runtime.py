@@ -6170,11 +6170,28 @@ def test_harness_commit_moves_stale_git_locks_aside_and_commits(env, monkeypatch
     assert p.clear_stale_git_locks() == [] and fresh.exists()
 
 
+def _real_git():
+    """The first git on PATH that is no tt-project git wrapper: a run puts its harness bin/ first on
+    PATH, and a wrapper linked alone into a test's PATH finds no git to exec."""
+    import os
+    import shutil
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        found = shutil.which("git", path=d) if d else None
+        if found:
+            try:
+                with open(found, errors="replace") as f:
+                    if "# tt-project git wrapper" not in f.read(4096):
+                        return found
+            except OSError:
+                continue
+    return shutil.which("git")
+
+
 def test_git_lock_holders_see_a_real_git_in_the_repo(env, tmp_path):
     from ttp import gitlocks
     p = make(env)
     gdir = gitlocks.git_dir(p.harness)
-    proc = subprocess.Popen(["git", "-C", str(p.harness), "hash-object", "--stdin"], stdin=subprocess.PIPE,
+    proc = subprocess.Popen([_real_git(), "-C", str(p.harness), "hash-object", "--stdin"], stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL)
     try:
         assert proc.pid in gitlocks.holders(p.harness, gdir, [])
