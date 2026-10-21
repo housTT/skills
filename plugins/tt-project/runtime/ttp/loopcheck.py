@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -190,7 +191,9 @@ class Watch:
 
 
 def stop_all(p) -> None:
-    """Stop every run still going and wait briefly for each to end."""
+    """Stop every run still going and wait briefly for each to end, then end the detached checks
+    still running in the scratch project (the daemon's prechecks, a run's own): left alone they run
+    on past the check and write into its folder after it is removed."""
     from .runner import stop_runs
     ids = stop_runs(p.db, p.runs, why="loop check over")
     deadline = time.time() + STOP_WAIT_S
@@ -198,6 +201,33 @@ def stop_all(p) -> None:
         exit_file = p.runs / str(rid) / "exit.json"
         while not exit_file.exists() and time.time() < deadline:
             time.sleep(1)
+    stop_checks(p)
+
+
+def stop_checks(p) -> None:
+    """End each detached `ttp checks` the scratch project started (its process group: TERM, then
+    KILL) and wait for it to exit."""
+    from .cli import _checks_alive, _read_checks_pid
+    from .daemon import PRECHECKS_DIR
+    dirs = []
+    for top in (p.state / PRECHECKS_DIR, p.runs):
+        try:
+            dirs += [d for d in top.iterdir() if d.is_dir()]
+        except OSError:
+            pass
+    live = [i for i in map(_read_checks_pid, dirs) if _checks_alive(i)]
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for info in live:
+            try:
+                os.killpg(info["pid"], sig)
+            except OSError:
+                pass
+        deadline = time.time() + STOP_WAIT_S / 2
+        while live and time.time() < deadline:
+            time.sleep(0.1)
+            live = [i for i in live if _checks_alive(i)]
+        if not live:
+            return
 
 
 def run(provider: str, *, home: Path | None = None, cap_s: float = CAP_S, cap_usd: float = CAP_USD,

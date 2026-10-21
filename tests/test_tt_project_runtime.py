@@ -5859,6 +5859,38 @@ def test_doctor_loop_fails_a_change_that_lands_outside_the_review_and_push_queue
     assert r["steps"]["landed"] is False and lines[-1].split()[1] == "FAIL", lines
 
 
+def test_doctor_loop_stops_a_precheck_still_running_when_it_ends(env, monkeypatch):
+    """The daemon's detached precheck of the code task's head outlives the runs: the loop check ends
+    its process group and waits for it, so nothing runs on past the check or writes into its
+    removed folder."""
+    from ttp import cli, daemon, loopcheck, project
+    monkeypatch.setenv("TTP_FAKE_SHELL", LOOP_FAKE_SHELL)
+    monkeypatch.setenv("TTP_FAKE_COST", "0.01")
+    setup, stop_all, seen = loopcheck.setup, loopcheck.stop_all, []
+
+    def slow_checks(*a, **k):
+        p, remote, tid = setup(*a, **k)
+        cfg = json.loads(p.config_path.read_text())
+        cfg["delivery"]["push_checks"] = ["sleep 120"]
+        project.write_json(p.config_path, cfg)
+        return p, remote, tid
+
+    def stop_and_see(p):
+        dirs = list((p.state / daemon.PRECHECKS_DIR).glob("t*"))
+        seen.extend(i for i in map(cli._read_checks_pid, dirs) if cli._checks_alive(i))
+        stop_all(p)
+
+    monkeypatch.setattr(loopcheck, "setup", slow_checks)
+    monkeypatch.setattr(loopcheck, "stop_all", stop_and_see)
+    lines = []
+    r = loopcheck.run("fake", tick_s=0.05, cap_s=15, emit=lines.append)   # the review waits for the precheck
+    assert r["outcome"] == "time cap 15s reached" and r["steps"].get("review"), (r, lines)
+    assert seen, "the precheck was still running when the check ended"
+    assert not any(cli._checks_alive(i) for i in seen), "and was stopped"
+    time.sleep(1)
+    assert not list(pathlib.Path(os.environ["TTP_HOME"]).glob("loop-check-*")), "the scratch project stays removed"
+
+
 def test_doctor_loop_stops_at_its_spend_cap_and_reports_a_missing_cli_with_exit_0(env, monkeypatch, capsys):
     from ttp import cli, loopcheck
     from ttp.providers import base
@@ -26030,6 +26062,7 @@ DURABLE_EXEMPT = {
     ("codex.py", "os.replace(tmp, path)"): "a cache, rewritten whenever its content differs",
     ("fake.py", '"result.json").write_text'): "the test provider",
     ("schedcheck.py", "out.write_text(printed)"): "a scratch project's watcher output, removed when the check ends",
+    ("loopcheck.py", '(repo / "NOTES.md").write_text'): "the scratch repository's seed file, committed at once and removed when the check ends",
     ("archive.py", '"changes.patch").write_bytes'): "a scratch patch for `git apply --check`, in a temporary directory removed after",
     ("archive.py", 'open(tmp, "wb") as fh'): "archive._write_new syncs a new patch before placing it (never over another)",
     ("archive.py", 'open(dst, "wb") as fo'): "archive.copy writes a big file's .part copy, synced before it is placed",
