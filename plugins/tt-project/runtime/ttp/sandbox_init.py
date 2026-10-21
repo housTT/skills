@@ -2,10 +2,11 @@
 and exits with its exit code, which ends every process left in the namespace. Standalone (run with
 `python3 -I -S`): it imports nothing from the runtime.
 
-As the namespace's first process it ignores signals it has no handler for, so a stop reaches the
-command through the process group (the command shares the caller's) or as SIGKILL, which ends the
-namespace. `unshare --fork` hands its child SIGINT and SIGTERM ignored; the command gets them back
-at their defaults, with SIGPIPE, which Python ignores."""
+The command runs in a session and process group of its own, so a `kill 0` or os.killpg(0, sig) in
+it reaches only the namespace, never the caller's group outside it. A SIGINT, SIGTERM or SIGHUP to
+this process (a terminal's Ctrl-C, a TERM to the caller's group from a timeout) is passed on to the
+command's group; a SIGKILL ends the namespace. `unshare --fork` hands its child SIGINT and SIGTERM
+ignored; the command gets them back at their defaults, with SIGPIPE, which Python ignores."""
 import os
 import signal
 import sys
@@ -17,17 +18,24 @@ def main(argv: list) -> int:
     if not argv:
         print("ttp sandbox: no command", file=sys.stderr)
         return 2
-    pid = os.fork()
-    if pid == 0:
-        for sig in RESET:
-            signal.signal(sig, signal.SIG_DFL)
+    forward = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    # Held until the command's group exists, so a stop that comes first is passed on, not lost.
+    signal.pthread_sigmask(signal.SIG_BLOCK, forward)
+    try:
+        pid = os.posix_spawnp(argv[0], argv, os.environ, setsid=True, setsigmask=(), setsigdef=RESET)
+    except OSError as e:
+        print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
+        return 127 if isinstance(e, FileNotFoundError) else 126
+
+    def pass_on(sig, _frame):
         try:
-            os.execvp(argv[0], argv)
-        except OSError as e:
-            print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
-            os._exit(127 if isinstance(e, FileNotFoundError) else 126)
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, signal.SIG_IGN)
+            os.killpg(pid, sig)
+        except OSError:
+            pass
+
+    for sig in forward:
+        signal.signal(sig, pass_on)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, forward)
     while True:
         try:
             done, status = os.wait()

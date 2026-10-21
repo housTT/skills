@@ -138,6 +138,6 @@ def run(argv: list[str]) -> int:
 
     signal.signal(signal.SIGTERM, end)
     signal.signal(signal.SIGHUP, end)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)   # a terminal's Ctrl-C reaches the command itself
+    signal.signal(signal.SIGINT, signal.SIG_IGN)   # a terminal's Ctrl-C reaches the sandbox init, which passes it on
     rc = proc.wait()
     return rc if rc >= 0 else 128 - rc

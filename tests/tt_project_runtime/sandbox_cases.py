@@ -41,6 +41,44 @@ def test_sandbox_hides_an_outside_process_and_a_kill_of_its_pid_reaches_nothing(
         sentinel.wait()
 
 
+def test_a_kill_of_group_0_inside_the_sandbox_reaches_no_outside_process(monkeypatch):
+    """`kill 0` or os.killpg(0, sig) in the command signals only its own group: a process outside
+    the namespace that shares the caller's group lives on."""
+    sandbox = _live_sandbox(monkeypatch)
+    argv = sandbox.wrap(["sh", "-c", "trap 'echo caught' USR1; kill -USR1 0; echo done"])
+    driver = ("import json, signal, subprocess, sys\nsignal.signal(signal.SIGUSR1, lambda *a: None)\n"
+              "s = subprocess.Popen(['sleep', '60'])\n"
+              "r = subprocess.run(json.loads(sys.argv[1]), capture_output=True, text=True, timeout=60)\n"
+              "print(json.dumps([r.returncode, r.stdout, s.poll()]))\ns.kill()\n")
+    r = subprocess.run([sys.executable, "-c", driver, json.dumps(argv)], start_new_session=True,
+                       capture_output=True, text=True, timeout=90)
+    assert r.returncode == 0, r.stderr
+    rc, out, sentinel = json.loads(r.stdout)
+    assert sentinel is None, "a signal to group 0 inside the sandbox reached a process outside it"
+    assert rc == 0 and out.splitlines() == ["caught", "done"]
+
+
+def test_a_term_or_int_to_the_callers_group_still_stops_the_command_in_its_own_group(tmp_path, monkeypatch):
+    """The command has a group of its own; the sandbox init passes a group TERM (a runner's stop) or
+    INT (Ctrl-C) on to it, and the command ends of that signal."""
+    sandbox = _live_sandbox(monkeypatch)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        ready = tmp_path / f"ready{int(sig)}"
+        proc = subprocess.Popen(sandbox.wrap(["sh", "-c", f"touch {shlex.quote(str(ready))}; sleep 60"]),
+                                start_new_session=True)
+        try:
+            deadline = time.time() + 30
+            while not ready.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            assert ready.exists()
+            os.killpg(proc.pid, sig)
+            assert proc.wait(timeout=20) == 128 + sig
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
 def test_sandbox_keeps_working_dir_environment_and_exit_code(tmp_path, monkeypatch):
     sandbox = _live_sandbox(monkeypatch)
     r = subprocess.run(sandbox.wrap(["sh", "-c", 'pwd; echo "$TTP_SANDBOX_TEST"; exit 7']), cwd=tmp_path,
