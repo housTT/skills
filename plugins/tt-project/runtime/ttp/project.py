@@ -185,7 +185,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # Prompt cache lifetime of coordinator turns: "auto" (1h, a write at 2x input
                     # instead of 1.25x, unless a 1h turn with the same prompt, schema, model, effort
                     # and agent CLI started under cache_warm_min minutes ago: then 5m, which still
-                    # reads that turn's 1h entries; cachettl.py), "1h", "5m", or "off" (the agent's
+                    # reads that turn's 1h entries; also 5m when no next turn looks likely within
+                    # the hour: nothing running or due, no recent user message, long turn gaps;
+                    # cachettl.py), "1h", "5m", or "off" (the agent's
                     # own choice, and charter and memory stay in the system prompt).
                     "cache_ttl": "auto", "cache_warm_min": 50,
                     # An agent whose prompt cache follows its session (Codex) continues the last

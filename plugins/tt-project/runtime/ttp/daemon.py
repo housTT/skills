@@ -1893,9 +1893,11 @@ class Daemon:
             if prov.cache_env("1h"):
                 cache_fp = cachettl.fingerprint(system, context, schema, model, effort,
                                                 cachettl.cli_stamp(prov.binary()))
+                now = time.time()
                 cache_ttl, ttl_why = cachettl.choose(
-                    self.p.db.kv(cachettl.KEY), cache_fp, time.time(),
-                    (self.cfg.get("coordinator") or {}).get("cache_warm_min", cachettl.WARM_MIN))
+                    self.p.db.kv(cachettl.KEY), cache_fp, now,
+                    (self.cfg.get("coordinator") or {}).get("cache_warm_min", cachettl.WARM_MIN),
+                    lambda: cachettl.signals(self.p.db, now))
             else:
                 cache_ttl, ttl_why = "1h", "the agent sets its own cache lifetime"
         else:

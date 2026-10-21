@@ -1337,7 +1337,7 @@ def test_auto_cache_ttl_goes_1h_when_the_prefix_changed(env, monkeypatch, tmp_pa
     head = coord.prompt_parts(p)[0]
     assert turn()[0] == "1h" and turn()[0] == "5m"
     ttl, _, note = turn(system=head + "\nnew charter line")
-    assert ttl == "1h" and note["cache_ttl_why"] == "changed since the last 1h turn: prompt", note
+    assert ttl == "1h" and note["cache_ttl_why"].startswith("changed since the last 1h turn: prompt; next turn likely"), note
     assert turn()[0] == "5m", "the earlier prefix's 1h turn is still warm"
     schema = {**coord.ACTIONS_SCHEMA, "description": "changed"}
     ttl, _, note = turn(schema=schema)
@@ -1349,6 +1349,108 @@ def test_auto_cache_ttl_goes_1h_when_the_prefix_changed(env, monkeypatch, tmp_pa
     cli.write_text("v2, an updated CLI")
     ttl, _, note = turn()
     assert ttl == "1h" and "cli" in note["cache_ttl_why"], note
+
+
+def test_likely_next_weighs_each_predictor_and_finds_a_quiet_project():
+    from ttp import cachettl
+    now, hour = 1_000_000.0, 3600.0
+    quiet_turns = [now - k * 2 * hour for k in range(1, 6)]           # median gap 2 h
+    quiet = {"running": [], "due": [], "chat": now - 5 * hour, "turns": quiet_turns}
+    likely, why = cachettl.likely_next(quiet, now)
+    assert not likely and "median turn gap 120 min" in why, why
+    cases = [({"running": [7, 8]}, "task #7, #8 running"),
+             ({"due": [("task #9", now + 20 * 60)]}, "task #9 due in 20 min"),
+             ({"due": [("task #9", None)]}, "task #9 due"),                       # ready now
+             ({"due": [("schedule review", now + 59 * 60)]}, "schedule review due in 59 min"),
+             ({"chat": now - 10 * 60}, "a user message 10 min ago"),
+             ({"turns": quiet_turns[:3]}, "only 3 earlier turns"),
+             ({"turns": [now - k * hour for k in range(1, 6)]}, "median turn gap 60 min")]
+    for change, reason in cases:
+        likely, why = cachettl.likely_next({**quiet, **change}, now)
+        assert likely and why == reason, (change, why)
+    # Past the hour, or a user message past CHAT_MIN, is no sign of a turn.
+    for change in ({"due": [("task #9", now + 61 * 60)]}, {"chat": now - 31 * 60}):
+        assert not cachettl.likely_next({**quiet, **change}, now)[0], change
+    # Busy then quiet: the gap from the last turn to now counts as one of the GAPS.
+    turns = [now - 4 * hour - k * 60 for k in range(5)]
+    assert cachettl.likely_next({**quiet, "turns": turns}, now)[0], "four 1 min gaps out of five"
+
+
+def test_cache_signals_read_running_due_tasks_llm_schedules_chat_and_turns(env):
+    from ttp import cachettl
+    p = make(env)
+    db, now = p.db, time.time()
+    db.x("UPDATE messages SET ts=?", (now - 86400,))
+    sig = cachettl.signals(db, now)
+    assert sig["running"] == [] and sig["due"] == [] and sig["chat"] == now - 86400, sig
+    run = db.add_task("running")
+    db.update_task(run, status="running")
+    ready = db.add_task("ready")
+    soon = db.add_task("waiting, retry in 30 min")
+    db.update_task(soon, not_before=now + 1800)
+    late = db.add_task("waiting, retry in 2 h")
+    db.update_task(late, not_before=now + 7200)
+    db.add_task("after the late one", depends_on=json.dumps([late]))
+    for name, kind, at in (("llm-soon", "llm", now + 600), ("llm-late", "llm", now + 7200),
+                           ("watcher-soon", "watcher", now + 60)):
+        db.x("INSERT INTO schedules(name, kind, every_s, next_run) VALUES (?,?,?,?)", (name, kind, 3600, at))
+    db.x("INSERT INTO runs(role, started, status) VALUES ('coordinator', ?, 'ok')", (now - 600,))
+    db.x("INSERT INTO messages(ts, direction, kind, text) VALUES (?, 'in', 'user', 'hi')", (now - 120,))
+    db.x("INSERT INTO messages(ts, direction, kind, text) VALUES (?, 'in', 'note', 'later')", (now - 60,))
+    sig = cachettl.signals(db, now)
+    assert sig["running"] == [run] and sig["chat"] == now - 120 and sig["turns"] == [now - 600], sig
+    assert sig["due"] == [(f"task #{ready}", None), (f"task #{soon}", now + 1800), ("schedule llm-soon", now + 600)]
+
+
+def test_auto_cache_ttl_sends_a_quiet_projects_cold_turn_at_5m_and_status_still_reports_its_hit(env, monkeypatch, tmp_path):
+    from ttp import budget, cachettl
+    p, box, cli, turn = _auto_ttl_daemon(env, monkeypatch, tmp_path)
+    now = time.time()
+    p.db.x("UPDATE messages SET ts=?", (now - 86400,))
+    for k in range(1, 6):   # a turn every 2 h, the last one 2 h ago
+        p.db.x("INSERT INTO runs(role, started, ended, status) VALUES ('coordinator', ?, ?, 'ok')",
+               (now - k * 7200, now - k * 7200 + 60))
+    ttl, marks, note = turn()
+    assert ttl == "5m" and marks == ["5m"], "the mark takes the turn's own lifetime"
+    assert note["cache_ttl_why"].startswith("cold: no earlier 1h turn; quiet: nothing running"), note
+    assert p.db.kv(cachettl.KEY) is None, "a 5m turn records no 1h entry"
+    assert turn()[0] == "5m", "a quick follow-up of a 5m turn is not a sign: the median gap stays long"
+    task = p.db.add_task("work")
+    p.db.update_task(task, status="running")
+    ttl, marks, note = turn()
+    assert ttl == "1h" and marks == ["1h"] and note["cache_ttl_why"].endswith(f"next turn likely: task #{task} running")
+    assert turn()[0] == "5m" and turn()[2]["cache_ttl_why"].startswith("warm"), "the warm rule is kept"
+    # A failing estimate costs only money: the turn goes at 1h as before.
+    p.db.x("DELETE FROM kv WHERE key=?", (cachettl.KEY,))
+    monkeypatch.setattr(cachettl, "signals", lambda db, now: 1 / 0)
+    ttl, _, note = turn()
+    assert ttl == "1h" and note["cache_ttl_why"].endswith("next turn not estimated: ZeroDivisionError"), note
+    # Status reads the quiet turn's cache use like any other.
+    rid = p.db.one("SELECT MIN(id) id FROM runs WHERE role='coordinator' AND note LIKE '%quiet:%'")["id"]
+    row = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])
+    p.db.x("UPDATE runs SET status='ok', ended=?, input_tokens=100, cache_read_tokens=900, cache_write_tokens=0, "
+           "note=? WHERE role='coordinator' AND status='running'", (now, json.dumps({**row, "cache_telemetry": {"complete": True}})))
+    assert "90% token hit" in budget.coordinator_cache_line(budget.coordinator_cache(p.db)["24h"])
+
+
+def test_cache_ttl_replay_of_recorded_gaps_cuts_unread_1h_writes_without_new_misses():
+    """Recorded 1h turns (cachettl_replay.json): a turn read nothing when no turn followed within
+    60 min; at 5m it misses when the next one comes 5-60 min later."""
+    from ttp import cachettl
+    data, now = json.loads((_CASES / "cachettl_replay.json").read_text()), 1_000_000.0
+    got = {}
+    for label in ("quiet", "busy"):
+        unread = kept = missed = 0
+        for nxt, running, queued, msg_min, gaps in data[label]:
+            turns = [now - sum(gaps[i:]) * 60 for i in range(len(gaps))]
+            sig = {"running": [1] if running else [], "due": [("task #1", None)] if queued else [],
+                   "chat": None if msg_min is None else now - msg_min * 60, "turns": turns}
+            likely = cachettl.likely_next(sig, now)[0]
+            unread += nxt > 60
+            kept += likely and nxt > 60
+            missed += not likely and 5 < nxt <= 60
+        got[label] = (len(data[label]), unread, kept, missed)
+    assert got == {"quiet": (66, 26, 21, 0), "busy": (204, 3, 3, 0)}, got
 
 
 
