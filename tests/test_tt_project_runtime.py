@@ -19389,7 +19389,7 @@ def test_a_failed_review_records_the_head_it_reviewed():
 
 def test_the_coordinator_prompt_leaves_review_tiers_to_the_diff():
     text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
-    assert "A `review` gets its tier from the diff" in text and "Set `deep` only to force it" in text
+    assert "A `review` gets its tier from the diff" in text and "set `deep` only to force it" in text
 
 
 def test_a_login_ends_the_logged_out_pause_without_a_model_call(env, monkeypatch, tmp_path):
