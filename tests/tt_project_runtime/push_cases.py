@@ -9397,3 +9397,66 @@ def test_a_held_push_row_shows_in_the_start_gate_and_counts_as_delivered(env, mo
            "VALUES(?,1,'b','abc123','origin/proj','held',?,0,0)", (t, json.dumps({"scope": "workflow"})))
     assert startgate.push_state(p.db, f"ttp landed --task {t}") == "held for the token scope workflow"
     assert reviewreuse.delivered(p, "abc123")
+
+
+def test_version_bump_changeset_file_keeps_one_release_changeset(tmp_path):
+    """`changeset_file` appends the batch's subjects to one release changeset (no duplicates), creates
+    it when missing, leaves a batch's own edit of it alone, and unset keeps one file per branch."""
+    import subprocess
+    from ttp import push
+    g = lambda *a: subprocess.run(["git", "-C", str(tmp_path), *a], check=True, capture_output=True, text=True).stdout.strip()
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "a@b.c")
+    g("config", "user.name", "t")
+    (tmp_path / "plug").mkdir()
+    (tmp_path / "plug" / "p.json").write_text('{"name": "pk", "version": "1.0.0"}\n')
+    (tmp_path / "plug" / "x.txt").write_text("0\n")
+    (tmp_path / ".changeset").mkdir()
+    (tmp_path / ".changeset" / "pk-release.md").write_text('---\n"pk": patch\n---\n\n`pk`:\n\n- old thing\n')
+    g("add", "-A")
+    g("commit", "-qm", "base")
+    tip = g("rev-parse", "HEAD")
+    base = {"files": ["plug/p.json"], "changeset_dir": ".changeset"}
+    cfg = push.bump_of({**base, "changeset_file": ".changeset/pk-release.md"})
+    assert cfg["changeset_file"] == ".changeset/pk-release.md"
+    for bad in ("../x.md", "/x.md", "x.txt"):
+        with pytest.raises(ValueError):
+            push.bump_of({**base, "changeset_file": bad})
+
+    def batch(*subjects, extra=None):
+        g("reset", "-q", "--hard", tip)
+        for i, s in enumerate(subjects):
+            (tmp_path / "plug" / "x.txt").write_text(f"{s}{i}\n")
+            g("commit", "-qam", f"pk: {s}")
+        if extra:
+            extra()
+            g("add", "-A")
+            g("commit", "-qm", "own changeset")
+
+    batch("new a", "old thing", "new b")
+    assert push.bump(tmp_path, tip, cfg, lambda m: None) == 0
+    text = (tmp_path / ".changeset" / "pk-release.md").read_text()
+    assert text.count("- old thing") == 1 and "- new a" in text and "- new b" in text
+    assert sorted(p.name for p in (tmp_path / ".changeset").iterdir()) == ["pk-release.md"]
+    assert '"version": "1.0.1"' in (tmp_path / "plug" / "p.json").read_text()
+    # appending the same batch again adds nothing
+    before = text
+    push.bump(tmp_path, tip, cfg, lambda m: None)
+    assert (tmp_path / ".changeset" / "pk-release.md").read_text() == before
+    # missing file: created
+    batch("only")
+    g("rm", "-q", ".changeset/pk-release.md")
+    g("commit", "-qm", "drop")
+    cfg2 = push.bump_of({**base, "changeset_file": ".changeset/pk-other.md"})
+    batch("only")
+    assert push.bump(tmp_path, tip, cfg2, lambda m: None) == 0
+    assert "- only" in (tmp_path / ".changeset" / "pk-other.md").read_text()
+    # batch bringing its own edit of the release changeset: untouched
+    own = lambda: (tmp_path / ".changeset" / "pk-release.md").write_text("own\n")
+    batch("mine", extra=own)
+    assert push.bump(tmp_path, tip, cfg, lambda m: None) == 0
+    assert (tmp_path / ".changeset" / "pk-release.md").read_text() == "own\n"
+    # unset: one file per branch, as before
+    batch("plain")
+    assert push.bump(tmp_path, tip, push.bump_of(base), lambda m: None) == 0
+    assert (tmp_path / ".changeset" / "pk-main.md").is_file()

@@ -2511,7 +2511,7 @@ def bump_of(v: Any) -> dict | None:
             raise ValueError(f"delivery.version_bump must be an object with `files`, not {v!r}") from None
     if not isinstance(v, dict):
         raise ValueError(f"delivery.version_bump must be an object with `files`, not {v!r}")
-    unknown = set(v) - {"files", "changeset_dir", "package", "paths"}
+    unknown = set(v) - {"files", "changeset_dir", "changeset_file", "package", "paths"}
     if unknown:
         raise ValueError(f"delivery.version_bump: unknown keys {', '.join(sorted(unknown))}")
 
@@ -2529,11 +2529,15 @@ def bump_of(v: Any) -> dict | None:
     if not files:
         raise ValueError("delivery.version_bump.files must list the files that hold the version")
     paths = rel_list("paths") or [os.path.commonpath(files) if len(files) > 1 else os.path.dirname(files[0])]
-    for key in ("changeset_dir", "package"):
+    for key in ("changeset_dir", "changeset_file", "package"):
         if v.get(key) is not None and not isinstance(v[key], str):
             raise ValueError(f"delivery.version_bump.{key} must be a string")
+    csfile = (v.get("changeset_file") or "").strip().strip("/")
+    if csfile and (csfile.startswith("..") or csfile.startswith("~") or str(v.get("changeset_file")).strip().startswith("/")
+                   or not csfile.endswith(".md")):
+        raise ValueError("delivery.version_bump.changeset_file must be a repo-relative .md path")
     return {"files": files, "paths": paths, "package": (v.get("package") or "").strip(),
-            "changeset_dir": (v.get("changeset_dir") or "").strip().strip("/")}
+            "changeset_file": csfile, "changeset_dir": (v.get("changeset_dir") or "").strip().strip("/")}
 
 
 def bump_problems(v: Any) -> list[str]:
@@ -2638,7 +2642,23 @@ def bump(repo: Path, tip: str, cfg: dict, say: Callable[[str], None]) -> int:
     if csdir:
         added = [f for f in _git(repo, "diff", "--name-only", "--diff-filter=A", tip, "HEAD", "--",
                                  csdir).stdout.split() if f.endswith(".md")]
-        if not added and package:
+        csfile = cfg.get("changeset_file") or ""
+        if csfile and csfile in _git(repo, "diff", "--name-only", tip, "HEAD", "--", csfile).stdout.split():
+            added = [csfile]     # the batch brings its own edit of the release changeset
+        if not added and package and csfile:
+            cs = repo / csfile   # one release changeset per package: append what is new, or create it
+            cs.parent.mkdir(parents=True, exist_ok=True)
+            if cs.is_file():
+                text = cs.read_text().rstrip("\n")
+                have = {ln.strip() for ln in text.splitlines()}
+                new_lines = [f"- {s}" for s in dict.fromkeys(subjects) if f"- {s}" not in have]
+                durable_write(cs, text + "".join(f"\n{ln}" for ln in new_lines) + "\n")
+            else:
+                durable_write(cs, f'---\n"{package}": patch\n---\n\n`{package}`:\n\n'
+                              + "\n".join(f"- {s}" for s in dict.fromkeys(subjects)) + "\n")
+            _git(repo, "add", "--", csfile)
+            wrote = True
+        elif not added and package:
             branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
             name = _slug(branch.rsplit("/", 1)[-1] if branch and branch != "HEAD" else subject)
             body = (f"`{package}`: {subjects[0]}." if len(subjects) == 1
