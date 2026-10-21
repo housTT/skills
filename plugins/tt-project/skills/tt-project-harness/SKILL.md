@@ -144,6 +144,17 @@ read the one for the lever you change.
   `TTP_DEVICE_MARKERS` variables (comma-separated).
 - Do not rely on `-m 'not device'` alone: a marker the repo does not define deselects nothing.
 
+## Test runs never reach other processes
+
+- On a shared host a test suite's own process-kill code (cleanup by pid, `pkill` in a fixture) can
+  hit other users' live jobs. `ttp checks`, `delivery.push_checks` and the push queue run every
+  local check in a process sandbox: its own PID namespace and /proc, so it sees and can signal only
+  its own process tree, and nothing it starts outlives it.
+- Run other test commands the same way: `ttp sandbox -- <command>`.
+- It needs unprivileged user namespaces and `unshare` or `bwrap`. Where the host allows none, checks
+  run as before and say why; `ttp doctor` names the setting. `"sandbox": false` on a push_checks
+  entry is only for a check that needs the host's process table, and is reported each run.
+
 ## Rebooting the harness's own host
 
 A reboot ends every run in flight, and nothing lifts a plain pause afterwards: schedules and probes

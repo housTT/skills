@@ -31,6 +31,10 @@ keeps going when the chat closes, and any later chat reconnects to it by name.
   scripts that would kill or change other people's processes and services.
 - Delivery: a push queue that rebases, runs the project's checks, batches version bumps and never
   force-pushes; a review step before any push; draft pull requests only.
+- Process sandbox: `ttp checks` and push checks run each local check in its own PID namespace
+  (`unshare` or `bwrap`), so a test cannot see or signal other processes; `ttp sandbox -- <cmd>`
+  does the same for any command. Where the host allows no user namespaces, checks run as before
+  and say why; `ttp doctor` names the setting.
 - Optional failover: standby state snapshots and a project lease, so only one host coordinates.
 - Plain-file memory and charter; entries with an end date or condition retire themselves.
 

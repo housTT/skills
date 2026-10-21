@@ -42,7 +42,8 @@
 - Make durable progress early (commit, write files): a killed run keeps what's on disk.
   No git repo: files written as you go to the output folder count.
 - Run builds and test suites as `ttp clip -- <command>`: it shows the failures or head and tail,
-  and the full log's path.
+  and the full log's path. Run test suites and other untrusted test code as
+  `ttp clip -- ttp sandbox -- <command>`: they then cannot see or signal other processes.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read
   with offset and limit). Do not re-read a range you already read: later calls pay it again.
 <!-- ttp:if harness -->

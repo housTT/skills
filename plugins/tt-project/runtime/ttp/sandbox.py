@@ -18,12 +18,12 @@ from pathlib import Path
 
 INIT = Path(__file__).with_name("sandbox_init.py")
 PROBE_S = 20
-# The settings that turn unprivileged user namespaces off: (file, value that disables, what enables).
-SETTINGS = (("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "1",
-             "set the sysctl kernel.apparmor_restrict_unprivileged_userns=0, or give unshare or bwrap an "
-             "AppArmor profile that allows userns"),
-            ("/proc/sys/kernel/unprivileged_userns_clone", "0", "set the sysctl kernel.unprivileged_userns_clone=1"),
-            ("/proc/sys/user/max_user_namespaces", "0", "set the sysctl user.max_user_namespaces above 0"))
+# The sysctls that turn unprivileged user namespaces off: (name, value that does, what turns them on).
+SETTINGS = (("kernel.apparmor_restrict_unprivileged_userns", "1",
+             "set it to 0, or give unshare or bwrap an AppArmor profile that allows user namespaces"),
+            ("kernel.unprivileged_userns_clone", "0", "set it to 1"),
+            ("user.max_user_namespaces", "0", "set it above 0"))
+SYSCTL_DIR = Path("/proc/sys")
 _STATE: dict[str, tuple[list[str] | None, str]] = {}   # by PATH: what status() found
 
 
@@ -42,10 +42,10 @@ def _init() -> list[str]:
 
 def _setting() -> str:
     """The kernel setting that keeps user namespaces off and how to turn them on, or ""."""
-    for path, off, fix in SETTINGS:
+    for name, off, fix in SETTINGS:
         try:
-            if Path(path).read_text().strip() == off:
-                return f"{Path(path).relative_to('/proc/sys').as_posix().replace('/', '.')}={off} turns off unprivileged user namespaces ({fix})"
+            if (SYSCTL_DIR / name.replace(".", "/")).read_text().strip() == off:
+                return f"sysctl {name}={off} turns off unprivileged user namespaces ({fix})"
         except OSError:
             pass
     return ""
