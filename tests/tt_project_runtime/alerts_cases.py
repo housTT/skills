@@ -4034,6 +4034,8 @@ _TS = "2026-01-01 09:00:00.123 Df usernoted[512:1a2b] [com.apple.unc:application
      f'{_TS} Not presenting <NotificationRecord app:"com.tt-project.notifier" ident:"1">: suppressed by Focus\n', 0, False),
     (f'{_TS} Withdrawing <NotificationRecord app:"com.tt-project.notifier" ident:"1">\n', 0, False),   # unknown
     ('usernoted: Delivering <NotificationRecord app:"com.tt-project.notifier">\n', 1, False),   # log show fails
+    (f'{_TS} Error delivering <NotificationRecord app:"com.tt-project.notifier" ident:"1">\n', 0, False),
+    (f'{_TS} Will not be delivering <NotificationRecord app:"com.tt-project.notifier" ident:"1">\n', 0, False),
     (None, 0, False),   # no `log` at all
 ])
 def test_where_macos_settings_list_no_apps_usernoted_log_decides_the_app_is_allowed(monkeypatch, tmp_path,
@@ -4047,7 +4049,9 @@ def test_where_macos_settings_list_no_apps_usernoted_log_decides_the_app_is_allo
     assert f"test notification sent ({sender}); macOS does not say whether it was shown" in lines, lines
     assert len(calls("open")) == (2 if switches else 1) and bool(calls("osascript")) != switches
     step = [ln for ln in lines if ln.startswith("alerts still come from Script Editor")]
-    assert bool(step) != switches, "the one Allow/Persistent step only while macOS does not show it allowed"
+    assert not step, "the pending app's step prints once, from fix_steps"
+    pend = [ln for ln in lines if "is not in System Settings > Notifications yet" in ln]
+    assert len(pend) == (0 if switches else 1), lines
     assert any(ln.startswith("alert style: macOS does not say here") for ln in lines) == switches
     assert notifier.show("t", "b")["backend"] == ("tt-project" if switches else "osascript")
     if text is not None:

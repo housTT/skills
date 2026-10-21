@@ -63,7 +63,8 @@ LOG_WINDOW_S = 24 * 3600   # how long after the app's first post its log entries
 SENDER_IDS = {APP_NAME: BUNDLE_ID, "osascript": "com.apple.ScriptEditor2",
               "terminal-notifier": "fr.julienxx.oss.terminal-notifier"}   # whose usernoted lines a test reads
 DENIED = ("denied", "not authorized", "unauthorized", "disallowed", "not allowed")
-SHOWN = re.compile(r"(?<![\w-])(not\s+)?(delivering|presenting)\b", re.I)   # usernoted: a record shown, or not
+SHOWN = re.compile(r"(?:usernoted:\s*|\d{4}-\d\d-\d\d[ T][\d:.+-]+\s+\w+\s+usernoted\[[^\]]*\]\s*(?:\[[^\]]*\]\s*)?)?"
+                   r"(not\s+)?(delivering|presenting)\b", re.I)   # a record BEGINNING so (after its prefix): shown, or not
 LOG_RECORD = re.compile(r"\d{4}-\d\d-\d\d[ T]\d")   # `log show --style compact`: a line starting a record
 
 
@@ -464,7 +465,7 @@ def _usernoted(bundle: str, since: float) -> list[str] | None:
 def _log_verdict(lines: list[str]) -> str:
     """'denied' (a denial, or a record not delivered or not presented: Focus, display state, turned off),
     'allowed' (only a record that was delivered or presented, not negated) or 'none' (nothing decisive)."""
-    said = [m for ln in lines for m in SHOWN.finditer(ln)]
+    said = [m for ln in lines for m in [SHOWN.match(ln.strip())] if m]
     if any(w in ln.lower() for ln in lines for w in DENIED) or any(m.group(1) for m in said):
         return "denied"
     return "allowed" if said else "none"
@@ -681,7 +682,8 @@ def fix_steps(res: dict) -> list[str]:
     other = ("  Or stop using the tt-project app: set \"app\": false in ~/.tt-project/notifier.json; alerts then "
              "come from terminal-notifier (`brew install terminal-notifier`) or else osascript (Script Editor).")
     pending = [f"The {APP_NAME} app is not in System Settings > Notifications yet, so alerts come from {b} until "
-               "it is: allow its first notification.", other] if b in ("osascript", "terminal-notifier") and \
+               "it is: allow its first notification, then keep alerts on screen: System Settings > Notifications > "
+               f"{APP_NAME} > Allow notifications on, alert style Persistent (older macOS: Alerts).", other] if b in ("osascript", "terminal-notifier") and \
         app_pending() else []
     if b == "osascript":
         return pending + ["macOS shows these as from Script Editor. If you saw nothing:",
@@ -731,7 +733,7 @@ def test(ask=None) -> tuple[bool, list[str]]:
         return True, pre + [f"test notification delivered ({b})"]
     if ask is None:
         return True, pre + [f"test notification sent ({b}); macOS does not say whether it was shown"] + \
-            style_lines(sb) + fix_steps(res)
+            ([] if sb != APP_NAME and app_pending() else style_lines(sb)) + fix_steps(res)
     if ask("Did a tt-project notification appear? [y/N] "):
         record(dict(res, confirmed=True, ts=time.time()))
         return True, pre + [f"test notification delivered ({b}), seen by you"] + style_lines(sb)
