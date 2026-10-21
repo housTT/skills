@@ -138,8 +138,8 @@ def _profiles() -> list[Path]:
     """Every shell profile install.sh may add its PATH line to."""
     home = Path.home()
     zdot = Path(os.environ.get("ZDOTDIR") or home)
-    files = [home / ".bashrc", home / ".bash_profile", home / ".zshrc", zdot / ".zshrc", home / ".profile",
-             home / ".config" / "fish" / "conf.d" / "tt-project.fish"]
+    files = [home / ".bashrc", home / ".bash_profile", home / ".bash_login", home / ".zshrc", zdot / ".zshrc",
+             home / ".profile", home / ".config" / "fish" / "conf.d" / "tt-project.fish"]
     return list(dict.fromkeys(files))
 
 

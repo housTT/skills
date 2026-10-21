@@ -152,6 +152,8 @@ def test_uninstall_removes_only_the_installers_marked_path_line(env, tmp_path):
     own = b"alias ll='ls -l'\r\n# my PATH\nexport PATH=\"$HOME/bin:$PATH\"\n"
     bashrc.write_bytes(b"# top\n" + f'export PATH="$HOME/.local/bin:$PATH"{mark}\n'.encode() + own)
     zshrc.write_bytes(own)                       # no marked line: left alone
+    login = home / ".bash_login"                 # macOS bash's login profile when it is the first found
+    login.write_bytes(own + f'export PATH="$HOME/.local/bin:$PATH"{mark}'.encode())
     fish.parent.mkdir(parents=True)
     fish.write_text(f"fish_add_path -g $HOME/.local/bin{mark}\n")
     dotfiles = tmp_path / "dotfiles" / "profile"   # a dotfile manager's symlink stays a symlink
@@ -163,9 +165,11 @@ def test_uninstall_removes_only_the_installers_marked_path_line(env, tmp_path):
         assert rc == 0, err
         assert "remove the PATH line the installer added to <tmp>/userhome/.bashrc" in out
         assert "added to <tmp>/userhome/.config/fish/conf.d/tt-project.fish" in out and ".zshrc" not in out
+        assert "added to <tmp>/userhome/.bash_login" in out
         rc, out, err = b["ttp"]("--yes")
         assert rc == 0 and "not done" not in err, err
         assert bashrc.read_bytes() == b"# top\n" + own and zshrc.read_bytes() == own
+        assert login.read_bytes() == own
         assert (home / ".profile").is_symlink() and dotfiles.read_bytes() == own
         assert not fish.exists() and fish.parent.is_dir()
         rc, out, err = b["ttp"]("--yes")

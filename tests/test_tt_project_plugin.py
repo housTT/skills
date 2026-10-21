@@ -4610,6 +4610,27 @@ def test_one_line_install_puts_local_bin_on_path_in_the_login_shells_profile_onc
     assert "ttp: ready in this shell" in on.stdout and "PATH for new shells" not in on.stdout
 
 
+@pytest.mark.parametrize("existing", [".profile", ".bash_login", None])
+def test_one_line_install_on_macos_bash_adds_to_the_login_profile_bash_reads_never_shadowing_it(install_env, existing):
+    """bash login shells read only the first of ~/.bash_profile, ~/.bash_login, ~/.profile: the line goes to
+    the one that exists, and a new ~/.bash_profile, which would hide it, is made only when none does."""
+    home = install_env.home
+    uname = home.parent / "bin" / "uname"
+    uname.write_text("#!/bin/sh\necho Darwin\n")
+    uname.chmod(0o755)
+    own = "alias ll='ls -l'\n"
+    if existing:
+        (home / existing).write_text(own)
+    r = install_env(on_path=False, env={"SHELL": "/bin/bash"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    rc = home / (existing or ".bash_profile")
+    assert f"ttp: added ~/.local/bin to PATH for new shells in {rc}\n" in r.stdout
+    lines = rc.read_text().splitlines()
+    assert lines[:-1] == ([own.strip()] if existing else []) and lines[-1].endswith(" # added by tt-project installer")
+    made = [f for f in (".bash_profile", ".bash_login", ".profile") if (home / f).exists()]
+    assert made == [existing or ".bash_profile"], made
+
+
 def test_one_line_install_reruns_update_the_clone_in_place_without_duplicates(install_env):
     home, repo = install_env.home, install_env.repo
     first = install_env()
