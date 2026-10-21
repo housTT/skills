@@ -21924,10 +21924,84 @@ def test_machines_push_skips_hosts_out_or_decommissioned(env):
     mm.add("box-b", tags="device,decommissioned", hostname="b-host")
     mm.add("box-c", tags="device")
     ml.set_outage("box-c", "repair", "proj", "1d")
-    got = mm.push_skips(["box-a", "b-host.example", "box-c", "box-z"])
-    assert got == {"b-host.example": "box-b is tagged decommissioned", "box-c": "box-c has an open known outage"}
+    got = mm.push_skips(["box-a", "b-host.example", "box-c", "user@box-c", "box-z"])
+    assert got.pop("b-host.example") == "box-b is tagged decommissioned"
+    assert set(got) == {"box-c", "user@box-c"} and got["box-c"] == got["user@box-c"]
+    assert got["box-c"].startswith("box-c is in a known outage until ")
     mm.add("box-d", tags="device,decommissioned", hostname="d-host.example.com")
     assert mm.push_skips(["d-host"]) == {"d-host": "box-d is tagged decommissioned"}
+
+
+def test_machines_set_skips_a_host_in_outage_in_one_line_and_saves_locally(env, monkeypatch, capsys):
+    """`ttp machines set` names a host in a known outage in one line and never copies to it; the local
+    change is saved whatever the other hosts' state."""
+    from ttp import cli
+    from ttp import machines as mm
+    from ttp import machine_ledger as ml
+    from ttp import timefmt
+    from ttp.project import register
+    register("p1", {"host": "box-out", "dir": "/p1"})
+    register("p2", {"host": "box-ok", "dir": "/p2"})
+    mm.add("box-out", tags="x")
+    ml.set_outage("box-out", "disk repair", "proj", "1d")
+    started = []
+    monkeypatch.setattr(mm, "push_background", lambda hosts: started.append(hosts) or "log")
+    cli.main(["machines", "set", "box-a", "--tags", "device", "--note", "edited"])
+    out = capsys.readouterr().out.splitlines()
+    assert mm.load()["box-a"]["note"] == "edited"
+    until = timefmt.long(ml.outages()["box-out"]["until"], timefmt.ambient())
+    assert [ln for ln in out if "box-out" in ln] == [f"skipped box-out: box-out is in a known outage until {until}"]
+    assert started == [["box-ok"]]
+    monkeypatch.setattr(mm, "push_background", lambda hosts: (_ for _ in ()).throw(OSError(5, "Input/output error")))
+    cli.main(["machines", "set", "box-b", "--tags", "device"])     # the copy cannot start: still saved, no raise
+    assert "box-b" in mm.load()
+    assert capsys.readouterr().out.splitlines()[-1] == ("could not start copying the machines list to box-ok: "
+                                                        "[Errno 5] Input/output error")
+
+
+def test_machines_push_reports_a_failing_host_in_one_line_and_updates_the_others(env, tmp_path, monkeypatch, capsys):
+    """A copy that fails on one host (a read-only or failing disk there, an OSError here) is one line with no
+    traceback, and the copies to the other hosts still go through."""
+    import errno
+    from ttp import cli
+    from ttp import machines as mm
+    from ttp.project import register
+    homes = {h: tmp_path / h for h in ("box-ok", "box-ro", "box-io", "box-z")}
+    for home in homes.values():
+        home.mkdir()
+    eio = tmp_path / "eio"      # the remote python on box-ro: every write fails with EIO, as on a failing /home
+    eio.mkdir()
+    (eio / "sitecustomize.py").write_text(
+        "import errno, os\n"
+        "def _eio(path, *a, **k):\n    raise OSError(errno.EIO, os.strerror(errno.EIO), path)\n"
+        "os.open = _eio\nos.replace = _eio\n")
+    real = subprocess.run
+
+    def run(args, **kw):
+        host = args[-2]
+        if host == "box-io":
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        env_ = {**os.environ, "HOME": str(homes[host])}
+        if host == "box-ro" and "python3" in args[-1]:
+            env_["PYTHONPATH"] = str(eio)
+        return real(["bash", "-c", args[-1]], env=env_, **kw)
+    monkeypatch.setattr(mm.subprocess, "run", run)
+    for n, h in enumerate(("box-io", "box-ok", "box-ro", "box-z")):
+        register(f"p{n}", {"host": h, "dir": f"/p{n}"})
+    mm.add("box-a", tags="device")
+    capsys.readouterr()
+    cli.main(["machines", "push"])
+    out = capsys.readouterr()
+    lines = out.out.splitlines()
+    assert "Traceback" not in out.out + out.err and len(lines) == 4
+    assert lines[0] == "could not copy the machines list to box-io: OSError: [Errno 5] Input/output error"
+    assert lines[2].startswith("could not copy the machines list to box-ro: [Errno 5] Input/output error: ")
+    assert lines[1] == "copied the machines list (1 machines) to box-ok"
+    assert lines[3] == "copied the machines list (1 machines) to box-z"
+    for h in ("box-ok", "box-z"):
+        assert "box-a" in json.loads((homes[h] / ".tt-project" / "machines.json").read_text())["machines"]
+    assert not (homes["box-ro"] / ".tt-project" / "machines.json").exists()
+    assert mm._short("Traceback (most recent call last):\n  File x\nOSError: boom\n\n") == "OSError: boom"
 
 
 def test_machines_add_copies_the_list_in_the_background_past_a_down_host(env, tmp_path, monkeypatch, capsys):
@@ -21952,7 +22026,7 @@ def test_machines_add_copies_the_list_in_the_background_past_a_down_host(env, tm
     cli.main(["machines", "add", "box-a", "--tags", "device"])
     assert time.monotonic() - t0 < 20 and not gate.exists()   # returned while the ssh still hangs
     out = capsys.readouterr().out
-    assert "skipped far-out: far-out has an open known outage" in out
+    assert "skipped far-out: far-out is in a known outage until " in out
     assert "copying the machines list to far-down in the background" in out
     gate.touch()
     for _ in range(300):

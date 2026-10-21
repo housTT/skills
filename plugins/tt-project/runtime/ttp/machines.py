@@ -227,13 +227,16 @@ def auth_failed_hint(stderr: str | None, booted_at: float | None = None, now: fl
             "console or connect path.")
 REMOTE = "~/.tt-project/machines.json"
 # Replaces the remote list only if it is still the one read (sha256 of its text), mode 0600.
-_WRITE = ("import hashlib,json,os,sys;h=os.path.expanduser('~/.tt-project');os.makedirs(h,mode=0o700,exist_ok=True);"
-          "p=os.path.join(h,'machines.json');d=json.load(sys.stdin)\n"
-          "try: cur=open(p,'rb').read()\nexcept FileNotFoundError: cur=b''\n"
-          "if hashlib.sha256(cur).hexdigest()!=d['expect']: sys.exit(3)\n"
-          "fd=os.open(p+'.tmp',os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600);"
-          "os.write(fd,(json.dumps(d['doc'],indent=2,sort_keys=True)+'\\n').encode());os.close(fd);"
-          "os.chmod(p+'.tmp',0o600);os.replace(p+'.tmp',p)")
+# A disk error there (a read-only or failing /home) exits 1 with one line, never a traceback.
+_WRITE = ("import hashlib,json,os,sys\ntry:\n"
+          " h=os.path.expanduser('~/.tt-project');os.makedirs(h,mode=0o700,exist_ok=True)\n"
+          " p=os.path.join(h,'machines.json');d=json.load(sys.stdin)\n"
+          " try: cur=open(p,'rb').read()\n except FileNotFoundError: cur=b''\n"
+          " if hashlib.sha256(cur).hexdigest()!=d['expect']: sys.exit(3)\n"
+          " fd=os.open(p+'.tmp',os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)\n"
+          " os.write(fd,(json.dumps(d['doc'],indent=2,sort_keys=True)+'\\n').encode());os.close(fd)\n"
+          " os.chmod(p+'.tmp',0o600);os.replace(p+'.tmp',p)\n"
+          "except OSError as e: sys.exit(str(e))")
 
 
 # A copy gives up on a host that is down within seconds, whatever the user's own ssh retry settings say.
@@ -253,17 +256,20 @@ def push_skips(hosts: list[str], known: dict[str, dict] | None = None,
     """{host: why} of the hosts a copy of the list skips: its machine has an open known outage or the
     decommissioned tag. A host is matched to a machine by alias or `hostname`, short names included."""
     from . import machine_ledger as ml
+    from . import timefmt
     known = load() if known is None else known
     outages = ml.outages() if outages is None else outages
     out = {}
     for host in hosts:
-        names = {host, host.split(".")[0]}
+        bare = host.rsplit("@", 1)[-1]     # an ssh target may name the user
+        names = {host, bare, bare.split(".")[0]}
         aliases = {a for a, m in known.items() if a in names or {(m.get("hostname") or ""), (m.get("hostname") or "").split(".")[0]} & names - {""}} | (names & set(outages))
         for alias in sorted(aliases):
             if DECOMMISSIONED in tag_names((known.get(alias) or {}).get("tags")):
                 out[host] = f"{alias} is tagged {DECOMMISSIONED}"
             elif alias in outages:
-                out[host] = f"{alias} has an open known outage"
+                until = float(outages[alias].get("until") or 0)
+                out[host] = f"{alias} is in a known outage" + (f" until {timefmt.long(until, timefmt.ambient())}" if until else "")
     return out
 
 
@@ -345,16 +351,29 @@ def _ssh(argv: list[str], **kw) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 124, "", err if kw.get("text") else err.encode())
 
 
+def _short(err: str) -> str:
+    """The last non-empty line of an error output, at most 200 characters: one line, never a traceback."""
+    lines = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
+    return lines[-1][-200:] if lines else "no error output"
+
+
 def push(host: str, tries: int = 3) -> str:
     """Copy this user's machines list to another machine (same user), merged with the list there.
-    A list there that cannot be read is left alone."""
+    A list there that cannot be read is left alone. Whatever fails, the result is one line."""
+    try:
+        return _push(host, tries)
+    except Exception as e:      # one bad host never stops the copies to the others
+        return f"could not copy the machines list to {host}: {type(e).__name__}: {_short(str(e))}"
+
+
+def _push(host: str, tries: int) -> str:
     mine = _doc()
     if not _part(mine, "machines") and not _part(mine, "removed"):
         return "no machines list to copy"
     for _ in range(tries):
         r = _ssh([*PUSH_SSH, host, f"cat {REMOTE} 2>/dev/null || true"], capture_output=True)
         if r.returncode != 0:
-            return f"could not copy the machines list to {host}: {r.stderr.decode(errors='replace').strip()[-200:]}"
+            return f"could not copy the machines list to {host}: {_short(r.stderr.decode(errors='replace'))}"
         try:
             theirs = json.loads(r.stdout) if r.stdout.strip() else {}
         except ValueError:
@@ -369,7 +388,7 @@ def push(host: str, tries: int = 3) -> str:
         if w.returncode == 0:
             return f"copied the machines list ({len(doc['machines'])} machines) to {host}"
         if w.returncode != 3:
-            return f"could not copy the machines list to {host}: {w.stderr.strip()[-200:]}"
+            return f"could not copy the machines list to {host}: {_short(w.stderr)}"
     return f"could not copy the machines list to {host}: it kept changing there; try `ttp machines push` again"
 
 

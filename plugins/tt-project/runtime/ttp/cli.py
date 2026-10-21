@@ -4935,7 +4935,11 @@ def cmd_machines(a) -> None:
             for line in mm.push_failures(mark=True):
                 print(f"last background copy: {line}")
             if hosts:
-                log = mm.push_background(hosts)
+                try:
+                    log = mm.push_background(hosts)
+                except OSError as e:     # the local change is saved; only the copy did not start
+                    print(f"could not start copying the machines list to {', '.join(hosts)}: {e}")
+                    return
                 print(f"copying the machines list to {', '.join(hosts)} in the background (results: {log}; "
                       f"`ttp machines push` copies in the foreground)")
     else:
