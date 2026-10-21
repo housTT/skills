@@ -4697,11 +4697,13 @@ def test_one_line_install_carries_on_when_one_tools_step_fails_and_exits_non_zer
 
 def test_plugin_readme_is_short_with_the_one_line_install_and_links_to_the_docs():
     """The README holds what it is, how to start a project from chat, the one line and links;
-    reference text lives in docs/."""
+    reference text, such as the shell quick start, lives in docs/."""
     text = (PLUGIN / "README.md").read_text(encoding="utf-8")
     assert len(text.splitlines()) < 80
     assert _install_line()
     assert "new tt-project named " in text and "by project name" in text and "Web UI" in text
+    guide = (PLUGIN / "docs" / "guide.md").read_text(encoding="utf-8")
+    assert "ttp new " in guide and "ttp web " in guide and "connect to project" in guide.lower()
     for doc in re.findall(r"\]\((docs/[\w.-]+)(?:#[\w-]+)?\)", text):
         assert (PLUGIN / doc).is_file(), doc
     assert {"docs/guide.md", "docs/install.md"} <= set(re.findall(r"\]\((docs/[\w.-]+)", text))

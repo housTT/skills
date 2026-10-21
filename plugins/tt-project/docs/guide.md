@@ -17,6 +17,10 @@ Install details, updates and uninstall: [install.md](install.md).
 The brief can be inline text, a file, or links. Goals, restrictions ("never access the internet")
 and preferences you add later become part of the project's charter and memory.
 
+From a shell inside a git repository, `ttp new demo --describe "Keep the README accurate."` creates a
+project and ends with a link to its web app, `http://127.0.0.1:<port>/#token=<token>`; `ttp web demo`
+prints it again. `ttp say demo "<your words>"` and `ttp status demo` talk to it without a chat.
+
 ## How it works
 
 ```
