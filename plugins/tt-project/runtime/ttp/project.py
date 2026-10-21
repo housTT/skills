@@ -799,6 +799,9 @@ COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS = 12000, 8000
 # Memory pinned for workers gets what the charter digest leaves of WORKER_MEMORY_CHARS, never less
 # than this: a long charter neither crowds it out nor is crowded out by it.
 WORKER_PINNED_MIN_CHARS = WORKER_MEMORY_CHARS // 2
+# Likewise the charter's policies and other items for workers get what its Goals and Resources leave
+# of it, never less than this, and never less because pinned memory is large.
+WORKER_POLICY_MIN_CHARS = WORKER_MEMORY_CHARS // 2
 # Memory kinds archive_hidden_memory may retire once no prompt shows them (never a standing entry).
 ARCHIVABLE_MEMORY_KINDS = ("decision", "fact")
 # An entry that cites the user's word (`user msg #N`, `(user, <date>)`, "the user's words"): the
@@ -1491,16 +1494,17 @@ class Project:
                             "archived": archived, "text": body.strip(), "created": c.group(1) if c else ""})
         return sorted(out, key=lambda e: (e["created"], e["name"]))
 
-    def supersede_memory(self, text: str, names: list[str], kind: str = "fact",
-                         standing: bool = False) -> tuple[Path, list[Path]]:
+    def supersede_memory(self, text: str, names: list[str], kind: str = "fact", standing: bool = False,
+                         title: str | None = None, audience: str | None = None) -> tuple[Path, list[Path]]:
         """Add a merged entry and retire the live entries it replaces, with one harness commit:
         (new entry, archived paths). Refused whole, nothing written, when a name is unknown, ambiguous
         or already archived, or the merge would lose a user rule: a standing entry is replaced only
         by a standing one, a restriction only by a restriction, a preference only by a preference or
         restriction, a resource only by a resource, and the quoted words of a restriction, preference
-        or standing entry (the user's verbatim words) stay word for word in the new text."""
+        or standing entry (the user's verbatim words) stay word for word in the new text. `title` and
+        `audience` as add_memory's; with no `audience` the new entry keeps the one its entries share."""
         from .forbidden import check
-        check(self, "memory", text)
+        check(self, "memory", text, title or "")
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
         new = " ".join(text.split())
@@ -1535,8 +1539,8 @@ class Project:
         if errors:
             raise ValueError("nothing changed: " + "\n".join(errors))
         # Merged entries that all share one audience keep it.
-        added = self.add_memory(text, kind=kind, standing=standing, commit=False,
-                                audience=next(iter(auds)) if len(auds) == 1 else None)
+        added = self.add_memory(text, kind=kind, title=title, standing=standing, commit=False,
+                                audience=audience or (next(iter(auds)) if len(auds) == 1 else None))
         done, errors = self.forget_memories(olds, keep=added.stem, why=f"merged into [{added.stem}]", commit=False)
         self.commit_harness([added, self.memory_index, *done],
                             f"memory ({kind}): [{added.stem}] supersedes {', '.join(d.stem for d in done)}",

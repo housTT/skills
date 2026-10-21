@@ -13716,3 +13716,70 @@ def test_archive_never_retires_worker_memory_cut_from_worker_prompts(env):
     assert not cut & set(hidden) and plain.stem in hidden, hidden
     assert p.archive_hidden_memory(7) == [plain.stem]
     assert all(f.exists() for f in (restated, *pinned)) and not plain.exists()
+
+
+def test_worker_memory_skips_a_restriction_the_binding_block_states_across_items_and_counts_the_rest(env):
+    """A memory restriction whose sentences the charter states in two different items is printed once,
+    in the binding block: not in the memory section, not counted against the budget. One with a
+    sentence the block lacks still shows and counts."""
+    p = make(env)
+    from ttp.prompts import worker_context, worker_system
+    p.charter_path.write_text(_LONG_GOALS_CHARTER)
+    _memories(p, [("restriction", "Push only to branch dev/widget.\n\nKeep content generic: no hostnames or "
+                                  "credentials."),
+                  ("restriction", "Never push to main. Never reboot box A."),
+                  ("resource", "Box A keeps its datasets under the project's data folder.")])
+    text, mem, use = worker_context(p)
+    lines = [e["line"] for e in mem]
+    assert use["duplicates"] == 1 and not any("dev/widget" in x for x in lines), lines
+    assert any("Never reboot box A." in x for x in lines) and use["pinned"] == 2
+    assert use["pinned_chars"] == sum(len(x) + 1 for x in lines)
+    system = worker_system(p)
+    assert system.count("Push only to branch dev/widget.") == 1
+
+
+def test_memory_cli_takes_a_title_and_an_audience_for_an_entry_and_a_merge(env, capsys):
+    """`ttp memory` sets an entry's title and audience, so a consolidation runs through the CLI: a
+    merge takes them too, and without --audience keeps the one its entries share."""
+    p = make(env)
+    from ttp import cli
+    from ttp.project import worker_memory
+    cli.main(["memory", "demo", "Box A builds with the shared cache.", "--kind", "decision",
+              "--title", "Box A build cache", "--audience", "workers"])
+    one = p.memory_dir / "decision-box-a-build-cache.md"
+    assert one.exists() and "audience: workers\n" in one.read_text()
+    assert "[Box A build cache](memory/decision-box-a-build-cache.md)" in p.memory_index.read_text()
+    e = next(x for x in p._memory_entries() if x["name"] == one.stem)
+    assert worker_memory(e) == 1
+    cli.main(["memory", "demo", "Box A builds with the shared cache in its scratch folder.", "--kind", "decision",
+              "--title", "Box A build setup", "--supersedes", one.stem])
+    merged = p.memory_dir / "decision-box-a-build-setup.md"
+    assert "audience: workers\n" in merged.read_text() and not one.exists()
+    cli.main(["memory", "demo", "Box A builds in its scratch folder.", "--kind", "decision",
+              "--audience", "coordinator", "--supersedes", merged.stem])
+    last = [x for x in p._memory_entries() if x["kind"] == "decision"]
+    assert len(last) == 1 and last[0]["audience"] == "coordinator" and worker_memory(last[0]) == 0
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["memory", "demo", "--forget", last[0]["name"], "--title", "x"])
+    assert "--title and --audience go with the memory's text" in str(ex.value)
+    with pytest.raises(SystemExit):
+        cli.main(["memory", "demo", "text", "--audience", "everyone"])
+
+
+def test_worker_policies_keep_their_own_room_beside_long_goals_and_large_pinned_memory(env):
+    """Goals that take most of the workers' budget, a long Policies section and pinned memory several
+    times its room: every Policies item for workers stays (they have room of their own, never less
+    than WORKER_POLICY_MIN_CHARS); only pinned memory past its room is left out, behind a pointer."""
+    p = make(env)
+    from ttp.prompts import WORKER_POLICY_MIN_CHARS, worker_context, worker_system
+    policies = [f"- Policy {i}: workers open a draft PR only once the tests pass. " + "p" * 280 for i in range(10)]
+    assert 3000 < sum(len(x) + 2 for x in policies) < WORKER_POLICY_MIN_CHARS
+    p.charter_path.write_text(_LONG_GOALS_CHARTER.replace("## Policies\n", "## Policies\n" + "\n".join(policies) + "\n"))
+    _memories(p, [("restriction", f"RULE-{i:02} " + "r" * 900) for i in range(30)])
+    text, mem, use = worker_context(p)
+    assert use["charter_dropped"] == 0
+    for item in policies + ["- Delivery: workers commit on their own branch", "- Style: workers keep answers short"]:
+        assert item in text, item[:20]
+    assert 0 < use["pinned_dropped"] < 30
+    block = worker_system(p)
+    assert "Policy 9: workers open a draft PR" in block and "more pinned memory entries for workers did not fit" in block

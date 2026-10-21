@@ -35,7 +35,7 @@ from . import schedule as sched
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
-                      NOTE_RUN_ENV, in_run, sync_all)
+                      NOTE_RUN_ENV, in_run, sync_all, MEMORY_AUDIENCES)
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -4634,12 +4634,15 @@ def cmd_memory(a) -> None:
         return
     if not a.text and not a.forget:
         sys.exit("give the memory's text, or --forget <entry>, or --search <words>")
+    if (a.title or a.audience) and not a.text:
+        sys.exit("--title and --audience go with the memory's text")
     if a.supersedes:
         if not a.text or a.forget:
             sys.exit("--supersedes needs the merged entry's text and no --forget: "
                      f"ttp memory {p.name} \"<text>\" --kind K --supersedes <entry> ...")
         try:
-            added, done = p.supersede_memory(a.text, a.supersedes, kind=a.kind, standing=a.standing)
+            added, done = p.supersede_memory(a.text, a.supersedes, kind=a.kind, standing=a.standing,
+                                             title=a.title, audience=a.audience)
         except ValueError as e:
             sys.exit(str(e))
         print(added)
@@ -4649,7 +4652,7 @@ def cmd_memory(a) -> None:
         return
     try:
         if a.text:
-            print(p.add_memory(a.text, kind=a.kind, standing=a.standing))
+            print(p.add_memory(a.text, kind=a.kind, title=a.title, standing=a.standing, audience=a.audience))
         done, errors = p.forget_memories(a.forget, why=a.why) if a.forget else ([], [])
     except ValueError as e:   # a forbidden-data refusal: it names the pattern, never the text
         sys.exit(str(e))
@@ -7340,6 +7343,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--standing", action="store_true",
                    help="an instruction that applies every time its case comes up (kept as a preference); "
                         "one finished instance never retires it")
+    s.add_argument("--title", help="with the text: the entry's title (its MEMORY.md line and file name; "
+                                   "default its first line, cut to 80 chars)")
+    s.add_argument("--audience", choices=MEMORY_AUDIENCES,
+                   help="with the text: who gets it. workers: pinned in worker prompts; coordinator: kept "
+                        "out of them (a restriction still reaches them). Default: by kind and wording. With --supersedes the default is the "
+                        "audience the replaced entries share")
     s.add_argument("--why", help="with --forget: why it ends; required for a standing entry (its end condition "
                                   "or the user's words ending it)")
     s.add_argument("--search", nargs="+", metavar="WORD",

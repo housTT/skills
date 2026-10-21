@@ -15,7 +15,7 @@ from . import chaincap, conflictfix, replymsg, settinghold, settled, taskfacts, 
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, Project, code_tasks_may_push, own_push, push_allowed,
-                      push_queue_on)
+                      push_queue_on, WORKER_POLICY_MIN_CHARS)
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch, recovery_note
 
 
@@ -359,12 +359,19 @@ def _norm(text: str) -> str:
 
 def restated_in(block: str):
     """A test of whether a memory entry's text is already stated by `block` (the charter's
-    restrictions): it is one of its items, or whole sentences of one, ignoring case, list markers and
-    spacing. "Never push." is not restated by "Never push to main.": a match ends where a sentence does."""
+    restrictions): it is one of its items, or whole sentences of one, or each of its sentences is
+    whole sentences of some item, ignoring case, list markers and spacing. "Never push." is not
+    restated by "Never push to main.": a match ends where a sentence does."""
     items = [_norm(x) for x in _items(block.splitlines())]
 
     def test(text: str) -> bool:
         t = _norm(text)
+        if one(t):
+            return True
+        parts = [s for s in re.split(r"(?<=[.;!?])\s+", t) if s]
+        return len(parts) > 1 and all(one(s) for s in parts)
+
+    def one(t: str) -> bool:
         for item in items if t else ():
             i = item.find(t)
             while i >= 0:
@@ -380,7 +387,8 @@ def restated_in(block: str):
 def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict], dict]:
     """A worker's digest of the charter and memory: the Goals and Resources whole (the Brief only when
     no Goals are stated) and the policies and other charter items meant for workers (see
-    for_workers) within WORKER_MEMORY_CHARS; then memory pinned for workers (see worker_memory) in
+    for_workers) within what those leave of WORKER_MEMORY_CHARS, never less than
+    WORKER_POLICY_MIN_CHARS; then memory pinned for workers (see worker_memory) in
     what is left of it, never less than WORKER_PINNED_MIN_CHARS, and the entries that share words with
     `task`, those that speak of workers and the newest facts while all still fit WORKER_MEMORY_CHARS
     (see worker_memory_select).
@@ -397,6 +405,7 @@ def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict
     heads = sum(len(x) + 2 for x in _worker_heads(p, 999, 99999))   # their longest
     used = heads + sum(len(h) + len("\n".join(b).strip()) + 3 for h, b in secs if whole(h))
     out, dropped = [], 0
+    cap = max(WORKER_MEMORY_CHARS, used + WORKER_POLICY_MIN_CHARS)   # long Goals never squeeze the policies out
     for h, b in secs:
         if whole(h):
             out.append(h + "\n" + "\n".join(b).strip())
@@ -407,7 +416,7 @@ def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict
         used += len(h) + 3
         for item in _items(b):
             sep = 2 if kept else 0   # the blank line before every kept item but the first
-            if for_workers(item) and used + sep + len(item) <= WORKER_MEMORY_CHARS:
+            if for_workers(item) and used + sep + len(item) <= cap:
                 kept.append(item)
                 used += sep + len(item)
             else:
