@@ -122,6 +122,17 @@ def upsert(db: DB, name: str, kind: str, every: str | int, at: str | None = None
          "at=excluded.at, enabled=excluded.enabled, budget_usd_day=excluded.budget_usd_day, "
          "description=excluded.description, payload=excluded.payload, next_run=excluded.next_run, tz=excluded.tz",
          (name, kind, every_s, at, int(enabled), budget_usd_day, description, json.dumps(payload or {}), nxt, tz))
+    if not enabled:
+        _end_mutes(db, [name], OFF, home)
+
+
+OFF, GONE = "schedule turned off", "schedule removed"
+
+
+def _end_mutes(db: DB, names: list[str], why: str, home: str | None) -> None:
+    """End the mutes of schedules that no longer run: they would mute nothing."""
+    from .screen import end_schedule_mutes
+    end_schedule_mutes(db, names, why, where=home)
 
 
 def reenabled(row: dict, enabled: bool, now: float | None = None) -> bool:
@@ -138,6 +149,8 @@ def set_enabled(db: DB, name: str, enabled: bool, home: str | None = None) -> No
     nxt = next_run(int(row["every_s"]), row["at"], time.time(), zone_of(row, home)) \
         if reenabled(row, enabled) else row["next_run"]
     db.x("UPDATE schedules SET enabled=?, next_run=? WHERE name=?", (int(bool(enabled)), nxt, name))
+    if not enabled:
+        _end_mutes(db, [name], OFF, home)
 
 
 def due(db: DB, now: float | None = None) -> list[dict]:
@@ -360,6 +373,8 @@ def sync_file(p: Any, force: bool = False) -> tuple[bool, str | None]:
             upsert(db, e["name"], e["kind"], e["every"], e.get("at") or None, e.get("enabled", True),
                    e.get("budget_usd_day"), e.get("description", ""), e.get("payload", {}), timefmt.home(p))
         names = [e["name"] for e in entries]
+        _end_mutes(db, [r["name"] for r in db.q("SELECT name FROM schedules") if r["name"] not in names], GONE,
+                   timefmt.home(p))
         db.x(f"DELETE FROM schedules WHERE name NOT IN ({','.join('?' * len(names))})", names)
         db.set_kv(_APPLIED, sha)
     return True, None

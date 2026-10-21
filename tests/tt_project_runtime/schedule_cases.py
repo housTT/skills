@@ -378,3 +378,43 @@ def test_a_precheck_is_set_and_cleared_by_schedule_set_and_shown_and_validated(e
                                ("llm", {"precheck": "true", "precheck_timeout_s": 0}, "number of seconds")]:
         with pytest.raises(ValueError, match=why):
             sched.parse_file(json.dumps([{"name": "x", "kind": kind, "every": "1d", "payload": payload}]))
+
+
+def test_turning_a_schedule_off_or_removing_it_ends_its_mutes_and_the_audit_skips_mutes_of_an_off_schedule(env):
+    """A schedule turned off still held its observation mutes, and the daily audit listed them every day as
+    overrides held long, though a schedule that does not run has nothing to mute."""
+    from ttp import audit, schedule as sched, screen
+    p = make(env)
+    now = time.time()
+    for name in ("watch", "probe", "gone", "live"):
+        sched.upsert(p.db, name, "command", "30m", payload={"command": "true", "timeout_s": 30})
+        screen.mute(p.db, f"watcher:{name}", "disk nearly full", 48, why="known")
+    screen.mute(p.db, "watcher-error:watch", "timed out after", 48, why="known")
+    screen.mute(p.db, "daemon:other", "something noisy", 48, why="known")
+    active = lambda: {m["source"] for m in screen.mutes(p.db)}
+
+    sched.set_enabled(p.db, "watch", False)   # the web app's switch
+    assert "watcher:watch" not in active() and "watcher-error:watch" not in active()
+    ended = p.db.q("SELECT status, text FROM events WHERE text LIKE 'mute ended:%watcher:watch%'")
+    assert ended and all("schedule turned off" in e["text"] and e["status"] == "handled" for e in ended)
+    sched.upsert(p.db, "probe", "command", "30m", enabled=False, payload={"command": "true"})   # schedule_set
+    assert "watcher:probe" not in active()
+    assert active() == {"watcher:gone", "watcher:live", "daemon:other"}, "other mutes are unchanged"
+
+    sched.file_path(p).parent.mkdir(parents=True, exist_ok=True)
+    sched.file_path(p).write_text(json.dumps([sched.entry(r) for r in p.db.q(
+        "SELECT * FROM schedules WHERE name!='gone'")]))
+    assert sched.sync_file(p, force=True) == (True, None)
+    assert active() == {"watcher:live", "daemon:other"}
+    assert p.db.q("SELECT 1 FROM events WHERE text LIKE 'mute ended:%watcher:gone%schedule removed%'")
+
+    # A mute left on an off schedule (set before this change, or written directly) is no override held.
+    mutes = p.db.kv(screen.MUTES_KEY)
+    p.db.set_kv(screen.MUTES_KEY, [{**m, "since": now - 30 * 3600} for m in mutes]
+                + [{**mutes[0], "source": "watcher:watch", "since": now - 30 * 3600}])
+    held = audit.overrides(p, p.db, now, 12)
+    assert any(h.startswith("mute of watcher:live") for h in held), "a running schedule's mute still counts"
+    assert any(h.startswith("mute of daemon:other") for h in held)
+    assert not any("watcher:watch" in h for h in held), "the off schedule's mute is skipped"
+    p.db.x("DELETE FROM schedules WHERE name='live'")
+    assert not any("watcher:live" in h for h in audit.overrides(p, p.db, now, 12)), "a gone schedule's too"

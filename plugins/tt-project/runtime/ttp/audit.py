@@ -230,9 +230,10 @@ def review_loops(db: DB, since: float) -> list[dict]:
 
 
 def overrides(p: Project | None, db: DB, now: float, hours: float) -> list[str]:
-    """Overrides held longer than `hours`: resource pauses, active mutes, and temporary instructions whose
-    end only a model can judge, listed as possibly over at least ends.RECHECK_S ago."""
-    from .screen import mutes
+    """Overrides held longer than `hours`: resource pauses, active mutes (not those of a schedule that is
+    off or gone: they mute nothing), and temporary instructions whose end only a model can judge, listed
+    as possibly over at least ends.RECHECK_S ago."""
+    from .screen import mutes, off_schedule_mute
     out = []
     for name, v in sorted(db.paused_resources(shared=False).items()):
         age = now - float(v.get("since") or now)
@@ -244,7 +245,7 @@ def overrides(p: Project | None, db: DB, now: float, hours: float) -> list[str]:
                        + (f" ({_short(v['reason'], 80)})" if v.get("reason") else "") + (f", {end}" if end else ""))
     for m in mutes(db, now):
         age = now - float(m.get("since") or now)
-        if age > hours * 3600:
+        if age > hours * 3600 and not off_schedule_mute(db, m):
             out.append(f"mute of {m.get('source')} {str(m.get('match'))[:60]!r} held {_dur(age)}, "
                        f"ends in {_dur(max(0.0, float(m.get('until') or now) - now))}")
     if p is not None:

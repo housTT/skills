@@ -832,6 +832,41 @@ def end_mute_by(db: DB, source: str, match: str, who: str, now: float | None = N
     return m
 
 
+def schedule_of(source: Any) -> str | None:
+    """The schedule a command watcher's mute source (watcher:<name> or watcher-error:<name>) belongs
+    to; None for any other source."""
+    kind, _, name = str(source or "").partition(":")
+    return name if kind in ("watcher", "watcher-error") and name else None
+
+
+def end_schedule_mutes(db: DB, names: Any, why: str, now: float | None = None,
+                       where: Any = None) -> list[dict]:
+    """End the active mutes of the schedules `names` (turned off or removed: they observe nothing, so
+    their mutes mute nothing), recording each one's summary event with `why` as handled."""
+    now = time.time() if now is None else now
+    names = {str(n) for n in names}
+    if not names:
+        return []
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        done = [m for m in active if float(m["until"]) > now and schedule_of(m["source"]) in names]
+        if not done:
+            return []
+        db.set_kv(MUTES_KEY, [m for m in active if not any(m is d for d in done)])
+        for m in done:
+            _ended(db, m, now, now, why, where, settled=True)
+    return done
+
+
+def off_schedule_mute(db: DB, m: dict) -> bool:
+    """Whether mute `m` belongs to a schedule that is off or gone, so it mutes nothing."""
+    name = schedule_of(m.get("source"))
+    if name is None:
+        return False
+    row = db.one("SELECT enabled FROM schedules WHERE name=?", (name,))
+    return row is None or not row["enabled"]
+
+
 def mute_probe_broken(db: DB, source: str, match: str, probe: str, why: str, now: float | None = None,
                       where: Any = None) -> bool:
     """Record that the `end_when` probe of a mute is broken and queue one event saying so, once per
