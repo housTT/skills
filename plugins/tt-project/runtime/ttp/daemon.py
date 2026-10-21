@@ -3785,7 +3785,9 @@ class Daemon:
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
         # An `upstream:` note that names nothing of tt-project is this project's own follow-up.
+        before = fups
         fups, local = upstream.reroute(fups)
+        rerouted = {id(g) for f, g in zip(before, fups) if f is not g}   # never a failed review's fix
         for t in local:
             log(self.p, f"task {task['id']}: `upstream:` follow-up names nothing of tt-project; "
                         f"kept as this project's follow-up: {t[:200]}")
@@ -3842,8 +3844,10 @@ class Daemon:
                                                  known["status"] == "done" else "was already queued.")
         # A review that failed with fix specs gets its fix and re-review from the daemon, and what waited
         # on it waits on the re-review instead of being blocked. A failure without them still blocks.
-        # Upstream notes and deferred follow-ups are not fixes: they stay with the coordinator.
-        fixes = [f for f in fups if not upstream.is_note(f) and not f.get("start_after") and not f.get("start_when")]
+        # Upstream notes (also those rerouted to this project) and deferred follow-ups are not fixes:
+        # they stay with the coordinator.
+        fixes = [f for f in fups if not upstream.is_note(f) and id(f) not in rerouted
+                 and not f.get("start_after") and not f.get("start_when")]
         # Across stacks, an area whose reviews keep failing gets no more automatic fixes: the
         # coordinator re-plans it (reviewcap).
         # A check-only failure stays failed: the coordinator routes the missing check to its owner,

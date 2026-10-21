@@ -169,3 +169,20 @@ def test_the_worker_prompt_and_harness_skill_keep_project_work_out_of_upstream_n
     skill = " ".join((plugin / "skills" / "tt-project-harness" / "SKILL.md").read_text().split())
     assert "only for a defect or missing feature in the tt-project plugin itself" in skill
     assert "names nothing of tt-project" in skill
+
+
+def test_a_rerouted_upstream_follow_up_is_never_a_failed_reviews_fix(env):
+    """A failed review's `upstream:` note that names nothing of tt-project loses its prefix, but stays
+    out of the daemon's automatic fix: it reaches the coordinator as a queued proposal."""
+    p = make(env)
+    _, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    _fail_review(env, p, rev["id"], [
+        {"title": "add the missing test", "spec": "test_x must fail without the change"},
+        {"title": "upstream: the build box needs a newer Node", "spec": "install it before the next run"}])
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    assert "test_x must fail" in fix["spec"] and "newer Node" not in fix["spec"]
+    assert "install it before the next run" not in fix["spec"]
+    ev = {e["text"].split(" — ")[0]: e["status"] for e in
+          p.db.q("SELECT text, status FROM events WHERE task=? AND kind='followup_proposed'", (rev["id"],))}
+    assert ev == {"proposed follow-up: add the missing test": "handled",
+                  "proposed follow-up: the build box needs a newer Node": "queued"}
