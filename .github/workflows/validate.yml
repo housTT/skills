@@ -17,6 +17,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    # Over twice the measured wall time of `pytest tests/`: 8 min on 4 CPUs with CI=true.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
