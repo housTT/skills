@@ -2145,8 +2145,11 @@ def _glean_fakes(home):
     bin_.mkdir(parents=True, exist_ok=True)
     (bin_ / "claude").write_text(
         "#!/bin/bash\nf=$HOME/claude-mcp\necho \"$*\" >> $HOME/claude.log\n"
+        # Like Commander: `mcp --help` lists the subcommands (no login on an old one), `mcp <any> --help` exits 0.
+        "[ \"$*\" = 'mcp --help' ] && { echo 'Commands:'; echo '  add [options] <name> <url>  Add a server';"
+        " [ -f $HOME/no-mcp-login ] || echo '  login [options] <name>  Authenticate'; exit 0; }\n"
+        "[ \"$1 $3\" = 'mcp --help' ] && exit 0\n"
         "[ \"$1 $2\" = 'mcp login' ] && [ -f $HOME/no-mcp-login ] && exit 1\n"
-        "[ \"$1 $2 $3\" = 'mcp login --help' ] && exit 0\n"
         "if [ \"$1 $2\" = 'mcp login' ]; then echo 'Visit this URL to authorize:';"
         " echo '  https://g.invalid/oauth/authorize?client_id=c&redirect_uri=http%3A%2F%2Flocalhost%3A41234%2Fcallback&s=1';"
         " echo 'Or paste the redirect URL here:'; read -r u; case $u in http://localhost:41234/callback?code=*)"
@@ -2163,6 +2166,7 @@ def _glean_fakes(home):
         "esac\n")
     (bin_ / "codex").write_text(
         "#!/bin/bash\nf=$HOME/codex-mcp\necho \"$*\" >> $HOME/codex.log\n"
+        "[ \"$*\" = 'mcp --help' ] && { echo 'Commands:'; echo '  login   Authenticate'; exit 0; }\n"
         "[ \"$1\" = mcp ] && case \"$*\" in *glean*|'mcp list'*) ;; *) exit 0 ;; esac\n"
         "entry() { printf '  {\\n    \"name\": \"glean\",\\n    \"transport\": {\\n      \"type\": \"streamable_http\",\\n'"
         "; printf '      \"url\": \"%s\",\\n      \"http_headers\": {\"X\": \"secret-header\"}\\n    },\\n' \"$(cat $f)\"; }\n"
@@ -2302,9 +2306,14 @@ def test_setup_box_agents_check_reports_glean_missing_signed_out_or_working(tmp_
     # Each editor server's own MCP config gets the entry (merged, backed up once); a second run keeps it.
     (home / ".cursor").mkdir()
     (home / ".cursor/mcp.json").write_text(json.dumps({"mcpServers": {"device": {"command": "x"}}}))
+    (home / ".cursor/mcp.json").chmod(0o600)
     add = ba.editor_mcp_script("add", url)
-    out = subprocess.run(["sh", "-c", add], env=env, capture_output=True, text=True, timeout=60).stdout
+    out = subprocess.run(["sh", "-c", "umask 022; " + add], env=env, capture_output=True, text=True,
+                         timeout=60).stdout
     assert out.split() == ["edmcp_cursor=added", "edmcp_vscode=added"], out
+    # A private mcp.json (it may hold headers or keys) stays private, and so does its backup.
+    for name in ("mcp.json", "mcp.json.ttp-bak"):
+        assert (home / ".cursor" / name).stat().st_mode & 0o777 == 0o600, name
     cursor = json.loads((home / ".cursor/mcp.json").read_text())
     assert cursor["mcpServers"] == {"device": {"command": "x"}, "glean": {"url": url}}
     assert json.loads((home / ".cursor/mcp.json.ttp-bak").read_text()) == {"mcpServers": {"device": {"command": "x"}}}

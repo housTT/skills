@@ -272,7 +272,7 @@ def _mcp_add(cli: str) -> str:
 
 
 _EDITOR_MCP_PY = r"""
-import json, os, sys
+import json, os, shutil, sys
 path, key, url, extra, mode = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4]), sys.argv[5]
 try:
     d = json.load(open(path)) if os.path.exists(path) else {}
@@ -288,10 +288,10 @@ if mode == "probe":
     print("missing"); sys.exit(0)
 servers["glean"] = dict(extra, url=url)
 d[key] = servers
+os.umask(0o077)
 os.makedirs(os.path.dirname(path), exist_ok=True)
 if os.path.exists(path) and not os.path.exists(path + ".ttp-bak"):
-    open(path + ".ttp-bak", "w").write(open(path).read())
-os.umask(0o077)
+    shutil.copy2(path, path + ".ttp-bak")
 open(path + ".ttp-tmp", "w").write(json.dumps(d, indent=2) + "\n")
 os.replace(path + ".ttp-tmp", path)
 print("added")
@@ -431,7 +431,9 @@ def mcp_login_script(cli: str, mcp: str) -> str:
     SIGNIN_WAIT seconds.
     """
     return (_TIMEOUT + 'umask 077; ' + _login_ready(cli, mcp)
-            + f'if ! $T "$b" mcp login --help </dev/null >/dev/null 2>&1; then echo state=no-login-cmd; exit 0; fi; '
+            # From the `mcp` listing: Claude Code (Commander) exits 0 for `mcp <unknown> --help`.
+            + 'if ! $T "$b" mcp --help </dev/null 2>/dev/null | grep -Eq "^[[:space:]]+login([[:space:]]|$)"; then '
+            'echo state=no-login-cmd; exit 0; fi; '
             'command -v tmux >/dev/null 2>&1 || { echo state=no-tmux; exit 0; }; ' + _tmux(cli, mcp)
             + 'if $X has-session -t "=$S" 2>/dev/null; then ' + _CAPTURE + _CALLBACK + _LISTEN
             + f'if {_DEAD}; then $X kill-session -t "=$S" 2>/dev/null; echo "replaced=$p"; fi; fi; '
