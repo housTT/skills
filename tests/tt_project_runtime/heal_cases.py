@@ -2939,7 +2939,9 @@ def test_project_machines_and_idle_capacity_skip_retired_machines(env):
     assert ml.project_machines(listed, {"shared_resources": ["box-b-device", "box-c"]}, known) == ["box-a"]
     for note, gone in (("Do not use", True), ("do not use.", True), ("Don't use this box!", True),
                        ("Retired", True), ("Do not use for builds; device runs only", False),
-                       ("not retired", False), ("build box", False)):
+                       ("not retired", False), ("build box", False), ("Not yet decommissioned", False),
+                       ("Will be decommissioned next month", False), ("To be retired", False),
+                       ("never retired; do not use sudo", False), ("Retired. Was to be retired in May", True)):
         assert mm.retired({"note": note}) is gone, note
     assert mm.retired({"tags": "x86,retired"}) and not mm.retired({}) and not mm.retired(None)
     # The charter's own Resources text retires an alias an older paragraph still lists.
@@ -2951,7 +2953,21 @@ def test_project_machines_and_idle_capacity_skip_retired_machines(env):
                        ("box-b and box-c are decommissioned.", ["box-a"]),
                        ("box-c was decommissioned last month.", ["box-a", "box-b"]),
                        ("box-b, box-c (decommissioned).", ["box-a", "box-b"]),
-                       ("box-b (read only; never reset it).", ["box-a", "box-b", "box-c"])):
+                       ("Do not use box-c.", ["box-a", "box-b"]),
+                       ("Do not use: box-b, box-c.", ["box-a"]),
+                       ("box-c: do not use it.", ["box-a", "box-b"]),
+                       ("box-b (read only; never reset it).", ["box-a", "box-b", "box-c"]),
+                       # A qualified, temporary, negated or future restriction keeps the machine.
+                       ("box-c: do not use for builds.", ["box-a", "box-b", "box-c"]),
+                       ("Do not use box-c while its live service runs.", ["box-a", "box-b", "box-c"]),
+                       ("Do not use box-c during working hours.", ["box-a", "box-b", "box-c"]),
+                       ("box-c: do not use sudo.", ["box-a", "box-b", "box-c"]),
+                       ("box-c is out of service until Monday.", ["box-a", "box-b", "box-c"]),
+                       ("box-c is out of service.", ["box-a", "box-b", "box-c"]),
+                       ("box-c is not yet decommissioned.", ["box-a", "box-b", "box-c"]),
+                       ("box-c will be decommissioned next month.", ["box-a", "box-b", "box-c"]),
+                       ("To be retired: box-c.", ["box-a", "box-b", "box-c"]),
+                       ("box-b and box-c are not retired.", ["box-a", "box-b", "box-c"])):
         got = ml.charter_machines(charter.format(f"Machines: box-a, box-b, box-c.\n\nLater: {line}"), live)
         assert got == want, (line, got)
     # Idle capacity: neither a retired machine nor its `<alias>-device` resource is a candidate.

@@ -1402,7 +1402,8 @@ def _refused(clause: str, start: int, end: int, alias_re) -> bool:
     return not rest or all(GLUE_RE.match(alias_re.sub(" ", seg)) for seg in rest[1:] + [own])
 
 
-RETIRED_WORDS = r"(?:retired|decommissioned|out of service|do(?:n't| not)\s+use)\b"
+# "Out of service" is left out: it is usually temporary ("until Monday", "for maintenance").
+RETIRED_WORDS = r"(?:retired|decommissioned|do(?:n't| not)\s+use)\b"
 # "box-a is retired", "box-a (decommissioned)", "box-a: do not use": the words right after the alias.
 RETIRED_AFTER_RE = re.compile(r"\s*\(?\s*(?:(?:[:\u2013\u2014-]|\b(?:is|are|was|were|has been|have been|now|stays?|"
                               rf"remains?)\b)\s*)*{RETIRED_WORDS}", re.I)
@@ -1413,12 +1414,22 @@ RETIRED_BEFORE_RE = re.compile(rf"{RETIRED_WORDS}(?:\s*[:\u2013\u2014,-]?\s*|\s+
 RETIRED_CLAUSE_RE = re.compile(r"[.;!?](?=\s|$)|\n")
 
 
+def _retires(word: str, ahead: str, prior: str) -> bool:
+    """Whether retirement word `word` (a RETIRED_WORDS match) retires its alias: not negated or still to come
+    (`prior`, the clause before it), and a "do not use" only when bare (`ahead`, what follows it and the
+    aliases it names): "do not use for builds", "Do not use box-a while ..." only limit its use."""
+    if machines.NOT_YET_RE.search(prior):
+        return False
+    return not machines.DO_NOT_USE_RE.match(word) or bool(machines.BARE_USE_RE.match(ahead))
+
+
 def charter_retired(text: str, known) -> set[str]:
-    """The machines in `known` that Resources text `text` calls retired, decommissioned, out of service
-    or "do not use", in the same sentence as the alias (an older paragraph naming it as a resource does
-    not bring it back)."""
+    """The machines in `known` that Resources text `text` calls retired, decommissioned or a bare "do not
+    use", in the same sentence as the alias (an older paragraph naming it as a resource does not bring it
+    back)."""
     pat = {a: re.compile(rf"(?<![\w.-]){re.escape(a)}(?![\w-]|\.\w)") for a in known}
     any_alias = re.compile("|".join(f"(?:{r.pattern})" for r in pat.values()) or r"(?!)")
+    word = re.compile(RETIRED_WORDS, re.I)
     out = set()
     for c in RETIRED_CLAUSE_RE.split(text):
         for a, r in pat.items():
@@ -1426,8 +1437,17 @@ def charter_retired(text: str, known) -> set[str]:
                 listed = re.sub(r"^(?:\s*(?:,|\band\b|\bor\b)\s*)+", "", any_alias.sub(" ", c[m.end():]))
                 before = any_alias.sub(" ", c[:m.start()])
                 before = re.sub(r"(?:\s*(?:,|\band\b|\bor\b)\s*)+$", "", before)
-                if (RETIRED_AFTER_RE.match(c[m.end():]) or RETIRED_LIST_RE.match(listed)
-                        or RETIRED_BEFORE_RE.search(before)):
+                hits = []
+                if x := RETIRED_AFTER_RE.match(c[m.end():]):
+                    w = word.search(x.group())
+                    hits.append((w.group(), c[m.end() + x.end():], c[:m.end() + w.start()]))
+                if x := RETIRED_LIST_RE.match(listed):
+                    w = word.search(x.group())
+                    hits.append((w.group(), listed[x.end():], listed[:w.start()]))
+                if x := RETIRED_BEFORE_RE.search(before):
+                    w = word.match(before, x.start())
+                    hits.append((w.group(), listed, before[:x.start()]))
+                if any(_retires(*h) for h in hits):
                     out.add(a)
     return out
 

@@ -252,18 +252,23 @@ PUSH_DONE = "finished"              # the background copy's last line
 
 
 RETIRED_TAGS = (DECOMMISSIONED, "retired")
-# A note that retires its machine: "Decommissioned", "retired", or a bare "Do not use" (one that goes on
-# with a qualifier, "do not use for builds", only limits how it is used).
-RETIRED_NOTE_RE = re.compile(r"(?<!not )\b(?:decommissioned|retired)\b|\bdo(?:n't| not)\s+use"
-                             r"(?:\s+(?:it|this(?:\s+(?:machine|box|host|node))?))?\s*(?:[.!;,)\u2013\u2014-]|$)", re.I)
+# A bare "Do not use" (one that goes on with a qualifier, "do not use for builds", only limits how it is used).
+DO_NOT_USE_RE = re.compile(r"\bdo(?:n't| not)\s+use\b", re.I)
+BARE_USE_RE = re.compile(r"(?:\s+(?:it|this(?:\s+(?:machine|box|host|node))?))?\s*(?:[.!;,)\u2013\u2014-]|$)", re.I)
+# A note that retires its machine: "Decommissioned", "retired", or a bare "Do not use".
+RETIRED_NOTE_RE = re.compile(r"\b(?:decommissioned|retired)\b|" + DO_NOT_USE_RE.pattern + BARE_USE_RE.pattern, re.I)
+# Words right before "retired"/"decommissioned" that make it negated or still to come: "not yet decommissioned",
+# "will be decommissioned next month", "to be retired", "never retired".
+NOT_YET_RE = re.compile(r"\b(?:not|never|yet|be|being|soon)\s+$", re.I)
 
 
 def retired(m: dict | None) -> bool:
     """Whether a machines-list entry is gone for good: a decommissioned or retired tag, or a note that
     says decommissioned, retired or "Do not use"."""
     m = m if isinstance(m, dict) else {}
+    note = str(m.get("note") or "")
     return (bool(set(RETIRED_TAGS) & set(tag_names(m.get("tags"))))
-            or bool(RETIRED_NOTE_RE.search(str(m.get("note") or ""))))
+            or any(not NOT_YET_RE.search(note[:x.start()]) for x in RETIRED_NOTE_RE.finditer(note)))
 
 
 def push_skips(hosts: list[str], known: dict[str, dict] | None = None,
