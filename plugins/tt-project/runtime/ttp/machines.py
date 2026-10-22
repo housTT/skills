@@ -251,6 +251,21 @@ PUSH_REPORTED = "reported"          # in PUSH_LOGS: the logs whose failures a ch
 PUSH_DONE = "finished"              # the background copy's last line
 
 
+RETIRED_TAGS = (DECOMMISSIONED, "retired")
+# A note that retires its machine: "Decommissioned", "retired", or a bare "Do not use" (one that goes on
+# with a qualifier, "do not use for builds", only limits how it is used).
+RETIRED_NOTE_RE = re.compile(r"(?<!not )\b(?:decommissioned|retired)\b|\bdo(?:n't| not)\s+use"
+                             r"(?:\s+(?:it|this(?:\s+(?:machine|box|host|node))?))?\s*(?:[.!;,)\u2013\u2014-]|$)", re.I)
+
+
+def retired(m: dict | None) -> bool:
+    """Whether a machines-list entry is gone for good: a decommissioned or retired tag, or a note that
+    says decommissioned, retired or "Do not use"."""
+    m = m if isinstance(m, dict) else {}
+    return (bool(set(RETIRED_TAGS) & set(tag_names(m.get("tags"))))
+            or bool(RETIRED_NOTE_RE.search(str(m.get("note") or ""))))
+
+
 def push_skips(hosts: list[str], known: dict[str, dict] | None = None,
                outages: dict[str, dict] | None = None) -> dict[str, str]:
     """{host: why} of the hosts a copy of the list skips: its machine has an open known outage or the

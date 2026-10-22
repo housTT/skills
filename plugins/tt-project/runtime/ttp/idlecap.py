@@ -31,6 +31,7 @@ import json
 import re
 
 from . import locks
+from .machines import retired
 
 KIND = "idle_capacity"
 STATE_KEY = "idle_capacity"   # kv: {resource: {"since", "fired", "n"}} of the open idle stretches
@@ -116,7 +117,8 @@ def uses(name: str, resource: str) -> bool:
 def candidates(cfg: dict, named: set[str], resource_machines: list[str], machines: dict[str, dict]) -> set[str]:
     """The project's device resources: its configured device lock, every `*-device` name its config or
     recent tasks name, and each machine its charter's Resources names that is tagged `device`. A machine
-    is dropped when its `<alias>-device` resource is there too: they are one device."""
+    is dropped when its `<alias>-device` resource is there too: they are one device. A retired machine's
+    resource (machines.retired) is never one."""
     out = set()
     dev = (cfg.get("device") or {}).get("locks") or []
     if dev:
@@ -126,7 +128,9 @@ def candidates(cfg: dict, named: set[str], resource_machines: list[str], machine
         if str(name).endswith(SUFFIX):
             out.add(locks.canonical(cfg, str(name)))
     out |= {a for a in resource_machines if "device" in ((machines.get(a) or {}).get("tags") or [])}
-    return {n for n in out if n and n + SUFFIX not in out}
+    gone = {a for a, m in machines.items() if retired(m)}
+    return {n for n in out if n and n + SUFFIX not in out and n not in gone
+            and not (n.endswith(SUFFIX) and n[:-len(SUFFIX)] in gone)}
 
 
 def step(st: dict | None, idle: set[str], now: float, grace: float, rearm: float,

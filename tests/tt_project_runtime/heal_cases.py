@@ -2924,6 +2924,42 @@ def test_project_machines_skip_an_alias_the_resources_section_only_prohibits(env
     assert sorted(json.loads(capsys.readouterr().out)[0]["projects"]) == sorted([me.name, "gamma"])
 
 
+def test_project_machines_and_idle_capacity_skip_retired_machines(env):
+    """A machine whose list entry is decommissioned or says "Do not use", or that the charter's Resources
+    calls retired, is not the project's: no idle-capacity candidate, even if an older paragraph names it."""
+    from ttp import idlecap
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    charter = "# P\n\n## Resources\n{}\n"
+    listed = charter.format("Machines: box-a, box-b, box-c.")
+    known = {"box-a": {"tags": ["device"]}, "box-b": {"tags": ["device", "decommissioned"]},
+             "box-c": {"tags": ["device"], "note": "Decommissioned last month. Do not use."}}
+    assert ml.project_machines(listed, {}, known) == ["box-a"]
+    # A config naming only retired machines names none, so the charter's live ones stand.
+    assert ml.project_machines(listed, {"shared_resources": ["box-b-device", "box-c"]}, known) == ["box-a"]
+    for note, gone in (("Do not use", True), ("do not use.", True), ("Don't use this box!", True),
+                       ("Retired", True), ("Do not use for builds; device runs only", False),
+                       ("not retired", False), ("build box", False)):
+        assert mm.retired({"note": note}) is gone, note
+    assert mm.retired({"tags": "x86,retired"}) and not mm.retired({}) and not mm.retired(None)
+    # The charter's own Resources text retires an alias an older paragraph still lists.
+    live = {a: {"tags": ["device"]} for a in ("box-a", "box-b", "box-c", "box-d")}
+    for line, want in (("box-c is retired.", ["box-a", "box-b"]),
+                       ("box-c (decommissioned).", ["box-a", "box-b"]),
+                       ("box-c: do not use.", ["box-a", "box-b"]),
+                       ("Retired: box-b, box-c.", ["box-a"]),
+                       ("box-b and box-c are decommissioned.", ["box-a"]),
+                       ("box-c was decommissioned last month.", ["box-a", "box-b"]),
+                       ("box-b, box-c (decommissioned).", ["box-a", "box-b"]),
+                       ("box-b (read only; never reset it).", ["box-a", "box-b", "box-c"])):
+        got = ml.charter_machines(charter.format(f"Machines: box-a, box-b, box-c.\n\nLater: {line}"), live)
+        assert got == want, (line, got)
+    # Idle capacity: neither a retired machine nor its `<alias>-device` resource is a candidate.
+    cfg = {"shared_resources": ["box-b-device", "box-a-device"]}
+    assert idlecap.candidates(cfg, {"box-c-device"}, ml.project_machines(listed, {}, known), known) == {"box-a-device"}
+    assert idlecap.candidates({}, set(), ["box-a", "box-b", "box-c"], known) == {"box-a"}
+
+
 def test_health_coverage_counts_report_only_checks_named_by_schedule_and_known_outages(env):
     """A command watcher without a heal block covers the machine its schedule name, command or fields
     name, and the line names it report-only; a machine no check covers is covered by a recorded known

@@ -1402,16 +1402,48 @@ def _refused(clause: str, start: int, end: int, alias_re) -> bool:
     return not rest or all(GLUE_RE.match(alias_re.sub(" ", seg)) for seg in rest[1:] + [own])
 
 
+RETIRED_WORDS = r"(?:retired|decommissioned|out of service|do(?:n't| not)\s+use)\b"
+# "box-a is retired", "box-a (decommissioned)", "box-a: do not use": the words right after the alias.
+RETIRED_AFTER_RE = re.compile(r"\s*\(?\s*(?:(?:[:\u2013\u2014-]|\b(?:is|are|was|were|has been|have been|now|stays?|"
+                              rf"remains?)\b)\s*)*{RETIRED_WORDS}", re.I)
+# "box-a and box-b are retired": the words after a list of aliases, which a plural verb makes all of them.
+RETIRED_LIST_RE = re.compile(rf"\s*(?:are|were|have been|remain|stay)\s+(?:now\s+)?{RETIRED_WORDS}", re.I)
+# "Retired: box-a, box-b", "Decommissioned box-a": the words before the alias, past only a list of aliases.
+RETIRED_BEFORE_RE = re.compile(rf"{RETIRED_WORDS}(?:\s*[:\u2013\u2014,-]?\s*|\s+(?:and|or|the)\s+)*$", re.I)
+RETIRED_CLAUSE_RE = re.compile(r"[.;!?](?=\s|$)|\n")
+
+
+def charter_retired(text: str, known) -> set[str]:
+    """The machines in `known` that Resources text `text` calls retired, decommissioned, out of service
+    or "do not use", in the same sentence as the alias (an older paragraph naming it as a resource does
+    not bring it back)."""
+    pat = {a: re.compile(rf"(?<![\w.-]){re.escape(a)}(?![\w-]|\.\w)") for a in known}
+    any_alias = re.compile("|".join(f"(?:{r.pattern})" for r in pat.values()) or r"(?!)")
+    out = set()
+    for c in RETIRED_CLAUSE_RE.split(text):
+        for a, r in pat.items():
+            for m in r.finditer(c):
+                listed = re.sub(r"^(?:\s*(?:,|\band\b|\bor\b)\s*)+", "", any_alias.sub(" ", c[m.end():]))
+                before = any_alias.sub(" ", c[:m.start()])
+                before = re.sub(r"(?:\s*(?:,|\band\b|\bor\b)\s*)+$", "", before)
+                if (RETIRED_AFTER_RE.match(c[m.end():]) or RETIRED_LIST_RE.match(listed)
+                        or RETIRED_BEFORE_RE.search(before)):
+                    out.add(a)
+    return out
+
+
 def charter_machines(charter: str, known) -> list[str]:
-    """The machines in `known` that the charter's Resources section names somewhere no negation refuses."""
+    """The machines in `known` that the charter's Resources section names somewhere no negation refuses,
+    less those it calls retired (charter_retired)."""
     from .prompts import charter_sections
     text = "\n".join("\n".join(body) for head, body in charter_sections(charter)
                      if ends.section_name(head).lower().startswith("resources"))
     clauses = [c for c in CLAUSE_RE.split(text) if c.strip()]
     pat = {a: re.compile(rf"(?<![\w.-]){re.escape(a)}(?![\w-]|\.\w)") for a in known}
     any_alias = re.compile("|".join(f"(?:{r.pattern})" for r in pat.values()) or r"(?!)")
-    return sorted(a for a in known if any(not _refused(c, m.start(), m.end(), any_alias)
-                                          for c in clauses for m in pat[a].finditer(c)))
+    gone = charter_retired(text, known)
+    return sorted(a for a in known if a not in gone and any(not _refused(c, m.start(), m.end(), any_alias)
+                                                            for c in clauses for m in pat[a].finditer(c)))
 
 
 def configured_machines(cfg: dict, known) -> list[str]:
@@ -1426,8 +1458,10 @@ def configured_machines(cfg: dict, known) -> list[str]:
 
 def project_machines(charter: str, cfg: dict, known) -> list[str]:
     """A project's machines: those its config authorizes explicitly when it names any, else those its
-    charter's Resources section names outside a prohibition."""
-    return configured_machines(cfg, known) or charter_machines(charter, known)
+    charter's Resources section names outside a prohibition. A machine whose list entry is retired
+    (machines.retired) is never one."""
+    live = [a for a in known if not machines.retired(known.get(a) if isinstance(known, dict) else None)]
+    return configured_machines(cfg, live) or charter_machines(charter, live)
 
 
 def resource_machines(p) -> list[str]:
