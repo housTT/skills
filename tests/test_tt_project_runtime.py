@@ -4787,6 +4787,21 @@ def test_waiting_handoff_requeues_without_spending_an_attempt(env, monkeypatch):
     assert json.loads(t["result"])["waits"] == 1
 
 
+def test_a_waiting_hand_off_whose_probe_reads_another_tasks_worktree_logs_one_line(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    other = p.db.add_task("finished job", "s", kind="work", tier="light", origin="user")
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "job runs", "waiting_for": "the job", "retry_after_s": 600,
+         "retry_when": f"cd {p.worktrees / f't{other}'} && ttp detach --check job"}))
+    tid = p.db.add_task("watch the job", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "queued" and p.db.task(tid)["not_before"]
+                      and not p.db.q("SELECT id FROM runs WHERE status='running'"))
+    log = (p.logs / "daemon.log").read_text()
+    assert log.count(f"task {tid} retry_when reads the worktree of task(s) #{other}: kept from pruning") == 1
+
+
 def test_a_wake_runs_at_light_or_its_wake_tier_never_above_the_task_and_other_runs_are_unchanged(
         env, monkeypatch):
     p = make(env)
@@ -11618,6 +11633,35 @@ def test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost(en
     p.db.update_task(t_dirty, status="cancelled")
     d.prune_worktrees()
     assert not dirty.exists() and str(t_dirty) not in (p.db.kv("worktrees_kept") or {})
+
+
+def test_a_worktree_another_tasks_probe_reads_survives_a_forced_prune_while_that_task_waits(env, monkeypatch, capsys):
+    """A waiting task whose retry_when cds into another, finished task's worktree: pruning that worktree
+    would leave the probe failing ("not yet") forever. It stays, with a keep reason naming the waiting
+    task, and one log line when the hand-off is accepted or the probe set by hand; it goes once the wait ends."""
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import cli, worktree
+    from ttp.daemon import Daemon
+    t_done, path, _ = _code_task(p, "finished, its job runs in its worktree")
+    probe = f"cd {path} && ttp detach --check job"
+    t_wait = _due_waiting_task(p, "true")
+    p.db.update_task(t_wait, not_before=time.time() + 3600)
+    cli.main(["task", "demo", "set-when", str(t_wait), probe])
+    assert f"reads the worktree of task(s) #{t_done}" in capsys.readouterr().out
+    assert f"task {t_wait} retry_when reads the worktree of task(s) #{t_done}" in (p.logs / "daemon.log").read_text()
+    d = Daemon(p.base)
+    d.prune_worktrees(force=True)
+    assert path.exists(), "the worktree a waiting task's probe reads was pruned"
+    why = p.db.kv("worktrees_kept")[str(t_done)]
+    assert f"task #{t_wait}" in why and "probe" in why, why
+    # A relative path from the project root, and the task's own worktree, count the same way / not at all.
+    rel = path.relative_to(p.root).as_posix()
+    assert worktree.worktree_refs(f"cd {rel} && true; cd tt-project/worktrees/t{t_wait}", t_wait) == [t_done]
+    assert worktree.worktree_refs(f"cd /x/myworktrees/t{t_done} && test -e worktrees/t{t_done}x") == []
+    p.db.update_task(t_wait, status="done")
+    d.prune_worktrees(force=True)
+    assert not path.exists(), "the worktree outlived the wait"
 
 
 def test_a_kept_worktree_is_logged_once_and_tracked_changes_raise_one_event(env, monkeypatch):
@@ -20639,6 +20683,27 @@ def test_a_broken_probe_wakes_the_task_at_its_timer(env, probe, why):
     d.probe_waiting()
     assert _ready(p, tid)
     assert f"Woken because: {why}." in worker_task(p, p.db.task(tid), str(p.root), None)
+
+
+@pytest.mark.parametrize("tail", ["&& exit 1", "&& exit 1 || exit 1"])
+def test_a_probe_that_cds_into_a_removed_worktree_wakes_the_task_as_broken(env, tail):
+    """`cd <gone worktree> && ...` exits 1 under bash (or with `|| exit 1`), which reads as "not yet"
+    forever: it wakes the task now, as a broken probe, not at its timer or never."""
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.prompts import worker_task
+    gone = p.worktrees / "t999"
+    tid = _due_waiting_task(p, f"cd {gone} {tail}")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    d = dmod.Daemon(p.base)
+    _settle_probe(d, tid)
+    assert _ready(p, tid), "a probe into a removed worktree left the task asleep"
+    assert "its cd target" in worker_task(p, p.db.task(tid), str(p.root), None)
+    # A directory a job may still make (not a task worktree) stays "not yet".
+    tid2 = _due_waiting_task(p, f"cd {p.root / 'out' / 'later'} 2>/dev/null || exit 1")
+    p.db.update_task(tid2, not_before=time.time() + 3600)
+    _settle_probe(d, tid2)
+    assert not _ready(p, tid2)
 
 
 def test_an_unreachable_host_probe_keeps_the_task_asleep_past_the_hold_cap(env):

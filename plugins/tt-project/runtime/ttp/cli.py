@@ -4529,6 +4529,11 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
                 said.append("retry_when " + (f"set: {probe.strip()}" if probe.strip()
                                              else "cleared; it wakes at its retry timer")
                             + (f"; flagged: {end}" if end else ""))
+                from . import worktree
+                if p and (held := worktree.probe_hold_text(tid, probe)):
+                    from .daemon import log
+                    log(p, held)
+                    said.append(held.removeprefix(f"task {tid} retry_when "))
             if on_pass_cmd is not None:
                 said.append("on_pass_cmd " + (f"set: {on_pass_cmd.strip()}" if on_pass_cmd.strip()
                                               else "cleared; a passed probe wakes it"))

@@ -1409,6 +1409,58 @@ def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
     return None
 
 
+# A task worktree's path in a probe: <root>/tt-project/worktrees/t<id>, or relative from the project root.
+WORKTREE_REF = re.compile(r"(?<![\w.-])worktrees/t(\d+)(?![\w-])")
+
+
+def worktree_refs(text: str | None, own: int | None = None) -> list[int]:
+    """The ids of the task worktrees `text` (a probe) names by path, its own task `own` left out."""
+    return sorted({int(m.group(1)) for m in WORKTREE_REF.finditer(text or "")} - {own})
+
+
+def probe_hold_text(tid: int, probe: str | None) -> str | None:
+    """One line saying which other tasks' worktrees task `tid`'s probe reads (probed_by keeps them
+    from pruning while it waits), or None when it reads none."""
+    refs = worktree_refs(probe, tid)
+    return (f"task {tid} retry_when reads the worktree of task(s) {', '.join(f'#{r}' for r in refs)}: "
+            f"kept from pruning while it waits") if refs else None
+
+
+def probed_by(task: dict, open_tasks: list[dict]) -> dict | None:
+    """The first unfinished task whose probe (its waiting hand-off's retry_when, or its start_when)
+    reads this task's worktree: removing the worktree would leave that probe failing forever."""
+    from .db import deferral, load_result
+    for t in open_tasks:
+        if t["id"] == task["id"]:
+            continue
+        probes = (load_result(t.get("result")).get("retry_when"), deferral(t).get("when"))
+        if any(isinstance(pr, str) and task["id"] in worktree_refs(pr, t["id"]) for pr in probes):
+            return t
+    return None
+
+
+# A `cd <dir>` that starts a command in a probe (at its start or after &&, ||, ;, | or a newline).
+CD_TARGET = re.compile(r"(?:^|&&|\|\||[;|(\n])\s*cd\s+('[^']*'|\"[^\"$`]*\"|[^\s;&|()'\"$`]+)(?=[\s;&|)]|$)")
+
+
+def missing_cd_worktree(probe: str | None, p: Project) -> str | None:
+    """The first `cd` target in `probe` that lies in a task worktree under this project's worktrees
+    folder which no longer exists (pruned), or None. Such a probe can never pass: `cd` fails, and
+    under bash (or with `|| exit 1`) that reads as "not yet" forever. A directory a job may still
+    make is not one of these: worktrees are made only by the harness, at a task's start."""
+    root = p.worktrees.resolve()
+    for m in CD_TARGET.finditer(probe or ""):
+        arg = m.group(1).strip("'\"")
+        target = Path(os.path.expanduser(arg))
+        target = (target if target.is_absolute() else p.root / target).resolve()
+        if target == root or root not in target.parents:
+            continue
+        top = root / target.relative_to(root).parts[0]
+        if re.fullmatch(r"t\d+", top.name) and not top.exists():
+            return str(target)
+    return None
+
+
 # A finished task's worktree stays at least this long, and while the coordinator has not yet seen how
 # the task ended: the review that pushes from it is often queued only after that.
 FINISH_GRACE_S = 3600
@@ -1421,6 +1473,9 @@ def held_by(p: Project, task: dict, open_tasks: list[dict], now: float, path: Pa
     path = (path or p.worktrees / f"t{task['id']}").resolve()
     if any(Path(m.get("repo") or "/").resolve() == path for m in running(p)):
         return "a detached `ttp push` runs in it"
+    user = probed_by(task, open_tasks)
+    if user:
+        return f"task #{user['id']} ({user['status']}) waits on a probe that reads it"
     user = needed_by(task, open_tasks)
     if user:
         return f"task #{user['id']} ({user['status']}) may still use it"
@@ -1570,7 +1625,7 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             return dry_run or ((archive_limit is None or archived < archive_limit)
                                and (deadline is None or time.time() < deadline))
         deferred = "archiving deferred to a later sweep (each daemon tick step archives at most one worktree)"
-        open_tasks = p.db.q("SELECT id, status, spec, depends_on, labels FROM tasks WHERE status NOT IN (%s)"
+        open_tasks = p.db.q("SELECT id, status, spec, depends_on, labels, result FROM tasks WHERE status NOT IN (%s)"
                             % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)
         targets: list[tuple[Path, dict | None, dict | None]] = []   # (path, task, run worktree or None)
         for path in sorted(p.worktrees.iterdir()) if p.worktrees.is_dir() else []:

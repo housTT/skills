@@ -3667,6 +3667,8 @@ class Daemon:
             if new == "blocked":
                 # A block is the coordinator's to decide: whoever requeues it starts the count over.
                 extra["stale_wakes"] = 0
+            if "waiting_since" in extra and (said := worktree.probe_hold_text(task["id"], result.get("retry_when"))):
+                log(self.p, said)
         # A review that passes may hand its approved commits to the push queue instead of pushing
         # (delivery.push_queue): it waits as 'pushing' until a batch pushed them (pushq.py).
         approval, push_note, push_quiet = None, "", False
@@ -6994,6 +6996,9 @@ class Daemon:
                 # Its device runner is down: the daemon brings it back, and the task sleeps on.
                 self._restart_runner(runner, tid, now)
                 rc = 1
+            gone = worktree.missing_cd_worktree(probe, self.p) if rc not in (0, None) else None
+            if gone:   # it cds into a pruned worktree: it can never pass, so it is broken, not "not yet"
+                rc = f"its cd target {gone} is gone (a removed task worktree)"
             if rc == netwait.UNREACHABLE_RC:
                 rc = self._own_255(tid, probe, outs[id(proc)], now)
             if task and task["status"] == "queued" and deferral(task).get("when"):
@@ -7006,6 +7011,8 @@ class Daemon:
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
                     (self._probe_passed if rc == 0 else self._job_failed)(task, now)
+            elif gone and task and task["status"] == "queued" and (task["not_before"] or 0) > now:
+                self._wake_waiting(task, f"probe broken: {rc}", now)   # no timer can make it pass
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
             prev = load_result(t["result"])
             probe = prev.get("retry_when")
