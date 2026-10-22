@@ -4,9 +4,10 @@ Runs a Quasar target's kernel-op tests on TTsim and replaces assumed results wit
 target is a Quasar destination (`quasar`, `quasar-bf16`) or a Quasar source; pass it as
 `--target <target>` (it may be omitted when the run has only one Quasar target). Each target has
 its own `kernel_tests_plan_<target>.csv` and `kernel_test_results_<target>.csv`.
-Do not run the whole-model test on a destination; this phase tests kernel ops one by one, with the
-parameters the source model passes at each row (shapes, sharding, dtype, fused activation, program
-config). A test with other parameters still decides a status, but its evidence names the differences. A
+Do not run the whole-model test on a destination; this phase runs kernel-op tests one by one, each with
+the parameters written in the test. A test decides a row's status when it runs the same kernel op (device
+op, program factory, layout and sharding, dtype; target-status.md). Its shapes, batch and core grid may
+differ from the row's and no script compares them, so the evidence names the differences. A
 Quasar source's entry test is its own item (measured-source.md).
 
 1. Readiness: `python3 <plugin-root>/scripts/same_commit.py <run dir> --tt-metal <checkout>` must
