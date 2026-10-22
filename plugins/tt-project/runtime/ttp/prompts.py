@@ -668,6 +668,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         + _runner_line(cfg)
         + _hostmap_line(cfg)
         + f"project root: {p.root}\n"
+        + root_behind_line(p, cwd)
         + _zone_line(p)
         + venv_line
         + f"delivery policy: draft PRs={delivery.get('draft_prs', True)}, review before PR="
@@ -754,6 +755,42 @@ def _trim_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: dic
         "runs again at once at standard, at no attempt.\n"
         "Never run `ttp push` or `git push`, never bump versions or write a changeset.",
         restrictions_block(p)])
+
+
+# A fetch of the push branch in the project root, for root_behind_line: bounded, and at most once per
+# ROOT_FETCH_TTL_S per root and branch (the daemon builds prompts in its dispatch loop).
+ROOT_FETCH_TIMEOUT_S = 20
+ROOT_FETCH_TTL_S = 300
+_root_fetched: dict[str, float] = {}
+
+
+def root_behind_line(p: Project, cwd: str) -> str:
+    """For a task that runs in the project root: a line saying how many commits its HEAD lacks of the
+    push branch's remote ref, fetched, and how to read current code without moving HEAD. "" when `cwd`
+    is not the root, the root is current, has no push branch or remote, or the fetch fails."""
+    from . import push
+    try:
+        root = Path(p.root)
+        if not cwd or Path(cwd).resolve() != root.resolve():
+            return ""
+        if not str((p.config().get("delivery") or {}).get("push_branch") or "").strip() or push.remote_less(root):
+            return ""
+        remote, branch = push.target(p, root)
+        ref, key = f"{remote}/{branch}", f"{root}\0{remote}/{branch}"
+        if time.time() - _root_fetched.get(key, 0.0) >= ROOT_FETCH_TTL_S:
+            got = push._git_net(root, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance",
+                                remote, f"+refs/heads/{branch}:refs/remotes/{ref}", timeout_s=ROOT_FETCH_TIMEOUT_S)
+            if got.returncode != 0:
+                return ""
+            _root_fetched[key] = time.time()
+        n = push._git(root, "rev-list", "--count", f"HEAD..refs/remotes/{ref}").stdout.strip()
+    except Exception:   # an unreadable root must not stop the prompt
+        return ""
+    if not n.isdigit() or int(n) == 0:
+        return ""
+    return (f"project root checkout: HEAD is {n} commit{'s' if int(n) != 1 else ''} behind {ref}, so its files "
+            f"are old. Read current code with `git show {ref}:<path>` or `git grep <pattern> {ref}`; never move "
+            "the root's HEAD (no checkout, pull, reset or rebase there).\n")
 
 
 def verified_line(p: Project, task: dict, cwd: str) -> str:
