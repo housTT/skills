@@ -1,0 +1,16 @@
+/goal Use $agentic-serving and $tt-device-usage for HF_MODEL after the benchmark stage in the current tt-metal checkout.
+
+Subagents are authorized when a selected skill requests or recommends them.
+
+This goal runs agentic evals on the served autoport and tunes its serving configuration for them, following the goal-12 section of $agentic-serving. Read bringup/agentic_evals/inputs.json if it exists; otherwise use that skill's defaults. Use only the hardware the inputs grant, and keep it busy.
+
+Goal completion requirements:
+- The harness is proven end to end before any scored run.
+- Small seeded samples measure the workload and noise and re-check the serving invariants on real traffic; failures are fixed in the owning stage's code.
+- Changes are tested one per arm against the current best on the same tasks, with a prediction first; kept changes beat the noise, have an explained mechanism, and are re-run together.
+- doc/agentic_evals/estimate.json records per eval a go/stop decision and reason. Full suites run only on go and record actual hours next to the prediction. A measured stop is a valid outcome.
+- doc/agentic_evals/serving_config.json records the measured serving values a release spec needs, and doc/agentic_serving.json `workload` is updated with measured values.
+- doc/agentic_evals/REPORT.md leads with hours per suite and scores against references, then the chosen configuration and remaining limits. Scores are reported, not gated.
+- Only owned processes and containers are stopped. Commit stage-owned changes locally, never push, and log SHAs.
+
+Unmet requirements and failed gates: work. Use $autofix for execution or integration failures. Stop only after `$autofix` fails or the stage budget ends, preserving partial results and the reason.

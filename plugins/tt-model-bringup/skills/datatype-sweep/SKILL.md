@@ -83,7 +83,7 @@ This order is a heuristic, not a law, with the typically most-sensitive parts of
 
 When backing out a failed BFP4 trial, restore to BFP8 first unless BFP8 itself is known to be the failing precision for that tensor group.
 
-For every material matmul group tested with BFP4 weights, include a LoFi compute-fidelity candidate for that same group. BFP4 with HiFi2 is allowed as a comparison or fallback, but it is not enough by itself. If a BFP4+LoFi candidate cannot be run, record the exact TTNN/runtime blocker and keep the stage open until the blocker is fixed or `$autofix` fails.
+For every material matmul group tested with BFP4 weights, include a LoFi compute-fidelity candidate for that same group. BFP4 with HiFi2 is allowed as a comparison or fallback, but it is not enough by itself. If a BFP4+LoFi candidate cannot be run, record the exact TTNN/runtime blocker and keep the stage open until the blocker is fixed or `$autofix` fails, unless BFP4 is already rejected for that group.
 
 Sweep compute fidelity even when dtype is unchanged. For dominant decode projection groups, include BFP8+LoFi and BFP8+HiFi2 candidates when both are legal. Do not assume HiFi2 is fastest for BFP8, and do not assume LoFi is safe without full-model top-1/top-5 evidence. Record dtype and fidelity together in each candidate id so later stages can construct the exact policy.
 
@@ -152,7 +152,7 @@ If the runtime does not currently expose fidelity as a policy field, add that pl
 
 ## Final Selection
 
-Select the fastest config that satisfies the acceptance bar. If two configs are within measurement noise, prefer the simpler and safer one.
+Select the fastest config that satisfies the acceptance bar, also checking agent-shaped long prefixes, free-running replies and the memory ledger as [`agentic-serving`](../agentic-serving/SKILL.md) describes. Higher precision chosen for those reasons is a valid selection. If two configs are within measurement noise, prefer the simpler and safer one.
 
 Before finishing:
 

@@ -40,8 +40,8 @@ def check(model_dir, hf_model=''):
     layers = identity.get('layer_count')
     if not isinstance(layers, int) or layers < 1 or layers != identity.get('configured_layer_count'):
         raise ValueError('identity must verify all configured model layers')
-    if identity.get('prefix_caching') is not False:
-        raise ValueError('performance evidence must disable prefix caching')
+    if not isinstance(identity.get('prefix_caching'), bool):
+        raise ValueError('performance evidence must record whether prefix caching is enabled')
     summary = read(evidence / 'run/summary.json')
     config = read(evidence / 'run/run_config.json')
     if config.get('model') != identity['model']:

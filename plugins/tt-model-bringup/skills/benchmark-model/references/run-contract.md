@@ -344,8 +344,8 @@ judge the model's accuracy.
   "configured_layer_count": 32,
   "source_commits": {"tt-metal": "commit", "vllm": "commit"},
   "hardware": "observed chip topology",
-  "server_command": ["vllm", "serve", "organization/model", "--max-num-seqs", "32", "--max-model-len", "131072", "--no-enable-prefix-caching"],
-  "prefix_caching": false,
+  "server_command": ["vllm", "serve", "organization/model", "--max-num-seqs", "32", "--max-model-len", "131072"],
+  "prefix_caching": true,
   "max_num_seqs": 32,
   "max_model_len": 131072
 }

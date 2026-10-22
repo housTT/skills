@@ -77,9 +77,10 @@ def test_clean_package_runs_all_goals_without_codex_or_old_framework(installed):
     manifest = runner.read_manifest(manifests[0])
     assert manifest['stage_11_dry_run'] == 'true'
     assert manifest['stage_11_check_script'].endswith('/11-benchmark.check.sh')
+    assert manifest['stage_12_check_script'].endswith('/12-agentic-evals.check.sh')
     assert all('tti-release' not in p.read_text() for p in prompts)
     assert manifest['stage_6_check_script'].startswith(str(plugin))
-    assert len(list(manifests[0].parent.glob('*.prompt.txt'))) == 11
+    assert len(list(manifests[0].parent.glob('*.prompt.txt'))) == 12
     assert not (target / '.agents').exists()
 
 
@@ -120,7 +121,8 @@ def test_skill_graph_and_package_links_resolve():
             assert target.exists(), (path, ref)
 
 
-@pytest.mark.parametrize('stage', ['06-full-model', '07-optimized-full-model', '09-vllm', '10-optimized-vllm', '11-benchmark'])
+@pytest.mark.parametrize('stage', ['06-full-model', '07-optimized-full-model', '09-vllm', '10-optimized-vllm',
+                                   '11-benchmark', '12-agentic-evals'])
 def test_installed_gates_fail_critical_for_missing_evidence(installed, stage):
     plugin, target, env = installed
     env['MODEL_DIR'] = 'models/autoports/org_model'
@@ -143,6 +145,13 @@ def test_full_model_gate_accepts_valid_evidence_and_rejects_context_reduction(in
     contract = doc / 'context_contract.json'
     contract.write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 8192}))
     env['MODEL_DIR'] = str(model)
+    gate = plugin / 'prompts/model_bringup_multigoal/06-full-model.check.sh'
+    result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 2
+    assert 'agentic_serving.json' in result.stderr
+    (doc / 'agentic_serving.json').write_text(json.dumps({
+        'workload': {'target_concurrency': 4, 'working_set_tokens': 2000},
+        'ledger': {'weights': [{'name': 'all', 'bytes': 2**30}], 'pool_tokens': 8192}}))
     gate = plugin / 'prompts/model_bringup_multigoal/06-full-model.check.sh'
     result = run('bash', str(gate), cwd=target, env=env)
     assert result.returncode == 0, result.stderr + result.stdout

@@ -18,4 +18,11 @@ python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
-  --stage vllm --require-contract
+  --stage vllm --require-contract || rc=$?
+rc=${rc:-0}
+[ "$rc" -ge 2 ] && exit "$rc"
+
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || serving=$?
+[ "${serving:-0}" -gt "$rc" ] && rc=$serving
+exit "$rc"

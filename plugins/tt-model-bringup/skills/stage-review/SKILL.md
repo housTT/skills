@@ -290,7 +290,8 @@ For datatype-sweep stages, also inspect:
   profiler/perf-report rows rather than JSON alone;
 - whether every material BFP4 matmul group considered or selected has a
   BFP4+LoFi candidate, or an exact TTNN/runtime blocker plus `$autofix`
-  evidence;
+  evidence, unless BFP4 is already rejected for that group. Higher precision
+  chosen for long-context accuracy or memory reasons is not a finding;
 - whether a "fastest evaluated config" claim is only true because an obvious
   legal precision/fidelity candidate was missing.
 

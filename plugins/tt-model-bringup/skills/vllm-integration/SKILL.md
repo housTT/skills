@@ -38,7 +38,7 @@ Load `models/autoports/<model>/doc/context_contract.json` and serve the recorded
 
 Serving requests may have any valid prompt length up to that supported context. The adapter must not require prompt length to be divisible by an internal prefill chunk, tile, block, page, or trace size. If the model path pads or chunks internally, the adapter passes the logical prompt length through to masks, positions, cache fill, and output slicing. Include a direct OpenAI-compatible request or targeted runner check with a valid non-aligned prompt length, not only the default 128-token benchmark.
 
-Preserve larger-batch serving capability. The headline performance target is still batch-1 single-user latency, but the adapter must not assume `max_num_seqs=1` or batch size 1 in cache allocation, page tables, scheduler inputs, sampling, async decode, or output formatting. Test serving up to 32 concurrent sequences when the target hardware, memory, and harness allow it. If 32 cannot run, record the largest tested value and the hard physical limit.
+Preserve larger-batch serving capability. The headline performance target is the target workload in [`agentic-serving`](../agentic-serving/SKILL.md); batch-1 single-user latency is a regression row. The adapter must not assume `max_num_seqs=1` or batch size 1 in cache allocation, page tables, scheduler inputs, sampling, async decode, or output formatting. Test serving up to 32 concurrent sequences when the target hardware, memory, and harness allow it. If 32 cannot run, record the largest tested value and the hard physical limit.
 
 ## Serving dependency
 
@@ -90,7 +90,7 @@ request reordering, pending-token handling and unchanged-table steady decode. A 
 manually forces `reset_batch=True`, changes only an unused page, or checks only for
 degenerate text does not establish page-table correctness.
 
-Leave prefix caching `False` unless it is implemented and tested.
+Implement prefix caching and enable it for serving, with a correct hit rule for every layer kind; check it as [`agentic-serving`](../agentic-serving/SKILL.md) describes. If it cannot be supported yet, record why.
 
 
 If the vLLM plugin or harness is being changed, prefer the same safety rule there: overlap should default to false unless the model declares this proof-backed capability. Leaving overlap disabled may cost a few tokens/sec/user; letting it default on can silently corrupt generation.
@@ -207,7 +207,7 @@ Check stages:
 
 - `sampling`: runs the canonical TT plugin pytest suite against the live server. `--sampling-profile full` runs the whole suite; `--sampling-profile smoke` runs a small integration sanity subset for slow bring-up loops.
 - `qualitative`: saves greedy and sampled completions for prompts from `${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/vllm_prompts.txt`; use `$qualitative-check` to ensure the prompts are sent in the HF-declared model format, compare against controls, and judge coherence, topic, repetition, gibberish, and wrong-language drift.
-- `benchmark`: runs the primary single-user decode profile by default: 128-token input, 128-token output, one prompt, `--max-concurrency 1`, `ignore_eos`, percentile metrics `ttft,tpot,itl,e2el`, and a completed-prompt gate. Use `vllm_benchmark.json` for headline decode t/s/u and comparisons to full-model or older agentic/custom-benchmark reports. This is the primary optimization target.
+- `benchmark`: runs the primary single-user decode profile by default: 128-token input, 128-token output, one prompt, `--max-concurrency 1`, `ignore_eos`, percentile metrics `ttft,tpot,itl,e2el`, and a completed-prompt gate. Use `vllm_benchmark.json` for headline decode t/s/u and comparisons to full-model or older agentic/custom-benchmark reports. This is the single-user regression row.
 - `benchmark`: also runs the vLLM-nightly-shaped CI serving-burst profile by default: 100-token inputs, 100-token outputs, 32 prompts, no explicit `--max-concurrency`, `ignore_eos`, and the same metric set. Use `vllm_ci_serving_benchmark.json` for vLLM-nightly parity, serving-capacity context, and larger-batch/concurrency coverage. Do not use it as the headline decode t/s/u because burst admission and chunked prefill can affect TPOT. The readiness runner passes `--temperature 0.0` by default so both benchmark profiles are greedy. Use `--benchmark-use-server-generation-config` only when intentionally reproducing exact nightly/server-generation-config behavior, and label those numbers as sampled/default-generation-config rather than greedy single-user t/s/u.
 
 When optimizing decode serving overhead, benchmark with the exact same runner, prompt/output lengths, `max_num_seqs`, model length, mesh, TT config, and sampling mode as the primary or previous comparison. Report raw vLLM `median_ttft_ms`/`p99_ttft_ms`, `mean_tpot_ms`/`p99_tpot_ms`, `median_itl_ms`/`p99_itl_ms`, `output_throughput`, and TPOT-derived decode t/s/u (`1000 / mean_tpot_ms`) before/after. Compare primary single-user 128/128/1 against primary single-user 128/128/1, and compare CI serving-burst 100/100/32 against CI serving-burst 100/100/32; do not treat those two workload shapes as direct perf verdicts against each other.
