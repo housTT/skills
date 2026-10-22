@@ -9714,3 +9714,189 @@ def test_the_run_git_wrapper_skips_other_wrappers_on_path_and_keeps_its_hook(env
     out = git("-c", f"core.hooksPath={own_hooks}", "push", "origin", f"ttp/t{tid}-notes")
     assert out.returncode == 0, out.stderr
     assert (env["tmp"] / "own-hook").read_text() == "ran\n"   # the caller's own hook still ran
+
+
+def _land_setup(env, monkeypatch, checks):
+    """A remote-less project whose push branch is local branch `proj`, a review task, and a branch
+    `work` one commit ahead of `proj` checked out in the repo: (land, p, repo, review id, head)."""
+    from ttp import land
+    p, repo = _local_push_setup(env, monkeypatch, checks)
+    t = p.db.add_task("review", "s", kind="review")
+    _git_out(repo, "checkout", "-q", "-b", "work")
+    _commit(repo, "a.txt", "a\n")
+    return land, p, repo, t, _git_out(repo, "rev-parse", "HEAD")
+
+
+def _worktrees(repo):
+    return [ln for ln in _git_out(repo, "worktree", "list", "--porcelain").splitlines() if ln.startswith("worktree ")]
+
+
+def _on_proj(repo, name, text):
+    """A commit on `proj` made from the repo's checkout, which goes back to `work`."""
+    _git_out(repo, "checkout", "-q", "proj")
+    _commit(repo, name, text)
+    _git_out(repo, "checkout", "-q", "work")
+    return _git_out(repo, "rev-parse", "proj")
+
+
+def test_ttp_land_replays_a_reviewed_head_onto_a_moved_local_branch_and_records_it(env, monkeypatch):
+    """A review of a project whose push branch is a local branch with no git remote gets a `ttp land`
+    step. `ttp land` replays the reviewed head onto the branch's new tip (each commit naming the one
+    it replays), fast-forwards the branch, and records the landing: `landed:#<code>` passes, the
+    review's verdict covers the new commit and the original head counts as delivered. Without the
+    local branch the review stays review only (the test above)."""
+    from ttp import cli, land, push, pushq, reviewreuse
+    from ttp.project import config_problems
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    _git_out(p.root, "branch", "work")
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_checks", ["true"])
+    assert "reviews land on it with `ttp land`" in push.push_branch_problem("work", p.root)
+    assert any("`ttp land`" in x for x in config_problems({"delivery": {"push_branch": "work"}}, p.root))
+    for queue in (False, True):
+        p.set_config("delivery.push_queue", queue)
+        cid, branch, _, (rev,) = _finish_code(env, p, f"landme{queue}", {f"landme{queue}.py": 3})
+        labels = json.loads(rev["labels"])
+        assert land.STEP in rev["spec"] and push.LAND_LABEL in labels, rev["spec"][-800:]
+        assert "ttp push` from" not in rev["spec"] and "Review only" not in rev["spec"]
+        assert reviewreuse.pushes(p.config(), labels)
+    head = _git_out(p.root, "rev-parse", branch)
+    # `work` moves on before the landing, in a worktree that is then gone.
+    side = env["tmp"] / "side"
+    _git_out(p.root, "worktree", "add", "-q", str(side), "work")
+    _commit(side, "other.txt", "other\n")
+    _git_out(p.root, "worktree", "remove", str(side))
+    tip = _git_out(p.root, "rev-parse", "work")
+    key = reviewreuse.check_key(p.config())
+    p.db.update_task(rev["id"], status="done", labels=reviewreuse.with_head(labels, head, key))
+    n = len(_worktrees(p.root))
+    said = []
+    assert land.land(p, p.root, head, rev["id"], said.append) == 0, said
+    new = _git_out(p.root, "rev-parse", "work")
+    assert new != head and _git_out(p.root, "rev-parse", f"{new}^") == tip
+    assert f"Ttp-Replayed-From: {head}" in _git_out(p.root, "log", "-1", "--format=%B", new)
+    assert [r["sha"] for r in p.db.q("SELECT sha FROM task_landings WHERE task=?", (rev["id"],))] == [new]
+    assert len(_worktrees(p.root)) == n
+    with pytest.raises(SystemExit) as e:
+        cli.main(["landed", "--task", str(cid)])
+    assert e.value.code == 0
+    assert reviewreuse.accepted(p.db, new, key)["id"] == rev["id"]
+    assert reviewreuse.delivered(p, head)
+    # Landing it again is a no-op that still exits 0.
+    assert land.land(p, p.root, head, rev["id"], said.append) == 0 and _git_out(p.root, "rev-parse", "work") == new
+
+
+def test_ttp_land_a_conflict_or_a_failing_check_lands_nothing(env, monkeypatch):
+    """A conflict exits 3 and a failing check 4 (a check's own exit 3 too): the branch keeps its tip,
+    no scratch worktree is left and no landing is recorded."""
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    tip = _on_proj(repo, "a.txt", "other\n")
+    n = len(_worktrees(repo))
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 3, said
+    assert "conflict replaying" in said[0] and "a.txt" in said[0], said
+    assert _git_out(repo, "rev-parse", "proj") == tip and len(_worktrees(repo)) == n
+    assert not p.db.q("SELECT * FROM task_landings")
+    _git_out(repo, "branch", "-f", "proj", f"{head}^")
+    for checks in (["false"], ["exit 3"]):
+        p.set_config("delivery.push_checks", checks)
+        said = []
+        assert land.land(p, repo, head, t, said.append) == 4, (checks, said)
+        assert _git_out(repo, "rev-parse", "proj") == _git_out(repo, "rev-parse", f"{head}^")
+        assert len(_worktrees(repo)) == n and not p.db.q("SELECT * FROM task_landings")
+
+
+def test_ttp_land_drops_a_commit_already_on_the_branch_and_tells_other_git_failures_from_conflicts(
+        env, monkeypatch):
+    """A commit whose change the branch already has under another commit becomes empty on its tip: it
+    is dropped, not reported as a conflict. A cherry-pick that fails with no unmerged paths exits 1."""
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    _commit(repo, "b.txt", "b\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "proj")      # a.txt's change inside a bigger commit (another patch)
+    (repo / "z.txt").write_text("z\n")
+    _git_out(repo, "add", "z.txt")
+    _commit(repo, "a.txt", "a\n")
+    _git_out(repo, "checkout", "-q", "work")
+    tip = _git_out(repo, "rev-parse", "proj")
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 0, said
+    new = _git_out(repo, "rev-parse", "proj")
+    assert any(m.startswith(f"dropped {_git_out(repo, 'rev-parse', 'work^')[:10]}") for m in said), said
+    assert _git_out(repo, "rev-parse", f"{new}^") == tip                            # b.txt alone
+    assert _git_out(repo, "show", "--name-only", "--format=", new) == "b.txt"
+    # Every commit already there in another form: nothing to replay, landed at the tip.
+    _git_out(repo, "checkout", "-q", "-b", "again", f"{tip}^")
+    _commit(repo, "a.txt", "a\n")
+    again = _git_out(repo, "rev-parse", "HEAD")
+    said = []
+    assert land.land(p, repo, again, t, said.append) == 0 and _git_out(repo, "rev-parse", "proj") == new, said
+    assert "already on local branch proj" in said[-1], said
+    # A git failure that is not a conflict.
+    _git_out(repo, "checkout", "-q", "work")
+    _commit(repo, "d.txt", "d\n")
+    real = land._git
+
+    def broken(where, *args, **kw):
+        if args[:1] == ("cherry-pick",) and "--abort" not in args:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: something else broke")
+        return real(where, *args, **kw)
+    monkeypatch.setattr(land, "_git", broken)
+    said = []
+    assert land.land(p, repo, _git_out(repo, "rev-parse", "HEAD"), t, said.append) == 1, said
+    assert _git_out(repo, "rev-parse", "proj") == new and "not a conflict" in " ".join(said)
+
+
+def test_ttp_land_starts_over_while_the_branch_moves_and_stops_after_its_tries(env, monkeypatch):
+    """The branch moving during the checks starts the landing over on its new tip; one that keeps
+    moving exits 5 after MOVE_TRIES. A dirty checkout that has the branch exits 6 and lands once clean."""
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    real, moves = land._checks, []
+
+    def moving(p_, wt, new, base, say):
+        if len(moves) < want:
+            moves.append(_on_proj(repo, f"m{len(moves)}-{want}.txt", "m\n"))
+        return real(p_, wt, new, base, say)
+    monkeypatch.setattr(land, "_checks", moving)
+    want = 1
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 0, said
+    assert _git_out(repo, "rev-parse", "proj^") == moves[0] and "starting over" in " ".join(said)
+    _commit(repo, "e.txt", "e\n")
+    head, moves[:], want = _git_out(repo, "rev-parse", "HEAD"), [], land.MOVE_TRIES
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 5, said
+    assert _git_out(repo, "rev-parse", "proj") == moves[-1]
+    monkeypatch.setattr(land, "_checks", real)
+    side = env["tmp"] / "side"
+    _git_out(repo, "worktree", "add", "-q", str(side), "proj")
+    (side / "x.txt").write_text("x")
+    _git_out(side, "add", "x.txt")
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 6, said
+    _git_out(side, "reset", "-q", "--hard")
+    assert land.land(p, repo, head, t, said.append) == 0, said
+    assert _git_out(side, "rev-parse", "HEAD") == _git_out(repo, "rev-parse", "proj")
+
+
+def test_ttp_land_waits_for_another_landing_and_runs_from_the_cli(env, monkeypatch):
+    """A held landing lock exits 75; `ttp land <head>` lands for the run's own task (TTP_TASK)."""
+    from ttp import cli, push
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.push_wait_s", 0)
+    held = push.take(p, push.LOCAL, "proj", 0)
+    said = []
+    try:
+        assert land.land(p, repo, head, t, said.append) == 75, said
+    finally:
+        held.close()
+    assert _git_out(repo, "rev-parse", "proj") != head
+    monkeypatch.setenv("TTP_TASK", str(t))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["land", head])
+    assert e.value.code == 0 and _git_out(repo, "rev-parse", "proj") == head
+    assert p.db.one("SELECT task FROM task_landings")["task"] == t

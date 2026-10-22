@@ -1455,7 +1455,8 @@ def push_branch_problem(push_branch: Any, repo: Path | None = None, allow: bool 
     remote, or none of the name the push would use. Local git only: the remote's default branch is
     refused where the remote is asked (refusal, pushq._refusal). Without `repo` (or outside a git
     repo) only the name is checked, its first part read as a remote or as part of the branch.
-    `ttp doctor` and the config check report it; reviews of such a project are review only. `allow`
+    `ttp doctor` and the config check report it; reviews of such a project are review only, except on
+    an existing local branch of a repo with no remote, where they land with `ttp land` (land.py). `allow`
     (allow_protected) lets main and master through."""
     ref = str(push_branch or "").strip()
     if not ref:
@@ -1463,6 +1464,10 @@ def push_branch_problem(push_branch: Any, repo: Path | None = None, allow: bool 
     r = _git(repo, "remote") if repo is not None else None
     remotes = r.stdout.split() if r is not None and r.returncode == 0 else None
     if remotes == []:
+        branch = _split_target(ref, [])[1]
+        if (branch not in PROTECTED or (allow and branch != "HEAD")) and _local_tip(repo, branch):
+            return (f"delivery.push_branch: the code repo has no git remote, so {ref} is never pushed; it is a "
+                    f"local branch, and reviews land on it with `ttp land`")
         return (f"delivery.push_branch: the code repo has no git remote, so {ref} can never be pushed to; "
                 f"reviews are review only (add a remote, or clear delivery.push_branch)")
     if remotes is None:

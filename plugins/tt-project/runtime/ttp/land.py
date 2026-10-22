@@ -10,9 +10,13 @@ there, and fast-forwards the branch to the result (in the worktree that has it c
 one does). The landing is recorded for the task (task_landings), so `landed:#<id>` passes for it and
 the review that ran it, and the review's verdict covers the landed commit too (reviewreuse).
 
-Exit codes: 0 landed (or already there); 3 a conflict; 4 a check failed; 5 the branch moved during
-the checks; 2 refused; 75 another landing held the branch. Only 0 moves the branch; the scratch
-worktree is always removed."""
+A commit that becomes empty on the branch's tip (its change is already there) is dropped. When the
+branch moves during the checks, it starts over on the new tip, up to MOVE_TRIES times in all.
+
+Exit codes: 0 landed (or already there); 1 git failed for a reason other than a conflict; 2 refused;
+3 a conflict (unmerged paths); 4 a check failed; 5 the branch kept moving during the checks; 6 the
+checkout that has the branch has uncommitted changes; 75 another landing held the branch. Only 0
+moves the branch; the scratch worktree is always removed."""
 from __future__ import annotations
 
 import os
@@ -27,8 +31,9 @@ from typing import Callable
 from . import push, reviewreuse
 from .project import Project, push_allowed
 
-LANDED, REFUSED, CONFLICT, CHECKS_FAILED, MOVED, BUSY = 0, push.REFUSED, push.CONFLICT, push.CHECKS_FAILED, \
-    push.KEPT_MOVING, push.BUSY
+LANDED, FAILED, REFUSED, CONFLICT, CHECKS_FAILED, MOVED, DIRTY, BUSY = 0, 1, push.REFUSED, push.CONFLICT, \
+    push.CHECKS_FAILED, push.KEPT_MOVING, push.REJECTED, push.BUSY
+MOVE_TRIES = 3   # landings in all while the branch keeps moving during the checks
 STEP = "If it passes, land the head you reviewed with `ttp land"   # the review spec's land step starts so
 
 
@@ -56,9 +61,14 @@ def step(branch: str, head: str) -> str:
             f"nowhere to push): it replays the head's commits onto {branch}'s tip in a scratch worktree, runs "
             f"the project's checks there and fast-forwards {branch}. Exit 0: landed; report the commit it "
             f"prints. Exit 3: a conflict with newer commits on {branch}, nothing landed: hand off `failed` with "
-            f"a finding to rebase the change onto {branch}, naming the files. Exit 75: hand off `waiting` with "
-            f"the retry_when it prints. Any other exit: nothing landed; hand off `failed` with its output. "
-            f"Never move {branch} by hand, and do not approve it for the push queue.")
+            f"a finding to rebase the change onto {branch}, naming the files. Exit 5 ({branch} kept moving) or 6 "
+            f"(the checkout that has {branch} has uncommitted changes): not a fault of the change; run it once "
+            f"more, and if it repeats hand off `waiting` naming it, with retry_after_s 1800 and a retry_when that "
+            f"only waits for that time. Exit 75: hand off `waiting` with the retry_when it prints. Any other "
+            f"exit: nothing landed; hand off `failed` with its output. If the project's checks may outlast one "
+            f"tool call, run it as `ttp detach land -- ttp land {head}` and hand off `waiting` with the "
+            f"retry_when that prints; on waking, read land.log and land.rc in your run folder and act on its "
+            f"exit code as above. Never move {branch} by hand, and do not approve it for the push queue.")
 
 
 def _holder(repo: Path, branch: str) -> str:
@@ -72,25 +82,34 @@ def _holder(repo: Path, branch: str) -> str:
     return ""
 
 
-def _replay(wt: Path, commits: list[str], say: Callable[[str], None]) -> bool:
+def _replay(wt: Path, commits: list[str], say: Callable[[str], None]) -> int:
     """Cherry-pick `commits` in scratch worktree `wt`, each keeping its author, date and message and
-    gaining a trailer naming the commit it replays (landed.on_branch reads it). False on a conflict."""
+    gaining a trailer naming the commit it replays (landed.on_branch reads it); one that becomes
+    empty on the new base is dropped. 0, CONFLICT on unmerged paths, or FAILED."""
     for c in commits:
         r = _git(wt, "cherry-pick", "--allow-empty", c)
         if r.returncode != 0:
             files = _git(wt, "diff", "--name-only", "--diff-filter=U").stdout.split()
-            say(f"conflict replaying {c[:10]}" + (f" in {', '.join(files[:8])}" if files else "")
-                + f": {(r.stderr or r.stdout).strip().splitlines()[0] if (r.stderr or r.stdout).strip() else ''}")
+            out = (r.stderr or r.stdout).strip()
+            first = out.splitlines()[0] if out else ""
+            staged = _git(wt, "diff", "--cached", "--quiet", "HEAD").returncode
             _git(wt, "cherry-pick", "--abort")
-            return False
+            if files:
+                say(f"conflict replaying {c[:10]} in {', '.join(files[:8])}: {first}")
+                return CONFLICT
+            if staged == 0 and "empty" in out:
+                say(f"dropped {c[:10]}: its change is already on the branch")
+                continue
+            say(f"could not replay {c[:10]} (not a conflict): {out[-400:]}")
+            return FAILED
         msg = _git(wt, "log", "-1", "--format=%B").stdout
         msg = subprocess.run(["git", "-C", str(wt), "interpret-trailers", "--trailer", f"{push.landed.REPLAYED}: {c}"],
                              input=msg, text=True, capture_output=True, timeout=60).stdout or msg
         if subprocess.run(["git", "-C", str(wt), "commit", "-q", "--amend", "--no-verify", "--allow-empty", "-F", "-"],
                           input=msg, text=True, capture_output=True, timeout=60).returncode != 0:
             say(f"could not add the replay trailer to {c[:10]}")
-            return False
-    return True
+            return FAILED
+    return 0
 
 
 def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None]) -> int:
@@ -148,11 +167,11 @@ def _move(repo: Path, branch: str, base: str, new: str, say: Callable[[str], Non
         if dirty.returncode != 0 or dirty.stdout.strip():
             say(f"{branch} is checked out in {held} with uncommitted changes: fast-forwarding it there would mix "
                 f"them with this work; nothing landed. Commit or discard them there, then run `ttp land` again")
-            return push.REJECTED
+            return DIRTY
         r = _git(wt, "merge", "--ff-only", "--quiet", new)
         if r.returncode != 0:
             say(f"could not fast-forward {branch} in {held}: {(r.stderr or r.stdout).strip()}; nothing landed")
-            return push.REJECTED
+            return DIRTY
         return LANDED
     r = _git(repo, "update-ref", "-m", "ttp land", f"refs/heads/{branch}", new, base)
     if r.returncode != 0:
@@ -196,28 +215,38 @@ def land(p: Project, repo: Path, head: str, tid: int | None = None,
     if lock is None:
         return BUSY
     try:
-        base = push._local_tip(repo, branch)
-        if _git(repo, "merge-base", "--is-ancestor", full, base).returncode == 0:
-            say(f"{full[:10]} is already on local branch {branch}")
-            record(p, tid, full, full, branch)
-            return LANDED
-        fork = _git(repo, "merge-base", base, full).stdout.strip()
-        if not fork:
-            say(f"{full[:10]} shares no history with local branch {branch}")
-            return REFUSED
-        ff = fork == base
-        commits = [] if ff else [ln.split()[1] for ln in _git(repo, "cherry", base, full).stdout.splitlines()
-                                 if ln.startswith("+ ")]
-        if not ff and _git(repo, "rev-list", "--merges", f"{fork}..{full}").stdout.strip():
-            say(f"{full[:10]} has merge commits past {fork[:10]}: they cannot be replayed; nothing landed")
-            return REFUSED
-        if not ff and not commits:
-            say(f"every commit of {full[:10]} is already on local branch {branch} (same patch)")
-            record(p, tid, full, base, branch)
-            return LANDED
-        return push.in_check_scratch(p, lambda: _land(p, repo, branch, base, full, commits, tid, say), "ttp land")
+        for n in range(1, MOVE_TRIES + 1):
+            rc = _attempt(p, repo, branch, full, tid, say)
+            if rc != MOVED or n == MOVE_TRIES:
+                return rc
+            say(f"starting over on {branch}'s new tip ({n + 1} of {MOVE_TRIES})")
+        return MOVED
     finally:
         lock.close()
+
+
+def _attempt(p: Project, repo: Path, branch: str, full: str, tid: int | None, say: Callable[[str], None]) -> int:
+    """One landing of `full` on `branch`'s current tip, under the landing lock."""
+    base = push._local_tip(repo, branch)
+    if _git(repo, "merge-base", "--is-ancestor", full, base).returncode == 0:
+        say(f"{full[:10]} is already on local branch {branch}")
+        record(p, tid, full, full, branch)
+        return LANDED
+    fork = _git(repo, "merge-base", base, full).stdout.strip()
+    if not fork:
+        say(f"{full[:10]} shares no history with local branch {branch}")
+        return REFUSED
+    ff = fork == base
+    commits = [] if ff else [ln.split()[1] for ln in _git(repo, "cherry", base, full).stdout.splitlines()
+                             if ln.startswith("+ ")]
+    if not ff and _git(repo, "rev-list", "--merges", f"{fork}..{full}").stdout.strip():
+        say(f"{full[:10]} has merge commits past {fork[:10]}: they cannot be replayed; nothing landed")
+        return REFUSED
+    if not ff and not commits:
+        say(f"every commit of {full[:10]} is already on local branch {branch} (same patch)")
+        record(p, tid, full, base, branch)
+        return LANDED
+    return push.in_check_scratch(p, lambda: _land(p, repo, branch, base, full, commits, tid, say), "ttp land")
 
 
 def _land(p: Project, repo: Path, branch: str, base: str, full: str, commits: list[str], tid: int | None,
@@ -228,10 +257,14 @@ def _land(p: Project, repo: Path, branch: str, base: str, full: str, commits: li
             say("could not make a scratch worktree; nothing landed")
             return REFUSED
         try:
-            if commits and not _replay(wt, commits, say):
+            if commits and (rc := _replay(wt, commits, say)):
                 say(f"nothing landed; local branch {branch} is still at {base[:10]}")
-                return CONFLICT
+                return rc
             new = _git(wt, "rev-parse", "HEAD").stdout.strip()
+            if new == base:
+                say(f"every commit of {full[:10]} is already on local branch {branch}")
+                record(p, tid, full, base, branch)
+                return LANDED
             if rc := _checks(p, wt, new, base, say):
                 return rc
             if rc := _move(repo, branch, base, new, say):
