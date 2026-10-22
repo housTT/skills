@@ -41897,6 +41897,51 @@ def test_after_push_deploy_unknown_upgrade_error_fails(env, tmp_path, held):
     assert 'runtime import failed' in p.db.one("SELECT text FROM messages WHERE kind='alert'")['text']
 
 
+@pytest.mark.parametrize('how', ['seen', 'unseen', 'deferred'])
+def test_after_push_deploy_daemon_owned_upgrade_is_pending_until_its_check_then_missed(env, tmp_path, how):
+    """A project whose live daemon has not merged the release yet (upgrade.auto on) is owned by that
+    daemon until its next release check (or a deferred merge's end): a low note, not a page; past the
+    deadline it is missed. A down daemon still fails at once, and with upgrade.auto off nothing owns it."""
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    base, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    now = time.time()
+    if how == 'seen':
+        db.set_kv(release.KV_RELEASE, {'version': '0.4.9'})
+        seen = db.one("SELECT ts FROM kv WHERE key=?", (release.KV_RELEASE,))['ts']
+        due = float(seen) + release.CHECK_S
+    elif how == 'deferred':
+        due = now + 7 * 3600
+        db.set_kv(release.KV_AUTO, {'key': '0.5.0 x', 'outcome': 'deferred', 'until': due, 'why': 'busy'})
+    else:
+        due = now + release.CHECK_S
+    row = overview.deployed(names=['alpha'])['projects'][0]
+    assert row['merge_pending'] and row['merge_owner'] == "this project's daemon", row
+    assert abs(row['takeover_at'] - due) < 60, (row['takeover_at'], due)
+    result = deploy.record(p, overview.deployed(names=['alpha']))
+    assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending', result
+    notes = p.db.q("SELECT severity FROM messages WHERE direction='out'")
+    assert [n['severity'] for n in notes] == ['low'] and not p.db.q('SELECT * FROM alerts')
+    rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+    assert rec['owner'] == "this project's daemon" and rec['due'] > now
+    assert deploy.assess(rec, row, rec['due'] - 1)[0] == 'pending'
+    assert deploy.assess(rec, row, rec['due'] + 1)[:2] == ('failed', 'missed')
+    down = dict(row, daemon_alive=False, daemon_state='stopped')
+    assert deploy.assess(rec, down, now)[:2] == ('failed', 'down')
+    db.set_kv('daemon', {'pid': 0, 'host': 'testhost'})
+    stopped = overview.deployed(names=['alpha'])['projects'][0]
+    assert not stopped.get('merge_owner') and deploy.assess({}, stopped, now)[:2] == ('failed', 'down')
+    db.close()
+    if how == 'unseen':     # with upgrade.auto off its daemon never merges it: nothing owns it
+        base2, db2 = _deploy_project(tmp_path, 'beta', '0.4.9')
+        cfg = json.loads((base2 / 'harness' / 'project.json').read_text())
+        (base2 / 'harness' / 'project.json').write_text(json.dumps(dict(cfg, upgrade={'auto': False})))
+        off = overview.deployed(names=['beta'])['projects'][0]
+        assert not off.get('merge_owner') and deploy.assess({}, off, now)[:2] == ('failed', 'unowned')
+        db2.close()
+
+
 def test_after_push_deploy_deadline_is_not_extended_by_retries_or_restart(env, tmp_path):
     from ttp import deploy, overview, release
     from ttp.project import Project

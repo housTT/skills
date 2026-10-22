@@ -364,6 +364,17 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         elif row["paused"] and not at_target:
             # Nothing upgrades a paused project by itself: the host-side takeover merges its files now.
             row.update(merge_pending=True, merge_owner="the host-side takeover (project paused)", takeover_at=now)
+        elif (not at_target and row["daemon_alive"] and (where.get("upgrade") or {}).get("auto", True)
+              and auto.get("outcome") not in ("running", "failed")):
+            # Its live daemon merges the release by itself: at its next release check, or when a deferred
+            # merge's wait ends. Past that deadline deploy.assess reports it missed.
+            from .release import CHECK_S, KV_RELEASE
+            if auto.get("outcome") == "deferred":
+                at = float(auto.get("until") or 0) or now + CHECK_S
+            else:
+                _, seen = db.kv(KV_RELEASE)
+                at = seen + CHECK_S if seen else now + CHECK_S
+            row.update(merge_pending=True, merge_owner="this project's daemon", takeover_at=at)
         if not pid:
             if not at_target:
                 return done(PENDING, *_behind(name, db, state, files, now, where))
