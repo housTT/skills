@@ -48,7 +48,8 @@ TRAILING_OP_FIELDS = ("grid_dependency", "op_code", "confidence", "dispatch_evid
 
 
 def cell(text: str):
-    if NUMBER.match(text):
+    # Sheets stores numbers as doubles; longer integers, such as kernel compile hashes, would be rounded.
+    if NUMBER.match(text) and ("." in text or len(text.lstrip("-")) <= 15):
         return float(text) if "." in text else int(text)
     if text and (text[0] in "+-=@'" or text[0].isdigit() or text.upper() in ("TRUE", "FALSE")):
         return "'" + text
