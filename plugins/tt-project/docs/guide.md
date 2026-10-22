@@ -204,7 +204,7 @@ prolonged whole-box outage.
   deferred follow-ups stay with the coordinator). Across stacks, once `review.area_fail_cap` (3; 0
   off) reviews of one area failed within 48 h (a lineage linked by `continues`, follow-ups,
   `depends_on` and `Review #N` / `Fix review #N` titles, or overlapping changes to the same main file), the
-  daemon queues no more fixes there and raises a high-effort coordinator turn to re-plan it
+  daemon queues no more fixes there and raises a tricky coordinator turn (one the turn gates never skip) to re-plan it
   ("repeated review failures in one area", also counted in the daily review).
 - A review's result: `done` lets the change proceed (its PR, push or push-queue approval and its
   dependents), `failed` stops it and starts the fix flow above. A review handed off `done` with
@@ -214,14 +214,15 @@ prolonged whole-box outage.
   keeps its wording through template upgrades without merge conflicts.
 - Each tier maps to a model and effort per provider (`providers.<name>.tiers`). The coordinator
   runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
-  those pin the coordinator alone. Unset, it takes its tier's effort and the model of
-  `coordinator.model_tier` (standard by default; "" uses its own tier's), so the cheaper light-tier
-  model does not move the coordinator. The model names one of `core_provider`'s models.
+  those pin the coordinator alone. Unset, it takes the model of `coordinator.model_tier`
+  (standard by default; "" uses its own tier's), so the cheaper light-tier model does not move the
+  coordinator, and xhigh effort (`coordinator.DEFAULT_EFFORT`), mapped to the provider's nearest
+  supported level. The model names one of `core_provider`'s models.
   `coordinator.turn_timeouts_s.<provider>.<effort>` sizes the turn after effort is resolved:
   low/medium/high/xhigh/max (or ultra) default to 300/600/900/1200/1500 seconds for Claude,
   and 300/600/1200/1800/2400 for Codex and Cursor; an unknown effort or provider gets 600.
   Above 32 KB of prompt text, each additional 8 KB adds 60 seconds. These allowances give slower
-  reasoning turns more time while routine low-effort turns stay short. The base is the first one
+  reasoning turns more time while turns at a lower set effort stay short. The base is the first one
   set: the project's own `turn_timeouts_s` entry for the provider and effort, then a flat
   `coordinator.turn_timeout_s` (0, the default, is unset; a stored 600, the old flat default, also
   counts as unset so older projects get effort sizing), then the built-in table. The prompt
@@ -255,7 +256,7 @@ prolonged whole-box outage.
 - Blocker sweep: every `coordinator.blocker_sweep_h` (6; 0 turns it off) hours while anything is
   stuck, and sooner (never within `coordinator.blocker_sweep_min_gap_h`, 1) when a pause ends, an
   ask is resolved, a dependency finishes, a provider pause ends or a re-check comes due, a
-  high-effort turn lists every blocked, waiting, in-review, setting-held and deferred task and every
+  tricky turn lists every blocked, waiting, in-review, setting-held and deferred task and every
   paused resource with its age, reason and last re-check. The coordinator records one `sweep`
   outcome for each; items without one, `still_blocked` ones with no re-checkable condition, and
   re-block loops (the same reason twice, or a spec addendum while still blocked) are flagged in the
@@ -282,7 +283,7 @@ prolonged whole-box outage.
   later; a named date already past or over 14 days ahead is ignored and its clock time applies), the batch's task
   that replies to that chat, and any obligation the same batch records or attaches that such a task
   owns. The digest lists open promises and marks overdue ones; the blocker sweep lists an overdue
-  one as an item. Once overdue, one high-effort wake asks for the deliverable or an honest update in
+  one as an item. Once overdue, one tricky wake asks for the deliverable or an honest update in
   that chat. A promise closes when its tasks finish and a reply reaches its chat, when every linked
   obligation has its receipt or is dropped, or when the
   coordinator closes it (`obligation` with its key, or a sweep outcome `closed` or `retired`).
@@ -295,7 +296,7 @@ prolonged whole-box outage.
   60-item cutoff. A restart or failed turn retries its batch; remaining batches stay queued.
 - Ask rethink: an open `restriction`, `irreversible` or `human` ask that holds a blocked task
   longer than `coordinator.ask_rethink_h` (2; 0 turns it off) raises one `ask_rethink` event, a
-  high-effort turn that decides the ask itself unless only the user can (then `human_indispensable`
+  tricky turn that decides the ask itself unless only the user can (then `human_indispensable`
   with a why). Each ask is raised once, across restarts; review, merge, access, funds and spend asks
   never are. A `still_blocked` on a task such an ask holds is flagged, not carried.
 - Hold loops (model-free, every tick): work nothing will move raises one event while it lasts and
