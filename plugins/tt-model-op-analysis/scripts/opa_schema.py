@@ -171,6 +171,7 @@ def kernel_ops_columns(source: str, destinations: list[str]) -> list[str]:
 OP_TABLE_TAB = "ttnn calls"
 CALL_TRACE_TAB = "Launch order"
 TTSIM_TESTS_TAB = "TTsim: tests"
+LLK_GAPS_TAB = "LLK gaps (Quasar)"
 SHEET_TABS = (
     ("op_table", OP_TABLE_TAB), ("kernel_ops", "Device ops by factory"), ("kernel_test_results", TTSIM_TESTS_TAB),
     ("call_trace", CALL_TRACE_TAB), ("port_blockers", "Port blockers"),
@@ -178,7 +179,7 @@ SHEET_TABS = (
     ("footprint", "Tracy: resource counts"), ("diff", "Static vs Tracy"), ("graph_ops", "Graph: launches"),
     ("graph_host_transfers", "Graph: host transfers"), ("cache_compute", "Cache: compute APIs"),
     ("cache_dataflow", "Cache: dataflow APIs"), ("cache_kernels", "Cache: kernels"),
-    ("llk_gaps_quasar", "LLK gaps (Quasar)"),
+    ("llk_gaps_quasar", LLK_GAPS_TAB),
 )
 # The method whose run writes each tab's CSV, for saying why a tab is missing.
 TAB_METHOD = {"op_table": "static", "kernel_ops": "static", "call_trace": "static", "port_blockers": "static",

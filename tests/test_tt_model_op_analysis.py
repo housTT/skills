@@ -2110,7 +2110,7 @@ def test_info_bring_up_checks(tmp_path):
     info = info_rows(sheet(run))
     assert info["End-to-end test"] == "✅ passed: PCC 0.99 (source:tracy on a local p150 device, 2026-10-20)"
     host = info["Host fallback"].lstrip("'")
-    assert host.startswith("5 of 100 ops on the host (5.0%), 4.20% of the time")
+    assert host.startswith("⚠️ 5 of 100 ops on the host (5.0%), 4.20% of the time")
     assert "3 host transfers between the first and the last launch over 2 inference(s)" in host
     assert "1 host steps per inference" in host
     assert info["Test hardware"] == "P150: arch blackhole, compute grid 13x10"
@@ -2335,3 +2335,43 @@ def test_host_work_flag_carries_an_icon(tmp_path):
     run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)], host_ops=host)
     rows = tab(sheet(run), "Host work in code")
     assert [r[3] for r in rows[1:]] == ["⚠️ yes", "✅ no"]
+
+
+@pytest.mark.parametrize("device_ops,host_ops,code_steps,mark", [
+    (100, 0, 0, "✅"), (100, 0, 1, "⚠️"), (95, 5, 0, "⚠️"), (90, 10, 0, "❌")])
+def test_host_fallback_icon(tmp_path, device_ops, host_ops, code_steps, mark):
+    host = [{"id": str(i), "host_work": "w", "when": "per inference", "counts_as_host_op": "yes", "reason": "r"}
+            for i in range(1, code_steps + 1)]
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)], host_ops=host)
+    write_rows(run / "host_fallback.csv", [{"scope": "model", "window": "warm", "device_ops": str(device_ops),
+                                           "host_ops": str(host_ops), "device_op_time_ms": "1", "host_op_time_ms": "0",
+                                           "total_time_ms": "1", "host_pct_of_total": "0.00"}])
+    assert info_rows(sheet(run))["Host fallback"].lstrip("'").startswith(mark + " ")
+
+
+def test_info_counts_llk_gaps(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    base = {k: "" for k in ("review_note", "template_args", "missing_template_args", "quasar_template_args",
+                            "missing_runtime_args", "similar_quasar_apis", "quasar_definitions", "configs",
+                            "cache_rows", "kernels")}
+    columns = ["id", "kind", "name", "quasar_status", "review", "review_note", "template_args", "missing_template_args",
+               "quasar_template_args", "missing_runtime_args", "similar_quasar_apis", "quasar_definitions", "configs",
+               "cache_rows", "kernels"]
+    write_rows(run / "llk_gaps_quasar.csv", [
+        base | {"id": "1", "kind": "llk_api", "name": "a", "quasar_status": "present", "review": ""},
+        base | {"id": "2", "kind": "llk_api", "name": "b", "quasar_status": "missing", "review": "gap"},
+        base | {"id": "3", "kind": "llk_api", "name": "c", "quasar_status": "signature differs", "review": ""},
+        base | {"id": "4", "kind": "data_format", "name": "Bfp8_b", "quasar_status": "missing", "review": ""}], columns)
+    spec = sheet(run)
+    info = tab(spec, "Info")
+    start = info.index(["LLK gaps (Quasar)", "Count"])
+    got = {r[0].strip(): spec["expected"][f"Info!B{start + 2 + i}"] for i, r in enumerate(info[start + 1:start + 10])}
+    assert got == {"LLK APIs in the cache": 3, "found on Quasar by name": 1, "signature differs": 1,
+                   "not found by name": 1, "Reviewed: ❌ gap": 1, "Reviewed: ✅ renamed": 0,
+                   "Reviewed: ✅ not a gap": 0, "⏳ not reviewed yet": 1, "Data formats missing on Quasar": 1}
+    assert info[start + 1][1].startswith("=COUNTIF('LLK gaps (Quasar)'!B2:B5")
+    # Without the tab in the sheet the counts are values, not formulas.
+    spec = sheet(run, "--max-tab-kb", "0")
+    info = tab(spec, "Info")
+    start = info.index(["LLK gaps (Quasar)", "Count"])
+    assert info[start + 1][1] == 3

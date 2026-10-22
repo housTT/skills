@@ -28,7 +28,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from sheet_notes import column_note, tab_description  # noqa: E402
 from opa_schema import (  # noqa: E402
-    ALWAYS, CALL_SITE, CALL_TRACE_TAB, CONFIDENCE_DISPLAY, GRID_KEYWORDS, KERNEL_OPS_TAB, LAUNCH_PROFILES,
+    ALWAYS, CALL_SITE, CALL_TRACE_TAB, LLK_GAPS_TAB, CONFIDENCE_DISPLAY, GRID_KEYWORDS, KERNEL_OPS_TAB, LAUNCH_PROFILES,
     METHOD_ITEMS, METHOD_LABELS, NOT_TRACED, OP_TABLE_TAB, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES,
     TAB_METHOD, TARGET_LABELS, TEST_TARGETS, TTSIM_TESTS_TAB, column_width, confidence, display_header,
     latest_entry_failure, methods_used, read_csv, read_header, run_targets, split_evidence,
@@ -306,7 +306,8 @@ def csv_value(column: str, row: dict, source: str) -> str:
     if column == "review":
         if value:
             return REVIEW_MARK.get(value, value)
-        return "⏳ not reviewed" if row.get("quasar_status") in CANDIDATES else ""
+        # A missing data format is read from the Quasar enum and needs no reading of headers.
+        return "⏳ not reviewed" if row.get("kind") == "llk_api" and row.get("quasar_status") in CANDIDATES else ""
     if column == "counts_as_host_op":
         return HOST_OP_MARK.get(value, value)
     if column == "attributes" and len(value) > LONG_TEXT_CHARS:
@@ -422,24 +423,40 @@ def entry_test_state(run: dict) -> str:
     return "not run on a device in this analysis"
 
 
+HOST_SHARE_WARN = 5.0
+
+
+def host_fallback_mark(share: float | None, code_steps: int) -> str:
+    """✅ no host op, ⚠️ up to 5% of ops, ❌ above. Tracy does not see torch calls in the model code, so host steps
+    the static trace found keep a 0% run at ⚠️."""
+    if share is None:
+        return ""
+    if share > HOST_SHARE_WARN:
+        return "❌ "
+    if share > 0 or code_steps:
+        return "⚠️ "
+    return "✅ "
+
+
 def host_fallback_state(run_dir: pathlib.Path, run: dict) -> str:
-    parts = []
+    parts, share = [], None
     path = run_dir / "host_fallback.csv"
     if path.exists():
         for row in read_csv(path):
             device, host = int(row["device_ops"] or 0), int(row["host_ops"] or 0)
-            share = 100 * host / (device + host) if device + host else 0.0
-            parts.append(f"{host} of {device + host} ops on the host ({share:.1f}%), {row['host_pct_of_total']}% of "
+            row_share = 100 * host / (device + host) if device + host else 0.0
+            share = max(share or 0.0, row_share)
+            parts.append(f"{host} of {device + host} ops on the host ({row_share:.1f}%), {row['host_pct_of_total']}% of "
                          f"the time (Tracy, {row['window']})")
     graph = run.get("graph_capture") or {}
     if graph:
         parts.append(f"{graph.get('host_transfers_inside', 0)} host transfers between the first and the last launch "
                      f"over {graph.get('inferences', 1)} inference(s) (graph capture; Graph: host transfers tab)")
     host_ops = run_dir / "host_ops.csv"
+    steps = sum(r["counts_as_host_op"] == "yes" for r in read_csv(host_ops)) if host_ops.exists() else 0
     if host_ops.exists():
-        steps = sum(r["counts_as_host_op"] == "yes" for r in read_csv(host_ops))
         parts.append(f"{steps} host steps per inference in the model code (static trace)")
-    return "; ".join(parts) or "not measured"
+    return host_fallback_mark(share, steps) + "; ".join(parts) if parts else "not measured"
 
 
 def peak_dram_state(run_dir: pathlib.Path, run: dict) -> str:
@@ -547,6 +564,38 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
             rows[-1].append(f"=SUM({launches})" if column is None else f'=SUMIFS({launches},{rng(column)},"{value}")')
             expected[f"Info!{col_letter(2 + i)}{len(rows)}"] = sum(int(m[f"{t}:launches"] or 0) for m in members)
 
+    gaps_path = run_dir / "llk_gaps_quasar.csv"
+    if gaps_path.exists():
+        gaps = read_csv(gaps_path)
+        gap_columns = read_header(gaps_path)
+        end = len(gaps) + 1
+
+        def gap_rng(column: str) -> str:
+            letter = col_letter(gap_columns.index(column))
+            return f"{quote(LLK_GAPS_TAB)}!{letter}2:{letter}{end}"
+
+        rows.append([])
+        bold.append(len(rows))
+        rows.append([LLK_GAPS_TAB, "Count"])
+        llk = [g for g in gaps if g["kind"] == "llk_api"]
+        checks = [("LLK APIs in the cache", f'=COUNTIF({gap_rng("kind")},"llk_api")', len(llk))]
+        for status, name in (("present", "found on Quasar by name"), ("signature differs", "signature differs"),
+                             ("missing", "not found by name")):
+            checks.append((f"  {name}", f'=COUNTIFS({gap_rng("kind")},"llk_api",{gap_rng("quasar_status")},"{status}")',
+                           sum(g["quasar_status"] == status for g in llk)))
+        for verdict, mark in (("gap", "❌ gap"), ("renamed", "✅ renamed"), ("not a gap", "✅ not a gap")):
+            checks.append((f"Reviewed: {mark}", f'=COUNTIF({gap_rng("review")},"{mark}")',
+                           sum(g["review"] == verdict for g in gaps)))
+        checks.append(("⏳ not reviewed yet", f'=COUNTIF({gap_rng("review")},"⏳ not reviewed")',
+                       sum(not g["review"] and g["quasar_status"] in CANDIDATES for g in llk)))
+        formats = [g for g in gaps if g["kind"] == "data_format"]
+        checks.append(("Data formats missing on Quasar",
+                        f'=COUNTIFS({gap_rng("kind")},"data_format",{gap_rng("quasar_status")},"missing")',
+                        sum(g["quasar_status"] == "missing" for g in formats)))
+        for name, formula, value in checks:
+            rows.append([name, formula])
+            expected[f"Info!B{len(rows)}"] = value
+
     offset = len(rows)
     rows += summary
     bold += [offset + h for h in summary_headings]
@@ -624,8 +673,9 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1, max_tab_kb:
                 directory.append((tab_title, None, why))
                 continue
             tab = csv_view(path, tab_title)
-            size_kb = len(json.dumps(tab["values"], ensure_ascii=False).encode()) // 1024
-            if size_kb > max_tab_kb:
+            size = len(json.dumps(tab["values"], ensure_ascii=False).encode())
+            size_kb = -(-size // 1024)
+            if size > max_tab_kb * 1024:
                 directory.append((tab_title, None, f"in the run directory only: {path.name}, {len(tab['values']) - 1} "
                                                    f"rows ({size_kb} KB), too large for the sheet"))
                 continue
@@ -636,6 +686,11 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1, max_tab_kb:
     directory += [(t["title"], t, "") for t in tabs if t["title"].startswith("Changes: ")]
 
     info_rows = info_tab["values"]
+    if not any(t["title"] == LLK_GAPS_TAB for t in tabs):
+        # The gap counts cannot point at a tab the sheet does not have; show their values instead.
+        for n, row in enumerate(info_rows, 1):
+            if len(row) > 1 and isinstance(row[1], str) and quote(LLK_GAPS_TAB) in row[1]:
+                row[1] = expected.pop(f"Info!B{n}")
     info_rows.append([])
     info_tab["bold"].append(len(info_rows))
     info_rows.append(["Tabs", "What it holds", "Filled by", "In this sheet"])
