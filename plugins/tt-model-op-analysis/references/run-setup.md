@@ -20,28 +20,35 @@ whole configuration in one message.
 
 ### Setup order
 
-1. Ask which model to analyse. Do no model-specific discovery before the answer. Then ask for the
+1. Preconditions, before the first question: probe the local device (`probe_device.py` through
+   `tt-device-mcp`), the elfray engine (measured-source.md, "Kernel cache") and TTsim readiness
+   for Quasar (`ttsim.md`). None of them depends on the model. Measurement items without their
+   hardware stay pending.
+2. Ask for the source architecture: the hardware the source analysis runs on. Offer the profiles
+   from `<plugin-root>/references/targets.md` with each one's one-line question; recommend the
+   probed local device's profile, since only it can be measured here, and say which profiles have
+   no local device (static analysis only) or need TTsim.
+3. Ask which model to analyse. Do no model-specific discovery before the answer. Then ask for the
    output root (or state the configured one) and list the model's runs with
    `python3 <plugin-root>/scripts/runs.py list <root> <model>`: implementation, source profile,
-   commit and date, static state, destinations and pending measurement items. Ask: continue one of
-   them, or start a new run. A run in an older format (a `run.json` with `targets` or a single
-   `destination`, plugin 0.3.0 or earlier) cannot be extended; say so and offer a new run.
-2. Preconditions, before any question that depends on them: probe a local device of each source
-   architecture the user may pick (`probe_device.py` through `tt-device-mcp`) and TTsim readiness
-   for Quasar (`ttsim.md`). Show what is available; measurement items without their hardware stay
-   pending.
-3. New run, ref: ask which ref to pin. Recommend the local checkout's HEAD when a matching device
+   commit and date, static state, destinations and pending measurement items; mark the runs on the
+   chosen source. Ask: continue one of them, or start a new run. A run in an older format (a
+   `run.json` with `targets` or a single `destination`, plugin 0.3.0 or earlier) cannot be
+   extended; say so and offer a new run. A run whose static state shows validator errors or
+   warnings was written by an earlier plugin version: before continuing it, offer its migration
+   first when it is feasible, then a new run ("Migrating a run" below).
+4. New run, ref: ask which ref to pin. Recommend the local checkout's HEAD when a matching device
    or TTsim is available and the user is likely to measure (measurements must run on the run's
    commit, and a checkout at HEAD needs no switch or rebuild); otherwise recommend a freshly
    fetched `origin/main`. Say which and why. Resolve the ref before any discovery so every path,
    skip marker and CI claim comes from the pinned SHA.
-4. Ask for the source profile from `<plugin-root>/references/targets.md`: where the implementation
-   runs today. Show each option's one-line question.
-5. Discover implementations compatible with the source profile and show the table from section 1.
-   Ask which implementation to analyse.
-6. Rank only the whole-model test candidates for that implementation and source. Recommend the
-   best candidate with a concrete reason, then ask which test to use. Measurements rerun this same
-   test.
+5. Ask which implementation to analyse: every implementation directory of the model at the pinned
+   SHA, in the table from section 1, each marked whether it fits the chosen source. Never hide a
+   directory; recommend only one that fits. If the user picks one that does not fit, say why and
+   ask again.
+6. Rank the whole-model (end-to-end) test candidates of the chosen implementation directory for the
+   chosen source. Recommend the best candidate with a concrete reason, then ask which test to use.
+   Measurements rerun this same test.
 7. If a run with this identity (model, implementation, entry test, source, commit) already exists,
    say so and continue it; never trace it again.
 
@@ -59,8 +66,9 @@ Ask which model. In the tt-metal checkout, find:
 - every model directory (`git ls-tree -r --name-only <sha> models/ | grep -i <model>`),
 - every implementation module (common, functional, interleaved, sharded, per-arch
   `blackhole/`, `wormhole/`, `t3000/`, `quasar/`),
-- for each implementation, its whole-model test candidates (below), with the workflow under
-  `.github/workflows/` that runs each one, if any,
+- for each implementation, its whole-model test candidates (below), with the CI job that runs each
+  one, if any (`.github/workflows/` and the pipeline lists in `tests/pipeline_reorg/*.yaml`, whose
+  `skus` name the hardware),
 - the skip markers on each of them: unconditional `skip` and every arch `skipif`
   (`is_blackhole`, `is_wormhole_b0`, ...), with their reasons.
 
@@ -75,12 +83,13 @@ Candidates: end-to-end PCC tests and demo tests, plus perf tests (device-perf: t
 measurements. For a Quasar source, candidates are whole-model tests of that implementation that run
 on TTsim; no CI requirement.
 
-Evaluate the implementation and entry test against the source profile only. Do not offer
-incompatible implementations as choices; summarize how many were excluded and make their details
-available on request.
+An implementation is a directory of the model: one with its own `tt/` code, or a per-arch
+directory (`blackhole/`, `wormhole/`, `t3000/`) whose tests and demo run another directory's `tt/`
+code. List them all. Evaluate each, and later its entry test, against the chosen source profile.
 
-Show one row per compatible implementation: module path, target fit, candidate node ids, skip
-markers and whether CI runs them on the relevant architecture. Never derive the implementation
+Show one row per implementation directory: path, the `tt/` code its tests run, fit with the chosen
+source (with the marker or skip that decides it), whole-model candidate node ids, skip markers and
+whether CI runs them on the relevant architecture. Never derive the implementation
 from a proposed test. Recommend an architecture-specific implementation exercised by CI or a demo,
 not a reference or functional version. If several remain, prefer full target coverage and runnable
 tests over naming or directory proximity.
@@ -95,6 +104,23 @@ After the user picks an implementation, rank its tests in this order:
 Present the top candidates with their node ids, relevant parameters, skip status, CI coverage and a
 one-line recommendation reason. Never recommend a test skipped unconditionally or for a relevant architecture. If none is runnable,
 say so and follow the temporary-test procedure instead of silently choosing another implementation.
+
+### Setup traps (each misled an earlier setup)
+
+- A directory's name is not its fit. ResNet-50's `quasar/` port branches on `is_blackhole()` and
+  `is_blackhole_p100(device)` and runs on Blackhole; a `wormhole/` or `blackhole/` directory may
+  only hold tests for shared code. Decide fit from the arch predicates in its `tt/` code and test
+  infra and from its `run_for_*`, `skipif` and `pytest.skip` markers, and cite the one that decides.
+- A defined skip helper is not a skip. Count a marker only where a test calls it.
+- Offer choices from discovery at the pinned SHA, never from earlier runs: the model question is
+  open, not a list of models that already have runs.
+- A CI command can name a node id the test no longer generates (a device-perf `command` string
+  with a dtype the test stopped parametrizing). Rebuild every proposed node id from the test's
+  parametrization at the pinned SHA.
+- CI is not only `.github/workflows/`: the pipeline lists in `tests/pipeline_reorg/*.yaml` run most
+  model tests, and their `skus` say on which hardware.
+- A native choice control holds at most four options. With more (five source profiles), offer
+  the likeliest four and name the rest in the question for the free-text answer.
 
 ### No whole-model test
 
@@ -128,7 +154,7 @@ own run with its own source. Comparing the two is a separate step on two runs.
 ## 2. Pin the source
 
 Record the full SHA of the commit analysed (`git rev-parse <ref>`; the recommendation is in the
-setup order, step 3). Read every file as `git show <sha>:<path>`; never read
+setup order, step 4). Read every file as `git show <sha>:<path>`; never read
 the working tree, except an approved temporary test (section 1). For Quasar, record the ttsim
 version if the user knows it.
 
@@ -223,3 +249,35 @@ key column is missing.
 
 Never use an earlier report as dispatch evidence for a new run. It is only a list of claims to
 re-check against pinned source.
+
+## 4. Migrating a run
+
+A run written by an earlier plugin version keeps its identity (model, implementation, entry test,
+source, commit) but can miss what the current version records or break a rule added since. The
+inventory shows it as validator errors or warnings in its static state. Offer, in this order:
+
+1. **Migrate** (recommended) when every fix can come from the run's own files and the tt-metal
+   source at its pinned commit: no new trace of the model and no new device run.
+2. **New run** when a fix needs what the run cannot give (a trace of a call the run never followed,
+   a measurement whose input is gone), or the run is in the 0.3.0-or-earlier format.
+
+Say which fixes each choice involves before asking.
+
+To migrate:
+
+1. Run `python3 <plugin-root>/scripts/validate_static.py <run dir>` and fix every error and warning.
+   Reopen the source as `git show <sha>:<path>` at the run's `tt_metal_commit` for any fix that is
+   a decision, never the working tree or another run:
+   - `grid_dependency` with text after `automatic` or `none`: decide per row from the pinned source
+     whether ttnn derives the grid from the device (the bare keyword) or the model sets it (the
+     value with its `<file>:<line>`). A row that cites a model file is not derived until the
+     source shows it.
+   - Missing `configurable_grid` or `configurable_layers`: static-phase.md, step 6.
+   - Missing `tracy_mode`: `live` when the entry test calls the forward directly, `trace` when the
+     measured window replays a captured device trace.
+2. Regenerate what newer scripts derive from inputs the run already has: `kernel_ops.py`;
+   `diff_reports.py` when `measured_ops.csv` exists; `graph_report.py` on the recorded capture file
+   when it still exists (peak DRAM). An input that is gone stays pending; do not rerun the device.
+3. Write every change with the scripts or a heredoc; never retype a table. Rerun the validator
+   until it prints `OK`, then update `summary.md` where its counts or statements changed, and list
+   what the migration changed and decided. Uploading the result is the `upload-op-analysis` skill.

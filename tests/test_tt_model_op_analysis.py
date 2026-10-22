@@ -36,6 +36,37 @@ def test_shared_setup_is_step_by_step():
     assert "Ask which model to analyse. Do no model-specific discovery before the answer" in setup
 
 
+def test_setup_asks_source_first_then_model_ref_implementation_test():
+    setup = (PLUGIN / "references" / "run-setup.md").read_text()
+    order = setup[setup.index("### Setup order"):setup.index("Destinations are asked after static analysis")]
+    steps = ["probe the local device", "Ask for the source architecture", "Ask which model to analyse",
+             "ask which ref to pin", "Ask which implementation to analyse", "Rank the whole-model"]
+    assert [order.index(s) for s in steps] == sorted(order.index(s) for s in steps)
+    assert "recommend the\n   probed local device's profile" in order
+    assert "Never hide a\n   directory" in order
+    flow = (PLUGIN / "skills" / "model-op-analysis" / "SKILL.md").read_text()
+    heads = ["**Preconditions, first.**", "**Source architecture.**", "**Model and inventory.**", "**New run.**"]
+    assert [flow.index(h) for h in heads] == sorted(flow.index(h) for h in heads)
+
+
+def test_setup_traps_cover_fit_by_code_not_name():
+    setup = (PLUGIN / "references" / "run-setup.md").read_text()
+    traps = setup[setup.index("### Setup traps"):setup.index("### No whole-model test")]
+    assert "A directory's name is not its fit" in traps and "cite the one that decides" in traps
+    assert "A defined skip helper is not a skip" in traps
+    assert "never from earlier runs" in traps and "tests/pipeline_reorg" in traps
+
+
+def test_earlier_runs_offer_migration_before_a_new_run():
+    setup = (PLUGIN / "references" / "run-setup.md").read_text()
+    section = setup[setup.index("## 4. Migrating a run"):]
+    assert section.index("**Migrate** (recommended)") < section.index("**New run**")
+    assert "no new trace of the model and no new device run" in section
+    assert "do not rerun the device" in section
+    for skill in SKILL_NAMES:
+        assert '"Migrating a run"' in (PLUGIN / "skills" / skill / "SKILL.md").read_text()
+
+
 def run_script(name: str, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, str(SCRIPTS / name), *args],
                           capture_output=True, text=True)
@@ -1597,20 +1628,20 @@ def _skill_step(n):
 
 
 def test_skill_asks_output_root_before_listing_runs():
-    first = _skill_step(1)
+    first = _skill_step(3)
     assert first.index("output root") < first.index("runs.py list")
-    assert "output root" not in _skill_step(3)
+    assert "output root" not in _skill_step(4)
 
 
 def test_skill_reprobes_device_before_offering_tracy():
-    step = _skill_step(6)
+    step = _skill_step(7)
     assert "probe the source device again" in step
     assert "measurements.py mark <run dir> <item> failed" in step
     assert "`source:tracy`, `source:graph` and `source:cache` come from" in step
 
 
 def test_skill_destination_step_names_quasar_code_modes():
-    step = _skill_step(5)
+    step = _skill_step(6)
     assert "`quasar`" in step and "`quasar-bf16`" in step
 
 
@@ -2008,7 +2039,7 @@ def test_source_methods_lists_all_four_with_reasons(tmp_path):
 
 
 def test_skill_offers_the_method_menu():
-    step = _skill_step(6)
+    step = _skill_step(7)
     assert "<plugin-root>/scripts/source_methods.py" in step and "multi-select" in step
     assert "<plugin-root>/scripts/llk_gaps.py" in step
     source = (PLUGIN / "references" / "measured-source.md").read_text(encoding="utf-8")
@@ -2283,7 +2314,7 @@ def test_validator_checks_configurability_fields(tmp_path):
 
 
 def test_destination_question_lists_plain_quasar():
-    step = _skill_step(5)
+    step = _skill_step(6)
     assert "`quasar` (the code as\n   written, on Quasar)" in step or "`quasar` (the code as written" in step
     assert "`quasar-bf16`" in step
 

@@ -29,7 +29,8 @@ state or earlier conversations.
    cannot be uploaded; say why.
 4. **Check.** For each picked run, `python3 <plugin-root>/scripts/validate_static.py <run dir>` must
    print `OK`, and `kernel_ops.csv` and `summary.md` must exist. Otherwise say what is missing and
-   that the `model-op-analysis` skill finishes the run; skip that run. Pass on the validator's
+   that the `model-op-analysis` skill finishes the run, or migrates it when an earlier plugin
+   version wrote it (`<plugin-root>/references/run-setup.md`, "Migrating a run"); skip that run. Pass on the validator's
    warnings (overlong or row-prefixed evidence) in the report: the sheet shows that text as is.
 5. **Drive folder.** Only for runs without a `drive_url`: ask for the Drive folder (link or name).
    A run with a `drive_url` refreshes its existing spreadsheet; say which.

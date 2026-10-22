@@ -14,26 +14,31 @@ resolve every `<plugin-root>/...` path against it.
 
 ## Flow
 
-1. **Model and inventory.** Ask for the model, then for the output root (state it instead when the
+1. **Preconditions, first.** Before any question, probe what measurements could use: the local
+   device (through `tt-device-mcp`), the elfray engine for the kernel cache
+   (`<plugin-root>/references/measured-source.md`, "Kernel cache") and TTsim readiness for Quasar
+   (`<plugin-root>/references/ttsim.md`). Report what is available.
+2. **Source architecture.** Ask which hardware the source analysis runs on, recommending the probed
+   local device's profile (`<plugin-root>/references/run-setup.md`, "Setup order").
+3. **Model and inventory.** Ask for the model, then for the output root (state it instead when the
    user's instructions fix it), then run `python3 <plugin-root>/scripts/runs.py list <root> <model>` and show its runs: implementation,
    source, commit, static state, destinations, pending measurements. Ask: continue a run, or start
    a new one. A run in an older format (plugin 0.3.0 or earlier) cannot be extended; offer a new
-   run.
-2. **Preconditions, early.** Probe what measurements could use before asking anything that depends
-   on them: a local device of each candidate source architecture (through `tt-device-mcp`), the
-   elfray engine for the kernel cache (`<plugin-root>/references/measured-source.md`, "Kernel cache")
-   and TTsim readiness for Quasar (`<plugin-root>/references/ttsim.md`). Report what is available.
-3. **New run.** Follow `<plugin-root>/references/run-setup.md`: ref, source profile,
-   implementation, entry test. If the same identity exists, say so and continue that
+   run. A run whose static state shows validator errors or warnings comes from an earlier plugin
+   version: offer its migration first when feasible, then a new run
+   (`<plugin-root>/references/run-setup.md`, "Migrating a run").
+4. **New run.** Follow `<plugin-root>/references/run-setup.md`: ref, then the implementation
+   (every implementation directory of the model, each marked whether it fits the source), then an
+   end-to-end entry test from that directory. If the same identity exists, say so and continue that
    run instead of tracing again.
-4. **Static.** Follow `<plugin-root>/references/static-phase.md`; it ends when
+5. **Static.** Follow `<plugin-root>/references/static-phase.md`; it ends when
    `python3 <plugin-root>/scripts/validate_static.py <run dir>` prints `OK`. Skipped for a run whose
    static analysis is done.
-5. **Destinations.** Ask whether to add a destination; repeat while the user wants more. Offer every
+6. **Destinations.** Ask whether to add a destination; repeat while the user wants more. Offer every
    choice but the source in one list: `p100`, `p150`, `n150`, `n300-1chip`, `quasar` (the code as
    written, on Quasar) and, for a non-Quasar source, `quasar-bf16` (BF16 projection). Each one is
    added to the same run from the existing source trace (static-phase.md, "Adding a destination").
-6. **Measurements.** First the source methods: probe the source device again, then run
+7. **Measurements.** First the source methods: probe the source device again, then run
    `python3 <plugin-root>/scripts/source_methods.py <run dir> --device <probed profile or none> --tt-metal <checkout>`
    and show all four analysis methods (static trace, Tracy, graph capture, kernel cache) with
    their state: done, available, available to read later, read an existing cache, or unavailable
@@ -52,7 +57,7 @@ resolve every `<plugin-root>/...` path against it.
    `<plugin-root>/scripts/llk_gaps.py` for the items picked); Quasar test items follow
    `<plugin-root>/references/measured-destination.md` (`python3 <plugin-root>/scripts/kernel_tests.py`).
    Unpicked items stay pending for a later session.
-7. **Report.** `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`, the validator again, and
+8. **Report.** `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`, the validator again, and
    `summary.md` with the per-kernel-op table first. `summary.md` names the methods the run used and
    the confidence they give (`<plugin-root>/references/schemas.md`, "Analysis methods and
    confidence"). Say where the results are; uploading them to Google Drive is the
