@@ -5464,7 +5464,7 @@ def test_worker_prompt_keeps_idleness_evidence_and_shared_script_rules():
     # The shared-script rules live in the tt-project-harness reference the prompt points at.
     assert "tt-project-harness reference `references/long-running-scripts.md`" in text
     ref = " ".join((SKILLS / "tt-project-harness" / "references" / "long-running-scripts.md").read_text(encoding="utf-8").split())
-    for part in ("Concurrent edits happen only under `ttp lock <name>` or in git", "`journalctl _TRANSPORT=kernel"):
+    for part in ("Concurrent edits happen only under `ttp lock <name>` or in git", "`journalctl _TRANSPORT=kernel", "echo PROBE_OK", "overall time cap"):
         assert part in ref, part
     raw = (PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8")
     sys.path.insert(0, str(RUNTIME.parent))

@@ -17,3 +17,20 @@ A worker that writes or launches a script meant to run for hours (a driver, a wa
 - Kernel logs across reboots need `journalctl _TRANSPORT=kernel --since ... --until ...`, not `journalctl -k` (current boot only); see [watchers.md](watchers.md).
 - Edit a shared script through a temp file plus `mv`, never in place: overwriting a running script corrupts it.
 - Concurrent edits happen only under `ttp lock <name>` or in git.
+
+## Polling a remote job
+
+- End every remote poll with an always-true sentinel (`echo PROBE_OK`) and parse markers from the output, never from the exit status: `ssh h 'test -s end && echo END; kill -0 $pid && echo ALIVE' || continue` exits 1 once the job ends and throws the END marker away.
+- Treat a poll with no `PROBE_OK` as a failed poll (ssh down), not as "job still running".
+- Log every failed poll (time, exit code, first error line).
+- Enforce an overall time cap on the loop, and release locks and temp files from an EXIT trap.
+
+```bash
+poll() { out=$(ssh "$1" "$2; echo PROBE_OK" 2>&1); rc=$?
+  case $out in *PROBE_OK*) return 0;; esac
+  echo "$(date +%T) poll failed rc=$rc: ${out%%$'\n'*}" >> poll.log; return 1; }
+end=$((SECONDS+MAX_S)); trap 'release_locks' EXIT
+while [ $SECONDS -lt $end ]; do
+  poll "$host" 'test -s end && echo END; kill -0 '"$pid"' 2>/dev/null && echo ALIVE' && case $out in *END*) break;; esac
+  sleep 30; done
+```
