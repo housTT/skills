@@ -16,7 +16,10 @@ dispatched (not replayed) as --inferences.
 
 With --entry-pass the entry test passed in the captured run: like merge_measured.py --entry-pass,
 it records the pass in run.json `entry_test_passes` and decides every source `⚠️` row of
-op_table.csv again from the op codes the run launched.
+op_table.csv again from the op codes the run launched. --entry-fail records a failed run.
+
+Peak DRAM is the largest total of DRAM buffers allocated at once on one device during the capture,
+which starts after the device opens; buffers allocated before that are not counted.
 
 The capture is parsed whole, so the host needs several times its size in memory.
 """
@@ -31,7 +34,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from merge_measured import decide_source_statuses, entry_pass_record  # noqa: E402
+from merge_measured import decide_source_statuses, record_entry_result  # noqa: E402
 from opa_schema import (  # noqa: E402
     GRAPH_HOST_TRANSFERS_COLUMNS, GRAPH_OPS_COLUMNS, op_table_columns, read_csv, run_targets, write_csv,
 )
@@ -105,6 +108,29 @@ def walk(nodes: list[dict]) -> tuple[list[dict], list[dict]]:
     return launches, transfers
 
 
+def peak_dram(nodes: list[dict]) -> dict[str, int]:
+    """Peak bytes of DRAM buffers live at once, per device id, over the capture."""
+    live: dict[tuple[str, str], int] = {}
+    current: dict[str, int] = {}
+    peak: dict[str, int] = {}
+    for node in nodes:
+        kind = node.get("node_type")
+        if kind not in ("buffer_allocate", "buffer_deallocate"):
+            continue
+        params = node.get("params", {})
+        if params.get("type") != "DRAM":
+            continue
+        device, key = str(params.get("device_id", "0")), (str(params.get("device_id", "0")), str(params.get("address")))
+        if kind == "buffer_allocate":
+            size = int(params.get("size", 0))
+            live[key] = size
+            current[device] = current.get(device, 0) + size
+            peak[device] = max(peak.get(device, 0), current[device])
+        elif key in live:
+            current[device] -= live.pop(key)
+    return peak
+
+
 def per_inference(count: int, inferences: int) -> str:
     return str(count // inferences) if count % inferences == 0 else f"{count / inferences:.2f}"
 
@@ -145,13 +171,19 @@ def main() -> int:
     parser.add_argument("--date", default=datetime.date.today().isoformat(), help="date of the captured run")
     parser.add_argument("--entry-pass", metavar="RESULT",
                         help="the entry test passed in this run; RESULT is its pass line (for example the PCC)")
+    parser.add_argument("--entry-fail", metavar="RESULT",
+                        help="the entry test failed in this run; RESULT is its failure line")
     args = parser.parse_args()
+    if args.entry_pass and args.entry_fail:
+        print("ERROR: give --entry-pass or --entry-fail, not both")
+        return 2
     if args.inferences < 1:
         print("ERROR: --inferences must be at least 1")
         return 2
     with args.capture.open(encoding="utf-8") as fh:
         document = json.load(fh)
     launches, transfers = walk(_graph(document))
+    dram = peak_dram(_graph(document))
     if not launches:
         print("ERROR: the capture has no device-op launch with a program factory; it was taken from a "
               "tt-metal without factory identity in graph capture, or the test launched nothing")
@@ -172,12 +204,13 @@ def main() -> int:
         "launches": len(launches), "kernel_ops": len(rows),
         "host_transfers_inside": sum(int(m["count"]) for m in moves),
         "git_sha": metadata.get("git_sha", ""), "dirty": metadata.get("dirty"),
+        "peak_dram_mib": round(max(dram.values()) / 2**20, 1) if dram else None,
+        "peak_dram_mib_per_device": {d: round(b / 2**20, 1) for d, b in sorted(dram.items())},
     }
+    source, destinations = run_targets(run)
+    record_entry_result(run, source, args.date, "source:graph", args.entry_pass, args.entry_fail)
     op_path = args.run_dir / "op_table.csv"
     if args.entry_pass and op_path.exists():
-        source, destinations = run_targets(run)
-        run["entry_test_passes"] = entry_pass_record(run.get("entry_test_passes") or {}, source, args.entry_pass,
-                                                     args.date, item="source:graph")
         ops = read_csv(op_path)
         launched = [{"op_type": "tt_dnn_device", "op_code": launch["op_code"]} for launch in launches]
         for warning in decide_source_statuses(ops, launched, source, args.inferences, run["entry_test_passes"],
@@ -185,8 +218,10 @@ def main() -> int:
             print(f"WARNING: {warning}")
         write_csv(op_path, op_table_columns(source, destinations), ops)
     run_path.write_text(json.dumps(run, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    peak = run["graph_capture"]["peak_dram_mib"]
     print(f"{len(launches)} launches, {len(rows)} (op code, factory) pairs, "
-          f"{run['graph_capture']['host_transfers_inside']} host transfers between the first and last launch")
+          f"{run['graph_capture']['host_transfers_inside']} host transfers between the first and last launch, "
+          f"peak DRAM {'not recorded' if peak is None else f'{peak} MiB'}")
     for line in uneven:
         print(f"WARNING: not a multiple of {args.inferences} inferences: {line}")
     if metadata.get("dirty"):

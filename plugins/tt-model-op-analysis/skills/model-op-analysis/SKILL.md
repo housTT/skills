@@ -29,10 +29,10 @@ resolve every `<plugin-root>/...` path against it.
 4. **Static.** Follow `<plugin-root>/references/static-phase.md`; it ends when
    `python3 <plugin-root>/scripts/validate_static.py <run dir>` prints `OK`. Skipped for a run whose
    static analysis is done.
-5. **Destinations.** Ask whether to add a destination; repeat while the user wants more. Ask for the
-   profile (any but the source), and when it is Quasar and the source is not, whether the code is
-   unchanged (`quasar`) or a BF16 projection (`quasar-bf16`). Each one is added to the same run
-   from the existing source trace (static-phase.md, "Adding a destination").
+5. **Destinations.** Ask whether to add a destination; repeat while the user wants more. Offer every
+   choice but the source in one list: `p100`, `p150`, `n150`, `n300-1chip`, `quasar` (the code as
+   written, on Quasar) and, for a non-Quasar source, `quasar-bf16` (BF16 projection). Each one is
+   added to the same run from the existing source trace (static-phase.md, "Adding a destination").
 6. **Measurements.** First the source methods: probe the source device again, then run
    `python3 <plugin-root>/scripts/source_methods.py <run dir> --device <probed profile or none> --tt-metal <checkout>`
    and show all four analysis methods (static trace, Tracy, graph capture, kernel cache) with

@@ -133,6 +133,15 @@ the closest Quasar overload does not take), `quasar_template_args` (that overloa
 missing API), `quasar_definitions` (`file:line` of each Quasar definition), `configs` (distinct
 template configurations), `cache_rows`, `kernels`.
 
+## Bring-up checks (Info tab)
+
+`sheet_spec.py` derives them, never by hand: end-to-end test (✅ from `entry_test_passes`, ❌ from a
+later `entry_test_failure`), host fallback (host op count and time share from `host_fallback.csv`,
+host transfers from `graph_capture`, host steps from `host_ops.csv`), test hardware
+(`profile_values`), peak DRAM (`graph_capture.peak_dram_mib`, else a measured `footprint.csv`
+value), blockers to a smaller grid (op_table rows whose `grid_dependency` is a hardcoded value, with
+the places they are set), and `configurable_grid` and `configurable_layers` from `run.json`.
+
 ## Analysis methods and confidence
 
 Four methods tell a run what the model launches, from least to most exact: the static trace (code

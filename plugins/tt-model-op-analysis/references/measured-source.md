@@ -106,7 +106,9 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
    not say which call site ran); a row it never launched stays `⚠️`. Each gets an evidence text
    saying that no CI workflow runs the entry test on this profile and that it passed on a local
    device under Tracy, with the pass line and date. `✅`, `❌` and `n/a` rows keep their status; a
-   `❌` row the test launched is printed as a warning to resolve by hand.
+   `❌` row the test launched is printed as a warning to resolve by hand. When the entry test failed,
+   add `--entry-fail "<failure line>"` instead: the failure is recorded in `run.json`
+   `entry_test_failure` and shown as ❌ on the sheet; statuses stay as they are.
 7. For each `measured` row, fill every destination's status per `target-status.md` (kernel-op
    lookup) and, for Quasar targets, its `<t>:tests` column, then rerun `validate_static.py`.
 8. **Graph capture** (`source:graph`).
@@ -116,10 +118,12 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
    compile and capture forwards only; read the test to count them. The script refuses a capture
    taken at another commit. When the entry test passed in the capture run, add
    `--entry-pass "<pass line>"`: as in step 6, the pass is recorded and source `⚠️` rows the run
-   launched become `✅` (this decides them when Tracy was not picked). A WARNING that a count is
+   launched become `✅` (this decides them when Tracy was not picked); `--entry-fail` records a
+   failure as in step 6. The script also records the peak DRAM allocated at once on a device
+   during the capture (`peak_dram_mib`), which the sheet shows. A WARNING that a count is
    not a multiple of `<n>` means `<n>` is wrong or a launch happens once per test, in setup such
-   as weight upload, which the capture includes; say which in `summary.md`. The script parses the whole capture, so a multi-GB capture needs a
-   host with several times its size in memory.
+   as weight upload, which the capture includes; say which in `summary.md`. The script parses the
+   whole capture, so a multi-GB capture needs a host with several times its size in memory.
    Read `graph_host_transfers.csv`: a transfer between two launches is the next inference's input
    upload, the previous one's readback, or host work inside the forward. Add the last kind to
    `host_ops.csv` (`counts_as_host_op` `yes`) and to `summary.md`.

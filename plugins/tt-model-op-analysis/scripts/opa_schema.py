@@ -46,6 +46,23 @@ HOST_OPS_COLUMNS = ("id", "host_work", "when", "counts_as_host_op", "reason")
 HOST_OP_VALUES = ("yes", "no")
 MATCH_KEY = ("stage", "ttnn_api", "device_op", "program_factory")
 
+# A file:line reference, and the grid_dependency values that are not a hardcoded grid.
+CALL_SITE = re.compile(r"[\w./-]+\.(?:py|cpp|hpp|cc|h):\d+")
+GRID_KEYWORDS = ("automatic", "none")
+
+
+def latest_entry_failure(run: dict) -> dict | None:
+    """The recorded local failure of the entry test when it is not older than the latest local pass."""
+    failure, passes = run.get("entry_test_failure"), run.get("entry_test_passes") or {}
+    if failure and (not passes.get("date") or failure.get("date", "") >= passes["date"]):
+        return failure
+    return None
+
+
+# Whether the model runs on a smaller core grid and with fewer layers (static-phase.md, step 6).
+CONFIG_KEYS = ("configurable_grid", "configurable_layers")
+CONFIG_VALUES = ("yes", "no", "partial", "n/a")
+
 # The four ways a run learns what the model launches, least to most exact. A graph capture names
 # every launch's device op and program factory with the call's real arguments; a kernel cache holds
 # the compiled kernels themselves. Tracy sees op codes, not factories; the static trace sees code.

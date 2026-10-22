@@ -14,15 +14,14 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    ALWAYS, CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_PROFILES,
+    ALWAYS, CALL_SITE, CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, CONFIG_KEYS, CONFIG_VALUES, GRID_KEYWORDS,
+    latest_entry_failure, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_PROFILES,
     LEGACY_RESULTS, NOT_TRACED, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, RESULT_STATUS, ROW_PREFIX,
     SOURCE_TARGETS, STATUS_VALUES, TARGETS, TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header, run_targets, split_evidence,
 )
 
-CALL_SITE = re.compile(r"[\w./-]+\.(?:py|cpp|hpp|cc|h):\d+")
 # Evidence is the decisive fact and its <file>:<line>; longer text is a walkthrough, not evidence.
 MAX_EVIDENCE_CHARS = 300
-GRID_KEYWORDS = ("automatic", "none")
 # A pytest node id: path, then ::-separated names, with an optional [parametrize id] that may hold
 # any character except the ';' this column uses as a separator.
 NODE_ID = re.compile(r"^[\w./-]+\.py(::\w+)*(\[[^;]*\])?$")
@@ -182,7 +181,17 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
             warnings.append(f"op_table.csv {column}: rows {', '.join(long)} exceed {MAX_EVIDENCE_CHARS} characters; "
                             "keep the decisive fact and its <file>:<line>")
 
-    if run.get("entry_test_passes"):
+    for key in CONFIG_KEYS:
+        entry = run.get(key)
+        if entry is None:
+            warnings.append(f"run.json has no {key}; record it (static-phase.md, step 6)")
+        elif not isinstance(entry, dict) or entry.get("value") not in CONFIG_VALUES or not str(entry.get("evidence", "")).strip():
+            errors.append(f"run.json {key} must be {{\"value\": one of {CONFIG_VALUES}, \"evidence\": \"...\"}}")
+
+    if latest_entry_failure(run):
+        warnings.append("run.json records a local failure of the entry test after its last pass: source statuses "
+                        "decided from that pass rest on a superseded run; rerun the test or decide them again")
+    elif run.get("entry_test_passes"):
         # A recorded pass covers every op the entry test launches (target-status.md).
         stale = [r["id"] for r in ops if r["origin"] == "static+measured" and r[f"{source}:status"] == "⚠️"
                  and r["launch_condition"].strip() == ALWAYS]

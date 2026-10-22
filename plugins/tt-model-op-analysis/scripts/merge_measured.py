@@ -7,7 +7,8 @@ of inferences in the measured window. Re-running replaces earlier measured rows.
 
 With --entry-pass the entry test passed in the measured run, so the source profile has a recorded
 passing run (references/target-status.md): it is added to run.json `entry_test_passes` and every
-source `⚠️` row is decided again from what the run launched.
+source `⚠️` row is decided again from what the run launched. --entry-fail records a failed run in
+`entry_test_failure`; statuses stay as they are.
 """
 
 from __future__ import annotations
@@ -96,6 +97,19 @@ def entry_pass_record(previous: dict, source: str, result: str, date: str, item:
     return record
 
 
+def record_entry_result(run: dict, source: str, date: str, item: str, passed: str | None, failed: str | None) -> None:
+    """Record the entry test's outcome in this run. A pass replaces an earlier local failure; a failure is kept
+    beside earlier passes, and the later of the two decides what the sheet shows."""
+    if passed:
+        run["entry_test_passes"] = entry_pass_record(run.get("entry_test_passes") or {}, source, passed, date, item)
+        run.pop("entry_test_failure", None)
+    elif failed:
+        run["entry_test_failure"] = {"by": f"{item} on a local {source} device", "date": date, "result": failed}
+        if (run.get("entry_test_passes") or {}).get("by"):
+            print("WARNING: source statuses decided from the earlier local pass now rest on a superseded run; "
+                  "rerun the entry test or decide them again")
+
+
 def decide_source_statuses(rows: list[dict], measured: list[dict], source: str, inferences: int,
                            entry_passes: dict, how: str = "under Tracy") -> list[str]:
     """Upgrade source `⚠️` rows the passing entry test covers; return warnings for `❌` rows it ran.
@@ -144,8 +158,13 @@ def main() -> int:
                         help="forward passes inside the measured window (1 for a warm signposted window)")
     parser.add_argument("--entry-pass", metavar="RESULT",
                         help="the entry test passed in this run; RESULT is its pass line (for example the PCC)")
+    parser.add_argument("--entry-fail", metavar="RESULT",
+                        help="the entry test failed in this run; RESULT is its failure line")
     parser.add_argument("--date", default=datetime.date.today().isoformat(), help="date of the measured run")
     args = parser.parse_args()
+    if args.entry_pass and args.entry_fail:
+        print("ERROR: give --entry-pass or --entry-fail, not both")
+        return 2
     run_path = args.run_dir / "run.json"
     run = json.loads(run_path.read_text(encoding="utf-8"))
     op_path = args.run_dir / "op_table.csv"
@@ -156,9 +175,8 @@ def main() -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}")
         return 2
+    record_entry_result(run, source, args.date, "source:tracy", args.entry_pass, args.entry_fail)
     if args.entry_pass:
-        run["entry_test_passes"] = entry_pass_record(run.get("entry_test_passes") or {}, source,
-                                                     args.entry_pass, args.date)
         for warning in decide_source_statuses(merged, measured, source, args.inferences, run["entry_test_passes"]):
             print(f"WARNING: {warning}")
     write_csv(op_path, op_table_columns(source, destinations), merged)

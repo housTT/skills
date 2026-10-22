@@ -27,7 +27,7 @@ def test_plugin_skills_and_phase_references():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.7.0"
+    assert claude["version"] == codex["version"] == "0.8.0"
 
 
 def test_shared_setup_is_step_by_step():
@@ -76,7 +76,9 @@ def make_static_run(tmp_path: pathlib.Path, op_rows: list[dict], trace_rows: lis
     run.mkdir()
     (run / "run.json").write_text(json.dumps({"kind": "static", "source": "p150",
                                               "destinations": [destination] if destination else [],
-                                              "stage_blocks": ["encoder", "s1", "s2"]}))
+                                              "stage_blocks": ["encoder", "s1", "s2"],
+                                              "configurable_grid": {"value": "yes", "evidence": "m.py:1 grid from device"},
+                                              "configurable_layers": {"value": "n/a", "evidence": "no layer stack"}}))
     write_rows(run / "op_table.csv", op_rows)
     write_rows(run / "call_trace.csv", trace_rows)
     write_rows(run / "port_blockers.csv", blockers or [], BLOCKER_FIELDS)
@@ -1021,7 +1023,7 @@ def test_sheet_spec_view_keeps_meaning(tmp_path):
     assert "Call site (file:line)" in ops[0]
     info = tab(spec, "Info")
     assert ["Dispatch evidence", "picks X if (a || b) at x.cpp:1"] in info
-    assert ["Entry test passes", "by: user; date: 2026-10-01; result: pass"] in info
+    assert ["End-to-end test", "✅ passed: pass (user, 2026-10-01)"] in info
     row = dict(zip(ops[0], ops[1]))
     assert row["Quasar, BF16 projection: evidence and gap"] == "TTsim run: t.py::a hang\nfork x"
 
@@ -1069,7 +1071,7 @@ def test_sheet_spec_kernel_ops_tab_groups_evidence(tmp_path):
     row = dict(zip(kernel[0], kernel[1]))
     assert row["Device op / program factory"] == "prim::a / F"
     assert row["Stages"] == "encoder, s1" and row["Launches (P150)"] == 4
-    assert row["Quasar, BF16 projection: evidence and gap"] == "rows 1, 2: same\nrow 3: other"
+    assert row["Quasar, BF16 projection: evidence and gap"] == "⚠️ rows 1, 2: same\n\n⚠️ row 3: other"
     assert "P150: evidence and gap" not in kernel[0]
     assert kernel[-1][0] == "Total" and kernel[-1][4] == "=SUM(E2:E2)"
     assert spec["expected"]["'Kernel ops'!E3"] == 4
@@ -2072,3 +2074,206 @@ def test_source_methods_reads_an_existing_cache_without_a_device(tmp_path):
     r = run_script("source_methods.py", str(run), "--device", "none", "--elfray", str(engine), "--json")
     cache = next(m for m in json.loads(r.stdout) if m["method"] == "cache")
     assert cache["state"] == "read an existing cache" and "failed earlier: no DWARF" in cache["reason"]
+
+
+# Info bring-up checks, tab list, header notes and readable evidence (0.8.0)
+
+
+def info_rows(spec):
+    """Info label -> value; the first occurrence, since the tab list repeats some tab names as labels."""
+    out = {}
+    for r in tab(spec, "Info"):
+        if len(r) > 1 and r[0]:
+            out.setdefault(r[0], r[1])
+    return out
+
+
+def test_info_bring_up_checks(tmp_path):
+    rows = [op_row(1, 3, grid_dependency="8x4 CoreGrid, models/a/tt/model.py:12"),
+            op_row(2, 1, grid_dependency="automatic"),
+            op_row(3, 2, grid_dependency="shard spec at models/a/tt/model.py:12 and models/a/tt/model.py:40")]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 6)])
+    data = json.loads((run / "run.json").read_text())
+    data.update({"profile_values": {"arch": "blackhole", "compute_grid": "13x10"},
+                 "configurable_layers": {"value": "yes", "evidence": "MODEL_NUM_LAYERS read at models/a/tt/model.py:5"},
+                 "entry_test_passes": {"by": "source:tracy on a local p150 device", "date": "2026-10-20",
+                                       "result": "PCC 0.99"},
+                 "graph_capture": {"inferences": 2, "host_transfers_inside": 3, "peak_dram_mib": 812.5,
+                                   "peak_dram_mib_per_device": {"0": 812.5}}})
+    (run / "run.json").write_text(json.dumps(data))
+    write_rows(run / "host_fallback.csv", [{"scope": "model", "window": "warm (signposts a..b)", "device_ops": "95",
+                                           "host_ops": "5", "device_op_time_ms": "1", "host_op_time_ms": "1",
+                                           "total_time_ms": "10", "host_pct_of_total": "4.20"}])
+    write_rows(run / "host_ops.csv", [{"id": "1", "host_work": "torch.cat", "when": "per inference",
+                                      "counts_as_host_op": "yes", "reason": "in forward"}], HOST_FIELDS)
+    info = info_rows(sheet(run))
+    assert info["End-to-end test"] == "✅ passed: PCC 0.99 (source:tracy on a local p150 device, 2026-10-20)"
+    host = info["Host fallback"].lstrip("'")
+    assert host.startswith("5 of 100 ops on the host (5.0%), 4.20% of the time")
+    assert "3 host transfers between the first and the last launch over 2 inference(s)" in host
+    assert "1 host steps per inference" in host
+    assert info["Test hardware"] == "P150: arch blackhole, compute grid 13x10"
+    assert info["Peak DRAM"].lstrip("'").startswith("812.5 MiB allocated at once")
+    grid = info["Blockers to a smaller grid"]
+    assert grid.startswith("❌ 2 of 3 op table rows (5 launches per inference)") and "set at 2 places" in grid
+    assert info["Configurable grid (TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE)"].startswith("✅ yes")
+    assert info["Configurable layer count"].startswith("✅ yes: MODEL_NUM_LAYERS")
+    # A later local failure wins over an earlier pass.
+    data["entry_test_failure"] = {"by": "source:graph on a local p150 device", "date": "2026-10-21",
+                                  "result": "PCC 0.71 < 0.90"}
+    (run / "run.json").write_text(json.dumps(data))
+    assert info_rows(sheet(run))["End-to-end test"].startswith("❌ failed: PCC 0.71 < 0.90")
+
+
+def test_info_lists_every_tab_and_headers_carry_notes(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    assert run_script("kernel_ops.py", str(run)).returncode == 0
+    spec = sheet(run)
+    info = tab(spec, "Info")
+    start = info.index(["Tabs in this spreadsheet", "What it holds", "Filled by"])
+    listed = [r[0] for r in info[start + 1:]]
+    assert listed == [t["title"] for t in spec["tabs"]]
+    noted = {r["updateCells"]["range"]["sheetId"]: [v.get("note", "") for v in r["updateCells"]["rows"][0]["values"]]
+             for r in spec["requests"] if "updateCells" in r}
+    for t in spec["tabs"][1:]:
+        header = t["values"][0]
+        assert len(noted[t["sheetId"]]) == len(header), t["title"]
+        assert all(noted[t["sheetId"]]), (t["title"], [h for h, n in zip(header, noted[t["sheetId"]]) if not n])
+
+
+def test_kernel_ops_evidence_orders_by_status_and_writes_short_repeats_once(tmp_path):
+    rows = [op_row(1, 1, device_op="prim::a", program_factory="F", op_code="A",
+                   **{"quasar-bf16:status": "✅", "quasar-bf16:evidence": "fork F runs test_a.py:3; bf16 no-op."}),
+            op_row(2, 1, device_op="prim::a", program_factory="F", op_code="A",
+                   **{"quasar-bf16:status": "❌", "quasar-bf16:evidence": "fork F hangs, test_b.py:9 xfail; bf16 no-op."}),
+            op_row(3, 1, device_op="prim::a", program_factory="F", op_code="A",
+                   **{"quasar-bf16:status": "⚠️", "quasar-bf16:evidence": "no test covers fork F with this input"})]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 3)])
+    assert run_script("kernel_ops.py", str(run)).returncode == 0
+    kernel = tab(sheet(run), "Kernel ops")
+    evidence = dict(zip(kernel[0], kernel[1]))["Quasar, BF16 projection: evidence and gap"]
+    assert evidence.split("\n\n") == [
+        "❌ row 2: fork F hangs, test_b.py:9 xfail.",
+        "⚠️ row 3: no test covers fork F with this input",
+        "✅ row 1: fork F runs test_a.py:3.",
+        "Rows 1, 2: bf16 no-op."]
+
+
+def test_kernel_op_tests_are_grouped_by_file():
+    sys.path.insert(0, str(SCRIPTS))
+    import sheet_spec
+    assert sheet_spec.grouped_nodes("a/t1.py::x[1]; a/t1.py::y; b/t2.py::z: pass") == (
+        "a/t1.py\n  ::x[1]\n  ::y\nb/t2.py\n  ::z: pass")
+
+
+def test_summary_bullets_put_labels_in_their_own_column(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    (run / "summary.md").write_text("# M\n\n## Gaps\n\n- **Confirmed gaps (14)**, all in one kernel.\n"
+                                    "- Renamed (22): mostly arguments.\n- Not a gap (58), wrappers only.\n")
+    info = tab(sheet(run), "Info")
+    assert ["Confirmed gaps (14)", "all in one kernel."] in info
+    assert ["Renamed (22)", "mostly arguments."] in info
+    assert ["Not a gap (58)", "wrappers only."] in info
+
+
+def test_graph_report_records_peak_dram_and_entry_failure(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    capture = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::Op1Factory")])
+    doc = json.loads(capture.read_text())
+    mib = 2**20
+    for kind, address, size in (("buffer_allocate", 1, 300 * mib), ("buffer_allocate", 2, 200 * mib),
+                                ("buffer_deallocate", 1, 300 * mib), ("buffer_allocate", 3, 50 * mib),
+                                ("buffer_deallocate", 99, 999 * mib)):
+        doc["graph"].append({"counter": len(doc["graph"]), "node_type": kind, "connections": [],
+                             "params": {"type": "DRAM", "device_id": "0", "address": str(address), "size": str(size)}})
+    doc["graph"].append({"counter": len(doc["graph"]), "node_type": "buffer_allocate", "connections": [],
+                         "params": {"type": "L1", "device_id": "0", "address": "7", "size": str(900 * mib)}})
+    capture.write_text(json.dumps(doc))
+    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-fail", "PCC 0.5",
+                   "--date", "2026-10-22")
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = json.loads((run / "run.json").read_text())
+    assert data["graph_capture"]["peak_dram_mib"] == 500.0
+    assert data["entry_test_failure"] == {"by": "source:graph on a local p150 device", "date": "2026-10-22",
+                                          "result": "PCC 0.5"}
+    assert read(run / "op_table.csv")[0]["p150:status"] == "✅"
+    assert run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-fail", "x",
+                      "--entry-pass", "y").returncode == 2
+
+
+def test_validator_checks_configurability_fields(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["configurable_grid"] = {"value": "maybe", "evidence": ""}
+    del data["configurable_layers"]
+    (run / "run.json").write_text(json.dumps(data))
+    r = validate(run)
+    assert r.returncode == 1 and "configurable_grid must be" in r.stdout
+    assert "run.json has no configurable_layers" in r.stdout
+
+
+def test_destination_question_lists_plain_quasar():
+    step = _skill_step(5)
+    assert "`quasar` (the code as\n   written, on Quasar)" in step or "`quasar` (the code as written" in step
+    assert "`quasar-bf16`" in step
+
+
+def test_review_fixes_for_sheet_text():
+    sys.path.insert(0, str(SCRIPTS))
+    import sheet_spec
+    assert sheet_spec.grouped_nodes("tests/a/test_x.py; b/t.py::z: pass") == "tests/a/test_x.py\nb/t.py\n  ::z: pass"
+    members = [{"id": "1", "q:status": "❌", "q:evidence": "Uses G, e.g. on matmul. Hangs test_b.py:9."},
+               {"id": "2", "q:status": "✅", "q:evidence": "Uses F, e.g. on matmul. Passes test_a.py:3."}]
+    assert sheet_spec.grouped_evidence(members, "q:evidence") == (
+        "❌ row 1: Uses G, e.g. on matmul. Hangs test_b.py:9.\n\n✅ row 2: Uses F, e.g. on matmul. Passes test_a.py:3.")
+    members = [{"id": "1", "q:status": "⚠️", "q:evidence": ""},
+               {"id": "2", "q:status": "✅", "q:evidence": "runs t.py:1; bf16 no-op"},
+               {"id": "3", "q:status": "✅", "q:evidence": "runs t.py:2; bf16 no-op"}]
+    assert sheet_spec.grouped_evidence(members, "q:evidence").startswith("⚠️ row 1: no evidence written.")
+
+
+def test_bold_emphasis_is_not_a_label(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    (run / "summary.md").write_text("# M\n\n## F\n\n- **Not** supported on Quasar yet.\n- **Note:** this one.\n")
+    info = tab(sheet(run), "Info")
+    assert ["", "Not supported on Quasar yet."] in info
+    assert ["Note", "this one."] in info
+
+
+def test_untraced_rows_keep_grid_blockers_unknown_and_ci_pass_stays_visible(tmp_path):
+    rows = [op_row(1, 1), op_row(2, 1, origin="measured", call_site="not traced", grid_dependency="not traced",
+                                     stage="measured only Op2DeviceOperation")]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["entry_test_passes"] = {"ci": "w.yml: job"}
+    data["entry_test_failure"] = {"by": "source:graph on a local p150 device", "date": "2026-10-22", "result": "bad"}
+    (run / "run.json").write_text(json.dumps(data))
+    info = info_rows(sheet(run))
+    assert info["Blockers to a smaller grid"].startswith("⚠️ none in the static trace; 1 measured-only rows")
+    assert info["End-to-end test"] == "❌ failed: bad (source:graph on a local p150 device, 2026-10-22); CI: w.yml: job"
+
+
+def test_failure_after_a_local_pass_is_flagged(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["entry_test_passes"] = {"by": "source:tracy on a local p150 device", "date": "2026-10-20", "result": "ok"}
+    (run / "run.json").write_text(json.dumps(data))
+    capture = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::Op1Factory")])
+    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-fail", "bad",
+                   "--date", "2026-10-21")
+    assert r.returncode == 0 and "superseded run" in r.stdout
+    assert "superseded run" in validate(run).stdout
+
+
+def test_every_llk_gaps_and_cache_column_has_a_note():
+    sys.path.insert(0, str(SCRIPTS))
+    import opa_schema
+    import sheet_notes
+    for title, columns in (("LLK gaps (Quasar)", opa_schema.LLK_GAPS_COLUMNS),
+                           ("Cache: compute APIs", opa_schema.CACHE_COMPUTE_COLUMNS),
+                           ("Cache: dataflow APIs", opa_schema.CACHE_DATAFLOW_COLUMNS),
+                           ("Cache: kernels", opa_schema.CACHE_KERNELS_COLUMNS),
+                           ("Graph capture", opa_schema.GRAPH_OPS_COLUMNS),
+                           ("Graph host transfers", opa_schema.GRAPH_HOST_TRANSFERS_COLUMNS)):
+        assert all(sheet_notes.column_note(title, c) for c in columns), (title, [c for c in columns
+                                                                                 if not sheet_notes.column_note(title, c)])

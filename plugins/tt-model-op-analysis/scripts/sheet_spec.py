@@ -26,8 +26,9 @@ import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from sheet_notes import column_note, tab_description  # noqa: E402
 from opa_schema import (  # noqa: E402
-    ALWAYS, LAUNCH_PROFILES, METHOD_ITEMS, METHOD_LABELS, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES, TARGET_LABELS,
+    ALWAYS, CALL_SITE, GRID_KEYWORDS, LAUNCH_PROFILES, METHOD_ITEMS, NOT_TRACED, latest_entry_failure, METHOD_LABELS, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES, TARGET_LABELS,
     TEST_TARGETS, column_width, confidence, display_header, methods_used, read_csv, read_header, run_targets,
     split_evidence,
 )
@@ -93,14 +94,6 @@ def label(target: str) -> str:
     return TARGET_LABELS.get(target, target)
 
 
-def describe(value) -> str:
-    if isinstance(value, dict):
-        return "; ".join(f"{k}: {describe(v)}" for k, v in value.items())
-    if isinstance(value, list):
-        return ", ".join(describe(v) for v in value)
-    return str(value)
-
-
 CONFIDENCE_TEXT = {
     "high": "a graph capture of the entry test names the device op and program factory of every launch",
     "medium": ("a run of the entry test confirmed op codes (Tracy) or compiled kernels (kernel cache); "
@@ -124,9 +117,9 @@ def method_state(run: dict, method: str) -> str:
         g = run.get("graph_capture")
         if not g:
             return "not run"
-        return (f"done {g['date']}: {g['launches']} launches over {g['inferences']} inference(s), "
-                f"{g['kernel_ops']} (op code, program factory) pairs, {g['host_transfers_inside']} host transfers "
-                "between the first and the last launch")
+        return (f"done {g.get('date', '')}: {g.get('launches', '?')} launches over {g.get('inferences', '?')} "
+                f"inference(s), {g.get('kernel_ops', '?')} (op code, program factory) pairs, "
+                f"{g.get('host_transfers_inside', '?')} host transfers between the first and the last launch")
     c = run.get("kernel_cache")
     if not c:
         return "not run"
@@ -171,16 +164,79 @@ def op_table_view(rows: list[dict], header: list[str], targets: tuple[str, ...])
     headers = [MERGED_HEADER if c == MERGED else display_header(c) for c in columns]
     values = [headers] + [[cell(view_text(c, raw(r, c))) for c in columns] for r in rows]
     widths = [300 if c == MERGED else column_width(c) for c in columns]
-    return new_tab("Op table", "op_table.csv", values, widths), columns, constant
+    tab = new_tab("Op table", "op_table.csv", values, widths)
+    tab["notes"] = [column_note("Op table", "program_factory" if c == MERGED else c) for c in columns]
+    return tab, columns, constant
+
+
+STATUS_RANK = {"❌": 0, "⚠️": 1, "✅": 2, "n/a": 3}
+# A clause ends at ';', or at '.' before a capital, so "e.g. on" stays whole.
+CLAUSE_SPLIT = re.compile(r"(?<=;)\s+|(?<=\.)\s+(?=[A-Z])")
+SHARED_CLAUSE_CHARS = 40
+
+
+def _clauses(text: str) -> list[str]:
+    return [c.strip().rstrip(";.").strip() for c in CLAUSE_SPLIT.split(text) if c.strip().rstrip(";.").strip()]
 
 
 def grouped_evidence(members: list[dict], column: str) -> str:
-    texts: dict[str, list[str]] = collections.OrderedDict()
+    """Evidence of a kernel op's rows: one block per distinct text, worst status first, each block led by its
+    status and rows; a clause every block repeats is written once at the end."""
+    texts: dict[str, dict] = collections.OrderedDict()
+    status_column = column.rsplit(":", 1)[0] + ":status"
     for m in members:
-        texts.setdefault(tidy(m[column]), []).append(m["id"])
-    if len(texts) == 1:
-        return next(iter(texts))
-    return "\n".join(f"{'row' if len(ids) == 1 else 'rows'} {', '.join(ids)}: {text}" for text, ids in texts.items())
+        group = texts.setdefault(tidy(m[column]), {"ids": [], "statuses": []})
+        group["ids"].append(m["id"])
+        if m.get(status_column) and m[status_column] not in group["statuses"]:
+            group["statuses"].append(m[status_column])
+    if len(texts) <= 1:
+        return next(iter(texts), "")
+    split = {text: _clauses(text) for text in texts}
+    # A short note several blocks repeat (bf16 no-op) is written once, with the rows it applies to; longer
+    # clauses carry a block's reasoning and stay in it.
+    shared: dict[str, list[str]] = collections.OrderedDict()
+    for text, clauses in split.items():
+        for c in clauses:
+            if len(c) <= SHARED_CLAUSE_CHARS and sum(c in other for other in split.values()) > 1:
+                shared.setdefault(c, []).extend(texts[text]["ids"])
+    common = list(shared)
+    def rank(item) -> int:
+        return min((STATUS_RANK.get(s, 9) for s in item[1]["statuses"]), default=9)
+
+    blocks = []
+    for text, group in sorted(texts.items(), key=rank):
+        if common:
+            own = [c for c in split[text] if c not in common]
+            end = "." if text.rstrip().endswith((".", ";")) else ""
+            if own:
+                body = "; ".join(own) + end
+            elif any(c in shared for c in split[text]):
+                body = "see below."
+            else:
+                body = text or "no evidence written."
+        else:
+            body = text
+        rows = f"{'row' if len(group['ids']) == 1 else 'rows'} {', '.join(group['ids'])}"
+        blocks.append(f"{' '.join(group['statuses'])} {rows}: {body}".strip())
+    every = [m["id"] for m in members]
+    by_rows: dict[tuple[str, ...], list[str]] = collections.OrderedDict()
+    for clause, ids in shared.items():
+        by_rows.setdefault(tuple(sorted(set(ids), key=every.index)), []).append(clause)
+    for ids, clauses in by_rows.items():
+        lead = "All rows" if len(ids) == len(set(every)) else f"{'Row' if len(ids) == 1 else 'Rows'} {', '.join(ids)}"
+        blocks.append(f"{lead}: " + "; ".join(clauses) + ".")
+    return "\n\n".join(blocks)
+
+
+def grouped_nodes(cell_text: str) -> str:
+    """`path::test[...]` entries (optionally `: result`) grouped under their test file."""
+    files: dict[str, list[str]] = collections.OrderedDict()
+    for entry in (e.strip() for e in cell_text.split("; ") if e.strip()):
+        path, sep, rest = entry.partition("::")
+        tests = files.setdefault(path, [])
+        if sep:
+            tests.append(rest)
+    return "\n".join("\n".join([path, *(f"  ::{test}" for test in tests)]) for path, tests in files.items())
 
 
 def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str, ...], op_columns: list[str]):
@@ -189,25 +245,22 @@ def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str,
     graphed = any(k.get("graph_launches", "0") not in ("", "0") for k in kernel_ops)
     # Evidence that is the same in every op-table row is on Info, not repeated per kernel op.
     shown = {t: f"{t}:evidence" in op_columns for t in targets}
-    headers = ["#", MERGED_HEADER, "Stages", "ttnn API", f"Launches ({label(targets[0])})"]
-    widths = [40, 300, 160, 180, 90]
+    # (header, width, field whose note the header carries)
+    columns = [("#", 40, "id"), (MERGED_HEADER, 300, "program_factory"), ("Stages", 160, "stage"),
+               ("ttnn API", 180, "ttnn_api"), (f"Launches ({label(targets[0])})", 90, "static_launches")]
     if measured:
-        headers.append("Measured launches (op code)")
-        widths.append(110)
+        columns.append(("Measured launches (op code)", 110, "measured_launches_op_code"))
     if graphed:
-        headers.append("Graph launches per inference")
-        widths.append(110)
-    headers += ["Seen by", "Op table rows"]
-    widths += [140, 120]
+        columns.append(("Graph launches per inference", 110, "graph_launches"))
+    columns += [("Seen by", 140, "sources"), ("Op table rows", 120, "op_table_ids")]
     for t in targets:
-        headers.append(f"{label(t)}: status (rows)")
-        widths.append(110)
+        columns.append((f"{label(t)}: status (rows)", 110, "statuses"))
         if shown[t]:
-            headers.append(f"{label(t)}: evidence and gap")
-            widths.append(420)
+            columns.append((f"{label(t)}: evidence and gap", 420, "evidence"))
         if t in TEST_TARGETS:
-            headers += [f"{label(t)}: kernel-op tests", f"{label(t)}: TTsim results"]
-            widths += [300, 300]
+            columns += [(f"{label(t)}: kernel-op tests", 300, "tests"), (f"{label(t)}: TTsim results", 300, "test_results")]
+    headers = [c[0] for c in columns]
+    widths = [c[1] for c in columns]
     values = [headers]
     for k in kernel_ops:
         members = [by_id[i] for i in k["op_table_ids"].split(",") if i in by_id]
@@ -228,18 +281,22 @@ def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str,
             if shown[t]:
                 row.append(cell(grouped_evidence(members, f"{t}:evidence")))
             if t in TEST_TARGETS:
-                row += [cell(k.get(f"{t}:tests", "").replace("; ", "\n")),
-                        cell(k.get(f"{t}:test_results", "").replace("; ", "\n"))]
+                row += [cell(grouped_nodes(k.get(f"{t}:tests", ""))),
+                        cell(grouped_nodes(k.get(f"{t}:test_results", "")))]
         values.append(row)
     values.append(["Total", "", "", "", f"=SUM(E2:E{len(kernel_ops) + 1})"])
-    return new_tab("Kernel ops", "kernel_ops.csv", values, widths, [0, len(values) - 1])
+    tab = new_tab("Kernel ops", "kernel_ops.csv", values, widths, [0, len(values) - 1])
+    tab["notes"] = [column_note("Kernel ops", c[2]) for c in columns]
+    return tab
 
 
 def csv_view(path: pathlib.Path, title: str) -> dict:
     columns = read_header(path)
     values = [[display_header(c) for c in columns]]
     values += [[cell(view_text(c, r[c])) for c in columns] for r in read_csv(path)]
-    return new_tab(title, path.name, values, [column_width(c) for c in columns])
+    tab = new_tab(title, path.name, values, [column_width(c) for c in columns])
+    tab["notes"] = [column_note(title, c) for c in columns]
+    return tab
 
 
 def summary_rows(path: pathlib.Path) -> tuple[str, list[list], list[int]]:
@@ -303,11 +360,16 @@ def summary_rows(path: pathlib.Path) -> tuple[str, list[list], list[int]]:
             flush()
             last_item = True
             text = clean(item.group(2))
-            labelled = re.match(r"^([^:]{1,40}):\s+(.+)$", text)
+            # A label is a bold lead, "Label: text", or a counted "Label (n), text".
+            match = (re.match(r"^\*\*(.{1,60}?):?\*\*(?<=:\*\*)\s+(.+)$", item.group(2))
+                     or re.match(r"^\*\*(.{1,60}?)\*\*[:,]\s+(.+)$", item.group(2))
+                     or re.match(r"^([^:]{1,40}):\s+(.+)$", text)
+                     or re.match(r"^([^:,]{1,40}\(\d+\))[,:]\s+(.+)$", text))
+            labelled = (clean(match.group(1)), clean(match.group(2))) if match else None
             if item.group(1):
                 rows.append([f"'{item.group(1)}.", cell(text)])
             elif labelled:
-                rows.append([labelled.group(1), cell(labelled.group(2))])
+                rows.append([labelled[0], cell(labelled[1])])
             else:
                 rows.append(["", cell(text)])
             continue
@@ -315,6 +377,81 @@ def summary_rows(path: pathlib.Path) -> tuple[str, list[list], list[int]]:
         paragraph.append(clean(s))
     flush()
     return title, rows, headings
+
+
+CONFIG_MARK = {"yes": "✅ yes", "no": "❌ no", "partial": "⚠️ partial", "n/a": "n/a"}
+
+
+def entry_test_state(run: dict) -> str:
+    passes, failure = run.get("entry_test_passes") or {}, latest_entry_failure(run)
+    if failure:
+        ci = f"; CI: {passes['ci']}" if passes.get("ci") else ""
+        return f"❌ failed: {failure['result']} ({failure['by']}, {failure['date']}){ci}"
+    if passes:
+        parts = []
+        if passes.get("result"):
+            parts.append(f"{passes['result']} ({passes.get('by', '')}, {passes.get('date', '')})")
+        if passes.get("ci"):
+            parts.append(f"CI: {passes['ci']}")
+        return "✅ passed: " + "; ".join(parts)
+    return "not run on a device in this analysis"
+
+
+def host_fallback_state(run_dir: pathlib.Path, run: dict) -> str:
+    parts = []
+    path = run_dir / "host_fallback.csv"
+    if path.exists():
+        for row in read_csv(path):
+            device, host = int(row["device_ops"] or 0), int(row["host_ops"] or 0)
+            share = 100 * host / (device + host) if device + host else 0.0
+            parts.append(f"{host} of {device + host} ops on the host ({share:.1f}%), {row['host_pct_of_total']}% of "
+                         f"the time (Tracy, {row['window']})")
+    graph = run.get("graph_capture") or {}
+    if graph:
+        parts.append(f"{graph.get('host_transfers_inside', 0)} host transfers between the first and the last launch "
+                     f"over {graph.get('inferences', 1)} inference(s) (graph capture; Graph host transfers tab)")
+    host_ops = run_dir / "host_ops.csv"
+    if host_ops.exists():
+        steps = sum(r["counts_as_host_op"] == "yes" for r in read_csv(host_ops))
+        parts.append(f"{steps} host steps per inference in the model code (static trace)")
+    return "; ".join(parts) or "not measured"
+
+
+def peak_dram_state(run_dir: pathlib.Path, run: dict) -> str:
+    graph = run.get("graph_capture") or {}
+    if graph.get("peak_dram_mib") is not None:
+        per_device = graph.get("peak_dram_mib_per_device") or {}
+        detail = f", per device {per_device}" if len(per_device) > 1 else ""
+        return f"{graph['peak_dram_mib']} MiB allocated at once during the test (graph capture){detail}"
+    footprint = run_dir / "footprint.csv"
+    if footprint.exists():
+        values = {r["peak_dram_mb"] for r in read_csv(footprint)} - {"not measured", ""}
+        if values:
+            return f"{values.pop()} MB (measured outside the analysis)"
+    return "not measured; a graph capture records it"
+
+
+def grid_blockers_state(ops: list[dict], source: str) -> str:
+    untraced = [r for r in ops if r["grid_dependency"].strip() == NOT_TRACED]
+    fixed = [r for r in ops if r["grid_dependency"].strip() not in (*GRID_KEYWORDS, NOT_TRACED)]
+    unknown = (f"; {len(untraced)} measured-only rows were not traced, so their grids are unknown"
+               if untraced else "")
+    if not fixed:
+        if untraced:
+            return f"⚠️ none in the static trace{unknown}"
+        return "✅ none: every op derives its grid from the device or uses no core grid"
+    settings = sorted({site for r in fixed for site in CALL_SITE.findall(r["grid_dependency"])})
+    launches = sum(int(r.get(f"{source}:launches") or 0) for r in fixed)
+    listed = ", ".join(tidy(s) for s in settings[:8]) + (f" and {len(settings) - 8} more" if len(settings) > 8 else "")
+    return (f"❌ {len(fixed)} of {len(ops)} op table rows ({launches} launches per inference) use hardcoded grids "
+            f"or shard specs, set at {len(settings)} places: {listed} (Op table, Grid dependency){unknown}")
+
+
+def config_state(run: dict, key: str) -> str:
+    entry = run.get(key)
+    if not entry:
+        return "not checked"
+    return f"{CONFIG_MARK.get(entry.get('value', ''), entry.get('value', ''))}: {tidy(entry.get('evidence', ''))}"
 
 
 def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_columns: list[str],
@@ -330,11 +467,24 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
     if detail:
         commit += f" ({', '.join(detail)})"
     meta = [("Model", run.get("model")), ("Implementation", run.get("implementation")),
-            ("Entry test", run.get("test")), ("Source", f"{label(source)}: {profile}" if profile else label(source)),
+            ("Entry test", run.get("test")), ("Source", label(source)),
             ("Destinations", ", ".join(label(d) for d in destinations)), ("tt-metal commit", commit),
-            ("TTsim commit", run.get("ttsim_commit")),
-            ("Entry test passes", describe(run["entry_test_passes"]) if run.get("entry_test_passes") else "")]
+            ("TTsim commit", run.get("ttsim_commit"))]
     rows += [[name, cell(str(v))] for name, v in meta if v]
+
+    rows.append([])
+    bold.append(len(rows))
+    rows.append(["Bring-up checks"])
+    checks = [
+        ("End-to-end test", entry_test_state(run)),
+        ("Host fallback", host_fallback_state(run_dir, run)),
+        ("Test hardware", f"{label(source)}: {profile}" if profile else label(source)),
+        ("Peak DRAM", peak_dram_state(run_dir, run)),
+        ("Blockers to a smaller grid", grid_blockers_state(ops, source)),
+        ("Configurable grid (TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE)", config_state(run, "configurable_grid")),
+        ("Configurable layer count", config_state(run, "configurable_layers")),
+    ]
+    rows += [[name, cell(value)] for name, value in checks]
 
     used = methods_used(run)
     level = confidence(used)
@@ -452,6 +602,15 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1) -> dict:
     tabs += [csv_view(run_dir / f"changes_{name}.csv", f"Changes: {title}") for name, title in SHEET_TABS
              if (run_dir / f"changes_{name}.csv").exists()]
 
+    info_rows = info_tab["values"]
+    info_rows.append([])
+    info_tab["bold"].append(len(info_rows))
+    info_rows.append(["Tabs in this spreadsheet", "What it holds", "Filled by"])
+    for tab in tabs:
+        description = tab_description(tab["title"])
+        if description:
+            info_rows.append([tab["title"], cell(description[0]), cell(description[1])])
+
     # The kept first tab may be smaller than Info needs; size it like the added tabs.
     info_size = {"rowCount": len(info_tab["values"]) + 50, "columnCount": max(len(r) for r in info_tab["values"])}
     requests = [{"updateSheetProperties": {
@@ -469,6 +628,12 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1) -> dict:
         requests += [_width(tab["sheetId"], i, w) for i, w in enumerate(tab.pop("widths")[:width])]
         header = tab.pop("header")
         requests += [_bold(tab["sheetId"], r, width, header and r == 0) for r in tab.pop("bold")]
+        notes = tab.pop("notes", None)
+        if notes and any(notes):
+            requests.append({"updateCells": {
+                "range": {"sheetId": tab["sheetId"], "startRowIndex": 0, "endRowIndex": 1,
+                          "startColumnIndex": 0, "endColumnIndex": len(notes)},
+                "rows": [{"values": [{"note": n} for n in notes]}], "fields": "note"}})
     return {"tabs": tabs, "requests": requests, "expected": expected}
 
 

@@ -5,12 +5,16 @@ host lists Google Drive and Google Sheets connector tools; otherwise say the CSV
 `<run dir>` and stop.
 
 The spreadsheet is a view of the run for people, built entirely by `sheet_spec.py`: Info (run
-details, counts as formulas over the Op table, `summary.md`, and the op-table columns that hold
-one value in every row; it also lists the four analysis methods with their state and the run's
-confidence, `schemas.md`), Kernel ops (one row per kernel op, evidence de-duplicated across its
+details; the bring-up checks: end-to-end test, host fallback, test hardware, peak DRAM, blockers to
+a smaller grid, configurable grid and layer count; the four analysis methods with their state and
+the run's confidence; counts as formulas over the Op table; `summary.md`; the op-table columns that
+hold one value in every row; and a list of every tab with what it holds and the method that fills
+it, `schemas.md`), Kernel ops (one row per kernel op, evidence de-duplicated across its
 rows, with the methods that saw it), Op table (one row per launching variant, device op and factory
 merged, constant columns dropped, source paths shortened), then Kernel tests, Call trace, Port
-blockers, Host ops, the Tracy, graph-capture and kernel-cache tables and any other CSV of the run. Never assemble a tab's values by hand.
+blockers, Host ops, the Tracy, graph-capture and kernel-cache tables and any other CSV of the run.
+Every column header carries a note that says what the column holds (`sheet_notes.py`); the
+`requests` set them. Never assemble a tab's values by hand.
 
 1. Ask for the Drive folder only when `run.json` has no `drive_url` (link or name). Create a
    subfolder named after the model if the user wants one. With a `drive_url`, say which

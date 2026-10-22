@@ -36,15 +36,26 @@ Reads code only; never touches a device. Every count must survive
    do not move a status to `⚠️` for it. `verified` requires the complete dispatch chain for the
    exact variant. Apply the same status to rows sharing the target-relevant signature unless
    row-specific evidence distinguishes them.
-6. **Gate.** Run `python3 <plugin-root>/scripts/validate_static.py <run dir>`. Fix and rerun until
+6. **Configurability.** Record in `run.json` whether the model can run on a smaller core grid and
+   with fewer layers, each as `{"value": "yes" | "no" | "partial" | "n/a", "evidence": "<file:line
+   and the decisive fact>"}`:
+   - `configurable_grid`: `yes` when every grid, shard spec and program config the model uses is
+     derived from the device grid, so the runtime override `TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE`
+     shrinks it with no code change (every row's `grid_dependency` is `automatic` or `none`); `no`
+     when grids are hardcoded (give how many places and one example); `partial` when some are.
+   - `configurable_layers`: `yes` when the model or its test reads a layer count it can be given,
+     such as an environment variable `<MODEL>_NUM_LAYERS` or a test parameter (name it); `no` when the
+     model has a repeated layer stack with a fixed count; `n/a` when it has no repeated layer stack.
+7. **Gate.** Run `python3 <plugin-root>/scripts/validate_static.py <run dir>`. Fix and rerun until
    it prints `OK`. Resolve every warning (shorten the evidence, drop row-number prefixes). No
    output, summary or upload before that.
-7. **Kernel ops and summary.** Run `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`. Write
+8. **Kernel ops and summary.** Run `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`. Write
    `summary.md` for a reader who opens it cold; the spreadsheet's Info tab is this file plus the
    run details from `run.json` and counts computed from the CSVs, so do not repeat those here.
    A `#` title, the per-kernel-op table from `kernel_ops.csv` (kernel op, launches, op-table rows,
-   statuses per target), then these `##` sections in this order, as `- Label: text` bullets or
-   short paragraphs:
+   statuses per target), then these `##` sections in this order, as `- **Label**: text` bullets or
+   short paragraphs. Every bullet that names something (a finding, a count, a verdict group) starts
+   with a bold label, so the sheet puts the label in its own column:
    - `Method`: one paragraph: what was traced, from which entry test, how statuses were decided,
      what was run and what was not.
    - `Targets`: one bullet per target: the question it answers (for a destination, what it
@@ -77,9 +88,11 @@ Reads code only; never touches a device. Every count must survive
 
 ## Adding a destination
 
-A destination reuses the source trace; it never re-traces the source. Ask for the profile (any but
-the source, likely ones first) and, for a non-Quasar source with Quasar chosen, whether the code is
-`same` (`quasar`) or a BF16 projection (`quasar-bf16`).
+A destination reuses the source trace; it never re-traces the source. Ask for it in one question
+listing every choice but the source, likely ones first: `p100`, `p150`, `n150`, `n300-1chip`,
+`quasar` (the code as written, on Quasar: block-float dtypes and mainline calls stay as they are) and,
+for a non-Quasar source, `quasar-bf16` (a BF16 projection: block-float dtypes become BF16 and
+mainline calls use their Quasar forks).
 
 1. Append the destination to `run.json` `destinations`.
 2. For a Blackhole or Wormhole destination running the same code, evaluate the profile predicates

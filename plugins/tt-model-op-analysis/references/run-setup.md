@@ -162,6 +162,10 @@ Root: current working directory unless the user names one; never inside the tt-m
  "date": "YYYY-MM-DD", "drive_url": null, "entry_test_passes": {}}
 ```
 
+Static analysis adds `configurable_grid` and `configurable_layers` (static-phase.md, step 6).
+`entry_test_failure` (`{"by", "date", "result"}`) records a failed local run of the entry test
+(`--entry-fail` of `merge_measured.py` or `graph_report.py`); a later recorded pass removes it.
+
 `entry_test_passes`, for a Blackhole or Wormhole source: where the entry test is shown to pass,
 either `{"ci": "<workflow file>: <job>"}` or `{"by": "...", "date": "...", "result": "<pcc line>"}`
 for a run the user reports or a passing Tracy run (`merge_measured.py --entry-pass` writes
