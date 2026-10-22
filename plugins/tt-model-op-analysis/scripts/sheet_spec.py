@@ -170,8 +170,10 @@ def op_table_view(rows: list[dict], header: list[str], targets: tuple[str, ...])
 
 
 STATUS_RANK = {"❌": 0, "⚠️": 1, "✅": 2, "n/a": 3}
-# A clause ends at ';', or at '.' before a capital, so "e.g. on" stays whole.
-CLAUSE_SPLIT = re.compile(r"(?<=;)\s+|(?<=\.)\s+(?=[A-Z])")
+# A clause ends at ';', or at '.' before a capital that does not close an abbreviation, so "e.g. on" and
+# "incl. DRAM" stay whole.
+CLAUSE_SPLIT = re.compile(r"(?<=;)\s+|(?<=\.)(?<!\bincl\.)(?<!\be\.g\.)(?<!\bi\.e\.)(?<!\bvs\.)(?<!\betc\.)"
+                          r"(?<!\bcf\.)(?<!\bapprox\.)(?<!\bno\.)\s+(?=[A-Z])")
 SHARED_CLAUSE_CHARS = 40
 
 

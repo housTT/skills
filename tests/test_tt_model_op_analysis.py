@@ -2277,3 +2277,9 @@ def test_every_llk_gaps_and_cache_column_has_a_note():
                            ("Graph host transfers", opa_schema.GRAPH_HOST_TRANSFERS_COLUMNS)):
         assert all(sheet_notes.column_note(title, c) for c in columns), (title, [c for c in columns
                                                                                  if not sheet_notes.column_note(title, c)])
+
+
+def test_abbreviations_do_not_split_evidence():
+    sys.path.insert(0, str(SCRIPTS))
+    import sheet_spec
+    assert sheet_spec._clauses("passes at 2x3, incl. DRAM TILE input; bf16.") == ["passes at 2x3, incl. DRAM TILE input", "bf16"]
