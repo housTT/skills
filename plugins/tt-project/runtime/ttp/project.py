@@ -1130,20 +1130,22 @@ class Project:
 
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
                    end: dict | None = None, standing: bool = False, audience: str | None = None,
-                   commit: bool = True) -> Path:
+                   commit: bool = True, dry_run: bool = False) -> Path:
         """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load.
         A memory written again under the same `key` (a replayed coordinator turn) keeps its one
         file and line. `end` (see ends.from_action) makes it temporary: the daemon retires it then.
         `standing` marks an instruction that applies every time its case comes up (a preference
         unless pinned already): finishing one instance never retires it (see forget_memory).
         `audience` (one of MEMORY_AUDIENCES) says whether workers get it (see worker_memory).
-        `commit` False leaves the harness commit to the caller (see supersede_memory)."""
+        `commit` False leaves the harness commit to the caller (see supersede_memory). `dry_run`
+        only returns the path it would write: no file, index line or commit."""
         from .ends import front_matter
         from .forbidden import check
         check(self, "memory", text, title or "")   # before any write: nothing refused reaches git
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        if not dry_run:
+            self.memory_dir.mkdir(parents=True, exist_ok=True)
         text = text.strip()
         title = (title or text.splitlines()[0])[:80]
         slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:48] or "note"
@@ -1160,6 +1162,9 @@ class Project:
             while path.exists() or (self.memory_dir / "archive" / path.name).exists():
                 path = self.memory_dir / f"{kind}-{slug}-{n}.md"
                 n += 1
+        if dry_run:
+            return path
+        if not same:
             durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}"
                                 f"{'standing: true' + chr(10) if standing else ''}"
                                 f"{f'audience: {audience}' + chr(10) if audience in MEMORY_AUDIENCES else ''}{tag}"
@@ -1343,10 +1348,11 @@ class Project:
         return done[0]
 
     def forget_memories(self, names: list[str], keep: str | None = None, why: str | None = None,
-                        commit: bool = True) -> tuple[list[Path], list[str]]:
+                        commit: bool = True, dry_run: bool = False) -> tuple[list[Path], list[str]]:
         """forget_memory for several entries with one MEMORY.md rewrite and one harness commit:
         (archived paths, one error per name refused). A refused name (unknown, ambiguous, standing
-        without `why`) leaves the others retired. `commit` False leaves the commit to the caller."""
+        without `why`) leaves the others retired. `commit` False leaves the commit to the caller.
+        `dry_run` returns the same without moving, rewriting or committing anything."""
         why = " ".join((why or "").split())
         from .forbidden import check
         check(self, "memory retirement reason (why)", why)   # it goes into the archive and the commit message
@@ -1368,10 +1374,15 @@ class Project:
                               "`why` naming its end condition or quoting the user's words ending it; to make "
                               "it shorter, add a standing entry that supersedes it")
                 continue
+            if dry_run:
+                done.append(dst)
+                continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             os.replace(src, dst)
             done.append(dst)
             moved.append(name)
+        if dry_run:
+            return done, errors
         # Whether a killed run left a replayed name uncommitted takes git, which never runs under the
         # write lock: inside a transaction that check waits until it ends.
         later = again if commit and self.db.conn.in_transaction else []
@@ -1504,14 +1515,16 @@ class Project:
         return sorted(out, key=lambda e: (e["created"], e["name"]))
 
     def supersede_memory(self, text: str, names: list[str], kind: str = "fact", standing: bool = False,
-                         title: str | None = None, audience: str | None = None) -> tuple[Path, list[Path]]:
+                         title: str | None = None, audience: str | None = None,
+                         dry_run: bool = False) -> tuple[Path, list[Path]]:
         """Add a merged entry and retire the live entries it replaces, with one harness commit:
         (new entry, archived paths). Refused whole, nothing written, when a name is unknown, ambiguous
         or already archived, or the merge would lose a user rule: a standing entry is replaced only
         by a standing one, a restriction only by a restriction, a preference only by a preference or
         restriction, a resource only by a resource, and the quoted words of a restriction, preference
         or standing entry (the user's verbatim words) stay word for word in the new text. `title` and
-        `audience` as add_memory's; with no `audience` the new entry keeps the one its entries share."""
+        `audience` as add_memory's; with no `audience` the new entry keeps the one its entries share.
+        `dry_run` checks the same and returns the same paths, writing and committing nothing."""
         from .forbidden import check
         check(self, "memory", text, title or "")
         if standing and kind not in PINNED_MEMORY_KINDS:
@@ -1548,8 +1561,10 @@ class Project:
         if errors:
             raise ValueError("nothing changed: " + "\n".join(errors))
         # Merged entries that all share one audience keep it.
-        added = self.add_memory(text, kind=kind, title=title, standing=standing, commit=False,
+        added = self.add_memory(text, kind=kind, title=title, standing=standing, commit=False, dry_run=dry_run,
                                 audience=audience or (next(iter(auds)) if len(auds) == 1 else None))
+        if dry_run:
+            return added, [self.memory_dir / "archive" / f"{n}.md" for n in olds]
         done, errors = self.forget_memories(olds, keep=added.stem, why=f"merged into [{added.stem}]", commit=False)
         self.commit_harness([added, self.memory_index, *done],
                             f"memory ({kind}): [{added.stem}] supersedes {', '.join(d.stem for d in done)}",

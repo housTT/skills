@@ -4615,13 +4615,15 @@ def cmd_prune(a) -> None:
     print(line)
 
 
-def _memory_room(p) -> None:
-    """After an entry is added: the pinned worker-memory total, and a warning once it is over its room."""
+def _memory_room(p, dry: str = "") -> None:
+    """After an entry is added: the pinned worker-memory total, and a warning once it is over its room.
+    In a dry run (dry is its prefix) nothing was added or retired, so it is the total as it stands."""
     from .coordinator import worker_pinned_total
     total, over = worker_pinned_total(p)
-    print(total)
+    now = " (as it stands: the dry run changed nothing)" if dry else ""
+    print(f"{dry}{total}{now}")
     if over:
-        print(f"warning: {over}", file=sys.stderr)
+        print(f"{dry}warning: {over}", file=sys.stderr)
 
 
 def cmd_memory(a) -> None:
@@ -4655,32 +4657,37 @@ def cmd_memory(a) -> None:
         sys.exit("give the memory's text, or --forget <entry>, or --search <words>")
     if (a.title or a.audience) and not a.text:
         sys.exit("--title and --audience go with the memory's text")
+    dry = "dry run, nothing written or committed: " if a.dry_run else ""
     if a.supersedes:
         if not a.text or a.forget:
             sys.exit("--supersedes needs the merged entry's text and no --forget: "
                      f"ttp memory {p.name} \"<text>\" --kind K --supersedes <entry> ...")
         try:
             added, done = p.supersede_memory(a.text, a.supersedes, kind=a.kind, standing=a.standing,
-                                             title=a.title, audience=a.audience)
+                                             title=a.title, audience=a.audience, dry_run=a.dry_run)
         except ValueError as e:
             sys.exit(str(e))
-        print(added)
+        print(f"{dry}would add {added}" if dry else added)
         for dst in done:
-            print(f"retired to {dst}")
-        memory_budget_check(p)
-        _memory_room(p)
+            print(f"{dry}would retire to {dst}" if dry else f"retired to {dst}")
+        if not a.dry_run:
+            memory_budget_check(p)
+        _memory_room(p, dry)
         return
     try:
         if a.text:
-            print(p.add_memory(a.text, kind=a.kind, title=a.title, standing=a.standing, audience=a.audience))
-        done, errors = p.forget_memories(a.forget, why=a.why) if a.forget else ([], [])
+            path = p.add_memory(a.text, kind=a.kind, title=a.title, standing=a.standing, audience=a.audience,
+                                dry_run=a.dry_run)
+            print(f"{dry}would add {path}" if dry else path)
+        done, errors = p.forget_memories(a.forget, why=a.why, dry_run=a.dry_run) if a.forget else ([], [])
     except ValueError as e:   # a forbidden-data refusal: it names the pattern, never the text
         sys.exit(str(e))
     for dst in done:
-        print(f"retired to {dst}")
-    memory_budget_check(p)
+        print(f"{dry}would retire to {dst}" if dry else f"retired to {dst}")
+    if not a.dry_run:
+        memory_budget_check(p)
     if a.text:
-        _memory_room(p)
+        _memory_room(p, dry)
     if spaced := [n for n in a.forget or [] if len(n.split()) > 1]:
         # --forget takes every word after it, so text written after it was read as an entry name.
         errors.append(f"{spaced[0]!r} is no entry name (names have no spaces): --forget takes every word "
@@ -7401,7 +7408,8 @@ def main(argv: list[str] | None = None) -> None:
                         "archive them from memory, in one harness commit; with no names, every decision that "
                         "records a review-area-cap settlement. Each entry's whole text stays as the record's "
                         "decision")
-    s.add_argument("--dry-run", action="store_true", help="with --settle: show what would move; change nothing")
+    s.add_argument("--dry-run", action="store_true",
+                   help="show what would be added, retired or moved (--settle); write and commit nothing")
     s.set_defaults(fn=cmd_memory)
 
     s = sub.add_parser("schedules", help="list or show schedules (read-only); --export moves them into the harness")

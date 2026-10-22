@@ -173,3 +173,47 @@ def test_an_undo_that_raises_on_rollback_is_logged_and_the_next_still_runs(env):
             raise RuntimeError("x")
     assert ran == [1]
     assert "rollback undo" in _daemon_log_text(p) and "disk gone" in _daemon_log_text(p)
+
+
+def test_memory_cli_dry_run_writes_retires_and_commits_nothing(env):
+    """--dry-run on an add, a --supersedes merge and a --forget only says what it would add and retire,
+    marked as a dry run: the memory files, index and harness HEAD stay as they were."""
+    from ttp import cli
+    p = make(env)
+    old = p.add_memory("An old decision.", kind="decision")
+    other = p.add_memory("Another fact.", kind="fact")
+    head = lambda: subprocess.run(["git", "-C", str(p.harness), "rev-parse", "HEAD"], capture_output=True,
+                                  text=True).stdout
+    snapshot = lambda: sorted((str(f.relative_to(p.memory_dir)), f.read_text())
+                              for f in p.memory_dir.rglob("*") if f.is_file())
+    before, index, h0 = snapshot(), p.memory_index.read_text(), head()
+    for argv, said in ((["A merged fact.", "--title", "x", "--supersedes", other.stem],
+                       ["would add", "fact-x.md", f"would retire to {p.memory_dir / 'archive' / other.name}"]),
+                      (["--forget", old.stem, other.stem],
+                       [f"archive/{old.name}", f"archive/{other.name}"]),
+                      (["A new fact."], ["would add", "fact-a-new-fact.md"])):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            cli.main(["memory", "demo", *argv, "--dry-run"])
+        lines = out.getvalue().splitlines()
+        assert lines and all(x.startswith("dry run, nothing written or committed: ") for x in lines), lines
+        assert all(s in out.getvalue() for s in said), out.getvalue()
+        # An add or merge still shows the pinned worker-memory total (as it stands); a --forget alone does not.
+        assert ("pinned worker memory: " in out.getvalue()) == ("--forget" not in argv), out.getvalue()
+        assert snapshot() == before and p.memory_index.read_text() == index, f"{argv} wrote"
+        assert head() == h0 and _harness_dirty(p) == "", f"{argv} committed or left changes"
+    # A refused name is still refused in a dry run.
+    with pytest.raises(SystemExit):
+        cli.main(["memory", "demo", "A merged fact.", "--supersedes", "no-such-entry", "--dry-run"])
+    assert snapshot() == before and head() == h0
+    # Over its room, a dry-run merge still warns, marked as a dry run, and still writes nothing.
+    big = [p.add_memory(f"RULE-{i:02} " + "r" * 900, kind="restriction") for i in range(30)]
+    before, index, h0 = snapshot(), p.memory_index.read_text(), head()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+        cli.main(["memory", "demo", "RULE-00 and RULE-01 merged.", "--kind", "restriction",
+                  "--supersedes", big[0].stem, big[1].stem, "--dry-run"])
+    assert all(x.startswith("dry run, nothing written or committed: ") for x in out.getvalue().splitlines())
+    assert err.getvalue().startswith("dry run, nothing written or committed: warning: pinned worker memory "
+                                     "over budget: "), err.getvalue()
+    assert snapshot() == before and p.memory_index.read_text() == index and head() == h0
+    assert _harness_dirty(p) == ""
