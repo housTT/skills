@@ -3337,6 +3337,32 @@ def cmd_sandbox(a) -> None:
     sys.exit(sandbox.run(cmd))
 
 
+def cmd_hours(a) -> None:
+    """`ttp hours`: the user's usual active hours, from the times of their own messages over the last
+    days in the project's home zone (hours.py). Before starting a time-limited step for the user (a
+    sign-in link, a device code), `--check` exits 0 when now is a good time (inside them, or no pattern
+    yet), 1 when not: hand off waiting with it as `retry_when`."""
+    import sqlite3
+    from . import hours
+    p = here()
+    if p is None:
+        die("ttp hours: no project here (run it in a project or its run)")
+    now = time.time()
+    try:
+        times = hours.user_times(p.state / "project.db", now - a.days * 86400)
+    except sqlite3.Error as e:
+        die(f"ttp hours: cannot read the project's messages ({e})", 75)
+    r = hours.assess(times, timefmt.home(p), now=now, need_s=a.need)
+    if a.json:
+        z = r["zone"]
+        print(json.dumps({**r, **{f"{k}_text": timefmt.long(r[k], z) for k in ("until", "next_start") if r[k]},
+                          "summary": hours.describe(r, now)}))
+    else:
+        print(hours.describe(r, now))
+    if a.check:
+        sys.exit(0 if r["ok"] else 1)
+
+
 def cmd_killscan(a) -> None:
     """Check scripts for kills by name or pattern (`pkill`, `killall`, `pgrep`/`pidof`, `ps | grep`) before
     running them: such a kill can match the worker's own tool shell. Exits 1 when one is found.
@@ -7127,6 +7153,15 @@ def main(argv: list[str] | None = None) -> None:
                                                "device_released log line), 1 while not")
     s.add_argument("files", nargs="*", help="/health JSON and log text to read (default: stdin)")
     s.set_defaults(fn=cmd_broker_released)
+
+    s = sub.add_parser("hours", help="the user's usual active hours, from their own messages in the home zone; "
+                                     "--check exits 0 when now is a good time for a step they must act on, 1 not")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--check", action="store_true", help="exit 0 inside the hours (or with no pattern yet), 1 outside")
+    s.add_argument("--for", dest="need", type=float, default=0, metavar="SECONDS",
+                   help="also need this much of the window left (a step's time to act)")
+    s.add_argument("--days", type=float, default=14, help="look back this many days (default 14)")
+    s.set_defaults(fn=cmd_hours)
 
     s = sub.add_parser("killscan", help="flag kills by name or pattern (pkill, killall, pgrep/pidof, ps | grep into kill) "
                                         "in scripts before running them; --shim writes stand-ins that only log")

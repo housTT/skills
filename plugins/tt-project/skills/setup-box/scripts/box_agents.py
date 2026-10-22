@@ -63,7 +63,8 @@ LOGIN_DIR = '"$HOME"/.cache/tt-project/agent-login'
 SETTING = "remote.SSH.defaultExtensions"
 MCP = "glean"
 LOGIN_TMUX = "tmux -L ttp-login"
-SIGNIN_WAIT = 3600  # seconds a pending MCP sign-in waits for the user's browser
+SIGNIN_WAIT = 3600  # seconds a pending MCP sign-in waits for the user's browser (default; `login --wait`)
+LOGIN_WAIT = 900  # seconds a CLI's own pending login waits (default; `login --wait`)
 # Each editor server's own MCP config on the box: (its server dir, config file, servers key, entry fields).
 EDITOR_MCP = {"cursor": (".cursor-server", ".cursor/mcp.json", "mcpServers", {}),
               "vscode": (".vscode-server", ".vscode-server/data/User/mcp.json", "servers", {"type": "http"})}
@@ -426,7 +427,7 @@ _LISTEN = ('l=; if [ -n "$p" ] && [ -n "$SS" ]; then l=$($SS -Hltn 2>/dev/null |
 _DEAD = '[ -n "$p" ] && [ -n "$SS" ] && [ -z "$l" ]'
 
 
-def mcp_login_script(cli: str, mcp: str) -> str:
+def mcp_login_script(cli: str, mcp: str, wait: int = SIGNIN_WAIT) -> str:
     """Start the CLI's sign-in to an MCP server on the box in a tmux session, unless it is signed in or one
     is pending whose callback still listens; print its link only once the callback port listens there.
 
@@ -434,7 +435,7 @@ def mcp_login_script(cli: str, mcp: str) -> str:
     box: never inside a sandbox, whose own network namespace a browser's localhost callback cannot reach. A
     pending sign-in whose callback no longer listens (it timed out or died) is replaced. The pane is a real
     terminal: the redirect URL the browser ends on can be pasted back (`--code-stdin`). It waits up to
-    SIGNIN_WAIT seconds.
+    `wait` seconds; the session keeps when that ends (`until=`, epoch seconds) for a later call.
     """
     return (_TIMEOUT + 'umask 077; ' + _login_ready(cli, mcp)
             # From the `mcp` listing: Claude Code (Commander) exits 0 for `mcp <unknown> --help`.
@@ -444,38 +445,44 @@ def mcp_login_script(cli: str, mcp: str) -> str:
             + 'if $X has-session -t "=$S" 2>/dev/null; then ' + _CAPTURE + _CALLBACK + _LISTEN
             + f'if {_DEAD}; then $X kill-session -t "=$S" 2>/dev/null; echo "replaced=$p"; fi; fi; '
             'if $X has-session -t "=$S" 2>/dev/null; then st=pending; else '
-            f'TL=; command -v timeout >/dev/null 2>&1 && TL="timeout {SIGNIN_WAIT}"; '
+            f'TL=; command -v timeout >/dev/null 2>&1 && TL="timeout {int(wait)}"; '
             f'$X new-session -d -s "$S" -x 400 -y 50 -c "$HOME" "exec $TL \\"$b\\" mcp login {mcp} --no-browser" '
-            '</dev/null >/dev/null 2>&1 || { echo state=failed; exit 0; }; st=started; fi; '
+            '</dev/null >/dev/null 2>&1 || { echo state=failed; exit 0; }; st=started; '
+            f'[ -n "$TL" ] && $X set-option -t "=$S" @ttp_until "$(( $(date +%s) + {int(wait)} ))" 2>/dev/null; fi; '
             'i=0; while :; do ' + _CAPTURE + 'case "$o" in *https://*) break ;; esac; '
             '[ $i -ge 30 ] && break; $X has-session -t "=$S" 2>/dev/null || break; sleep 1; i=$((i+1)); done; '
             + _CALLBACK + 'i=0; while [ -n "$p" ] && [ -n "$SS" ]; do ' + _LISTEN
             + '[ -n "$l" ] && break; [ $i -ge 10 ] && break; sleep 1; i=$((i+1)); done; '
             f'if {_DEAD}; then $X kill-session -t "=$S" 2>/dev/null; echo "nolisten=$p"; echo state=no-listener; exit 0; fi; '
             'echo "state=$st"; echo "session=$S"; [ -n "$l" ] && echo "listen=$l"; '
+            'u=$($X show-options -v -t "=$S" @ttp_until 2>/dev/null); [ -n "$u" ] && echo "until=$u"; '
             '[ -n "$p" ] && [ -z "$SS" ] && echo "listen=unknown"; '
             'printf "%s\\n" "$o" | sed -n "1,40p" | sed "s/^/out=/"; true')
 
 
-def login_script(cli: str, mcp: Optional[str] = None) -> str:
+def login_script(cli: str, mcp: Optional[str] = None, wait: Optional[int] = None) -> str:
     """Start the CLI's headless login on the box, detached, unless it is logged in or one is pending.
 
     Its stdin is a fifo held open, so a code the sign-in page shows can be passed back (`--code-stdin`);
-    output goes to an owner-only log that is removed when the login ends. An MCP sign-in runs in tmux
+    output goes to an owner-only log that is removed when the login ends. It waits up to `wait` seconds
+    (LOGIN_WAIT by default); when that ends is kept beside it (`until=`). An MCP sign-in runs in tmux
     instead (`mcp_login_script`).
     """
     if mcp:
-        return mcp_login_script(cli, mcp)
+        return mcp_login_script(cli, mcp, SIGNIN_WAIT if wait is None else wait)
+    wait = int(LOGIN_WAIT if wait is None else wait)
     c = _login_key(cli, mcp)
     cmd = f'$TL $b {CLIS[cli]["login"]}'
     return (_TIMEOUT + f'umask 077; d={LOGIN_DIR}; mkdir -p "$d"; chmod 700 "$d"; ' + _login_ready(cli, mcp)
             + f'pid=$(cat "$d/{c}.pid" 2>/dev/null); '
             'if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo state=pending; else '
-            f'rm -f "$d/{c}.in" "$d/{c}.log"; mkfifo "$d/{c}.in" || {{ echo state=failed; exit 0; }}; '
-            'TL=; command -v timeout >/dev/null 2>&1 && TL="timeout 900"; '
-            'nohup setsid sh -c \'exec 3<>"$1"; eval "$2" <&3 >"$3" 2>&1; exec 3<&-; sleep 5; rm -f "$1" "$3" "$4"\' sh '
-            f'"$d/{c}.in" "{cmd}" "$d/{c}.log" "$d/{c}.pid" </dev/null >/dev/null 2>&1 & '
-            f'echo $! >"$d/{c}.pid"; echo state=started; fi; '
+            f'rm -f "$d/{c}.in" "$d/{c}.log" "$d/{c}.until"; mkfifo "$d/{c}.in" || {{ echo state=failed; exit 0; }}; '
+            f'TL=; command -v timeout >/dev/null 2>&1 && TL="timeout {wait}"; '
+            'nohup setsid sh -c \'exec 3<>"$1"; eval "$2" <&3 >"$3" 2>&1; exec 3<&-; sleep 5; rm -f "$1" "$3" "$4" "$5"\' sh '
+            f'"$d/{c}.in" "{cmd}" "$d/{c}.log" "$d/{c}.pid" "$d/{c}.until" </dev/null >/dev/null 2>&1 & '
+            f'echo $! >"$d/{c}.pid"; [ -n "$TL" ] && echo "$(( $(date +%s) + {wait} ))" >"$d/{c}.until"; '
+            'echo state=started; fi; '
+            f'u=$(cat "$d/{c}.until" 2>/dev/null); [ -n "$u" ] && echo "until=$u"; '
             f'i=0; while [ $i -lt 30 ] && ! grep -q "https://" "$d/{c}.log" 2>/dev/null; do sleep 1; i=$((i+1)); done; '
             f'sed -n "1,40p" "$d/{c}.log" 2>/dev/null | sed "s/^/out=/"; true')
 
@@ -680,6 +687,30 @@ def callback_forward(listen: str) -> Optional[str]:
     return f"{m.group(2)}:{host}:{m.group(2)}"
 
 
+def home_zone(env: Optional[dict] = None):
+    """The tzinfo times for the user are shown in: the home zone of the project in TTP_PROJECT
+    (`home_timezone` in its project.json), else this machine's."""
+    env = os.environ if env is None else env
+    try:
+        cfg = json.loads((pathlib.Path(env["TTP_PROJECT"]) / "harness" / "project.json").read_text())
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(cfg["home_timezone"])
+    except Exception:
+        return datetime.datetime.now().astimezone().tzinfo
+
+
+def until_text(epoch, tz=None, now: Optional[float] = None) -> str:
+    """'01:07 PDT' (with the weekday when not within 20 h): when a sign-in's window ends, in the home zone
+    with its abbreviation; '' when the box did not say."""
+    try:
+        ts = float(epoch)
+    except (TypeError, ValueError):
+        return ""
+    now = datetime.datetime.now().timestamp() if now is None else now
+    fmt = "%H:%M %Z" if abs(ts - now) < 20 * 3600 else "%a %H:%M %Z"
+    return datetime.datetime.fromtimestamp(ts, tz or home_zone()).strftime(fmt)
+
+
 def cmd_login(args) -> int:
     cli, mcp = args.cli, args.mcp
     what = f"{cli} {mcp} sign-in" if mcp else f"{cli} login"
@@ -703,7 +734,11 @@ def cmd_login(args) -> int:
         print(f"passed to the pending {what}; then `{again} --status`"
               if st == "sent" else f"no pending {what} on {args.alias}: start one with `{again}`")
         return 0 if st == "sent" else 1
-    r = _ssh(args.alias, login_script(cli, mcp), timeout=240)
+    wait = getattr(args, "wait", None)
+    if wait is not None and wait < 60:
+        print(f"--wait {wait}: give the user at least 60 s to act")
+        return 2
+    r = _ssh(args.alias, login_script(cli, mcp, wait), timeout=240)
     bad = _ssh_failed(args.alias, r)
     if bad is not None:
         return bad
@@ -740,8 +775,11 @@ def cmd_login(args) -> int:
         return 1
     if mcp and "replaced" in kv:
         print(f"(an earlier pending {what} whose callback port {kv['replaced']} no longer listened was replaced)")
+    ends = until_text(kv.get("until"))
     print(f"{what} on {args.alias} is waiting for the user (tell them, word for word):")
     print("\n".join(f"  {ln}" for ln in shown))
+    if ends:
+        print(f"  This link works until {ends}.")
     if mcp:
         fwd = callback_forward(kv.get("listen", ""))
         print((f"Its callback listens on the box at {kv['listen']}. " if fwd else "")
@@ -753,7 +791,9 @@ def cmd_login(args) -> int:
               + "after signing in, the browser ends on a localhost page that may not load: the user copies that "
               f"page's full address and gives it to you; pass it on with `{again} --code-stdin` (on stdin; it only "
               "completes this pending sign-in and is never stored).")
-        print(f"It waits up to {SIGNIN_WAIT // 60} min in tmux session {kv.get('session', _session(cli, mcp))} on the "
+        span = f"up to {(wait or SIGNIN_WAIT) // 60} min"   # a pending one keeps the wait it started with
+        span = (f"{span} (until {ends})" if st == "started" else f"until {ends}") if ends else span
+        print(f"It waits {span} in tmux session {kv.get('session', _session(cli, mcp))} on the "
               f"box (`ssh -t {args.alias} {LOGIN_TMUX} attach -t {kv.get('session', _session(cli, mcp))}` shows it).")
     elif cli == "claude":
         print(f"If the page then shows a code to paste back, pass it on with: "
@@ -940,6 +980,9 @@ def register(sub) -> None:
     how = lg.add_mutually_exclusive_group()
     how.add_argument("--status", action="store_true", help="exit 0 logged in, 1 not (or pending)")
     how.add_argument("--code-stdin", action="store_true", help="pass the code from stdin to the pending login")
+    lg.add_argument("--wait", type=int, metavar="SECONDS",
+                    help=f"how long a new sign-in waits for the user (default {SIGNIN_WAIT} for --mcp, "
+                         f"else {LOGIN_WAIT}); a pending one keeps its own")
     lg.set_defaults(func=cmd_login)
     e = ag.add_parser("editor-defaults", help="add both extensions to remote.SSH.defaultExtensions on this machine "
                                               "(dry run unless --run; only on the user's yes)")
