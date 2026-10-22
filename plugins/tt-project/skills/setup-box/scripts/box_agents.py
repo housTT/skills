@@ -18,10 +18,14 @@
 - Glean: `install` also adds the HTTP MCP server `glean` to each CLI (Claude Code user scope, Codex
   `[mcp_servers.glean]`); an existing `glean` entry is always kept, even on another URL. Its URL comes from
   `--glean-url`, the site file's `mcp.glean` (the box's entry, else top level) or this machine's own
-  agent configs, never from a repo; with none it skips with one line. `login <alias> <cli> --mcp glean`
-  runs the CLI's paste-the-redirect-URL OAuth sign-in on the box; `check` reports Glean per CLI as
-  missing, signed out or working. Claude Code loads MCP servers when a session starts: one open before
-  the server was added (an editor's Claude panel too) needs a reload to see it.
+  agent configs, never from a repo; with none it skips with one line. It also adds `glean` to the MCP
+  config of each editor server on the box (Cursor `~/.cursor/mcp.json`, VS Code's remote user `mcp.json`).
+  `login <alias> <cli> --mcp glean` runs the CLI's OAuth sign-in on the box in a tmux session of its own
+  server (`tmux -L ttp-login`), started over ssh in the user's session, never in a sandbox; it hands out
+  the link only once the sign-in's localhost callback port listens on the box. `check` reports Glean per
+  agent as missing, configured but signed out, or working; `check --search` proves working with a real
+  one-shot Glean search per CLI. Agents load MCP servers when a session starts: one open before the
+  server was added (an editor's agent panel too) needs a reload to see it.
 """
 
 from __future__ import annotations
@@ -58,6 +62,14 @@ PATH_LINE = ('case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local
 LOGIN_DIR = '"$HOME"/.cache/tt-project/agent-login'
 SETTING = "remote.SSH.defaultExtensions"
 MCP = "glean"
+LOGIN_TMUX = "tmux -L ttp-login"
+SIGNIN_WAIT = 3600  # seconds a pending MCP sign-in waits for the user's browser
+# Each editor server's own MCP config on the box: (its server dir, config file, servers key, entry fields).
+EDITOR_MCP = {"cursor": (".cursor-server", ".cursor/mcp.json", "mcpServers", {}),
+              "vscode": (".vscode-server", ".vscode-server/data/User/mcp.json", "servers", {"type": "http"})}
+SEARCH_PROMPT = (f"Call the {MCP} MCP server's search tool (mcp__{MCP}__search) with the query Tenstorrent. Use no "
+                 "other tool. Then reply with one line only: GLEAN_RESULTS=<number of results>, or "
+                 "GLEAN_ERROR=<short reason> if the tool is missing or fails.")
 MCP_URL_HINT = ('set its URL with --glean-url, or in the site file as "mcp": {"glean": "<url>"} (site.md), '
                 "or run setup from a machine whose Claude Code, Codex or Cursor already has a `glean` server")
 
@@ -127,6 +139,8 @@ def probe_script(clis: Sequence[str], editors: bool = True, mcp: bool = True) ->
                   + _mcp_status(c) + f'echo "mcp_{c}=configured"; echo "mcpurl_{c}=$u"; echo "mcpauth_{c}=$a"; fi; ')
                  if mcp else "")
               + 'fi; ')
+    if mcp:
+        s += editor_mcp_script("probe")
     if editors:
         s += (f'for s in {" ".join(SERVER_GLOBS)}; do [ -x "$s" ] || continue; '
               'echo "server=$s|$($T "$s" --list-extensions </dev/null 2>/dev/null | tr "\\n" ",")"; done; ')
@@ -142,9 +156,10 @@ def server_label(path: str) -> str:
     return f"{kind} {'/'.join(build) or '?'}"
 
 
-def read_check(out: str, alias: str, clis: Sequence[str], exts: Sequence[str],
-               glean: Optional[str] = None) -> "tuple[List[str], List[str], List[str]]":
-    """(report lines, problems, fixes) from the probe's key=value lines; `glean` is the configured URL."""
+def read_check(out: str, alias: str, clis: Sequence[str], exts: Sequence[str], glean: Optional[str] = None,
+               search: Optional[Dict[str, str]] = None) -> "tuple[List[str], List[str], List[str]]":
+    """(report lines, problems, fixes) from the probe's key=value lines; `glean` is the configured URL and
+    `search` each CLI's one-shot Glean search answer (`check --search`)."""
     rows = [ln.split("=", 1) for ln in out.splitlines() if "=" in ln]
     kv = {k: v.strip() for k, v in rows}
     lines: List[str] = []
@@ -175,7 +190,19 @@ def read_check(out: str, alias: str, clis: Sequence[str], exts: Sequence[str],
             problems.append(f"{c}: not logged in")
             fix(f"{BOX_PY} agents login {alias} {c}  (relay its sign-in link and code to the user)")
         lines.append(f"{c}: {ver if name.split()[0].lower() in ver.lower() else f'{name} {ver}'}" + (f", not on PATH for {' and '.join(path_gap)}" if path_gap else "")
-                     + (", logged in" if authed else ", not logged in") + _read_mcp(kv, c, alias, glean, problems, fix))
+                     + (", logged in" if authed else ", not logged in")
+                     + _read_mcp(kv, c, alias, glean, problems, fix, (search or {}).get(c)))
+    for ed in EDITOR_MCP:
+        state = kv.get(f"edmcp_{ed}")
+        if state is None or (state == "missing" and not glean):
+            continue
+        if state == "missing":
+            problems.append(f"editor {ed}: {MCP} missing")
+            fix(f"{BOX_PY} agents install {alias} --run")
+        elif state.startswith("failed"):
+            problems.append(f"editor {ed}: {MCP} config {state}")
+        lines.append(f"editor {ed}: {MCP} " + ("configured (it signs in from the editor's own MCP view)"
+                                              if state == "configured" else state))
     servers = [v.split("|", 1) for k, v in rows if k == "server"]
     if exts and not servers:
         lines.append("editor servers: none on the box yet (an editor's first Remote-SSH connect installs one; "
@@ -192,9 +219,11 @@ def read_check(out: str, alias: str, clis: Sequence[str], exts: Sequence[str],
     return lines, problems, fixes
 
 
-def _read_mcp(kv: Dict[str, str], c: str, alias: str, glean: Optional[str], problems: List[str], fix) -> str:
-    """The Glean part of a CLI's check line: missing, on another URL, signed out, working, or the CLI's own
-    status; each gap goes to problems with its fix. Missing with no URL configured is not a gap."""
+def _read_mcp(kv: Dict[str, str], c: str, alias: str, glean: Optional[str], problems: List[str], fix,
+              search: Optional[str] = None) -> str:
+    """The Glean part of a CLI's check line: missing, configured but signed out, working (with `search`, only
+    when the real search returned results), or the CLI's own error status; each gap goes to problems with its
+    fix. Missing with no URL configured is not a gap."""
     state = kv.get(f"mcp_{c}")
     if state is None:
         return ""
@@ -208,11 +237,29 @@ def _read_mcp(kv: Dict[str, str], c: str, alias: str, glean: Optional[str], prob
     url, auth = kv.get(f"mcpurl_{c}", ""), kv.get(f"mcpauth_{c}", "")
     other = f" (kept on another URL: {url or 'none'})" if glean and url != glean else ""
     working = _mcp_working(c, auth)
+    found = re.match(r"GLEAN_RESULTS=(\d+)$", search or "")
+    if working and (search is None or (found and int(found.group(1)) > 0)):
+        return f", {MCP} working{other}" + (f" (search: {found.group(1)} results)" if found else "")
     if working:
-        return f", {MCP} working{other}"
+        problems.append(f"{c}: {MCP} search failed ({search})")
+        return f", {MCP} configured{other} but its search failed ({search})"
     problems.append(f"{c}: {MCP} " + ("signed out" if working is False else f"not working ({auth or 'no status'})"))
     fix(f"{BOX_PY} agents login {alias} {c} --mcp {MCP}  (relay its sign-in link to the user)")
-    return f", {MCP} configured{other}, " + ("signed out" if working is False else f"not working ({auth or 'no status'})")
+    return (f", {MCP} configured{other} but " + ("signed out" if working is False
+                                                 else f"not working ({auth or 'no status'})"))
+
+
+def search_script(clis: Sequence[str]) -> str:
+    """Shell: one non-interactive Glean search per CLI, `search_<cli>=` its one answer line (GLEAN_RESULTS=<n> or
+    GLEAN_ERROR=<reason>), or `no answer`. Only that line leaves the box."""
+    s = f'T=; command -v timeout >/dev/null 2>&1 && T="timeout 300"; Q={shlex.quote(SEARCH_PROMPT)}; '
+    for c in clis:
+        run = (f'"$b" -p "$Q" --allowedTools=mcp__{MCP}' if c == "claude"
+               else '"$b" exec --skip-git-repo-check "$Q"')
+        s += (_find(c) + 'if [ -n "$b" ]; then r=$(cd "$HOME" && $T ' + run + ' </dev/null 2>/dev/null '
+              '| grep -oE "GLEAN_(RESULTS=[0-9]+|ERROR=.*)" | tail -n 1 | cut -c1-160); '
+              f'echo "search_{c}=${{r:-no answer}}"; fi; ')
+    return s + "true"
 
 
 def _mcp_add(cli: str) -> str:
@@ -224,6 +271,45 @@ def _mcp_add(cli: str) -> str:
     return f'$TA "$b" mcp add {MCP} --url "$G" </dev/null >/dev/null 2>&1; '
 
 
+_EDITOR_MCP_PY = r"""
+import json, os, sys
+path, key, url, extra, mode = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4]), sys.argv[5]
+try:
+    d = json.load(open(path)) if os.path.exists(path) else {}
+except ValueError:
+    print("failed (not JSON, left as it is)"); sys.exit(0)
+servers = d.get(key) if isinstance(d.get(key), dict) else {}
+g = servers.get("glean")
+if isinstance(g, dict):
+    u = g.get("url") or ""
+    print("configured" if mode == "probe" else "present" if u == url else "kept (on another URL: %s)" % (u or "none"))
+    sys.exit(0)
+if mode == "probe":
+    print("missing"); sys.exit(0)
+servers["glean"] = dict(extra, url=url)
+d[key] = servers
+os.makedirs(os.path.dirname(path), exist_ok=True)
+if os.path.exists(path) and not os.path.exists(path + ".ttp-bak"):
+    open(path + ".ttp-bak", "w").write(open(path).read())
+os.umask(0o077)
+open(path + ".ttp-tmp", "w").write(json.dumps(d, indent=2) + "\n")
+os.replace(path + ".ttp-tmp", path)
+print("added")
+"""
+
+
+def editor_mcp_script(mode: str, url: str = "") -> str:
+    """Shell: per editor server on the box, its `glean` MCP entry: `edmcp_<editor>=` added, present, kept (on
+    another URL), missing or configured (probe), or failed. Nothing for an editor with no server there."""
+    s = f"PY={shlex.quote(_EDITOR_MCP_PY)}; "
+    for ed, (server, rel, key, extra) in EDITOR_MCP.items():
+        s += (f'if [ -d "$HOME/{server}" ]; then if command -v python3 >/dev/null 2>&1; then '
+              f'echo "edmcp_{ed}=$(python3 -c "$PY" "$HOME/{rel}" {key} {shlex.quote(url or "-")} '
+              f'{shlex.quote(json.dumps(extra))} {mode} 2>/dev/null || echo failed)"; '
+              f'else echo "edmcp_{ed}=failed (no python3)"; fi; fi; ')
+    return s
+
+
 def mcp_install_script(clis: Sequence[str], url: str) -> str:
     """Shell: the `glean` server at `url` for each CLI; an existing `glean` entry is kept as it is."""
     s = (f'G={shlex.quote(url)}; '
@@ -233,6 +319,7 @@ def mcp_install_script(clis: Sequence[str], url: str) -> str:
               + _mcp_read(c) + f'if [ "$u" = "$G" ]; then echo "mcp_{c}=present"; '
               f'elif [ -n "$g" ]; then echo "mcp_{c}=kept (on another URL: ${{u:-none}})"; else ' + _mcp_add(c) + _mcp_read(c)
               + f'if [ "$u" = "$G" ]; then echo "mcp_{c}=added"; else echo "mcp_{c}=failed"; fail=1; fi; fi; fi; ')
+    s += editor_mcp_script("add", url)
     return s
 
 
@@ -274,7 +361,7 @@ def install_script(clis: Sequence[str], exts: Sequence[str], glean: Optional[str
 
 
 def read_install(out: str) -> "tuple[List[str], bool]":
-    lines, ok = [], True
+    lines, ok, added = [], True, False
     for ln in out.splitlines():
         k, _, v = ln.partition("=")
         if k.startswith("cli_"):
@@ -284,18 +371,20 @@ def read_install(out: str) -> "tuple[List[str], bool]":
             lines.append(f"  {k[4:]} installer: {v}")
         elif k == "path":
             lines.append(f"PATH line: {v}")
-        elif k.startswith("mcp_"):
-            lines.append(f"{k[4:]}: {MCP} {v}")
+        elif k.startswith("mcp_") or k.startswith("edmcp_"):
+            lines.append(("editor " if k.startswith("ed") else "") + f"{k.split('_', 1)[1]}: {MCP} {v}")
             ok = ok and not v.startswith("failed")
-            if k == "mcp_claude" and v == "added":
-                lines.append(f"  claude: sessions already open (an editor's Claude panel too) load {MCP} only after a "
-                             "reload: restart `claude`, or run `Developer: Reload Window` in the editor")
+            added = added or v == "added"
         elif k == "ext" and v == "none":
             lines.append("editor servers: none on the box yet (an editor's first Remote-SSH connect installs one)")
         elif k == "ext":
             path, ext, state = (v.split("|") + ["", ""])[:3]
             lines.append(f"editor {server_label(path)}: {ext} {state}")
             ok = ok and state != "failed"
+    if added:
+        lines.append(f"reload (tell the user once): agent sessions already open, an editor's agent panel too, load "
+                     f"{MCP} only when they start: restart `claude` or `codex`, or run `Developer: Reload Window` "
+                     "in the editor")
     return lines, ok
 
 
@@ -312,24 +401,66 @@ def _login_ready(cli: str, mcp: Optional[str]) -> str:
             + 'case "$a" in *Connected*|o_auth|oauth|bearer_token) echo state=logged-in; exit 0 ;; esac; ')
 
 
+def _session(cli: str, mcp: str) -> str:
+    return f"ttp-login-{_login_key(cli, mcp)}"
+
+
+def _tmux(cli: str, mcp: str) -> str:
+    """Shell: $X the sign-in tmux server, $S the session, $SS the path of `ss` (empty without it)."""
+    return f'X="{LOGIN_TMUX}"; S={_session(cli, mcp)}; SS=$(command -v ss 2>/dev/null); '
+
+
+# Shell: the pane's text into $o, the localhost callback port its sign-in link names into $p (empty when the
+# link has none), and the address listening on that port on the box into $l (empty when nothing listens).
+_CAPTURE = 'o=$($X capture-pane -p -J -t "=$S:" -S -200 2>/dev/null); '
+_CALLBACK = ('p=$(printf "%s\\n" "$o" | grep -ioE "redirect_uri=https?%3A%2F%2F[^&]*%3A[0-9]+" | head -n 1 '
+             '| sed "s/.*%3[aA]//"); ')
+_LISTEN = ('l=; if [ -n "$p" ] && [ -n "$SS" ]; then l=$($SS -Hltn 2>/dev/null | awk -v p=":$p" '
+           '\'{a=$4; if (substr(a, length(a) - length(p) + 1) == p) {print a; exit}}\'); fi; ')
+_DEAD = '[ -n "$p" ] && [ -n "$SS" ] && [ -z "$l" ]'
+
+
+def mcp_login_script(cli: str, mcp: str) -> str:
+    """Start the CLI's sign-in to an MCP server on the box in a tmux session, unless it is signed in or one
+    is pending whose callback still listens; print its link only once the callback port listens there.
+
+    The session lives in a tmux server of its own, started by this ssh command in the user's session on the
+    box: never inside a sandbox, whose own network namespace a browser's localhost callback cannot reach. A
+    pending sign-in whose callback no longer listens (it timed out or died) is replaced. The pane is a real
+    terminal: the redirect URL the browser ends on can be pasted back (`--code-stdin`). It waits up to
+    SIGNIN_WAIT seconds.
+    """
+    return (_TIMEOUT + 'umask 077; ' + _login_ready(cli, mcp)
+            + f'if ! $T "$b" mcp login --help </dev/null >/dev/null 2>&1; then echo state=no-login-cmd; exit 0; fi; '
+            'command -v tmux >/dev/null 2>&1 || { echo state=no-tmux; exit 0; }; ' + _tmux(cli, mcp)
+            + 'if $X has-session -t "=$S" 2>/dev/null; then ' + _CAPTURE + _CALLBACK + _LISTEN
+            + f'if {_DEAD}; then $X kill-session -t "=$S" 2>/dev/null; echo "replaced=$p"; fi; fi; '
+            'if $X has-session -t "=$S" 2>/dev/null; then st=pending; else '
+            f'TL=; command -v timeout >/dev/null 2>&1 && TL="timeout {SIGNIN_WAIT}"; '
+            f'$X new-session -d -s "$S" -x 400 -y 50 -c "$HOME" "exec $TL \\"$b\\" mcp login {mcp} --no-browser" '
+            '</dev/null >/dev/null 2>&1 || { echo state=failed; exit 0; }; st=started; fi; '
+            'i=0; while :; do ' + _CAPTURE + 'case "$o" in *https://*) break ;; esac; '
+            '[ $i -ge 30 ] && break; $X has-session -t "=$S" 2>/dev/null || break; sleep 1; i=$((i+1)); done; '
+            + _CALLBACK + 'i=0; while [ -n "$p" ] && [ -n "$SS" ]; do ' + _LISTEN
+            + '[ -n "$l" ] && break; [ $i -ge 10 ] && break; sleep 1; i=$((i+1)); done; '
+            f'if {_DEAD}; then $X kill-session -t "=$S" 2>/dev/null; echo "nolisten=$p"; echo state=no-listener; exit 0; fi; '
+            'echo "state=$st"; echo "session=$S"; [ -n "$l" ] && echo "listen=$l"; '
+            '[ -n "$p" ] && [ -z "$SS" ] && echo "listen=unknown"; '
+            'printf "%s\\n" "$o" | sed -n "1,40p" | sed "s/^/out=/"; true')
+
+
 def login_script(cli: str, mcp: Optional[str] = None) -> str:
     """Start the CLI's headless login on the box, detached, unless it is logged in or one is pending.
 
-    Its stdin is a fifo held open, so a code the sign-in page shows (or, for an MCP server, the redirect
-    URL the browser ends on) can be passed back (`--code-stdin`); output goes to an owner-only log that is
-    removed when the login ends. Claude Code reads a pasted redirect URL only from a terminal: its MCP
-    sign-in runs under `script`, which gives it one.
+    Its stdin is a fifo held open, so a code the sign-in page shows can be passed back (`--code-stdin`);
+    output goes to an owner-only log that is removed when the login ends. An MCP sign-in runs in tmux
+    instead (`mcp_login_script`).
     """
+    if mcp:
+        return mcp_login_script(cli, mcp)
     c = _login_key(cli, mcp)
-    if not mcp:
-        cmd = f'$TL $b {CLIS[cli]["login"]}'
-    elif cli == "claude":
-        cmd = f'$TL env TERM=dumb script -qefc \\"$b mcp login {mcp} --no-browser\\" /dev/null'
-    else:
-        cmd = f'$TL $b mcp login {mcp} --no-browser'
-    has = (f'if ! $T "$b" mcp login --help </dev/null >/dev/null 2>&1; then echo state=no-login-cmd; exit 0; fi; '
-           if mcp else "")
-    return (_TIMEOUT + f'umask 077; d={LOGIN_DIR}; mkdir -p "$d"; chmod 700 "$d"; ' + _login_ready(cli, mcp) + has
+    cmd = f'$TL $b {CLIS[cli]["login"]}'
+    return (_TIMEOUT + f'umask 077; d={LOGIN_DIR}; mkdir -p "$d"; chmod 700 "$d"; ' + _login_ready(cli, mcp)
             + f'pid=$(cat "$d/{c}.pid" 2>/dev/null); '
             'if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo state=pending; else '
             f'rm -f "$d/{c}.in" "$d/{c}.log"; mkfifo "$d/{c}.in" || {{ echo state=failed; exit 0; }}; '
@@ -362,18 +493,30 @@ def relay_lines(out: str) -> List[str]:
 
 def code_script(cli: str, mcp: Optional[str] = None) -> str:
     """Pass one line from stdin (the code the sign-in page showed, or the redirect URL) to the pending login."""
+    if mcp:  # typed into the sign-in's tmux pane through a buffer, never on a command line
+        return ('IFS= read -r code || true; ' + _tmux(cli, mcp)
+                + 'if ! command -v tmux >/dev/null 2>&1 || ! $X has-session -t "=$S" 2>/dev/null; then '
+                'echo state=no-login; exit 1; fi; '
+                'if printf "%s" "$code" | $X load-buffer -b ttp-login-code - && '
+                '$X paste-buffer -d -b ttp-login-code -t "=$S:" && $X send-keys -t "=$S:" Enter; then echo state=sent; '
+                'else $X delete-buffer -b ttp-login-code 2>/dev/null; echo state=failed; exit 1; fi')
     c = _login_key(cli, mcp)
-    end = "\\r" if mcp and cli == "claude" else "\\n"  # Enter on the terminal `script` gives it
     return (f'd={LOGIN_DIR}; IFS= read -r code || true; '
             f'pid=$(cat "$d/{c}.pid" 2>/dev/null); '
             'if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null || [ ! -p "$d/' + c + '.in" ]; then '
             'echo state=no-login; exit 1; fi; '
-            f'printf "%s{end}" "$code" >"$d/{c}.in"; echo state=sent')
+            'printf "%s\\n" "$code" >"$d/' + c + '.in"; echo state=sent')
 
 
 def status_script(cli: str, mcp: Optional[str] = None) -> str:
+    """`state=` logged-in, logged-out, pending, or (MCP) no-listener: a pending sign-in whose callback died."""
     c = _login_key(cli, mcp)
-    return ('st=$( (' + _TIMEOUT + _login_ready(cli, mcp) + 'echo state=logged-out) | sed -n "s/^state=//p" | head -n 1); '
+    st = 'st=$( (' + _TIMEOUT + _login_ready(cli, mcp) + 'echo state=logged-out) | sed -n "s/^state=//p" | head -n 1); '
+    if mcp:
+        return (st + _tmux(cli, mcp) + 'if [ "$st" = logged-out ] && command -v tmux >/dev/null 2>&1 && '
+                '$X has-session -t "=$S" 2>/dev/null; then ' + _CAPTURE + _CALLBACK + _LISTEN
+                + f'if {_DEAD}; then st=no-listener; else st=pending; fi; fi; echo "state=$st"')
+    return (st +
             f'd={LOGIN_DIR}; pid=$(cat "$d/{c}.pid" 2>/dev/null); '
             'if [ "$st" = logged-out ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then st=pending; fi; '
             'echo "state=$st"')
@@ -461,7 +604,18 @@ def cmd_check(args) -> int:
     bad = _ssh_failed(args.alias, r)
     if bad is not None:
         return bad
-    lines, problems, fixes = read_check(r.stdout, args.alias, clis, exts, glean_url(args)[0])
+    search = None
+    if getattr(args, "search", False):
+        kv = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+        ready = [c for c in clis if kv.get(f"mcp_{c}") == "configured" and _mcp_working(c, kv.get(f"mcpauth_{c}", ""))]
+        if ready:
+            rs = _ssh(args.alias, search_script(ready), timeout=900)
+            bad = _ssh_failed(args.alias, rs)
+            if bad is not None:
+                return bad
+            search = {ln.split("=", 1)[0][7:]: ln.split("=", 1)[1].strip()
+                      for ln in rs.stdout.splitlines() if ln.startswith("search_")}
+    lines, problems, fixes = read_check(r.stdout, args.alias, clis, exts, glean_url(args)[0], search)
     if args.json:
         print(json.dumps({"alias": args.alias, "lines": lines, "problems": problems, "fixes": fixes}))
     else:
@@ -508,12 +662,14 @@ def cmd_install(args) -> int:
     return 0 if ok and r.returncode == 0 else 1
 
 
-_CALLBACK_PORT = re.compile(r"redirect_uri=https?%3A%2F%2F(localhost|127\.0\.0\.1)%3A(\d+)")
-
-
-def callback_forward(lines: Sequence[str]) -> Optional[str]:
-    """`<port>:<host>:<port>` for `ssh -L`, from the localhost callback an OAuth sign-in link shows, if any."""
-    return next((f"{m.group(2)}:{m.group(1)}:{m.group(2)}" for m in map(_CALLBACK_PORT.search, lines) if m), None)
+def callback_forward(listen: str) -> Optional[str]:
+    """`<port>:<address>:<port>` for `ssh -L`, from the address the sign-in's callback listens on (as `ss` shows
+    it): the forward goes to that address, never to `localhost`, which may resolve to another one on the box."""
+    m = re.match(r"^(\[[0-9a-fA-F:.]+\]|[0-9.]+|\*):(\d+)$", listen.strip())
+    if not m:
+        return None
+    host = "127.0.0.1" if m.group(1) in ("*", "0.0.0.0") else "[::1]" if m.group(1) == "[::]" else m.group(1)
+    return f"{m.group(2)}:{host}:{m.group(2)}"
 
 
 def cmd_login(args) -> int:
@@ -526,7 +682,9 @@ def cmd_login(args) -> int:
         if bad is not None:
             return bad
         st = _state(r.stdout) or "unknown"
-        print(f"{cli}{f' {mcp}' if mcp else ''} on {args.alias}: {st}")
+        print(f"{cli}{f' {mcp}' if mcp else ''} on {args.alias}: {st}"
+              + (f" (its callback no longer listens: the link is dead; `{again}` starts a new one)"
+                 if st == "no-listener" else ""))
         return 0 if st == "logged-in" else 1
     if args.code_stdin:
         r = _ssh(args.alias, code_script(cli, mcp), timeout=60, input=sys.stdin.readline())
@@ -557,21 +715,38 @@ def cmd_login(args) -> int:
               + (f" (`claude update`), or the user signs in once by hand: ssh to the box, run `claude`, type `/mcp`, "
                  f"pick {mcp} and choose Authenticate" if cli == "claude" else ""))
         return 1
+    kv = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln and not ln.startswith("out="))
+    if st == "no-tmux":
+        print(f"{what} on {args.alias} needs tmux on the box (the sign-in waits there in a session of its own): "
+              "install it with the box's package manager, then rerun")
+        return 1
+    if st == "no-listener":
+        print(f"{what} on {args.alias}: its callback port {kv.get('nolisten', '?')} is not listening on the box, so "
+              "its link would not work; not handing it out (stopped it). Sign-ins run over ssh in the box's own "
+              f"tmux server; if this repeats, look for what blocks localhost listeners on the box, then `{again}`")
+        return 1
     shown = relay_lines(r.stdout)
     if st not in ("started", "pending") or not any("https://" in ln for ln in shown):
         print(f"{what} on {args.alias} did not show a sign-in link ({st or 'no answer'})"
               + ("".join(f"\n  {ln}" for ln in shown)))
         return 1
+    if mcp and "replaced" in kv:
+        print(f"(an earlier pending {what} whose callback port {kv['replaced']} no longer listened was replaced)")
     print(f"{what} on {args.alias} is waiting for the user (tell them, word for word):")
     print("\n".join(f"  {ln}" for ln in shown))
     if mcp:
-        fwd = callback_forward(shown)
-        print("After signing in, the browser ends on a localhost page that may not load: the user copies that "
+        fwd = callback_forward(kv.get("listen", ""))
+        print((f"Its callback listens on the box at {kv['listen']}. " if fwd else "")
+              + ("Its callback could not be checked (no `ss` on the box). " if kv.get("listen") == "unknown" else "")
+              + "Either way completes it: "
+              + (f"(a) before opening the link, the user forwards that port from the machine their browser runs "
+                 f"on: `ssh -N -L {fwd} <their ssh alias for {args.alias}>`, and the page completes by itself; or (b) "
+                 if fwd else "")
+              + "after signing in, the browser ends on a localhost page that may not load: the user copies that "
               f"page's full address and gives it to you; pass it on with `{again} --code-stdin` (on stdin; it only "
-              "completes this pending sign-in and is never stored)."
-              + (f" Or, before signing in, the user forwards the port from their own machine with "
-                 f"`ssh -N -L {fwd} <their ssh alias for {args.alias}>` and the page completes it."
-                 if fwd else ""))
+              "completes this pending sign-in and is never stored).")
+        print(f"It waits up to {SIGNIN_WAIT // 60} min in tmux session {kv.get('session', _session(cli, mcp))} on the "
+              f"box (`ssh -t {args.alias} {LOGIN_TMUX} attach -t {kv.get('session', _session(cli, mcp))}` shows it).")
     elif cli == "claude":
         print(f"If the page then shows a code to paste back, pass it on with: "
               f"`{again} --code-stdin` (the code on stdin; it only completes "
@@ -739,6 +914,8 @@ def register(sub) -> None:
     c.add_argument("--cli", help="comma-separated CLIs to check (default: the box's setup answer, else claude,codex)")
     c.add_argument("--json", action="store_true")
     c.add_argument("--glean-url", help="the Glean MCP URL to expect (default as for install)")
+    c.add_argument("--search", action="store_true",
+                   help="prove Glean works: one real one-shot Glean search per signed-in CLI (a model call each)")
     c.set_defaults(func=cmd_check)
     i = ag.add_parser("install", help="CLIs, PATH lines and editor extensions (dry run unless --run)")
     i.add_argument("alias")

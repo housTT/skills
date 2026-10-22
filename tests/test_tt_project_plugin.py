@@ -2146,6 +2146,12 @@ def _glean_fakes(home):
     (bin_ / "claude").write_text(
         "#!/bin/bash\nf=$HOME/claude-mcp\necho \"$*\" >> $HOME/claude.log\n"
         "[ \"$1 $2\" = 'mcp login' ] && [ -f $HOME/no-mcp-login ] && exit 1\n"
+        "[ \"$1 $2 $3\" = 'mcp login --help' ] && exit 0\n"
+        "if [ \"$1 $2\" = 'mcp login' ]; then echo 'Visit this URL to authorize:';"
+        " echo '  https://g.invalid/oauth/authorize?client_id=c&redirect_uri=http%3A%2F%2Flocalhost%3A41234%2Fcallback&s=1';"
+        " echo 'Or paste the redirect URL here:'; read -r u; case $u in http://localhost:41234/callback?code=*)"
+        " echo \"$u\" > $HOME/pasted; echo '\u2713 Connected' > $HOME/claude-glean-status ;; esac; exit 0; fi\n"
+        "[ \"$1\" = -p ] && { echo \"$*\" > $HOME/claude-p.args; echo 'Searching.'; echo 'GLEAN_RESULTS=7'; exit 0; }\n"
         "[ \"$1\" = mcp ] && case \"$*\" in *glean*|'mcp list'*) ;; *) exit 0 ;; esac\ncase \"$1 $2\" in\n"
         "'--version ') echo '2.1.0 (Claude Code)' ;;\n"
         "'auth status') echo '{\"loggedIn\": true}' ;;\n"
@@ -2167,6 +2173,7 @@ def _glean_fakes(home):
         "'mcp list') echo '['; [ -f $f ] && { entry; echo \"    \\\"auth_status\\\": \\\"$(cat $HOME/codex-glean-auth 2>/dev/null"
         " || echo not_logged_in)\\\"\"; echo '  }'; }; echo ']' ;;\n"
         "'mcp add') echo \"$5\" > $f; echo 'Detected OAuth support. Starting OAuth flow'; sleep 1 ;;\n"
+        "'exec --skip-git-repo-check') echo 'GLEAN_ERROR=Glean search tool unavailable' ;;\n"
         "'mcp remove') rm -f $f ;;\n"
         "esac\n")
     for c in ("claude", "codex"):
@@ -2281,27 +2288,59 @@ def test_setup_box_agents_check_reports_glean_missing_signed_out_or_working(tmp_
         out = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True, timeout=120).stdout
         assert "secret-header" not in out
         return ba.read_check(out, "<box-alias>", ["claude", "codex"], [], glean)
-    # Missing.
+    # Missing, in both CLIs and both editor servers on the box.
     lines, problems, fixes = check()
-    assert problems == ["claude: glean missing", "codex: glean missing"]
+    assert problems == ["claude: glean missing", "codex: glean missing", "editor cursor: glean missing",
+                        "editor vscode: glean missing"]
     assert lines[0].endswith(", logged in, glean missing")
-    assert fixes == [f"{ba.BOX_PY} agents install <box-alias> --cli {c} --run" for c in ("claude", "codex")]
+    assert fixes == [f"{ba.BOX_PY} agents install <box-alias> --cli {c} --run" for c in ("claude", "codex")] \
+        + [f"{ba.BOX_PY} agents install <box-alias> --run"]
     # Missing with no URL configured: said how to set it, not a gap.
     lines, problems, _ = check(None)
     assert problems == [] and "glean not set up (no URL configured" in lines[0]
+    assert not any(ln.startswith("editor ") for ln in lines)
+    # Each editor server's own MCP config gets the entry (merged, backed up once); a second run keeps it.
+    (home / ".cursor").mkdir()
+    (home / ".cursor/mcp.json").write_text(json.dumps({"mcpServers": {"device": {"command": "x"}}}))
+    add = ba.editor_mcp_script("add", url)
+    out = subprocess.run(["sh", "-c", add], env=env, capture_output=True, text=True, timeout=60).stdout
+    assert out.split() == ["edmcp_cursor=added", "edmcp_vscode=added"], out
+    cursor = json.loads((home / ".cursor/mcp.json").read_text())
+    assert cursor["mcpServers"] == {"device": {"command": "x"}, "glean": {"url": url}}
+    assert json.loads((home / ".cursor/mcp.json.ttp-bak").read_text()) == {"mcpServers": {"device": {"command": "x"}}}
+    vscode = json.loads((home / ".vscode-server/data/User/mcp.json").read_text())
+    assert vscode == {"servers": {"glean": {"type": "http", "url": url}}}
+    out = subprocess.run(["sh", "-c", ba.editor_mcp_script("add", "https://other.invalid/g")], env=env,
+                         capture_output=True, text=True, timeout=60).stdout
+    assert out.split("\n")[0] == f"edmcp_cursor=kept (on another URL: {url})"
+    assert json.loads((home / ".cursor/mcp.json").read_text()) == cursor
     # Configured, signed out.
     for c in ("claude", "codex"):
         (home / f"{c}-mcp").write_text(url + "\n")
     lines, problems, fixes = check()
     assert problems == ["claude: glean signed out", "codex: glean signed out"]
-    assert lines[1].endswith(", glean configured, signed out")
+    assert lines[1].endswith(", glean configured but signed out")
+    assert lines[2:] == ["editor cursor: glean configured (it signs in from the editor's own MCP view)",
+                         "editor vscode: glean configured (it signs in from the editor's own MCP view)"]
     assert fixes == [f"{ba.BOX_PY} agents login <box-alias> {c} --mcp glean  (relay its sign-in link to the user)"
                      for c in ("claude", "codex")]
     # Working.
     (home / "claude-glean-status").write_text("\u2713 Connected\n")
     (home / "codex-glean-auth").write_text("o_auth\n")
     lines, problems, fixes = check()
-    assert problems == [] and fixes == [] and all(ln.endswith(", glean working") for ln in lines), lines
+    assert problems == [] and fixes == [] and all(ln.endswith(", glean working") for ln in lines[:2]), lines
+    # A real search proves working; one that fails is a gap, whatever the config says.
+    out = subprocess.run(["sh", "-c", ba.search_script(["claude", "codex"])], env=env, capture_output=True,
+                         text=True, timeout=120).stdout
+    search = {ln.split("=", 1)[0][7:]: ln.split("=", 1)[1] for ln in out.splitlines()}
+    assert search == {"claude": "GLEAN_RESULTS=7", "codex": "GLEAN_ERROR=Glean search tool unavailable"}
+    assert "--allowedTools=mcp__glean" in (home / "claude-p.args").read_text() and "mcp__glean__search" in ba.SEARCH_PROMPT
+    lines, problems, _ = check_search = ba.read_check(
+        subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True, timeout=120).stdout,
+        "<box-alias>", ["claude", "codex"], [], url, search)
+    assert lines[0].endswith(", glean working (search: 7 results)")
+    assert lines[1].endswith(", glean configured but its search failed (GLEAN_ERROR=Glean search tool unavailable)")
+    assert problems == ["codex: glean search failed (GLEAN_ERROR=Glean search tool unavailable)"]
     # An entry on another URL is kept and only noted; an error the CLI reports is a gap.
     (home / "codex-mcp").write_text("https://old.example.invalid/mcp\n")
     (home / "claude-glean-status").write_text("\u2718 Failed to connect\n")
@@ -2309,16 +2348,17 @@ def test_setup_box_agents_check_reports_glean_missing_signed_out_or_working(tmp_
     assert problems == ["claude: glean not working (\u2718 Failed to connect)"]
     assert lines[1].endswith(", glean working (kept on another URL: https://old.example.invalid/mcp)"), lines
     assert not any("agents install" in f for f in fixes)
-    # The sign-in is Codex's paste flow, Claude Code's under a terminal; both are seen as signed in once done.
-    assert "mcp login glean --no-browser" in ba.login_script("codex", "glean")
-    assert "script -qefc" in ba.login_script("claude", "glean") and "\\r" in ba.code_script("claude", "glean")
+    # Both sign-ins run in the box's own tmux server; both are seen as signed in once done.
+    for c in ("claude", "codex"):
+        assert "mcp login glean --no-browser" in ba.login_script(c, "glean") and ba.LOGIN_TMUX in ba.login_script(c, "glean")
     (home / "codex-mcp").write_text(url + "\n")
     for c in ("claude", "codex"):
         st = subprocess.run(["sh", "-c", ba.status_script(c, "glean")], env=env, capture_output=True, text=True,
                             timeout=120).stdout
         assert ba._state(st) == ("logged-in" if c == "codex" else "logged-out"), (c, st)
-    assert ba.callback_forward(["https://g.invalid/oauth?redirect_uri=http%3A%2F%2F127.0.0.1%3A40635%2Fcb&x=1"]) \
-        == "40635:127.0.0.1:40635"
+    assert ba.callback_forward("127.0.0.1:40635") == "40635:127.0.0.1:40635"
+    assert ba.callback_forward("[::1]:40635") == "40635:[::1]:40635" and ba.callback_forward("*:5") == "5:127.0.0.1:5"
+    assert ba.callback_forward("") is None and ba.callback_forward("unknown") is None
     # A Claude Code too old for `mcp login` starts nothing and gets the one step the user can take.
     (home / "no-mcp-login").write_text("")
     out = subprocess.run(["sh", "-c", ba.login_script("claude", "glean")], env=env, capture_output=True, text=True,
@@ -2332,6 +2372,84 @@ def test_setup_box_agents_check_reports_glean_missing_signed_out_or_working(tmp_
         rc = ba.cmd_login(argparse.Namespace(alias="<box-alias>", cli="claude", mcp="glean", status=False,
                                              code_stdin=False))
     assert rc == 1 and "too old for `claude mcp login`" in buf.getvalue() and "/mcp" in buf.getvalue()
+
+
+def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_while_its_callback_listens(
+        tmp_path, monkeypatch):
+    import argparse
+    import contextlib
+    import io
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+    if not shutil.which("tmux"):
+        pytest.skip("no tmux")
+    ba = _agents(monkeypatch)
+    home, env = _agents_home(tmp_path)
+    _glean_fakes(home)
+    (home / "claude-mcp").write_text("https://g.invalid/mcp\n")
+    # A fake ss: the sign-in's callback listens once $HOME/listen exists.
+    (tmp_path / "shim/ss").write_text("#!/bin/sh\n[ -f \"$HOME/listen\" ] && echo 'LISTEN 0 4096 127.0.0.1:41234 0.0.0.0:*'\n"
+                                     "exit 0\n")
+    (tmp_path / "shim/ss").chmod(0o755)
+    env["TMUX_TMPDIR"] = tempfile.mkdtemp(prefix="ttpt", dir="/tmp")
+    tmux = shutil.which("tmux")
+    (tmp_path / "sysbin/tmux").unlink(missing_ok=True)
+    (tmp_path / "sysbin/tmux").symlink_to(tmux)
+
+    def run(script, input=None):
+        return subprocess.run(["sh", "-c", script], env=env, input=input, capture_output=True, text=True, timeout=120)
+
+    def login(**kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ba.cmd_login(argparse.Namespace(alias="<box-alias>", cli="claude", mcp="glean",
+                                                 **{"status": False, "code_stdin": False, **kw}))
+        return rc, buf.getvalue()
+
+    monkeypatch.setattr(ba, "_ssh", lambda alias, script, timeout, input=None: run(script, input))
+    session = ba._session("claude", "glean")
+    alive = lambda: subprocess.run([tmux, "-L", "ttp-login", "has-session", "-t", f"={session}"], env=env,
+                                   capture_output=True).returncode == 0
+    try:
+        # Nothing listens: no link is handed out, the session is stopped, and the user is told plainly.
+        rc, out = login()
+        assert rc == 1 and "https://" not in out and "port 41234 is not listening" in out, out
+        assert not alive()
+        # It listens: the link goes out with both ways to complete it, the forward aimed at the listen address.
+        (home / "listen").write_text("")
+        rc, out = login()
+        assert rc == 0 and "redirect_uri=http%3A%2F%2Flocalhost%3A41234" in out, out
+        assert "ssh -N -L 41234:127.0.0.1:41234 <their ssh alias for <box-alias>>" in out and "--code-stdin" in out
+        assert alive() and "60 min" in out
+        rc, out = login(status=True)
+        assert rc == 1 and out.strip() == "claude glean on <box-alias>: pending"
+        # A second start reuses the waiting sign-in; once its callback dies the link is called dead and replaced.
+        assert ba._state(run(ba.login_script("claude", "glean")).stdout) == "pending"
+        (home / "listen").unlink()
+        rc, out = login(status=True)
+        assert rc == 1 and "the link is dead" in out
+        again = run(ba.login_script("claude", "glean")).stdout
+        assert "replaced=41234" in again and ba._state(again) == "no-listener" and not alive()
+        (home / "listen").write_text("")
+        assert ba._state(run(ba.login_script("claude", "glean")).stdout) == "started"
+        # The browser's localhost address goes in over stdin, never on a command line, and completes it.
+        back = "http://localhost:41234/callback?code=abc&state=s"
+        assert back not in ba.code_script("claude", "glean")
+        monkeypatch.setattr(sys, "stdin", io.StringIO(back + "\n"))
+        rc, out = login(code_stdin=True)
+        assert rc == 0 and "passed to the pending" in out, out
+        for _ in range(100):
+            if (home / "pasted").exists():
+                break
+            time.sleep(0.1)
+        assert (home / "pasted").read_text().strip() == back
+        rc, out = login(status=True)
+        assert rc == 0 and out.strip() == "claude glean on <box-alias>: logged-in"
+    finally:
+        subprocess.run([tmux, "-L", "ttp-login", "kill-server"], env=env, capture_output=True)
+        shutil.rmtree(env["TMUX_TMPDIR"], ignore_errors=True)
 
 
 def test_setup_box_agents_editor_defaults_merge_keeps_entries_and_comments(tmp_path, monkeypatch):
