@@ -3709,6 +3709,16 @@ def cmd_lock(a) -> None:
                 f"`ttp lock --probe{' --shared' if a.shared else ''} {a.resource}`", 75)
         time.sleep(poll_s(3))
 
+def cmd_land(a) -> None:
+    """Land a reviewed head on a push branch that is a local branch of a code repo with no git remote
+    (land.py): 0 landed, 3 a conflict, any other exit lands nothing."""
+    from . import land
+    p = here()
+    if not p:
+        die("ttp land: no project here (run it in a project or with TTP_PROJECT set)")
+    sys.exit(land.run(p, a))
+
+
 def cmd_landed(a) -> None:
     """Probe for start_when/retry_when: exit 0 once a commit, or a task's landing (`--task <id>`),
     is on the push branch, also as rebased commits; 1 while not yet; 2 when it cannot tell. The
@@ -6756,7 +6766,7 @@ COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
-    ("inside a run", ("note", "notify", "checks", "lock", "detach", "devq", "push", "clip", "sandbox",
+    ("inside a run", ("note", "notify", "checks", "lock", "detach", "devq", "push", "land", "clip", "sandbox",
                       "skill", "killscan", "svcscan")),
     ("probes (retry_when, start_when)", ("landed", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal")),
@@ -7188,6 +7198,13 @@ def main(argv: list[str] | None = None) -> None:
                    help="exit 12 instead of 255 when the host is not reachable (not for retry_when: "
                         "only 255 keeps a waiting task asleep)")
     s.set_defaults(fn=cmd_ssh_preflight)
+
+    s = sub.add_parser("land", help="land a reviewed head on a local push branch (code repo with no git remote): "
+                                    "replay its commits onto the tip, run the push checks, fast-forward; 0 landed, "
+                                    "3 conflict, other exits land nothing")
+    s.add_argument("head", help="the reviewed commit (or branch) to land")
+    s.add_argument("--task", type=int, help="the task to record the landing for (default: this run's task)")
+    s.set_defaults(fn=cmd_land)
 
     s = sub.add_parser("landed", help="exit 0 once a commit or a task's landing is on the push branch, even "
                                       "rebased (same patch-id or author/date/subject), 1 while not yet, 2 if it "

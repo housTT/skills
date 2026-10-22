@@ -70,6 +70,7 @@ from . import idlecap
 from . import integrity
 from . import jevuse
 from . import jobuse
+from . import land
 from . import landed
 from . import lease as leasemod
 from . import localspend
@@ -8638,6 +8639,7 @@ class Daemon:
             ref = landed._push_ref(self.p, self.p.root) if d.get("push_branch") else ""
             never = push.push_branch_problem(d["push_branch"], self.p.root, push.allow_protected(d)) \
                 if d.get("push_branch") and d.get("push_allowed", True) else ""
+            never = "" if never and land.local_branch(self.p, self.p.root) else never   # `ttp land` lands it
         except Exception:
             log(self.p, "unreviewed sweep failed\n" + traceback.format_exc())
             return []
@@ -8842,6 +8844,8 @@ class Daemon:
         # exit 2 and block the review, and a raw `git push` would skip the checks and the queue.
         never = "" if delivered or elsewhere or off or not (d.get("push_branch") and d.get("push_allowed", True)) \
             else push.push_branch_problem(d["push_branch"], self.p.root, push.allow_protected(d))
+        # A local push branch of a code repo with no git remote lands with `ttp land` (land.py) instead.
+        lands = land.local_branch(self.p, self.p.root) if never and full and not (pr or published) else ""
         pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered and not elsewhere \
             and not off and not never
         if delivered:
@@ -8870,6 +8874,8 @@ class Daemon:
             lines.append(f"It must not reach {d['push_branch']}: {off}. Review only: if it passes, hand off "
                          f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch"
                          + (" and the PR" if pr else "") + " as they are.")
+        elif lands:
+            lines.append(land.step(lands, full))
         elif never:
             lines.append(f"Nothing can be pushed: {never.removeprefix('delivery.push_branch: ')}. Review only: if it "
                          f"passes, hand off `done`; do not run `ttp push` or approve it for the push queue, and "
@@ -8889,10 +8895,11 @@ class Daemon:
         if notes := own_free(str(rules.get("auto_notes") or ""), own_mode):
             lines.append(notes)
         own_step = bool(elsewhere and not uncreatable and d.get("push_allowed", True))
-        lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes or own_step else "."))
+        lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes or own_step else
+                                                          ", and the landed commit." if lands else "."))
         # A review that publishes with `ttp push --own` carries the branch it publishes onto, as its subject does.
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
-            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never else []) \
+            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never else []) + ([push.LAND_LABEL] if lands else []) \
             + ([f"pr_branch:{elsewhere}"] if own_step else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
@@ -9216,6 +9223,12 @@ class Daemon:
                 if not step:
                     step = (f"Review only: {why}. If it passes, hand off `done`; do not push it anywhere or approve "
                             f"it for the push queue. This overrides any push step in the first review's spec.")
+            # A stack that lands with `ttp land` lands the fix's head, not the head the first review named.
+            lands = land.local_branch(self.p, self.p.root) \
+                if not step and push.LAND_LABEL in push._labels(review) + push._labels(first) else ""
+            if lands:
+                tail = [ln for ln in tail if not ln.startswith(land.STEP)]
+                step = land.step(lands, f"<#{fid}'s head as you reviewed it>")
             first_spec = "\n".join(body + tail)
             rid = db.add_task(f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
                               "\n".join([
@@ -9231,7 +9244,7 @@ class Daemon:
                               kind="review", tier=rtier, priority=review["priority"], origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
                               depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"]
-                              + ([push.REVIEW_ONLY_LABEL] if only else [])
+                              + ([push.REVIEW_ONLY_LABEL] if only else []) + ([push.LAND_LABEL] if lands else [])
                               + ([f"pr_branch:{onto}"] if publish and onto else []),
                               **(pin_of(review) or pin_of(code)))
             if prfix:

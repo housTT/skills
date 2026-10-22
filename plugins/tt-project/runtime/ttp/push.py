@@ -2173,6 +2173,7 @@ def pr_change(p: Project, url: str) -> dict | None:
 
 
 REVIEW_ONLY_LABEL = "review_only"   # a review whose change must not reach the push branch (kept_off)
+LAND_LABEL = "lands_local"   # a review that lands with `ttp land` on a local push branch (no git remote)
 # A spec keeps its change off the push branch only with an explicit marker line, never by its prose:
 # free text cannot tell a ban from a sentence that reports, quotes or conditions one.
 _NO_PUSH_MARKER = re.compile(r"^[ \t]*no_push:[ \t]*(.*?)[ \t]*$", re.M)
@@ -3153,10 +3154,18 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
 def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None, after: bool = True) -> int:
     if os.environ.get("TTP_CHECK_OUTPUT_DIR"):
         return _run(p, repo, own, recorded, after)
+    recorded = recorded or recorded_checks(os.environ.get("TTP_RUN_DIR"))
+    return in_check_scratch(p, lambda: _run(p, repo, own, recorded, after))
+
+
+def in_check_scratch(p: Project, fn: Callable[[], int], what: str = "ttp push") -> int:
+    """fn() with the checks' output going to a scratch directory of the project's own (checkdirs),
+    as `ttp push` and `ttp land` run their checks; CHECKS_FAILED when it cannot be set up."""
+    if os.environ.get("TTP_CHECK_OUTPUT_DIR"):
+        return fn()
     output = None
     guard = None
     previous = dict(os.environ)
-    recorded = recorded or recorded_checks(previous.get("TTP_RUN_DIR"))
     try:
         output = checkdirs.new(p.state)
         guard = checkdirs.take(output)
@@ -3170,9 +3179,9 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None,
         os.environ.clear()
         os.environ.update(env)
         os.environ['TTP_CHECKS_TMP_FD'] = str(guard.fileno())
-        return _run(p, repo, own, recorded, after)
+        return fn()
     except OSError as e:
-        print(f"ttp push: {e}", file=sys.stderr)
+        print(f"{what}: {e}", file=sys.stderr)
         return CHECKS_FAILED
     finally:
         os.environ.clear()

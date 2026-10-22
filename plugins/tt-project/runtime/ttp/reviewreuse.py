@@ -49,20 +49,25 @@ def pushes(cfg: dict, labels: list | tuple = ()) -> bool:
     """Whether a review with `labels` (a code task's review: no labels) would deliver its head to the
     push branch: the project pushes to one and the review is not labelled review only."""
     from .project import push_allowed
-    from .push import REVIEW_ONLY_LABEL
+    from .push import LAND_LABEL, REVIEW_ONLY_LABEL
     d = cfg.get("delivery") or {}
-    return push_allowed(d) and bool(str(d.get("push_branch") or "").strip()) and REVIEW_ONLY_LABEL not in labels
+    return push_allowed(d) and bool(str(d.get("push_branch") or "").strip()) \
+        and (REVIEW_ONLY_LABEL not in labels or LAND_LABEL in labels)
 
 
 def delivered(p, sha: str) -> bool:
-    """Whether head `sha` is on its way or already there: a live push_queue row for it, or the push
-    target's tip as last fetched contains it."""
-    from . import pushq
+    """Whether head `sha` is on its way or already there: a live push_queue row for it, a review that
+    reviewed it and recorded a landing (`ttp land`), or the push target's tip as last fetched (a
+    local branch in a code repo with no git remote) contains it."""
+    from . import push, pushq
     if p.db.one("SELECT 1 FROM push_queue WHERE head=? AND status IN ('approved','batched','held','pushed',"
                 "'landed') LIMIT 1", (sha,)):
         return True
+    if p.db.one("SELECT 1 FROM task_landings l JOIN tasks t ON t.id=l.task WHERE t.kind='review' AND t.labels LIKE ? "
+                "LIMIT 1", (f'%"{HEAD_LABEL}{sha}@%',)):
+        return True
     tgt = pushq.target(p)
-    tip = pushq._tracking_tip(p, *tgt) if tgt else ""
+    tip = (push._local_tip(p.root, tgt[1]) if push.remote_less(p.root) else pushq._tracking_tip(p, *tgt)) if tgt else ""
     return bool(tip) and pushq._contains(p, [tip], sha)
 
 
