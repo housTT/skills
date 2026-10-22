@@ -9900,3 +9900,73 @@ def test_ttp_land_waits_for_another_landing_and_runs_from_the_cli(env, monkeypat
         cli.main(["land", head])
     assert e.value.code == 0 and _git_out(repo, "rev-parse", "proj") == head
     assert p.db.one("SELECT task FROM task_landings")["task"] == t
+
+
+def _repo_state(repo):
+    """Everything a dry run must leave alone: refs, worktrees, objects and the index."""
+    objects = sorted(str(x.relative_to(repo)) for x in (repo / ".git" / "objects").rglob("*") if x.is_file())
+    return (_git_out(repo, "for-each-ref", "--format=%(refname) %(objectname)"), _worktrees(repo), objects,
+            (repo / ".git" / "index").read_bytes(), _git_out(repo, "status", "--porcelain"))
+
+
+def test_ttp_land_dry_run_reports_a_clean_landing_or_a_conflict_and_writes_nothing(env, monkeypatch):
+    """`ttp land --dry-run` replays in a throwaway clone: a clean head exits 0 naming the checks it would
+    run (without running them) and the records it would write, a conflict exits 3, and neither moves a
+    ref, adds an object or worktree, writes a record or takes the landing lock."""
+    from ttp import push
+    log = env["tmp"] / "checked"
+    land, p, repo, t, head = _land_setup(env, monkeypatch, [f"echo ran >> {log}"])
+    tip = _on_proj(repo, "b.txt", "b\n")
+    before = _repo_state(repo)
+    monkeypatch.setattr(push, "take", lambda *a, **k: pytest.fail("a dry run took the landing lock"))
+    said = []
+    assert land.land(p, repo, head, t, said.append, dry=True) == 0, said
+    text = "\n".join(said)
+    assert "replays 1 commit(s)" in text and f"echo ran >> {log}" in text and "not run now" in text, text
+    assert f"would record a landing of task #{t}" in text and "nothing written" in said[-1], text
+    assert not log.exists() and _repo_state(repo) == before
+    assert not p.db.q("SELECT * FROM task_landings") and _git_out(repo, "rev-parse", "proj") == tip
+    _on_proj(repo, "a.txt", "other\n")
+    before = _repo_state(repo)
+    said = []
+    assert land.land(p, repo, head, t, said.append, dry=True) == 3, said
+    assert "conflict replaying" in said[0] and "a.txt" in said[0] and "would exit 3" in said[-1], said
+    assert _repo_state(repo) == before and not p.db.q("SELECT * FROM task_landings")
+    # Its branch checked out with uncommitted changes: 6, as the landing would.
+    _git_out(repo, "branch", "-f", "proj", tip)
+    side = env["tmp"] / "side"
+    _git_out(repo, "worktree", "add", "-q", str(side), "proj")
+    (side / "b.txt").write_text("dirty\n")
+    said = []
+    assert land.land(p, repo, head, t, said.append, dry=True) == 6, said
+
+
+def test_ttp_land_root_lands_in_another_repo_and_the_cli_dry_run_changes_nothing(env, monkeypatch, capsys):
+    """`ttp land --root <repo>` works on that repo, not the current directory's: a temporary clone
+    with its remote removed takes a dry run and then the landing while the project's repo keeps its
+    branch; a missing --root is refused. --help says the push checks run on the replayed head."""
+    from ttp import cli
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    tip = _on_proj(repo, "b.txt", "b\n")
+    clone = env["tmp"] / "try"
+    _git_out(env["tmp"], "clone", "-q", str(repo), str(clone))
+    _git_out(clone, "remote", "remove", "origin")
+    _git_out(clone, "branch", "proj", tip)
+    monkeypatch.chdir(env["tmp"])
+    before = _repo_state(clone)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["land", head, "--root", str(clone), "--task", str(t), "--dry-run"])
+    assert e.value.code == 0, capsys.readouterr().err
+    assert "nothing written" in capsys.readouterr().err
+    assert _repo_state(clone) == before and not p.db.q("SELECT * FROM task_landings")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["land", head, "--root", str(clone), "--task", str(t)])
+    assert e.value.code == 0, capsys.readouterr().err
+    assert _git_out(clone, "rev-parse", "proj^") == tip and _git_out(repo, "rev-parse", "proj") == tip
+    with pytest.raises(SystemExit) as e:
+        cli.main(["land", head, "--root", str(env["tmp"] / "nope")])
+    assert e.value.code == 2 and "no such directory" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["land", "--help"])
+    out = capsys.readouterr().out
+    assert "--dry-run" in out and "--root" in out and "push checks" in out

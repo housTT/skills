@@ -16,7 +16,14 @@ branch moves during the checks, it starts over on the new tip, up to MOVE_TRIES 
 Exit codes: 0 landed (or already there); 1 git failed for a reason other than a conflict; 2 refused;
 3 a conflict (unmerged paths); 4 a check failed; 5 the branch kept moving during the checks; 6 the
 checkout that has the branch has uncommitted changes; 75 another landing held the branch. Only 0
-moves the branch; the scratch worktree is always removed."""
+moves the branch; the scratch worktree is always removed.
+
+`--root <repo>` lands in that repo instead of the current directory's, e.g. a temporary clone with
+its remote removed, to try a landing first. `--dry-run` writes nothing and moves no ref: it replays the
+commits in a throwaway shared clone (so not even the repo's object store changes), says whether they
+conflict, which push checks would run (it does not run them), whether the branch's checkout is dirty,
+and the landing and review records it would write, and exits with the code a landing would get as
+far as it can tell without running the checks (0, 1, 2, 3, 4 when no check could pass, or 6)."""
 from __future__ import annotations
 
 import os
@@ -180,24 +187,37 @@ def _move(repo: Path, branch: str, base: str, new: str, say: Callable[[str], Non
     return LANDED
 
 
-def record(p: Project, tid: int | None, head: str, new: str, branch: str) -> None:
+def record(p: Project, tid: int | None, head: str, new: str, branch: str, dry: bool = False) -> list[str]:
     """Record that task `tid` landed reviewed `head` as `new` on local branch `branch`: a task_landings
     row (landed.task_shas: `landed:#<id>` for it and every task it carries), and, on a review that
-    recorded `head` as the head it reviews, the same verdict for `new` (reviewreuse)."""
+    recorded `head` as the head it reviews, the same verdict for `new` (reviewreuse). Returns a line
+    per record; with `dry`, writes nothing."""
     task = p.db.task(tid) if tid else None
     if not task:
-        return
-    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES(?,?,?,?) ON CONFLICT(marker) DO NOTHING",
-           (f"land-t{tid}-{new}", tid, new, f"{push.LOCAL}/{branch}"))
+        return []
+    lines = [f"a landing of task #{tid} as {new[:10]} on {push.LOCAL}/{branch} (task_landings; `landed:#{tid}` passes)"]
+    if not dry:
+        p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES(?,?,?,?) ON CONFLICT(marker) DO NOTHING",
+               (f"land-t{tid}-{new}", tid, new, f"{push.LOCAL}/{branch}"))
     if task.get("kind") == "review" and new != head and (rec := reviewreuse.recorded(task)) and rec[0] == head:
         labels = push._labels(task)
-        if (lb := reviewreuse.head_label(new, rec[1])) not in labels:
+        lines.append(f"review #{tid}'s verdict on {head[:10]} also for {new[:10]} (reviewreuse)")
+        if not dry and (lb := reviewreuse.head_label(new, rec[1])) not in labels:
             p.db.update_task(tid, labels=labels + [lb])
+    return lines
+
+
+def _record(p: Project, tid: int | None, head: str, new: str, branch: str, say: Callable[[str], None],
+            dry: bool) -> None:
+    for line in record(p, tid, head, new, branch, dry):
+        if dry:
+            say(f"dry run: would record {line}")
 
 
 def land(p: Project, repo: Path, head: str, tid: int | None = None,
-         say: Callable[[str], None] = lambda m: print(f"ttp land: {m}", file=sys.stderr)) -> int:
-    """Land `head` on the project's local push branch (local_branch); see the module's exit codes."""
+         say: Callable[[str], None] = lambda m: print(f"ttp land: {m}", file=sys.stderr), dry: bool = False) -> int:
+    """Land `head` on the project's local push branch (local_branch); see the module's exit codes.
+    `dry`: only say what it would do (the module's --dry-run)."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     branch = local_branch(p, repo)
     if not branch:
@@ -208,6 +228,8 @@ def land(p: Project, repo: Path, head: str, tid: int | None = None,
     if not full:
         say(f"no commit {head} in {repo}")
         return REFUSED
+    if dry:
+        return _attempt(p, repo, branch, full, tid, say, dry)
     d = p.config().get("delivery") or {}
     wait = d.get("push_wait_s")
     lock = push.take(p, push.LOCAL, branch, push.default_wait(push.last_check_s(p)) if wait in (None, "")
@@ -225,12 +247,13 @@ def land(p: Project, repo: Path, head: str, tid: int | None = None,
         lock.close()
 
 
-def _attempt(p: Project, repo: Path, branch: str, full: str, tid: int | None, say: Callable[[str], None]) -> int:
-    """One landing of `full` on `branch`'s current tip, under the landing lock."""
+def _attempt(p: Project, repo: Path, branch: str, full: str, tid: int | None, say: Callable[[str], None],
+             dry: bool = False) -> int:
+    """One landing of `full` on `branch`'s current tip, under the landing lock (`dry`: a dry run)."""
     base = push._local_tip(repo, branch)
     if _git(repo, "merge-base", "--is-ancestor", full, base).returncode == 0:
         say(f"{full[:10]} is already on local branch {branch}")
-        record(p, tid, full, full, branch)
+        _record(p, tid, full, full, branch, say, dry)
         return LANDED
     fork = _git(repo, "merge-base", base, full).stdout.strip()
     if not fork:
@@ -244,8 +267,10 @@ def _attempt(p: Project, repo: Path, branch: str, full: str, tid: int | None, sa
         return REFUSED
     if not ff and not commits:
         say(f"every commit of {full[:10]} is already on local branch {branch} (same patch)")
-        record(p, tid, full, base, branch)
+        _record(p, tid, full, base, branch, say, dry)
         return LANDED
+    if dry:
+        return _dry(p, repo, branch, base, full, commits, tid, say)
     return push.in_check_scratch(p, lambda: _land(p, repo, branch, base, full, commits, tid, say), "ttp land")
 
 
@@ -278,8 +303,68 @@ def _land(p: Project, repo: Path, branch: str, base: str, full: str, commits: li
     return LANDED
 
 
+def _dry(p: Project, repo: Path, branch: str, base: str, full: str, commits: list[str], tid: int | None,
+         say: Callable[[str], None]) -> int:
+    """The dry run of _land: the replay in a shared clone of `repo` (its own objects, refs and
+    worktree, all thrown away), then what the checks, the move and the records would be."""
+    with tempfile.TemporaryDirectory(prefix="ttp-land-dry-") as tmp:
+        wt = Path(tmp) / "clone"
+        if _git(repo, "clone", "-q", "--shared", "--no-checkout", str(repo), str(wt)).returncode \
+                or _git(wt, "checkout", "-q", "--detach", base if commits else full).returncode:
+            say("dry run: could not make a scratch clone")
+            return REFUSED
+        for key in ("user.name", "user.email"):
+            if val := _git(repo, "config", key).stdout.strip():
+                _git(wt, "config", key, val)
+        if commits and (rc := _replay(wt, commits, say)):
+            say(f"dry run: a landing would exit {rc}; local branch {branch} would stay at {base[:10]}")
+            return rc
+        new = _git(wt, "rev-parse", "HEAD").stdout.strip()
+        if new == base:
+            say(f"every commit of {full[:10]} is already on local branch {branch}")
+            _record(p, tid, full, base, branch, say, True)
+            return LANDED
+        how = (f"replays {len(commits)} commit(s) of {full[:10]} onto {base[:10]} cleanly (as {new[:10]} here; "
+               f"the landing's commit ids differ by their commit time)") if commits else \
+            f"fast-forwards {branch} from {base[:10]} to {new[:10]}"
+        say(f"dry run: {how}")
+        d = p.config().get("delivery") or {}
+        checks = push.with_host(push.check_list(d.get("push_checks")), d.get("checks_host"))
+        if not checks:
+            if code := push.code_paths(wt, base, new):
+                say(f"dry run: no checks configured, and this change touches more than docs ({', '.join(code[:3])}); "
+                    f"a landing would exit {CHECKS_FAILED}")
+                return CHECKS_FAILED
+            say("dry run: no checks configured; a docs-only change lands without them")
+        else:
+            try:
+                todo, skipped = push.applicable(wt, new, checks, say, base)
+            except push.ScopeError as e:
+                say(f"dry run: {e}; a landing would exit {CHECKS_FAILED}")
+                return CHECKS_FAILED
+            if todo:
+                say(f"dry run: would run the push checks on the replayed head (not run now): {'; '.join(todo)}")
+            elif not push.outside_scope(checks, skipped):
+                say(f"dry run: {push.NONE_APPLY}; a landing would exit {CHECKS_FAILED}: {push.NONE_APPLY_FIX}")
+                return CHECKS_FAILED
+    if held := _holder(repo, branch):
+        dirty = _git(Path(held), "status", "--porcelain", "--untracked-files=no")
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            say(f"dry run: {branch} is checked out in {held} with uncommitted changes; a landing would exit {DIRTY}")
+            return DIRTY
+    say(f"dry run: then fast-forwards {branch} from {base[:10]}" + (f" in {held}" if held else ""))
+    _record(p, tid, full, new, branch, say, True)
+    say("dry run: nothing written, no ref moved")
+    return LANDED
+
+
 def run(p: Project, args) -> int:
-    """`ttp land <head> [--task <id>]`: the task defaults to the run's own (TTP_TASK)."""
+    """`ttp land <head> [--task <id>] [--root <repo>] [--dry-run]`: the task defaults to the run's
+    own (TTP_TASK), the repo to the current directory's."""
     tid = args.task if args.task is not None else (int(os.environ["TTP_TASK"]) if re.fullmatch(
         r"[0-9]+", os.environ.get("TTP_TASK", "")) else None)
-    return land(p, Path.cwd(), args.head, tid)
+    root = Path(args.root).expanduser() if getattr(args, "root", None) else Path.cwd()
+    if not root.is_dir():
+        print(f"ttp land: --root {root}: no such directory", file=sys.stderr)
+        return REFUSED
+    return land(p, root, args.head, tid, dry=bool(getattr(args, "dry_run", False)))
