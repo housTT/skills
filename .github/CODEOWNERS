@@ -19,13 +19,16 @@
 /SOURCES.md @blozano-tt @yieldthought
 /plugins/tt-review-skills/ @blozano-tt @yieldthought
 # Staged TTNN model bring-up
-/plugins/tt-model-bringup/ @yieldthought @tchedaTT
+/plugins/tt-model-bringup/ @yieldthought @tchedaTT @odjuricicTT @mvasiljevicTT
 
 # Debug tools
 /plugins/tt-debug-tools/ @ppetrovicTT
 
 # Tenstorrent operating principles
 /plugins/tt-buddy/ @ppetrovicTT
+
+# Model-deployment lifecycle (launch, verify; discover/retrieve to follow)
+/plugins/tt-serve-model/ @ctr-fmamedov-crypto @ndalyTT
 
 # Model kernel-op analysis
 /plugins/tt-model-op-analysis/ @ctr-mmicic
