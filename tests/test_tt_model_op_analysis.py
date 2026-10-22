@@ -49,6 +49,14 @@ def test_setup_asks_source_first_then_model_ref_implementation_test():
     assert [flow.index(h) for h in heads] == sorted(flow.index(h) for h in heads)
 
 
+def test_device_runs_are_sequential():
+    skill = (PLUGIN / "skills" / "model-op-analysis" / "SKILL.md").read_text()
+    assert "Device runs are sequential: one device job at a time" in skill
+    assert "never give device runs to parallel subagents" in skill
+    source = (PLUGIN / "references" / "measured-source.md").read_text()
+    assert "one after the other" in source and "never two at once" in source
+
+
 def test_destination_is_a_projection_of_source_rows():
     static = (PLUGIN / "references" / "static-phase.md").read_text()
     section = static[static.index("## Adding a destination"):]

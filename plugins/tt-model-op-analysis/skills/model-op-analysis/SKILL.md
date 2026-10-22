@@ -72,6 +72,10 @@ resolve every `<plugin-root>/...` path against it.
 - Measurements run on the run's `tt_metal_commit` only; `same_commit.py` is the gate.
 - Physical-device commands go through `tt-device-mcp`; TTsim runs on the host with Bash, never
   through `tt-device-mcp`, even under a rule that routes all pytest there (`ttsim.md`).
+- Device runs are sequential: one device job at a time (probe, capture run, Tracy run), each started
+  only after the previous one has finished and the device reports healthy. Never submit a second
+  device job while one runs or is queued, and never give device runs to parallel subagents: two
+  workloads on one device can hang it and leave it held. TTsim tests also run one at a time.
 - Subagents follow the contract in `<plugin-root>/references/dispatch-tracing.md`: no nested
   subagents, one complete result.
 - Write CSVs with the scripts or a heredoc into the run directory; never retype a table to fix it.

@@ -56,7 +56,8 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
    beside the cache directory when there is one (a long run writes GB). If the entry
    test runs in a CI workflow, record its `pytest_timeout` in `run.json` as `ci_pytest_timeout_s`.
 4. Run the entry test from `run.json` (`test`) through `tt-device-mcp`, once for each run the
-   picked items need:
+   picked items need, one after the other: start the next run only when the previous one has
+   finished and the device reports healthy, never two at once:
 
    | Run | Items | Command |
    |---|---|---|
