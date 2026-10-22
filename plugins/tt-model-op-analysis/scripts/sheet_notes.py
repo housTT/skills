@@ -71,7 +71,11 @@ FIELD_NOTES = {
     "launches": "Launches per inference on this target.",
     "status": STATUS_NOTE,
     "evidence": "The decisive fact behind this target's status, with file:line.",
-    "tests": "Quasar kernel-op tests (pytest node ids) that decide the status.",
+    "tests": "Quasar kernel-op tests (pytest node ids) that decide the status. For each row the static phase picks "
+             "the tests that run the same kernel op: device op, program factory, layout and sharding, dtype. Batch, "
+             "core grid and shard sizes are not part of the match; the evidence names where a test differs from "
+             "the row. A TTsim run of these tests outweighs the static reading: a fail or xfail makes the status "
+             "❌, ✅ needs every test to pass, and timeout, error or skip decide nothing.",
     "test_result": "Simulator result of those tests: pass, fail, xfail, timeout, error, skip, or not run.",
     "statuses": "Number of rows in the ttnn calls tab with each status. " + STATUS_NOTE,
     "test_results": "Simulator result of each kernel-op test.",
