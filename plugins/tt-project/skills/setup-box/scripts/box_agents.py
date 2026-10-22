@@ -70,6 +70,11 @@ EDITOR_MCP = {"cursor": (".cursor-server", ".cursor/mcp.json", "mcpServers", {})
 SEARCH_PROMPT = (f"Call the {MCP} MCP server's search tool (mcp__{MCP}__search) with the query Tenstorrent. Use no "
                  "other tool. Then reply with one line only: GLEAN_RESULTS=<number of results>, or "
                  "GLEAN_ERROR=<short reason> if the tool is missing or fails.")
+# Codex defers MCP tools behind its own tool lookup: naming Claude's tool id or forbidding other tools makes it
+# answer that the tool is unavailable, so its prompt names only the server.
+CODEX_SEARCH_PROMPT = (f"Use the {MCP} MCP server's search tool to search for Tenstorrent. Then reply with one line "
+                       "only: GLEAN_RESULTS=<number of results>, or GLEAN_ERROR=<short reason> if the tool is missing "
+                       "or fails.")
 MCP_URL_HINT = ('set its URL with --glean-url, or in the site file as "mcp": {"glean": "<url>"} (site.md), '
                 "or run setup from a machine whose Claude Code, Codex or Cursor already has a `glean` server")
 
@@ -252,10 +257,11 @@ def _read_mcp(kv: Dict[str, str], c: str, alias: str, glean: Optional[str], prob
 def search_script(clis: Sequence[str]) -> str:
     """Shell: one non-interactive Glean search per CLI, `search_<cli>=` its one answer line (GLEAN_RESULTS=<n> or
     GLEAN_ERROR=<reason>), or `no answer`. Only that line leaves the box."""
-    s = f'T=; command -v timeout >/dev/null 2>&1 && T="timeout 300"; Q={shlex.quote(SEARCH_PROMPT)}; '
+    s = (f'T=; command -v timeout >/dev/null 2>&1 && T="timeout 300"; Q={shlex.quote(SEARCH_PROMPT)}; '
+         f'QC={shlex.quote(CODEX_SEARCH_PROMPT)}; ')
     for c in clis:
         run = (f'"$b" -p "$Q" --allowedTools=mcp__{MCP}' if c == "claude"
-               else '"$b" exec --skip-git-repo-check "$Q"')
+               else '"$b" exec --skip-git-repo-check "$QC"')
         s += (_find(c) + 'if [ -n "$b" ]; then r=$(cd "$HOME" && $T ' + run + ' </dev/null 2>/dev/null '
               '| grep -oE "GLEAN_(RESULTS=[0-9]+|ERROR=.*)" | tail -n 1 | cut -c1-160); '
               f'echo "search_{c}=${{r:-no answer}}"; fi; ')

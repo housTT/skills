@@ -2177,7 +2177,7 @@ def _glean_fakes(home):
         "'mcp list') echo '['; [ -f $f ] && { entry; echo \"    \\\"auth_status\\\": \\\"$(cat $HOME/codex-glean-auth 2>/dev/null"
         " || echo not_logged_in)\\\"\"; echo '  }'; }; echo ']' ;;\n"
         "'mcp add') echo \"$5\" > $f; echo 'Detected OAuth support. Starting OAuth flow'; sleep 1 ;;\n"
-        "'exec --skip-git-repo-check') echo 'GLEAN_ERROR=Glean search tool unavailable' ;;\n"
+        "'exec --skip-git-repo-check') echo \"$3\" > $HOME/codex-exec.prompt; echo 'GLEAN_ERROR=Glean search tool unavailable' ;;\n"
         "'mcp remove') rm -f $f ;;\n"
         "esac\n")
     for c in ("claude", "codex"):
@@ -2344,6 +2344,11 @@ def test_setup_box_agents_check_reports_glean_missing_signed_out_or_working(tmp_
     search = {ln.split("=", 1)[0][7:]: ln.split("=", 1)[1] for ln in out.splitlines()}
     assert search == {"claude": "GLEAN_RESULTS=7", "codex": "GLEAN_ERROR=Glean search tool unavailable"}
     assert "--allowedTools=mcp__glean" in (home / "claude-p.args").read_text() and "mcp__glean__search" in ba.SEARCH_PROMPT
+    # Codex defers MCP tools behind its own tool lookup: a prompt naming Claude's tool id or forbidding other
+    # tools makes it answer 'tool unavailable', so its prompt names only the server.
+    codex_prompt = (home / "codex-exec.prompt").read_text()
+    assert "glean MCP server's search tool" in codex_prompt and "GLEAN_RESULTS=" in codex_prompt
+    assert "mcp__" not in codex_prompt and "no other tool" not in codex_prompt
     lines, problems, _ = check_search = ba.read_check(
         subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True, timeout=120).stdout,
         "<box-alias>", ["claude", "codex"], [], url, search)
