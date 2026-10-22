@@ -137,6 +137,8 @@ METER_EVERY_S = 600
 RED_CLEAR_RATIO = 0.8
 RED_REPEAT_S = 3600
 CLEAN_STOP_KEY = "clean_stop"   # kv: {boot, ts} of the daemon's last clean stop
+SCHEDULE_GAP_KEY = "schedule_gap_names"   # kv: schedule-gap issue key -> the schedules it names (sweep_schedule_gaps)
+SCHEDULE_GAP_CLEARED = "every schedule named ran again"
 LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
 WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service restarts the daemon
@@ -1069,6 +1071,7 @@ class Daemon:
         self._run_step(lambda: scr.expire_mutes(self.p.db, where=self.p), "expire_mutes")
         self._run_step(self.check_mute_ends)
         self._run_step(self.sweep_watcher_issues)
+        self._run_step(self.sweep_schedule_gaps)
         self._run_step(self.review_jev)
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
@@ -4425,7 +4428,42 @@ class Daemon:
                  (now, "daemon:schedule-gap", "schedule_gap", f"schedule-gap:{int(since)}", "low", text[:4000],
                   "record"))
         else:
-            self.observe("daemon:schedule-gap", text, "normal", whole=True, key=f"schedule-gap:{int(since)}")
+            key = f"schedule-gap:{int(since)}"
+            named = dict(db.kv(SCHEDULE_GAP_KEY) or {})
+            named[key] = sorted(set(named.get(key) or ()) | {s["name"] for s, _ in gaps})
+            db.set_kv(SCHEDULE_GAP_KEY, named)
+            self.observe("daemon:schedule-gap", text, "normal", whole=True, key=key)
+
+    def sweep_schedule_gaps(self) -> int:
+        """Close each open schedule-gap issue once every schedule it names has run since its last sighting
+        or is off (disabled or removed): the gap is over, and only a new one opens it again. An issue whose
+        names were never recorded stays open for a hand close. Returns how many closed."""
+        db = self.p.db
+        named = db.kv(SCHEDULE_GAP_KEY) or {}
+        if not named:
+            return 0
+        rows = db.q("SELECT id, watch_key, last_seen, history FROM issues WHERE source='daemon:schedule-gap' "
+                    "AND status='open'")
+        live = {r["name"]: r for r in db.q("SELECT name, enabled, last_run FROM schedules")}
+        now, n, still = time.time(), 0, set()
+        for r in rows:
+            names = named.get(r["watch_key"])
+            if not names:
+                continue
+            still.add(r["watch_key"])
+            ran = [x for x in names if live.get(x) and live[x]["enabled"]]
+            if any(float(live[x]["last_run"] or 0) <= float(r["last_seen"] or 0) for x in ran):
+                continue
+            why = SCHEDULE_GAP_CLEARED if len(ran) == len(names) else SCHEDULE_GAP_CLEARED + " or is off"
+            history = json.loads(r["history"] or "[]") + [{"ts": now, "action": "closed", "by": "daemon", "why": why}]
+            db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=?, history=? WHERE id=?",
+                 (now, why, json.dumps(history), r["id"]))
+            still.discard(r["watch_key"])
+            n += 1
+        keep = {k: v for k, v in named.items() if k in still}   # a closed one's names: a new sighting writes them again
+        if keep != named:
+            db.set_kv(SCHEDULE_GAP_KEY, keep)
+        return n
 
     def _start_schedule(self, s: dict, payload: dict) -> schedrun.Run:
         """Start one command, heal, builtin watcher or prechecked llm run in its own thread. It works on a

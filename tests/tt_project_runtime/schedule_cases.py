@@ -418,3 +418,55 @@ def test_turning_a_schedule_off_or_removing_it_ends_its_mutes_and_the_audit_skip
     assert not any("watcher:watch" in h for h in held), "the off schedule's mute is skipped"
     p.db.x("DELETE FROM schedules WHERE name='live'")
     assert not any("watcher:live" in h for h in audit.overrides(p, p.db, now, 12)), "a gone schedule's too"
+
+
+def test_a_schedule_gap_issue_closes_itself_once_every_schedule_it_names_ran_again_or_is_off(env):
+    """A one-time gap is over once each schedule it named has run again (or was turned off or removed):
+    the tick's sweep closes its issue with the reason, so none stays open for days until a hand close."""
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon, SCHEDULE_GAP_CLEARED, SCHEDULE_GAP_KEY
+    p = make(env)
+    _late_schedule(p, 3 * 3600)
+    sched.upsert(p.db, "other", "command", "30m", payload={"command": "true", "timeout_s": 30})
+    sched.upsert(p.db, "gone", "command", "30m", payload={"command": "true", "timeout_s": 30})
+    now = time.time()
+    p.db.x("UPDATE schedules SET last_run=?, next_run=? WHERE name IN ('other','gone')", (now - 4 * 3600, now - 3 * 3600))
+    d = Daemon(p.base)
+    d.gates = {}
+    d._started = now - 10 * 3600
+    d._schedule_gaps([dict(r) for r in p.db.q("SELECT * FROM schedules")])
+    issue = _gap_issue(p)
+    assert issue["status"] == "open"
+    assert p.db.kv(SCHEDULE_GAP_KEY)[issue["watch_key"]] == ["gone", "other", "watch"]
+    assert d.sweep_schedule_gaps() == 0 and _gap_issue(p)["status"] == "open"   # none ran yet
+    seen = float(issue["last_seen"])
+    p.db.x("UPDATE schedules SET last_run=? WHERE name IN ('watch','gone')", (seen + 1,))
+    assert d.sweep_schedule_gaps() == 0 and _gap_issue(p)["status"] == "open"   # 'other' has not run
+    p.db.x("UPDATE schedules SET last_run=? WHERE name='gone'", (seen - 1,))
+    p.db.x("UPDATE schedules SET last_run=? WHERE name='other'", (seen + 2,))
+    assert d.sweep_schedule_gaps() == 0 and _gap_issue(p)["status"] == "open"   # 'gone' ran before it
+    sched.set_enabled(p.db, "gone", False)   # the rest is off
+    assert d.sweep_schedule_gaps() == 1
+    row = _gap_issue(p)
+    assert row["status"] == "fixed" and row["closed"] and row["cleared_why"].startswith(SCHEDULE_GAP_CLEARED)
+    assert "off" in row["cleared_why"] and json.loads(row["history"])[-1]["action"] == "closed"
+    assert not p.db.kv(SCHEDULE_GAP_KEY)   # its names go with it; a new gap records them again
+    assert d.sweep_schedule_gaps() == 0
+
+
+def test_a_schedule_gap_issue_closes_once_all_named_ran_in_the_tick_and_one_without_names_stays_open(env):
+    from ttp.daemon import Daemon, SCHEDULE_GAP_CLEARED
+    p = make(env)
+    _late_schedule(p, 3 * 3600)
+    d = Daemon(p.base)
+    d.gates = {}
+    d._started = time.time() - 10 * 3600
+    d.run_schedules()   # observes the gap, then runs 'watch'
+    assert p.db.one("SELECT last_run FROM schedules WHERE name='watch'")["last_run"] > _gap_issue(p)["last_seen"]
+    d.observe("daemon:schedule-gap", "Schedules missed runs since 09:00: old 3.", "normal", whole=True,
+              key="schedule-gap:1")   # from before names were recorded: left for a hand close
+    d.tick()   # its issue sweep closes the gap that is over
+    rows = {r["watch_key"]: r for r in p.db.q("SELECT * FROM issues WHERE source='daemon:schedule-gap'")}
+    assert rows["schedule-gap:1"]["status"] == "open"
+    gap = next(r for k, r in rows.items() if k != "schedule-gap:1")
+    assert gap["status"] == "fixed" and gap["cleared_why"] == SCHEDULE_GAP_CLEARED
