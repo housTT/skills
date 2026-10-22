@@ -151,9 +151,9 @@ def test_missing_benchmark_evidence_fails_closed(tmp_path):
         check(tmp_path / 'models/autoports/model')
 
 
-def expectations_fixture():
+def expectations_fixture(profiles=(1, 8, 16)):
     return {str(n): {'max_ttft_ms': 10, 'min_decode_tokens_per_second_per_user': 100,
-                     'source': 'synthetic prior measurement'} for n in (1, 8, 16)}
+                     'source': 'synthetic prior measurement'} for n in profiles}
 
 
 def performance_fixture(requests, output_tokens=128):
@@ -230,7 +230,7 @@ def fake_roofline_command(argv):
     return True
 
 
-def valid_gate_fixture(tmp_path):
+def valid_gate_fixture(tmp_path, profiles=(1, 8, 16), accuracy_cache=False):
     root = tmp_path / 'models/autoports/model'
     evidence = root / 'doc/benchmark'
     evidence.mkdir(parents=True)
@@ -247,19 +247,20 @@ def valid_gate_fixture(tmp_path):
                 'tasks': {t: {'indices': [0, 1], 'document_sha256': [digest(d) for d in docs]} for t in tasks}}
     manifest['manifest_sha256'] = digest(manifest)
     write('run/manifest.json', manifest)
-    write('identity.json', server_fixture(16))
+    write('identity.json', dict(server_fixture(max(profiles)), prefix_caching=accuracy_cache))
     write('run/run_config.json', dict(model='org/model', base_url='http://unused', tasks=tasks,
-                                     budget_seconds=3600, output_tokens=128, performance_expectations=expectations_fixture()))
+                                     budget_seconds=3600, output_tokens=128, performance_expectations=expectations_fixture(profiles),
+                                     performance_concurrencies=list(profiles), accuracy_prefix_caching=accuracy_cache))
     summary = dict(status='completed', elapsed_seconds=30, accuracy={}, performance={})
     for task in tasks:
         stage = dict(model='org/model', subset_sha256=manifest['manifest_sha256'],
-                     responses=2, expected_samples=2, concurrency=16, finish_reasons={'stop': 2})
+                     responses=2, expected_samples=2, concurrency=max(profiles), finish_reasons={'stop': 2})
         summary['accuracy'][task] = stage
         write(f'run/{task}/results.json', dict(results={task: {'acc,none': 0.5}}, benchmark_stage=stage))
         (evidence / f'run/{task}/samples_{task}.jsonl').write_text(''.join(json.dumps({'doc_id': i, 'doc': d}) + '\n' for i, d in enumerate(docs)))
         response = dict(choices=[dict(index=0, message=dict(content='answer'), finish_reason='stop')])
         (evidence / f'run/{task}/responses.jsonl').write_text((json.dumps(response) + '\n') * 2)
-    for b in (1, 8, 16):
+    for b in profiles:
         server = write_server_fixture(evidence / 'run', b)
         requests = max(8, b * 3)
         raw = dict(performance_fixture(requests), model_id='org/model', max_concurrency=b)
@@ -269,14 +270,15 @@ def valid_gate_fixture(tmp_path):
         write(f'run/perf-b{b}.json', raw)
         write(f'run/perf-b{b}-warmup.json', dict(performance_fixture(b), model_id='org/model', max_concurrency=b))
     from benchmark_stage.performance import review_performance, select_accuracy_concurrency
-    summary['performance_review'] = review_performance(summary['performance'], expectations_fixture())
+    summary['performance_review'] = review_performance(summary['performance'], expectations_fixture(profiles))
     summary['accuracy_concurrency'], summary['serial_batch1_speedups'] = select_accuracy_concurrency(summary['performance'])
     server = write_server_fixture(evidence / 'run', summary['accuracy_concurrency'])
+    server['prefix_caching'] = accuracy_cache
     write('run/accuracy-server.json', server)
     summary['accuracy_server_identity_sha256'] = digest(server)
     write('run/performance_review.json', summary['performance_review'])
     write('run/summary.json', summary)
-    roofline_fixture(evidence / 'run')
+    roofline_fixture(evidence / 'run', capacities=profiles)
     return root, evidence
 
 
@@ -698,14 +700,16 @@ def test_gate_requires_real_single_user_profile(tmp_path, mutation):
         check(root)
 
 
+@pytest.mark.parametrize('profiles,accuracy_cache', [((1, 8, 16), False), ((1, 4, 32), True)])
 @pytest.mark.parametrize('wrong_capacity', [False, True])
-def test_runner_switches_server_capacity_before_each_performance_profile(tmp_path, monkeypatch, wrong_capacity):
+def test_runner_switches_server_capacity_before_each_performance_profile(tmp_path, monkeypatch, wrong_capacity, profiles, accuracy_cache):
     from benchmark_stage import run as runner
     manifest = tmp_path / 'manifest.json'
     manifest.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {'ifeval': {'tasks': ['ifeval'], 'sample_count': 1, 'population': 1}}}))
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused',
-        manifest=str(manifest), tasks=['ifeval'], performance_server_command=['server-control'], roofline_command=['collector'], performance_expectations=expectations_fixture())))
+        manifest=str(manifest), tasks=['ifeval'], performance_server_command=['server-control'], roofline_command=['collector'], performance_expectations=expectations_fixture(profiles),
+        performance_concurrencies=list(profiles), accuracy_prefix_caching=accuracy_cache)))
     events = []
     def completed(argv, log, deadline):
         if fake_roofline_command(argv): return
@@ -714,6 +718,7 @@ def test_runner_switches_server_capacity_before_each_performance_profile(tmp_pat
             path = Path(argv[argv.index('--output') + 1])
             events.append(('server', capacity))
             server = write_server_fixture(path.parent, capacity)
+            server['prefix_caching'] = '--enable-prefix-caching' in argv
             path.write_text(json.dumps(server))
             if wrong_capacity and capacity == 1:
                 server['max_num_seqs'] = 32
@@ -741,12 +746,12 @@ def test_runner_switches_server_capacity_before_each_performance_profile(tmp_pat
         assert not (tmp_path / 'run/perf-b1.json').exists()
     else:
         summary = runner.run(config_path=config_path, output=tmp_path / 'run')
-        assert events == [(action, n) for n in (1, 8, 16)
-                          for action in ('server', 'measure', 'measure')] + [('server', 16), ('accuracy', 16)]
+        assert events == [(action, n) for n in profiles
+                          for action in ('server', 'measure', 'measure')] + [('server', max(profiles)), ('accuracy', max(profiles))]
         assert summary['performance']['1']['server_max_num_seqs'] == 1
-        assert summary['performance']['16']['server_max_num_seqs'] == 16
+        assert summary['performance'][str(max(profiles))]['server_max_num_seqs'] == max(profiles)
         report = (tmp_path / 'run/REPORT.md').read_text()
-        assert report.index('| Single user | 1 | 1 |') < report.index('| 16 users | 16 | 16 |')
+        assert report.index('| Single user | 1 | 1 |') < report.index(f'| {max(profiles)} users | {max(profiles)} | {max(profiles)} |')
 
 
 def test_runner_rejects_implicit_shared_server_before_accuracy(tmp_path, monkeypatch):
@@ -915,4 +920,32 @@ def test_performance_gate_rejects_omitted_review_and_unprofitable_pool(tmp_path)
     summary_path.write_text(json.dumps(original))
     (evidence / 'run/performance_review.json').unlink()
     with pytest.raises(ValueError, match='missing benchmark evidence'):
+        check(root)
+
+
+@pytest.mark.parametrize('profiles', [[], [8], [1, 1], [True, 8], [1, 0], [1, -2], [1, 2.5], '1,8'])
+def test_invalid_performance_profiles(profiles):
+    from benchmark_stage.performance import performance_profiles
+    with pytest.raises(ValueError, match='positive integers'):
+        performance_profiles({'performance_concurrencies': profiles})
+
+
+def test_gate_supports_workload_profiles_and_cache_on_accuracy(tmp_path):
+    root, evidence = valid_gate_fixture(tmp_path, profiles=(1, 4, 32), accuracy_cache=True)
+    assert check(root) == evidence
+    path = evidence / 'run/perf-b4-server.json'
+    server = json.loads(path.read_text())
+    server['prefix_caching'] = True
+    path.write_text(json.dumps(server))
+    with pytest.raises(ValueError, match='prefix caching'):
+        check(root)
+
+
+def test_gate_rejects_accuracy_cache_mode_mismatch(tmp_path):
+    root, evidence = valid_gate_fixture(tmp_path, accuracy_cache=True)
+    path = evidence / 'run/accuracy-server.json'
+    server = json.loads(path.read_text())
+    server['prefix_caching'] = False
+    path.write_text(json.dumps(server))
+    with pytest.raises(ValueError, match='prefix caching'):
         check(root)

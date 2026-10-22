@@ -5,9 +5,10 @@ Subagents are authorized when a selected skill requests or recommends them.
 Start from completed vLLM integration and the selected datatype-sweep config; optimize serving in place.
 
 Goal completion requirements:
+- Record applicable target-workload evidence from the model-bringup reference.
 - The measured path is real vLLM TT plugin serving through models/autoports/<model>/tt/generator_vllm.py.
-- vLLM sampling tests, qualitative outputs, primary single-user benchmarks, and CI serving-burst benchmarks pass.
-- Warmed primary single-user TTFT, TPOT, ITL, aggregate throughput, and TPOT-derived decode t/s/u are measured before and after using the same run_vllm_server workload, generation mode, max-num-seqs, max-model-len, mesh, sampling mode, and TT config.
+- vLLM sampling tests, qualitative outputs, single-user regression benchmarks, and CI serving-burst benchmarks pass.
+- Warmed single-user regression TTFT, TPOT, ITL, aggregate throughput, and TPOT-derived decode t/s/u are measured before and after using the same run_vllm_server workload, generation mode, max-num-seqs, max-model-len, mesh, sampling mode, and TT config.
 - CI serving-burst metrics are measured before and after as capacity/nightly-parity evidence. Do not use CI burst as headline decode t/s/u.
 - Preserve the context contract. Do not lower `max_model_len`, benchmark context, or eval context below doc/context_contract.json except for a proven hard physical limit.
 - Preserve valid non-aligned prompt-length serving support while optimizing. Do not trade it away for an aligned-only faster path.
@@ -23,9 +24,7 @@ Goal completion requirements:
 - optimized_vllm README/work_log record commands, before/after single-user metrics, CI burst metrics, full-model comparison, trace/async decisions, rejected options, limitations, and artifacts.
 - Relevant $optimize checklist items are completed with evidence for the vLLM serving path.
 - Use $tt-enable-tracing for trace capture, nonblocking replay, async readback, stale inputs, or serving trace correctness.
-- README.md leads with primary single-user vLLM TTFT and decode t/s/u; CI serving-burst metrics are secondary. Workload shapes sit next to every number.
+- README.md leads with target-workload performance, with single-user and CI burst regression rows alongside. Workload shapes sit next to every number.
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.
-
-- Keep batch 1 primary; measure secondary 8/16 against serial batch 1. Follow the $benchmark-model performance-review reference before benchmarks/evals.

@@ -18,8 +18,8 @@ def load_roofline(output, *, required=()):
             raise ValueError('missing required roofline.json; collect full-phase accounting')
         return {}
     data = json.loads(path.read_text())
-    if not isinstance(data, dict) or set(data) - {'1', '8', '16'}:
-        raise ValueError('roofline accounting must use concurrency 1, 8 or 16')
+    if not isinstance(data, dict) or any(not key.isascii() or not key.isdigit() or int(key) < 1 or str(int(key)) != key for key in data):
+        raise ValueError('roofline accounting must use positive integer concurrency keys')
     if set(required) - set(data):
         raise ValueError('missing required roofline profile: ' + ', '.join(sorted(set(required) - set(data))))
     for concurrency, row in data.items():

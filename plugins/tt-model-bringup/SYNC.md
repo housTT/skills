@@ -32,7 +32,7 @@ target tt-metal checkout.
   Preserve stage goals, checker exit meanings and resume behavior when importing.
 - Use operator-selected paths and limit Docker cleanup to the recorded run container.
 - The benchmark runtime is in `runtime/benchmark_stage`; Stage 11 uses fixed lm-eval
-  subsets through native-chat vLLM and 4K-input performance at concurrency 1, 8 and 16.
+  subsets through native-chat vLLM and 4K-input performance at configurable concurrency (default 1, 8 and 16).
 - The standalone TTI release workflow, handoff guidance and artifact checker are in
   `skills/tti-release/`.
 

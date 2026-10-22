@@ -6,7 +6,7 @@ from pathlib import Path
 
 from benchmark_stage.evidence import PERFORMANCE_METRICS, benchmark_rows, finite_number, validate_performance, validate_server
 from benchmark_stage.roofline import load_roofline
-from benchmark_stage.performance import review_performance, select_accuracy_concurrency
+from benchmark_stage.performance import performance_profiles, review_performance, select_accuracy_concurrency
 from benchmark_stage.subsets import digest
 from benchmark_stage.responses import read_jsonl, scoring_response
 
@@ -41,8 +41,8 @@ def check(model_dir, hf_model=''):
     layers = identity.get('layer_count')
     if not isinstance(layers, int) or layers < 1 or layers != identity.get('configured_layer_count'):
         raise ValueError('identity must verify all configured model layers')
-    if identity.get('prefix_caching') is not False:
-        raise ValueError('performance evidence must disable prefix caching')
+    if type(identity.get('prefix_caching')) is not bool:
+        raise ValueError('identity must record prefix caching mode')
     summary = read(evidence / 'run/summary.json')
     config = read(evidence / 'run/run_config.json')
     if config.get('model') != identity['model']:
@@ -125,7 +125,10 @@ def check(model_dir, hf_model=''):
     osl = config.get('output_tokens', 128)
     if not isinstance(osl, int) or osl < 2:
         raise ValueError('performance output length must permit decode timing')
-    for batch in ('1', '8', '16'):
+    profiles = tuple(map(str, performance_profiles(config)))
+    if set(summary.get('performance', {})) != set(profiles):
+        raise ValueError('performance results differ from configured profiles')
+    for batch in profiles:
         result = summary.get('performance', {}).get(batch, {})
         server = read(evidence / 'run' / f'perf-b{batch}-server.json')
         validate_server(server, int(batch), config['model'], config['base_url'],
@@ -158,10 +161,11 @@ def check(model_dir, hf_model=''):
     if summary.get('accuracy_concurrency') != concurrency or summary.get('serial_batch1_speedups') != speedups:
         raise ValueError('accuracy parallelism does not match measured performance')
     server = read(evidence / 'run/accuracy-server.json')
-    validate_server(server, concurrency, config['model'], config['base_url'], baseline=identity, output=evidence / 'run')
+    validate_server(server, concurrency, config['model'], config['base_url'], baseline=identity, output=evidence / 'run',
+                    prefix_caching=config.get('accuracy_prefix_caching', False))
     if summary.get('accuracy_server_identity_sha256') != digest(server):
         raise ValueError('accuracy server identity mismatch')
-    load_roofline(evidence / 'run', required=('1', '8', '16'))
+    load_roofline(evidence / 'run', required=profiles)
     return evidence
 
 

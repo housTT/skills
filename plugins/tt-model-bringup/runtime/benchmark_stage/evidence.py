@@ -16,14 +16,14 @@ SERVER_FIELDS = ('model', 'implementation', 'generator_module', 'model_revision'
                  'source_commits', 'hardware', 'max_model_len')
 
 
-def validate_server(server, capacity, model, base_url, *, baseline=None, output=None):
+def validate_server(server, capacity, model, base_url, *, baseline=None, output=None, prefix_caching=False):
     """Check recorded server capacity independently of client concurrency."""
     if server.get('max_num_seqs') != capacity or type(server.get('max_num_seqs')) is not int:
         raise ValueError(f'performance requires a {capacity}-slot server')
     if server.get('model') != model or server.get('base_url') != base_url:
         raise ValueError('performance server model/endpoint mismatch')
-    if server.get('prefix_caching') is not False:
-        raise ValueError('performance server must disable prefix caching')
+    if type(prefix_caching) is not bool or server.get('prefix_caching') is not prefix_caching:
+        raise ValueError('server prefix caching does not match the requested measurement mode')
     for field in SERVER_FIELDS:
         if not server.get(field):
             raise ValueError(f'missing performance server identity: {field}')

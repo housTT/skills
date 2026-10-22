@@ -11,6 +11,8 @@ Resolve its package root from this installed skill's location; do not assume
 this plugin is copied into the target tt-metal checkout.
 
 
+Read the [target workload and evidence contract](../model-bringup/references/target-workload.md) for this stage’s workload, memory, long-context quality and serving-reuse checks. Record the applicable evidence in the existing stage report.
+
 ## Mission Context
 
 This skill starts from a working optimized TTNN full model and chooses the fastest practical precision configuration that still meets a stated full-model accuracy bar. It is normally used after optimized full model and before vLLM so the serving adapter inherits a settled weight, activation, CCL, KV-cache dtype, and compute-fidelity policy.
@@ -19,7 +21,7 @@ The selected precision artifact must be complete enough for later stages to cons
 
 Recorded policy is not enough. The runtime construction path must actually consume every selected dtype and compute-fidelity field. Prove this with a model summary, config propagation check, or profiler/perf-report rows from the measured candidate. If a field appears in `selected_precision_config.json` but the code path ignores it or hard-codes a different value, the sweep is incomplete.
 
-The expensive source of truth is full-model top-1/top-5 accuracy. Decoder-layer PCC and component timing are useful only for ordering candidates and debugging surprises.
+The expensive source of truth is full-model top-1/top-5 accuracy together with the target-workload long-context checks. Decoder-layer PCC and component timing are useful only for ordering candidates and debugging surprises.
 
 Datatype selection must preserve the capability and context contract. KV-cache dtype can change the largest feasible context, so recompute `models/autoports/<model>/doc/context_contract.json` for the selected config. If a candidate only passes by lowering context or another advertised capability, it fails unless a hard physical device limit prevents the advertised capability from fitting or running and evidence proves that the smaller value is the largest feasible one for that candidate.
 
@@ -83,7 +85,7 @@ This order is a heuristic, not a law, with the typically most-sensitive parts of
 
 When backing out a failed BFP4 trial, restore to BFP8 first unless BFP8 itself is known to be the failing precision for that tensor group.
 
-For every material matmul group tested with BFP4 weights, include a LoFi compute-fidelity candidate for that same group. BFP4 with HiFi2 is allowed as a comparison or fallback, but it is not enough by itself. If a BFP4+LoFi candidate cannot be run, record the exact TTNN/runtime blocker and keep the stage open until the blocker is fixed or `$autofix` fails.
+For every material matmul group tested with BFP4 weights, include a LoFi compute-fidelity candidate for that same group. BFP4 with HiFi2 is allowed as a comparison or fallback, but it is not enough by itself. If a BFP4+LoFi candidate cannot run or fails the quality checks, record the exact limitation or real-model quality failure and retain a passing policy. Investigate suspected implementation bugs; a measured precision limitation is a valid rejection.
 
 Sweep compute fidelity even when dtype is unchanged. For dominant decode projection groups, include BFP8+LoFi and BFP8+HiFi2 candidates when both are legal. Do not assume HiFi2 is fastest for BFP8, and do not assume LoFi is safe without full-model top-1/top-5 evidence. Record dtype and fidelity together in each candidate id so later stages can construct the exact policy.
 
@@ -139,12 +141,12 @@ Plot every evaluated full-model config as a point. Fit or draw the non-dominated
 
 Compute fidelity is part of the selected precision policy, not only documentation.
 
-For reduced-precision matmuls, sweep legal compute fidelities in the same candidate matrix as datatypes once the promising dtype groups are known. Use the `tt-perf-report` output from individual decoder or reduced full-model runs and full-model accuracy to guide this decision. BFP4 weights are expected to use LoFi unless measured evidence says otherwise. BFP8 weights should compare HiFi2 and LoFi for dominant decode projection groups instead of assuming one fidelity is best. HiFi4 is usually reserved for accuracy-sensitive operations with BF16 weights. FP32 destination accumulation is also an option.
+For reduced-precision matmuls, sweep legal compute fidelities in the same candidate matrix as datatypes once the promising dtype groups are known. Use the `tt-perf-report` output from individual decoder or reduced full-model runs and full-model accuracy to guide this decision. BFP4/LoFi is a candidate; full-model and long-context evidence determine acceptance. BFP8 weights should compare HiFi2 and LoFi for dominant decode projection groups instead of assuming one fidelity is best. HiFi4 is usually reserved for accuracy-sensitive operations with BF16 weights. FP32 destination accumulation is also an option.
 
 Before selecting a config:
 
 - prove the model code can construct the requested fidelity policy without hard-coded overrides;
-- include at least one BFP4+LoFi candidate for every selected or seriously considered BFP4 matmul group;
+- include a BFP4+LoFi trial or recorded runtime/quality rejection for every selected or seriously considered BFP4 matmul group;
 - compare BFP4+LoFi against BFP4+HiFi2 when both are legal and the group is a meaningful decode cost;
 - record a short table for each material matmul group: weight dtype, compute fidelity, traced decode speed, accuracy result, kept/rejected decision, and reason.
 
@@ -152,7 +154,7 @@ If the runtime does not currently expose fidelity as a policy field, add that pl
 
 ## Final Selection
 
-Select the fastest config that satisfies the acceptance bar. If two configs are within measurement noise, prefer the simpler and safer one.
+Select the fastest config that satisfies the top-k and target-workload quality bars within the concurrent memory budget. If two configs are within measurement noise, prefer the simpler and safer one.
 
 Before finishing:
 

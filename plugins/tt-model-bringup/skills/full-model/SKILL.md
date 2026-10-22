@@ -15,6 +15,8 @@ This skill starts from working TTNN block or decoder code and turns it into a co
 
 The full model stage does not implement the vLLM adapter, but it must design the model and generator so a later serving adapter can drive the same low-level prefill/decode path without duplicating model logic. Treat the generator as a serving component, not only as a demo loop: external callers may own scheduling, cache/page-table state, prompt lengths, positions, sampling parameters, fixed request slots, inactive rows, and mixed-length prompts.
 
+Read the [target workload and evidence contract](../model-bringup/references/target-workload.md) for this stage’s workload, memory, long-context quality and serving-reuse checks. Record the applicable evidence in the existing stage report.
+
 ## What To Build
 
 Implement the model-specific pieces around the working block stack:
@@ -38,7 +40,7 @@ Also preserve the rest of the advertised model capability contract established b
 
 Prompt length is a logical API input. The full model and generator must accept valid prompt lengths up to the supported context, including lengths that are not divisible by internal prefill chunk, tile, block, page, or trace sizes. If an op path needs aligned physical shapes, pad or chunk internally, mask padded tokens, and slice returned logits/output state back to the logical prompt length. Do not expose assertions such as `seq_len % chunk_size == 0` unless the HF model itself has that semantic restriction.
 
-Batch handling is part of the capability contract. Optimize primarily for batch-1 single-user latency, but do not hard-code batch 1 into the model, generator, cache, page tables, position handling, sampling, or output formatting. Support larger batches through the same low-level API and test at batches 8 and 16 when the target hardware, memory, and harness allow it. If either secondary batch cannot run, record the largest tested batch and the hard physical limit.
+Batch handling is part of the capability contract. Optimize for the recorded target workload, but do not hard-code batch 1 into the model, generator, cache, page tables, position handling, sampling, or output formatting. Support larger batches through the same low-level API and test at the target and representative larger batches when the target hardware, memory, and harness allow it. If a requested batch cannot run, record the largest tested batch and the hard physical limit.
 
 ## How To Approach It
 
@@ -124,7 +126,7 @@ Compare full-model behavior against the HuggingFace reference with real weights.
 
 Run correctness from the smallest useful surface to the full gate. Start with a short smoke check on the reduced full-model probe when the all-layer gate is slow, then move to the complete all-layer model after the smoke check passes. If a test, prompt, or command fails, rerun that failing item directly while debugging; do not rerun the whole suite after every edit. Once the targeted failure is fixed, rerun the smoke check, then rerun the full all-layer correctness gate for final evidence.
 
-Include both batch-1 and larger-batch correctness coverage. Batch 1 is the primary latency target, but the model must still handle batch dimensions correctly. Add at least one batch >1 test for prefill, decode, cache/page-table indexing, token feedback, and output formatting; test at batches 8 and 16 when the hardware and harness allow it.
+Include both batch-1 and larger-batch correctness coverage. Batch 1 remains a regression row, and the model must still handle batch dimensions correctly. Add at least one batch >1 test for prefill, decode, cache/page-table indexing, token feedback, and output formatting; test at the target and representative larger batches when the hardware and harness allow it.
 
 For instruction/chat models, prefer a teacher-forcing reference generated from a normal chat-template prompt over raw book text. In tt-metal autoports, use the DeepSeek AIME24 prompt set rendered by the HF tokenizer chat template as the main readiness reference, for example:
 
@@ -199,7 +201,7 @@ Do not compare a sampling-inclusive serving result against a teacher-forcing/log
 
 Treat host steps between decode iterations as implementation bugs to remove from the steady-state path, not just performance terms to report. Add counters for trace replays, token-input refreshes, current-position/RoPE refreshes, page-table refreshes, synchronizations, and readbacks, then drive the steady-state refresh counts to zero except where the caller-visible API truly requires a readback or the scheduler changes state. If current-position/RoPE refreshes happen once per generated token, the full model still has a host-stepped decode loop; fix it with device-side state advance where possible before claiming optimized full-model performance.
 
-Measure the primary batch-1 TTFT and trace-verified decode t/s/u with the same workload shape as the vLLM primary single-user profile (prompt 128 / generate 128 by default unless the project specifies otherwise), separate from the accuracy workload, and record the workload shape next to every number. Compare this to `vllm_benchmark.json` in later stages. The larger-batch or concurrent-serving checks prove capability and serving behavior; they are not a replacement for the batch-1 latency target.
+Measure the batch-1 regression TTFT and trace-verified decode t/s/u with the same workload shape as the vLLM single-user regression profile (prompt 128 / generate 128 by default unless the project specifies otherwise), separate from the accuracy workload, and record the workload shape next to every number. Compare this to `vllm_benchmark.json` in later stages. Also measure the target workload at its typical context and concurrency; lead with that result when it differs from single-user usage.
 
 If performance regresses badly from block-level evidence, inspect data movement between embeddings, blocks, final norm, LM head, and sampling before changing precision.
 
@@ -224,7 +226,7 @@ Done means all of these are true and recorded:
 - state-dict mapping, tied-embedding behavior if relevant, and real-weight loading behavior;
 - KV-cache, page-table or position handling, prompt lengths, and repeated decode reuse;
 - context contract: HF-advertised context, full-model supported context, and any hard-physical-limit reduction evidence;
-- batch contract: batch-1 primary path, batches 8 and 16 tested, and any hard-physical-limit reduction evidence;
+- batch contract: batch-1 regression path and target workload concurrency tested, and any hard-physical-limit reduction evidence;
 - full-model accuracy and `$qualitative-check` evidence, including prompt-format metadata, rendered prompt artifacts, HF controls, and the shared qualitative prompt suite run through the TT generator;
 - split-sampling trace evidence: model trace to logits, internal sampling trace, `tt_out_tok` feedback into the persistent decode token input, current-position coherence, and page-table refresh coverage;
 - determinism or repeated-run coverage appropriate to the implementation risk, including logit reproducibility across runs and batch positions;

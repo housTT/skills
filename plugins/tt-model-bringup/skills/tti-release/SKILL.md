@@ -23,6 +23,8 @@ The release stage must evaluate the autoport at the context length recorded in `
 
 Treat a valid TTI prompt length as a logical request length. If TTI sends a prompt whose length is within the supported context and the autoport fails because the length is not divisible by an internal chunk, tile, block, page, or trace size, that is an autoport model bug. Do not waive it, lower the context, or change the benchmark to an aligned length. Fix the model/generator/adapter padding, chunking, masking, or output slicing path and rerun the failing item.
 
+For requested long-running agentic suites, follow the [bounded evaluation procedure](references/agentic-evaluation.md) before the full release run.
+
 ## Topology
 
 Assume the agent usually starts inside an IRD reservation/Codex container:

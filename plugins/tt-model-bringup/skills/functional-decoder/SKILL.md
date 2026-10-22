@@ -11,6 +11,8 @@ Resolve its package root from this installed skill's location; do not assume
 this plugin is copied into the target tt-metal checkout.
 
 
+Read the [target workload and evidence contract](../model-bringup/references/target-workload.md) for this stage’s workload, memory, long-context quality and serving-reuse checks. Record the applicable evidence in the existing stage report.
+
 ## Mission Context
 
 If this skill is used as part of `$model-bringup`, follow that skill's mission, workspace, and reporting contract. This stage turns the HF decoder layer (or multiple layers if there are different kinds in the HF model) into complete, working, tested TTNN code. It's called "functional" because it should be functionally complete and ready to ship - this is not a minimal prototype, it's the heart of everything else that follows. You should bring up the decoder on a single 1x1 device mesh. No need to use multiple devices at this stage.

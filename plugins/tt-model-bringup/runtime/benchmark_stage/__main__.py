@@ -17,7 +17,7 @@ def main():
     evaluate.add_argument('--base-url', default='http://127.0.0.1:8000')
     evaluate.add_argument('--manifest', type=Path, required=True)
     evaluate.add_argument('--task', required=True)
-    evaluate.add_argument('--concurrency', type=int, choices=(1, 8, 16), default=1)
+    evaluate.add_argument('--concurrency', type=int, default=1)
     evaluate.add_argument('--shared', action='store_true', help='evaluate comma-separated groups in one request pool')
     evaluate.add_argument('--output', type=Path, required=True)
     evaluate.add_argument('--generation', type=json.loads, default={})

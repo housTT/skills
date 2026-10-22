@@ -114,7 +114,7 @@ and sampling options for the model you are benchmarking:
 ```
 
 The expectation values above are illustrative, not performance targets. Replace
-all three ranges with estimates derived before the run and record the sources.
+all configured ranges with estimates derived before the run and record the sources.
 The runner compares mean TTFT and `1000 / mean_tpot_ms` against them after warmed
 performance collection and before full accuracy. An unmet expectation retains
 `performance_review.json` and fails the run for diagnosis; do not silently relax
@@ -123,7 +123,7 @@ limits. A justified revision needs the cause and timing evidence in the notes.
 The runner compares `duration / completed` across the three fixed-length profiles
 to estimate speedup against serial batch 1. It selects the fastest profitable
 profile, preferring the smaller concurrency on a tie. Set `accuracy_concurrency`
-to 1, 8 or 16 when the representative eval pilot favors a different choice;
+to a measured profile when the representative eval pilot favors a different choice;
 8/16 must still beat serial batch 1 in the performance measurements. The eval
 pilot must also demonstrate a useful win with real benchmark lengths and tails.
 HTTP request concurrency is not the physical device batch: partial device batches
@@ -173,7 +173,7 @@ Run into a new directory:
 ```
 
 The runner freezes a copy of the configuration and manifest. Accuracy uses fresh
-requests at the measured profitable concurrency from 1, 8 and 16. A watchdog terminates owned client subprocesses when
+requests at the measured profitable concurrency from the configured profiles. A watchdog terminates owned client subprocesses when
 the one-hour budget expires and writes a failed summary. Preserve that evidence;
 use a new output directory for a rerun. The servers remain owned by the enclosing bringup; the control hook follows its cleanup policy.
 
@@ -191,9 +191,9 @@ Malformed responses or empty answers with a normal stop fail the run. Preserve
 upstream extraction results, including apparent scorer mistakes; document a
 protocol limitation without hand-correcting scores.
 
-## Single-user and secondary 8-/16-user server profiles
+## Configured server profiles
 
-The headline rows use different server configurations:
+The default headline rows use different server configurations:
 
 | Profile | Concurrent requests | Server `max_num_seqs` | Input / output tokens |
 |---|---:|---:|---:|
@@ -203,10 +203,10 @@ The headline rows use different server configurations:
 
 Use the best validated single-user serving settings from optimized-vLLM. Keep the
 same implementation, checkpoint, precision, hardware and full context capacity
-for all three profiles. Changing request concurrency alone does not select a one-slot
+for all configured profiles. Changing request concurrency alone does not select a one-slot
 decode trace or cache configuration.
 
-The runner warms and measures 1-, 8- and 16-slot servers before accuracy, checks
+The runner warms and measures the configured servers before accuracy, checks
 performance expectations, then selects the profitable accuracy profile. It records
 that final selection separately in `accuracy-server.json`, preserving the performance
 identities and phase accounting. Configure `performance_server_command` as an argument
@@ -223,7 +223,7 @@ server when its configuration matches, otherwise stop only the server owned by
 this bringup and launch the requested configuration. Wait for API readiness
 before returning. Keep process ownership and cleanup with the enclosing bringup;
 on startup failure, clean up any server started by the hook. Enable the prepared
-phase-timing instrumentation in all three server profiles. The runner invokes the
+phase-timing instrumentation in all configured server profiles. The runner invokes the
 phase collector before switching; retain its exported logs after shutdown.
 
 Each call writes an observed server identity using the fields in `identity.json`
@@ -256,7 +256,7 @@ the measured stage runtime can be interpreted.
 ## Full-phase roofline accounting
 
 The performance table requires estimated prefill FLOP utilization and decode DRAM
-bandwidth utilization for all three server profiles. These are required measurements,
+bandwidth utilization for all configured server profiles. These are required measurements,
 with no minimum percentage needed for completion. For each phase:
 
 `percent = 100 × modeled work / (elapsed phase seconds × hardware peak rate)`
@@ -353,7 +353,7 @@ doc/benchmark/
     <task>/                     upstream results, scored samples and raw responses
     perf-b{1,8,16}*.json           raw performance measurements, warmups and server identities
     configuration-*.log          retained effective server configuration evidence
-    roofline.json               required full-phase accounting for all three profiles
+    roofline.json               required full-phase accounting for all configured profiles
     performance_review.json    expected versus observed TTFT and t/s/u
     accuracy-server.json       observed server selected for accuracy
     roofline-b{1,8,16}-*.log      collector readiness and collection commands/results
@@ -392,3 +392,24 @@ the final bringup checker requires the target autoport implementation.
 
 References: [lm-evaluation-harness v0.4.13](https://github.com/EleutherAI/lm-evaluation-harness/tree/v0.4.13),
 [vLLM benchmark CLI](https://docs.vllm.ai/en/v0.26.0/benchmarking/cli/).
+
+
+### Workload configuration
+
+`performance_concurrencies` is a list of unique positive integers including 1;
+it defaults to `[1, 8, 16]`. Include the target workload concurrency when supported.
+The runner, report and offline gate use this same list. Provide
+`performance_expectations` for exactly these profiles. File names and roofline
+keys use the configured concurrency, so the examples above are not a fixed schema.
+
+The random 4096-token performance rows remain cold-prefill measurements with
+prefix caching disabled. Accuracy can use validated prefix caching by setting
+`accuracy_prefix_caching: true` (default false). For that selection only, the
+server hook receives `--enable-prefix-caching`; it must record the actual mode in
+`accuracy-server.json` and retain configuration evidence. Other selections must
+use cache off. The gate verifies both modes independently; model, precision,
+hardware and context must still agree. Implement cache-mode switching in the
+hook before opting in. Record cache correctness and representative evaluation
+pilot results in RUN_NOTES.md. Fixed-length cache-off throughput estimates do not
+predict multi-turn cache-on throughput; use the pilot to choose the explicit
+`accuracy_concurrency` from the measured profiles.

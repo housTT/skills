@@ -9,6 +9,8 @@ Own the implementation, stage gates and evidence for one target HF model in a tt
 Read the relevant stage skill and its exact goal before doing that stage. Do not skip unmet gates
 or replace acceptance criteria with a review plugin's criteria.
 
+Read the [target workload and evidence contract](references/target-workload.md) for this stage’s workload, memory, long-context quality and serving-reuse checks. Record the applicable evidence in the existing stage report.
+
 ## Startup
 
 1. Resolve this plugin root from this file: two directories above its skill directory. Set
@@ -72,7 +74,8 @@ The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
 11. Benchmarks — `benchmark-model`
 
 For an optional standalone TTI release handoff once serving is ready, use
-[`tti-release`](../tti-release/SKILL.md).
+[`tti-release`](../tti-release/SKILL.md), including its bounded sample/confirm/full-run
+procedure when agentic evaluation is requested.
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
 requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation

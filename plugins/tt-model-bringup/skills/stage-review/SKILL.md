@@ -11,6 +11,8 @@ Resolve its package root from this installed skill's location; do not assume
 this plugin is copied into the target tt-metal checkout.
 
 
+Read the [target workload and evidence contract](../model-bringup/references/target-workload.md) for this stage’s workload, memory, long-context quality and serving-reuse checks. Record the applicable evidence in the existing stage report.
+
 ## Mission
 
 Prevent unsupported stage closure. A stage review is an independent,
@@ -124,7 +126,7 @@ Return `more-work-needed` when evidence shows one of these:
   blocker is random/synthetic "representative semantics" PCC.
 - a dominant matmul geometry sweep mixes evidence across incompatible precision
   policies, for example measuring a smaller-core or residual-grid geometry only
-  under BFP8/HiFi while the final or mandatory policy is BFP4/LoFi. Geometry is
+  under BFP8/HiFi while the final or candidate policy is BFP4/LoFi. Geometry is
   not rejected until the material geometry candidates have been measured under
   the same dtype/fidelity policy, or an exact op-contract blocker is recorded.
 - prompt-based quality evidence violates `$qualitative-check`, for example an
@@ -289,8 +291,8 @@ For datatype-sweep stages, also inspect:
   the measured runtime path, using model summaries, propagation checks, or
   profiler/perf-report rows rather than JSON alone;
 - whether every material BFP4 matmul group considered or selected has a
-  BFP4+LoFi candidate, or an exact TTNN/runtime blocker plus `$autofix`
-  evidence;
+  BFP4+LoFi candidate, or recorded runtime/long-context quality evidence
+  explaining its rejection;
 - whether a "fastest evaluated config" claim is only true because an obvious
   legal precision/fidelity candidate was missing.
 

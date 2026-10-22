@@ -39,6 +39,8 @@ Async CCLs and semaphores are subtle. Read the relevant docs and consider reusin
 
 Use `$optimize` and `tt-perf-report` before finishing this stage. The final multichip decoder should use the hardware well within the limits of available TTNN ops.
 
+Read the [target workload and evidence contract](../model-bringup/references/target-workload.md) for this stage’s workload, memory, long-context quality and serving-reuse checks. Record the applicable evidence in the existing stage report.
+
 ## Evidence To Leave
 
 Done means all of these are true and recorded:
@@ -174,7 +176,7 @@ On Galaxy 4x8, do not blindly flatten to TP=8. Make an explicit 2D plan:
 - Identify which collectives cross rows and which cross columns.
 - Estimate activation, weight, expert, and KV-cache memory with all layers loaded.
 - Compare communication volume against the 1D alternative.
-- Record why the selected strategy should improve single-user latency.
+- Record why the selected strategy should improve the recorded workload, including concurrent state capacity.
 
 GPT-OSS `MeshConfig` is the preferred shape for representing this plan. Galaxy Llama is useful for validating where reductions and gathers happen in an optimized 2D decoder, not for copying bespoke ops.
 

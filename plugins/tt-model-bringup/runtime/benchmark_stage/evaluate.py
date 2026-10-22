@@ -17,8 +17,8 @@ def evaluate(*, model, base_url, manifest_path, group, output, generation=None, 
 
 
 def evaluate_groups(*, model, base_url, manifest_path, groups, output, generation=None, shared=True, concurrency=1):
-    if type(concurrency) is not int or concurrency not in (1, 8, 16):
-        raise ValueError('accuracy concurrency must be 1, 8 or 16')
+    if type(concurrency) is not int or concurrency < 1:
+        raise ValueError('accuracy concurrency must be a positive integer')
     from importlib.metadata import version
     from lm_eval import evaluator
     from lm_eval.models.openai_completions import LocalChatCompletion

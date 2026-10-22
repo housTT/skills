@@ -5,6 +5,7 @@ from pathlib import Path
 
 from benchmark_stage.evidence import benchmark_rows
 from benchmark_stage.roofline import load_roofline
+from benchmark_stage.performance import performance_profiles
 
 
 def cell(value):
@@ -18,7 +19,7 @@ def write_report(output, config, summary):
     manifest = json.loads(Path(config['manifest']).read_text())
     roofline_error = None
     try:
-        roofline = load_roofline(output, required=('1', '8', '16') if summary['status'] == 'completed' else ())
+        roofline = load_roofline(output, required=tuple(map(str, performance_profiles(config))) if summary['status'] == 'completed' else ())
     except (ValueError, OSError) as exc:
         if summary['status'] == 'completed':
             raise
@@ -26,7 +27,7 @@ def write_report(output, config, summary):
         # fails; the run remains incomplete and no invalid percentage is shown.
         roofline, roofline_error = {}, str(exc)
     lines = [f"# Benchmark: {config['model']}", '',
-             f"Status: {summary['status']}. Accuracy concurrency: {summary.get('accuracy_concurrency', 'Pending')}.", '',
+             f"Status: {summary['status']}. Accuracy concurrency: {summary.get('accuracy_concurrency', 'Pending')}. Accuracy prefix caching: {config.get('accuracy_prefix_caching', False)}.", '',
              '| Benchmark | Samples / full | Metric | Subset % | Published full % | Difference pp | Source |',
              '|---|---:|---|---:|---:|---:|---|']
     notes = []
@@ -50,10 +51,10 @@ def write_report(output, config, summary):
         utilization = [f"{roofline[batch][phase]['percent']:.2f}" if roofline.get(batch, {}).get(phase) else '—'
                        for phase in ('prefill', 'decode')]
         capacity = row.get('server_max_num_seqs', 'Unrecorded')
-        profile = 'Single user' if batch == '1' and capacity == 1 else f'{batch} users' if batch in ('8', '16') and capacity == int(batch) else 'Serving'
+        profile = 'Single user' if batch == '1' and capacity == 1 else f'{batch} users' if capacity == int(batch) else 'Serving'
         lines.append(f"| {profile} | {batch} | {capacity} | {row['requested_input_tokens']} / {row['requested_output_tokens']} | {row.get('mean_ttft_ms', 0):.2f} | {tpot:.2f} | {1000/tpot if tpot else 0:.2f} | {row.get('output_throughput', 0):.2f} | " + ' | '.join(utilization) + ' |')
     lines += ['', 'Scores use fixed subsets; published figures cover the full dataset. Missing references are shown as unavailable. The bringup owner decides whether these results meet their needs.', '',
-              'Roofline estimates divide modeled work by full-phase elapsed wall time and the participating hardware’s peak rate. Both phases are required for all three serving profiles; — indicates incomplete accounting. HTTP concurrency is not a fixed device batch size.', '']
+              'Roofline estimates divide modeled work by full-phase elapsed wall time and the participating hardware’s peak rate. Both phases are required for all configured serving profiles; — indicates incomplete accounting. HTTP concurrency is not a fixed device batch size.', '']
     if summary.get('performance_review'):
         lines += ['Performance expectations and observations: [performance_review.json](performance_review.json).', '']
     if summary.get('serial_batch1_speedups'):
