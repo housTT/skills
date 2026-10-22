@@ -22,6 +22,9 @@ TARGET_PROFILE = {t: t for t in PROFILES} | {"quasar-bf16": "quasar"}
 
 STATUS_VALUES = ("✅", "⚠️", "❌", "n/a")
 CONFIDENCE_VALUES = ("verified", "unverified")
+# How the sheet shows `confidence`: whether the code alone fixes the factory a call selects.
+CONFIDENCE_DISPLAY = {"verified": "fixed by the code", "unverified": "decided at run time"}
+KERNEL_OPS_TAB = "Device ops by factory"
 ALWAYS = "always"
 ORIGIN_VALUES = ("static", "measured", "static+measured")
 NOT_TRACED = "not traced"
@@ -165,7 +168,7 @@ def kernel_ops_columns(source: str, destinations: list[str]) -> list[str]:
 
 # Spreadsheet presentation: tab order, readable headers and column widths in pixels.
 SHEET_TABS = (
-    ("op_table", "Op table"), ("kernel_ops", "Kernel ops"), ("kernel_test_results", "Kernel tests"),
+    ("op_table", "Op table"), ("kernel_ops", "Device ops by factory"), ("kernel_test_results", "Kernel tests"),
     ("call_trace", "Call trace"), ("port_blockers", "Port blockers"),
     ("host_ops", "Host ops"), ("measured_ops", "Measured ops"), ("host_fallback", "Host fallback"),
     ("footprint", "Footprint"), ("diff", "Static vs measured"), ("graph_ops", "Graph capture"),
@@ -176,7 +179,7 @@ SHEET_TABS = (
 FIELD_LABELS = {
     "id": "#", "stage": "Stage", "origin": "Origin (static / measured)", "ttnn_api": "ttnn API", "op_code": "Op code (Tracy)",
     "device_op": "Device op", "program_factory": "Program factory", "call_site": "Call site (file:line)",
-    "launch_condition": "Launch condition", "confidence": "Dispatch confidence",
+    "launch_condition": "Launch condition", "confidence": "Factory choice",
     "dispatch_evidence": "Dispatch evidence", "grid_dependency": "Grid dependency",
     "launches_per_repeat": "Launches per repeat", "affected_ids": "Affected op table rows",
     "required_change": "Required change", "op_table_ids": "Op table rows",

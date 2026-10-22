@@ -89,7 +89,7 @@ launches of this op code, traced and measured; Tracy reports op codes, not facto
 measured count is per op code and repeats on every kernel op that shares it), `graph_launches`
 (launches per inference of this device op and factory in the graph capture), then per target (source, then destinations) `<t>:statuses` (count of each status over
 its rows), and for Quasar targets `<t>:tests` and `<t>:test_results`. Written by `kernel_ops.py`;
-`summary.md` starts with this table and the spreadsheet shows it as the Kernel ops tab.
+`summary.md` starts with this table and the spreadsheet shows it as the Device ops by factory tab.
 
 ## graph_ops.csv and graph_host_transfers.csv (graph capture)
 

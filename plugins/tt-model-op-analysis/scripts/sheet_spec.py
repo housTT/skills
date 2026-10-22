@@ -4,7 +4,7 @@ The sheet is a view of the run's files for human readers. Nothing is invented: t
 op-table columns that hold one value in every row (listed once on Info), merges device op and
 program factory, shortens source paths to their last two components, strips row-number prefixes
 from evidence and orders columns reader-first. Tabs: Info (run, counts, summary.md, constant
-columns), Kernel ops (one row per kernel op), Op table (one row per launching variant), then the
+columns), Device ops by factory (one row per device op and program factory), Op table (one row per launching variant), then the
 other CSVs.
 
 Prints JSON with `tabs` (sheetId, title, source file, values: a 2D array for one write from A1;
@@ -28,7 +28,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from sheet_notes import column_note, tab_description  # noqa: E402
 from opa_schema import (  # noqa: E402
-    ALWAYS, CALL_SITE, GRID_KEYWORDS, LAUNCH_PROFILES, METHOD_ITEMS, NOT_TRACED, latest_entry_failure, METHOD_LABELS, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES, TARGET_LABELS,
+    ALWAYS, CALL_SITE, CONFIDENCE_DISPLAY, GRID_KEYWORDS, KERNEL_OPS_TAB, LAUNCH_PROFILES, METHOD_ITEMS, NOT_TRACED, latest_entry_failure, METHOD_LABELS, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES, TARGET_LABELS,
     TEST_TARGETS, column_width, confidence, display_header, methods_used, read_csv, read_header, run_targets,
     split_evidence,
 )
@@ -83,6 +83,8 @@ def field(column: str) -> str:
 
 
 def view_text(column: str, value: str) -> str:
+    if field(column) == "confidence":
+        return CONFIDENCE_DISPLAY.get(value, value)
     return tidy(value) if field(column) in PROSE_FIELDS else value
 
 
@@ -287,8 +289,8 @@ def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str,
                         cell(grouped_nodes(k.get(f"{t}:test_results", "")))]
         values.append(row)
     values.append(["Total", "", "", "", f"=SUM(E2:E{len(kernel_ops) + 1})"])
-    tab = new_tab("Kernel ops", "kernel_ops.csv", values, widths, [0, len(values) - 1])
-    tab["notes"] = [column_note("Kernel ops", c[2]) for c in columns]
+    tab = new_tab(KERNEL_OPS_TAB, "kernel_ops.csv", values, widths, [0, len(values) - 1])
+    tab["notes"] = [column_note(KERNEL_OPS_TAB, c[2]) for c in columns]
     return tab
 
 
@@ -590,7 +592,7 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1) -> dict:
     if kernel_ops_path.exists():
         kernel_ops = read_csv(kernel_ops_path)
         tabs.append(kernel_ops_view(kernel_ops, ops, targets, op_columns))
-        expected[f"{quote('Kernel ops')}!E{len(kernel_ops) + 2}"] = sum(int(k["static_launches"] or 0)
+        expected[f"{quote(KERNEL_OPS_TAB)}!E{len(kernel_ops) + 2}"] = sum(int(k["static_launches"] or 0)
                                                                        for k in kernel_ops)
     tabs.append(op_tab)
     for name, title in SHEET_TABS:

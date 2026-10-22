@@ -12,8 +12,8 @@ STATIC, TRACY, GRAPH, CACHE, TTSIM = ("static trace", "Tracy", "graph capture", 
 # Tab title (or prefix for tabs with a target suffix) -> (what it holds, the methods that fill it).
 TAB_DESCRIPTIONS = {
     "Info": ("Run identity, bring-up checks, analysis methods and confidence, counts and the summary.", "all"),
-    "Kernel ops": ("One row per kernel op (device op and program factory): launches, the methods that saw it, "
-                   "and its status and evidence per target.", f"{STATIC}; {TRACY} and {GRAPH} confirm launches"),
+    "Device ops by factory": ("One row per device op and the program factory it selected (the kernels that run): "
+                              "launches, the methods that saw it, and its status and evidence per target.", f"{STATIC}; {TRACY} and {GRAPH} confirm launches"),
     "Op table": ("One row per launching variant of a ttnn call: call site, dispatch, grid dependency, shapes and "
                  "status per target.", f"{STATIC}; {TRACY} adds measured-only rows"),
     "Kernel tests": ("Quasar kernel-op tests run on the simulator, one row per test with its result.", TTSIM),
@@ -54,7 +54,10 @@ FIELD_NOTES = {
     "program_factory": "The C++ program factory the device op selects for this call: the kernels that run.",
     "call_site": "Where the model makes the call, as file:line at the pinned tt-metal commit.",
     "launch_condition": "always, or the runtime condition under which the launch happens.",
-    "confidence": "verified: the dispatch chain to this factory was followed in the code. unverified: not fully.",
+    "confidence": "Whether the code alone fixes which program factory this call selects. fixed by the code: the "
+                  "static trace followed the dispatch to this factory. decided at run time: the choice depends on "
+                  "something known only when it runs (free L1, buffer addresses); a graph capture shows the factory "
+                  "that was used.",
     "dispatch_evidence": "The C++ file and function that select the device op and factory, and any runtime "
                          "alternative.",
     "grid_dependency": "Hardcoded grid, shard spec or program config this op depends on, with file:line. "

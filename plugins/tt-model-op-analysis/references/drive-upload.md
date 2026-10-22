@@ -9,7 +9,7 @@ details; the bring-up checks: end-to-end test, host fallback, test hardware, pea
 a smaller grid, configurable grid and layer count; the four analysis methods with their state and
 the run's confidence; counts as formulas over the Op table; `summary.md`; the op-table columns that
 hold one value in every row; and a list of every tab with what it holds and the method that fills
-it, `schemas.md`), Kernel ops (one row per kernel op, evidence de-duplicated across its
+it, `schemas.md`), Device ops by factory (one row per device op and program factory, evidence de-duplicated across its
 rows, with the methods that saw it), Op table (one row per launching variant, device op and factory
 merged, constant columns dropped, source paths shortened), then Kernel tests, Call trace, Port
 blockers, Host ops, the Tracy, graph-capture and kernel-cache tables and any other CSV of the run.
@@ -32,7 +32,7 @@ Every column header carries a note that says what the column holds (`sheet_notes
 4. Write each entry of `tabs` with one `update_formulas` call on `'<title>'!A1` with its `values`
    as given: formulas stay formulas, numbers stay numbers, and text the sheet would parse already
    carries a leading `'`.
-5. Sheet row = CSV `id` + 1 on the Kernel ops, Op table and CSV tabs (header is row 1). Before any
+5. Sheet row = CSV `id` + 1 on the Device ops by factory, Op table and CSV tabs (header is row 1). Before any
    targeted cell write, read the rows and confirm the `id` column; after writing, read the range
    again and check it.
 6. Read back every cell in `expected` and compare it with the value given there; then read the Op

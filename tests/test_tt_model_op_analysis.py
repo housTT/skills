@@ -1066,15 +1066,15 @@ def test_sheet_spec_kernel_ops_tab_groups_evidence(tmp_path):
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 4)])
     assert run_script("kernel_ops.py", str(run)).returncode == 0
     spec = sheet(run)
-    assert [t["title"] for t in spec["tabs"]][:3] == ["Info", "Kernel ops", "Op table"]
-    kernel = tab(spec, "Kernel ops")
+    assert [t["title"] for t in spec["tabs"]][:3] == ["Info", "Device ops by factory", "Op table"]
+    kernel = tab(spec, "Device ops by factory")
     row = dict(zip(kernel[0], kernel[1]))
     assert row["Device op / program factory"] == "prim::a / F"
     assert row["Stages"] == "encoder, s1" and row["Launches (P150)"] == 4
     assert row["Quasar, BF16 projection: evidence and gap"] == "⚠️ rows 1, 2: same\n\n⚠️ row 3: other"
     assert "P150: evidence and gap" not in kernel[0]
     assert kernel[-1][0] == "Total" and kernel[-1][4] == "=SUM(E2:E2)"
-    assert spec["expected"]["'Kernel ops'!E3"] == 4
+    assert spec["expected"]["'Device ops by factory'!E3"] == 4
 
 
 # Final-review fixes
@@ -1712,7 +1712,7 @@ def test_kernel_ops_adds_graph_launches_and_graph_only_rows(tmp_path):
     assert [(r["op_code"], r["origin"], r["graph_launches"], r["sources"]) for r in rows] == [
         ("Op1DeviceOperation", "static", "1", "static, graph"),
         ("FooDeviceOperation", "graph", "1", "graph")]
-    kernel = tab(sheet(run), "Kernel ops")
+    kernel = tab(sheet(run), "Device ops by factory")
     header = kernel[0]
     assert "Graph launches per inference" in header and "Seen by" in header
     assert dict(zip(header, kernel[2]))["Device op / program factory"] == "prim::foo / FooFactory"
@@ -2150,7 +2150,7 @@ def test_kernel_ops_evidence_orders_by_status_and_writes_short_repeats_once(tmp_
                    **{"quasar-bf16:status": "⚠️", "quasar-bf16:evidence": "no test covers fork F with this input"})]
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 3)])
     assert run_script("kernel_ops.py", str(run)).returncode == 0
-    kernel = tab(sheet(run), "Kernel ops")
+    kernel = tab(sheet(run), "Device ops by factory")
     evidence = dict(zip(kernel[0], kernel[1]))["Quasar, BF16 projection: evidence and gap"]
     assert evidence.split("\n\n") == [
         "❌ row 2: fork F hangs, test_b.py:9 xfail.",
@@ -2283,3 +2283,11 @@ def test_abbreviations_do_not_split_evidence():
     sys.path.insert(0, str(SCRIPTS))
     import sheet_spec
     assert sheet_spec._clauses("passes at 2x3, incl. DRAM TILE input; bf16.") == ["passes at 2x3, incl. DRAM TILE input", "bf16"]
+
+
+def test_factory_choice_is_shown_in_plain_words(tmp_path):
+    rows = [op_row(1, 1, confidence="verified"), op_row(2, 1, confidence="unverified")]
+    spec = sheet(make_static_run(tmp_path, rows, [trace_row(1, 1, 2)]))
+    ops = tab(spec, "Op table")
+    column = ops[0].index("Factory choice")
+    assert [r[column] for r in ops[1:]] == ["fixed by the code", "decided at run time"]
