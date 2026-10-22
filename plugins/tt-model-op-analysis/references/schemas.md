@@ -22,7 +22,7 @@ write them with `opa_schema.write_csv` or open files with `encoding="utf-8-sig"`
 | `launch_condition` | exactly `always`, or the runtime condition under which the launch happens (`skipped when the new buffer lands at the same address`) |
 | `confidence` | `verified` \| `unverified`: whether the dispatch chain to this factory is fully followed (`dispatch-tracing.md`) |
 | `dispatch_evidence` | file and function that select the device op and factory, and every runtime-dependent alternative; at most 300 characters, shared by rows with one dispatch chain |
-| `grid_dependency` | the hardcoded grid, shard spec or program config this op depends on, with its value and `<file>:<line>` (`8x4 CoreGrid, <model>.py:<line>`); `automatic` when derived from the device grid; `none` when the op uses no core grid (interleaved DRAM) |
+| `grid_dependency` | the hardcoded grid, shard spec or program config this op depends on, with its value and `<file>:<line>` (`8x4 CoreGrid, <model>.py:<line>`); `automatic` when derived from the device grid, including a model constant the code clamps to the device grid (`min(64, device cores)`), since a smaller grid shrinks it without a code change; `none` when the op uses no core grid (interleaved DRAM) |
 
 Then, for the source and then each destination in `run.json` order, the columns from
 `opa_schema.target_columns`:

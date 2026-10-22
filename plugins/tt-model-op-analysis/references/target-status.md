@@ -48,7 +48,8 @@ whole-model pass or failure does not say which kernel op caused it.
 ## quasar as a destination (code unchanged)
 
 The analysed code unchanged on Quasar: same dtypes, grids and mainline ttnn calls. Mainline calls
-are not routed to Quasar forks automatically. Most rows are usually `❌` for a reason shared by
+are not routed to Quasar forks automatically. Each row keeps the kernel op and parameters the source traced: a branch the
+code takes on Quasar (`is_quasar()`, an arch check in a fork) neither drops the row nor makes it `n/a`. Most rows are usually `❌` for a reason shared by
 many rows; state the specific check once in `port_blockers.csv` and cite its id plus the row's own
 detail (dtype, factory family) in the evidence.
 

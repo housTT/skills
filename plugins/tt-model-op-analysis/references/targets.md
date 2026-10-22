@@ -5,7 +5,10 @@ A run has one **source** and zero or more **destinations**:
 - **source**: the profile the analysed implementation runs on today. The implementation and entry
   test are chosen for it, and its launches are traced.
 - **destination**: another profile the same kernel ops are projected onto, from the source trace,
-  without tracing again. Its columns say what happens to each source op there.
+  without tracing again. Its columns say what happens to each source op there. The question it
+  answers: can the source code's kernel ops run on that architecture, that is, does it have the
+  same device ops and program factories, and the LLK APIs their kernels call (the LLK gap check
+  over the source kernel cache).
 
 The user picks the source; destinations are optional and added one at a time. A destination is a
 profile other than the source running the same code, or `quasar-bf16` (only for a non-Quasar

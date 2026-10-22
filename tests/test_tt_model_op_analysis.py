@@ -49,6 +49,17 @@ def test_setup_asks_source_first_then_model_ref_implementation_test():
     assert [flow.index(h) for h in heads] == sorted(flow.index(h) for h in heads)
 
 
+def test_destination_is_a_projection_of_source_rows():
+    static = (PLUGIN / "references" / "static-phase.md").read_text()
+    section = static[static.index("## Adding a destination"):]
+    assert "always a projection of the source rows" in section
+    assert "never offer a separate run instead of a\ndestination" in section
+    status = (PLUGIN / "references" / "target-status.md").read_text()
+    assert "neither drops the row nor makes it `n/a`" in status
+    measured = (PLUGIN / "references" / "measured-destination.md").read_text()
+    assert "with the\nparameters the source model passes at each row" in measured
+
+
 def test_setup_traps_cover_fit_by_code_not_name():
     setup = (PLUGIN / "references" / "run-setup.md").read_text()
     traps = setup[setup.index("### Setup traps"):setup.index("### No whole-model test")]
@@ -1488,6 +1499,16 @@ def test_runs_list_separates_implementations(tmp_path):
                    ("", "p150", "old")}
     text = run_script("runs.py", "list", str(tmp_path), "resnet50").stdout
     assert "cannot be extended" in text and "ttnn_resnet on p150 @ 20e872e" in text
+
+
+def test_impl_slug_accepts_module_file_tt_dir_and_implementation_dir():
+    sys.path.insert(0, str(SCRIPTS))
+    import runs
+    base = "models/demos/vision/classification/resnet50"
+    assert runs.impl_slug(f"{base}/ttnn_resnet/tt/ttnn_functional_resnet50.py") == "ttnn_resnet"
+    assert runs.impl_slug("models/demos/vision/detection/rtdetr/tt") == "rtdetr"
+    assert runs.impl_slug(f"{base}/quasar") == "quasar"
+    assert runs.impl_slug(f"{base}/blackhole") == "blackhole"
 
 
 def test_runs_list_validated_run_is_done(tmp_path):

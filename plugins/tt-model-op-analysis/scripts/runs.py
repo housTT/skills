@@ -13,8 +13,12 @@ from validate_static import validate  # noqa: E402
 
 
 def impl_slug(implementation: str) -> str:
-    """Directory name of the implementation module, or its parent's when that directory is `tt`."""
-    directory = pathlib.PurePosixPath(implementation).parent
+    """Name of the implementation directory: a module file stands for its directory, and a `tt` directory
+    for its parent, so `.../ttnn_resnet/tt/model.py`, `.../rtdetr/tt` and `.../resnet50/quasar` give
+    `ttnn_resnet`, `rtdetr` and `quasar`."""
+    directory = pathlib.PurePosixPath(implementation)
+    if directory.suffix == ".py":
+        directory = directory.parent
     return directory.parent.name if directory.name == "tt" else directory.name
 
 

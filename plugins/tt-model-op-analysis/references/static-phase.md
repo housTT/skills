@@ -100,6 +100,14 @@ listing every choice but the source, likely ones first: `p100`, `p150`, `n150`, 
 for a non-Quasar source, `quasar-bf16` (a BF16 projection: block-float dtypes become BF16 and
 mainline calls use their Quasar forks).
 
+A destination is always a projection of the source rows: one to one (the other profile, or `quasar`
+with the code as written) or with the BF16 change (`quasar-bf16`). Each row's kernel op, with the
+parameters the source model passes there, is judged on the destination. Branches the code takes on
+the destination's architecture (`is_quasar()`, `is_wormhole_b0()`, arch checks in the forks) do not
+add, drop or rewrite rows and never make a row `n/a`; never offer a separate run instead of a
+destination. `n/a` is only for a row whose source launch does not happen on that profile under the
+same branch.
+
 1. Append the destination to `run.json` `destinations`.
 2. For a Blackhole or Wormhole destination running the same code, evaluate the profile predicates
    from targets.md for every source row and fill `<dest>:shapes` and `<dest>:launches`; add its
