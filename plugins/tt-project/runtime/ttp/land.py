@@ -11,10 +11,11 @@ one does). The landing is recorded for the task (task_landings), so `landed:#<id
 the review that ran it, and the review's verdict covers the landed commit too (reviewreuse).
 
 A commit that becomes empty on the branch's tip (its change is already there) is dropped. When the
-branch moves during the checks, it starts over on the new tip, up to MOVE_TRIES times in all.
+branch moves during the checks or the fast-forward, it starts over on the new tip, up to MOVE_TRIES
+times in all.
 
 Exit codes: 0 landed (or already there); 1 git failed for a reason other than a conflict; 2 refused;
-3 a conflict (unmerged paths); 4 a check failed; 5 the branch kept moving during the checks; 6 the
+3 a conflict (unmerged paths); 4 a check failed; 5 the branch kept moving; 6 the
 checkout that has the branch has uncommitted changes; 75 another landing held the branch. Only 0
 moves the branch; the scratch worktree is always removed.
 
@@ -46,8 +47,10 @@ STEP = "If it passes, land the head you reviewed with `ttp land"   # the review 
 
 
 def _git(repo: Path, *args: str, timeout: float = 120) -> subprocess.CompletedProcess:
+    # The C locale keeps git's messages in English whatever the user's: _replay reads one.
     return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=timeout,
-                          stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                          stdin=subprocess.DEVNULL,
+                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANGUAGE": ""})
 
 
 def local_branch(p: Project, repo: Path) -> str:
@@ -177,6 +180,9 @@ def _move(repo: Path, branch: str, base: str, new: str, say: Callable[[str], Non
                 f"them with this work; nothing landed. Commit or discard them there, then run `ttp land` again")
             return DIRTY
         r = _git(wt, "merge", "--ff-only", "--quiet", new)
+        if r.returncode != 0 and push._local_tip(repo, branch) != base:
+            say(f"local branch {branch} moved off {base[:10]} in {held}; nothing landed. Run `ttp land` again")
+            return MOVED
         if r.returncode != 0:
             say(f"could not fast-forward {branch} in {held}: {(r.stderr or r.stdout).strip()}; nothing landed")
             return DIRTY

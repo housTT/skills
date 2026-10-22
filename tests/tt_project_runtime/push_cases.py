@@ -9739,7 +9739,7 @@ def _on_proj(repo, name, text):
     return _git_out(repo, "rev-parse", "proj")
 
 
-def test_ttp_land_replays_a_reviewed_head_onto_a_moved_local_branch_and_records_it(env, monkeypatch):
+def test_ttp_land_replays_a_reviewed_head_onto_a_moved_local_branch_and_records_it(env, monkeypatch, capsys):
     """A review of a project whose push branch is a local branch with no git remote gets a `ttp land`
     step. `ttp land` replays the reviewed head onto the branch's new tip (each commit naming the one
     it replays), fast-forwards the branch, and records the landing: `landed:#<code>` passes, the
@@ -9756,7 +9756,12 @@ def test_ttp_land_replays_a_reviewed_head_onto_a_moved_local_branch_and_records_
     p.set_config("delivery.push_branch", "work")
     p.set_config("delivery.push_checks", ["true"])
     assert "reviews land on it with `ttp land`" in push.push_branch_problem("work", p.root)
-    assert any("`ttp land`" in x for x in config_problems({"delivery": {"push_branch": "work"}}, p.root))
+    # A valid setup, not a config problem (no low alert); `ttp doctor` still says how reviews land.
+    assert config_problems({"delivery": {"push_branch": "work"}}, p.root) == []
+    assert push.lands_locally("work", p.root) and not push.lands_locally("gone", p.root)
+    assert "review only" in config_problems({"delivery": {"push_branch": "gone"}}, p.root)[0]
+    cli.main(["doctor", p.name])
+    assert "reviews land on it with `ttp land`" in capsys.readouterr().out
     for queue in (False, True):
         p.set_config("delivery.push_queue", queue)
         cid, branch, _, (rev,) = _finish_code(env, p, f"landme{queue}", {f"landme{queue}.py": 3})
@@ -9881,6 +9886,48 @@ def test_ttp_land_starts_over_while_the_branch_moves_and_stops_after_its_tries(e
     _git_out(side, "reset", "-q", "--hard")
     assert land.land(p, repo, head, t, said.append) == 0, said
     assert _git_out(side, "rev-parse", "HEAD") == _git_out(repo, "rev-parse", "proj")
+
+
+def test_ttp_land_reads_git_in_any_locale_and_starts_over_when_the_branch_moves_under_its_fast_forward(
+        env, monkeypatch, tmp_path):
+    """A commit that becomes empty is dropped under a user locale whose git messages are not English
+    (a `git` stand-in that translates unless LC_ALL=C). The branch moving in the checkout that has it,
+    between the tip check and the fast-forward there, is a moved branch (start over), not exit 6."""
+    import shlex
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    _commit(repo, "b.txt", "b\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "proj")      # a.txt's change inside a bigger commit: empty on proj
+    (repo / "z.txt").write_text("z\n")
+    _git_out(repo, "add", "z.txt")
+    _commit(repo, "a.txt", "a\n")
+    _git_out(repo, "checkout", "-q", "work")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "git").write_text(f"""#!/bin/sh
+PATH={shlex.quote(os.environ["PATH"])}; export PATH
+[ "$LC_ALL" = C ] && exec git "$@"
+o=$(mktemp) e=$(mktemp)
+git "$@" >"$o" 2>"$e"; rc=$?
+sed 's/empty/leer/g' "$o"; sed 's/empty/leer/g' "$e" >&2; rm -f "$o" "$e"; exit $rc
+""")
+    (shim / "git").chmod(0o755)
+    side = env["tmp"] / "side"
+    _git_out(repo, "worktree", "add", "-q", str(side), "proj")
+    real, moved = land._git, []
+
+    def racing(where, *args, **kw):
+        if args[:2] == ("merge", "--ff-only") and not moved:
+            _commit(side, "m.txt", "m\n")
+            moved.append(_git_out(repo, "rev-parse", "proj"))
+        return real(where, *args, **kw)
+    monkeypatch.setattr(land, "_git", racing)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 0, said
+    assert any(m.startswith("dropped ") for m in said) and "starting over" in " ".join(said), said
+    assert _git_out(repo, "rev-parse", "proj^") == moved[0] == _git_out(side, "rev-parse", "HEAD^")
+    assert _git_out(repo, "show", "--name-only", "--format=", "proj") == "b.txt"
 
 
 def test_ttp_land_waits_for_another_landing_and_runs_from_the_cli(env, monkeypatch):

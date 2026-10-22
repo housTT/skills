@@ -6742,6 +6742,9 @@ def cmd_doctor(a) -> None:
     for line in config_problems(p.raw_config(), p.root):
         print(f"project.json: {line}")
     from . import push as _push
+    _d = p.config().get("delivery") or {}
+    if _push.lands_locally(_d.get("push_branch"), p.root, _push.allow_protected(_d)):
+        print(f"project.json: {_push.push_branch_problem(_d.get('push_branch'), p.root, _push.allow_protected(_d))}")
     checks = _push.check_list((p.config().get("delivery") or {}).get("push_checks"))
     if checks and (p.config().get("delivery") or {}).get("push_branch"):
         try:

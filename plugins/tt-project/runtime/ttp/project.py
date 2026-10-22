@@ -633,7 +633,8 @@ def pin_verify_mode(value: Any) -> str:
 def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     """Unknown keys, non-command push_checks or after_push, a scalar push_exclude_paths, a malformed version_bump, push queue
     settings out of range and a push branch that can never be pushed to (push_branch_problem; with
-    `root`, the code repo, its remotes are checked too) in a project's own settings, one line each."""
+    `root`, the code repo, its remotes are checked too) in a project's own settings, one line each. A
+    local push branch of a repo with no remote is not one: reviews land on it (lands_locally)."""
     out: list[str] = []
 
     def walk(node: dict, path: list[str]) -> None:
@@ -645,10 +646,11 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
                 walk(v, path + [str(k)])
     walk(raw, [])
     from .push import (allow_protected, applicability_problems, backup_problem, bump_problems, check_problems,   # push imports this module
-                       fast_forward_check, mirror_check, push_branch_problem, scalar_problem)
+                       fast_forward_check, lands_locally, mirror_check, push_branch_problem, scalar_problem)
     delivery = raw.get("delivery") or {}
     out += [why for why in [backup_problem(delivery)] if why]
-    out += [why for why in [push_branch_problem(delivery.get("push_branch"), root, allow_protected(delivery))] if why]
+    if not lands_locally(delivery.get("push_branch"), root, allow_protected(delivery)):
+        out += [why for why in [push_branch_problem(delivery.get("push_branch"), root, allow_protected(delivery))] if why]
     try:
         fast_forward_check(delivery.get("fast_forward_also"), str(delivery.get("push_branch") or ""))
     except ValueError as e:

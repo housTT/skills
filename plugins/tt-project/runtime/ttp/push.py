@@ -1464,8 +1464,7 @@ def push_branch_problem(push_branch: Any, repo: Path | None = None, allow: bool 
     r = _git(repo, "remote") if repo is not None else None
     remotes = r.stdout.split() if r is not None and r.returncode == 0 else None
     if remotes == []:
-        branch = _split_target(ref, [])[1]
-        if (branch not in PROTECTED or (allow and branch != "HEAD")) and _local_tip(repo, branch):
+        if lands_locally(ref, repo, allow):
             return (f"delivery.push_branch: the code repo has no git remote, so {ref} is never pushed; it is a "
                     f"local branch, and reviews land on it with `ttp land`")
         return (f"delivery.push_branch: the code repo has no git remote, so {ref} can never be pushed to; "
@@ -1484,6 +1483,17 @@ def push_branch_problem(push_branch: Any, repo: Path | None = None, allow: bool 
                 f"would fail; reviews are review only and never fall back to a raw `git push` to it (name a "
                 f"branch of its own, or, only on the user's word, set delivery.allow_protected_push_branch)")
     return ""
+
+
+def lands_locally(push_branch: Any, repo: Path | None, allow: bool = False) -> bool:
+    """Whether `push_branch` names an existing local branch of `repo` (the code repo), which has no git
+    remote (main/master only with `allow`): reviews land on it with `ttp land` (land.py), so
+    push_branch_problem's line for it is information for `ttp doctor`, not a config problem."""
+    ref = str(push_branch or "").strip()
+    if not ref or repo is None or not remote_less(repo):
+        return False
+    branch = _split_target(ref, [])[1]
+    return (branch not in PROTECTED or (allow and branch != "HEAD")) and bool(_local_tip(repo, branch))
 
 
 LOCAL_HARNESS = ("nothing to push: this is the project's harness, a local git repo with no remote. "
