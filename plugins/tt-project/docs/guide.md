@@ -275,6 +275,14 @@ prolonged whole-box outage.
   (a non-empty `user's words (verbatim)` part); then the sweep judges them again. An outcome stored
   in an older format is no cover. A waiting task on a user-pause probe is never reported
   as a stale wait. The daily review lists everything stuck over 6 h with its sweep outcome.
+- Course check: a digest section, shown only when something trips, with model-free signs the project
+  is off track or wasteful, each with its evidence and a suggested correction: an open task that
+  failed `fails_24h` (3) times in 24 h; queued tasks that never ran held `queued_h` (6) hours on a
+  dependency or paused resource while worker slots are free; a task that spent `spend_ratio` (3)
+  times the 7-day median of its kind and at least `spend_min_usd` ($2), given `spend_min_samples` (5)
+  finished ones; and the last `idle_turns` (6) coordinator turns in a row that decided nothing.
+  Thresholds live under `coordinator.course_check` (0 turns one off). The coordinator corrects course
+  in that turn or says why it is fine.
 - Promises: a coordinator reply or notify that commits to a deliverable or a time ("I'll report the
   sha by 15:00", "ETA 18:30") is always recorded as a promise. It holds the chat, the promised
   words, the due time (the time it names, in the home zone, else `coordinator.promise_default_h`, 6,

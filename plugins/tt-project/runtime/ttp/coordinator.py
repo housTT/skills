@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -304,7 +304,7 @@ MUTE_CHARS = 200
 # resources and memory changes are always shown whole; the machine ledger collapses per line
 # (LEDGER_SEEN_KEY).
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
-COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried", "settled_areas")
+COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried", "settled_areas", "course_check")
 # The shared machine ledger collapses per line: co-tenants reword its lines often ('seen by', 'page
 # held', outage ends), so a turn with no machine_* event shows only the new or reworded ones, and the
 # whole ledger again after a machine event (ledger_section). The seen lines are keyed on the ledger
@@ -822,6 +822,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))
     section("blocker_sweep", sweep.digest_lines(db, event_ids, now, p.config()))
+    course_lines, course_id = course.digest_lines(db, p.config(), now)
+    section("course_check", course_lines, course_id,
+            f"## Course check: {len(course_lines) - 1} lines (as last turn; correct course or say why it is fine)")
     mem = memory_budget_line(p)
     if mem:
         section("memory_budget", [mem], mem, mem.split(";")[0] + " (as last turn)")

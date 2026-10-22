@@ -375,8 +375,9 @@ EXTRA_KEYS = {
     # user_pause_marker: regex for the marker file a user-pause probe tests for (userpause.py; default `user-*`).
     # promise_default_h: when a chat promise that names no time is due (obligations.py; default 6).
     # mitigation_due_h: when a live-impact mitigation is due after it is filed (mitigate.py; default 4, 0 off).
+    # course_check: thresholds of the digest's Course check ({"fails_24h", "queued_h", "spend_ratio", ...}; course.py).
     "coordinator": {"max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
-                    "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h"},
+                    "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check"},
     "notify": {"slack_poll_s"},
     # stale_lock_s: see "harness_git" in DEFAULT_CONFIG; unset so that the old watchdog key below still counts.
     "harness_git": {"stale_lock_s"},

@@ -290,6 +290,8 @@ The project runs unattended. The user reads what you decided; they do not approv
 - A blocked task is yours first: decide it, re-plan around it, or run other work.
 - A `Blocker sweep` turn re-checks everything stuck. A provider held by its plan window is not out
   of options: free window resets and paid credits are an unblock path the daemon uses itself.
+- A `Course check` line: correct course this turn (re-plan, cancel, route around, scope down, or a
+  harness task), or say in `summary` why it is fine. Never pass it to the user unless only they can clear it.
 - A hold never replaces an ask or a decision: block a task only with `waits_on` naming what ends it.
 - `ask_user` only when you cannot go on without them, with `blocking` set to the reason:
   `access` (missing access or credentials), `funds` (out of funds or quota), `spend` (past the

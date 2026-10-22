@@ -989,6 +989,9 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     _resources(p, "- box-c")
     ml.add_change("box-c", "disabled auto power cycle", "enable it", "other", expires="6h")
     tid = db.add_task("open work", "s", origin="user")
+    for _ in range(3):   # trips the Course check, so it collapses too
+        db.x("INSERT INTO runs(task, role, started, ended, status, cost_usd) VALUES(?,?,?,?,?,?)",
+             (tid, "worker", time.time() - 120, time.time() - 60, "failed", 0.5))
     shelf = db.add_task("tile size lever", "s", origin="user")
     db.update_task(shelf, status="done", result=json.dumps({"status": "done", "summary": "Shelved: no gain."}))
     ask = db.post("out", "Which board should the soak use?", kind="ask")
@@ -13930,3 +13933,139 @@ def test_worker_memory_gives_task_ranked_entries_a_floor_past_a_long_charter(env
     assert sum(len(x) + 1 for x in lines) <= use["pinned_chars"] + WORKER_RANKED_MIN_CHARS
     assert "OLD-PATH" in worker_system(p, task)
     assert not any("OLD-PATH" in e["line"] for e in worker_context(p)[1]), "no task: newest facts, as before"
+
+
+
+def _course_run(db, task, status="failed", ago=60.0, cost=0.5, role="worker", note=None):
+    now = time.time()
+    db.x("INSERT INTO runs(task, role, started, ended, status, cost_usd, note) VALUES(?,?,?,?,?,?,?)",
+         (task, role, now - ago - 30, now - ago, status, cost, json.dumps(note) if note is not None else None))
+
+
+def test_course_check_is_omitted_on_a_healthy_project(env):
+    """Nothing tripped: no Course check section, so a healthy digest pays nothing for it."""
+    from ttp import coordinator as coord
+    from ttp import course
+    p = make(env)
+    tid = p.db.add_task("fine work", "s", origin="user")
+    _course_run(p.db, tid)   # one failure is no pattern
+    _course_run(p.db, None, "ok", role="coordinator", note={"decided": 0})
+    assert course.digest_lines(p.db, p.config())[0] == []
+    parts, _ = coord.digest_parts(p, {}, [], [])
+    assert "course_check" not in dict(parts) and "Course check" not in coord.digest(p, {}, [], [])
+
+
+def test_course_check_flags_a_task_failing_repeatedly_with_its_cost(env):
+    from ttp import course
+    p = make(env)
+    tid = p.db.add_task("port the kernel", "s", origin="user")
+    for _ in range(2):
+        _course_run(p.db, tid, cost=1.25)
+    _course_run(p.db, tid, "lost", note={"lost_to_reboot": True})   # a reboot is not a failure
+    _course_run(p.db, tid, "failed", ago=2 * 86400)                  # outside the 24 h window
+    assert course.digest_lines(p.db, p.config())[0] == []
+    _course_run(p.db, tid, "timeout", cost=0.5)
+    lines, ident = course.digest_lines(p.db, p.config())
+    assert lines[0] == course.HEADER, lines
+    assert f"- failing: #{tid} 'port the kernel' failed 3 times in 24 h ($3.00) | change the approach" in lines[1], lines
+    assert ident == f"fails:{tid}"
+    p.db.update_task(tid, status="failed")   # a finished task is not flagged
+    assert course.digest_lines(p.db, p.config())[0] == []
+
+
+def test_course_check_flags_queued_work_held_while_slots_are_free(env):
+    from ttp import course
+    p = make(env)
+    dep = p.db.add_task("first", "s", origin="user", status="blocked")
+    held = p.db.add_task("second", "s", origin="user", depends_on=[dep])
+    boxed = p.db.add_task("needs the board", "s", origin="user", labels=["resource:board-a"])
+    planned = p.db.add_task("later", "s", origin="user", depends_on=[dep], not_before=time.time() + 3600)
+    from ttp import coordinator as coord
+    coord.pause_resource(p, "board-a", True, reason="firmware", by="user")
+    assert course.queued(p.db, p.config(), 6, time.time()) is None   # too young yet
+    p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?,?)", (time.time() - 7 * 3600, held, boxed, planned))
+    lines, ident = course.digest_lines(p.db, p.config())
+    line = next(x for x in lines if x.startswith("- queued work held:"))
+    assert f"#{held}, #{boxed} never ran, oldest 7.0h" in line and f"dependency #{dep}" in line, line
+    assert "paused board-a" in line and "6 of 6 worker slots free" in line, line
+    assert f"#{planned}" not in line and ident == f"queued:{held},{boxed}"
+    for _ in range(6):   # every slot busy: nothing is wasted
+        p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?,?,?,?)", (dep, "worker", time.time(), "running"))
+    assert course.queued(p.db, p.config(), 6, time.time()) is None
+
+
+def test_course_check_flags_spend_far_above_the_projects_own_median(env):
+    from ttp import course
+    p = make(env)
+    for i in range(5):
+        t = p.db.add_task(f"routine {i}", "s", origin="user", kind="code")
+        p.db.update_task(t, status="done", spent_usd=1.0 + i * 0.1)   # median $1.20
+    big = p.db.add_task("huge refactor", "s", origin="user", kind="code")
+    p.db.update_task(big, spent_usd=3.5)   # 2.9x the median: under the line
+    assert course.digest_lines(p.db, p.config())[0] == []
+    p.db.update_task(big, spent_usd=4.0)
+    lines, ident = course.digest_lines(p.db, p.config())
+    assert f"- costly: #{big} 'huge refactor' (queued) spent $4.00, 3.3x the 7-day median $1.20 per done code task" \
+        in lines[1] and "split it" in lines[1], lines
+    assert ident == f"spend:{big}"
+    cheap = p.db.add_task("a review", "s", origin="user", kind="review")   # another kind has no median yet
+    p.db.update_task(cheap, spent_usd=50.0)
+    assert len(course.digest_lines(p.db, p.config())[0]) == 2
+
+
+def test_course_check_flags_a_run_of_coordinator_turns_that_decided_nothing(env):
+    from ttp import course
+    p = make(env)
+    _course_run(p.db, None, "ok", ago=9000, role="coordinator", note={"decided": 2})
+    for i in range(6):
+        _course_run(p.db, None, "ok", ago=3600 - i * 600, cost=0.25, role="coordinator",
+                    note={"decided": 0, **({"wake_due": "idle"} if i % 2 else {"events": 1})})
+    lines, ident = course.digest_lines(p.db, p.config())
+    assert lines[1].startswith("- idle turns: the last 6 coordinator turns decided nothing ($1.50 over 0.8h; "
+                               "woken by events 3, idle 3) | mute or fix"), lines
+    _course_run(p.db, None, "ok", ago=1, role="coordinator", note={"decided": 1})
+    assert course.digest_lines(p.db, p.config())[0] == []
+
+
+def test_course_check_thresholds_come_from_config(env):
+    from ttp import course
+    p = make(env)
+    tid = p.db.add_task("flaky", "s", origin="user")
+    for _ in range(2):
+        _course_run(p.db, tid)
+    for _ in range(3):
+        _course_run(p.db, None, "ok", role="coordinator", note={"decided": 0})
+    assert course.digest_lines(p.db, p.config())[0] == []
+    cfg = {**p.config(), "coordinator": {**p.config()["coordinator"],
+                                         course.KEY: {"fails_24h": 2, "idle_turns": 3}}}
+    lines, ident = course.digest_lines(p.db, cfg)
+    assert ident == f"fails:{tid}\nidle_turns", lines
+    off = {**cfg, "coordinator": {**cfg["coordinator"], course.KEY: {"fails_24h": 0, "idle_turns": 0}}}
+    assert course.digest_lines(p.db, off)[0] == []
+    assert course.settings({"coordinator": {course.KEY: {"queued_h": "x", "spend_ratio": -1}}}) == \
+        {**course.DEFAULTS, "spend_ratio": 0.0}
+    from ttp import project
+    assert course.KEY in project.EXTRA_KEYS["coordinator"]
+
+
+def test_course_check_collapses_while_unchanged_and_reports_its_size(env):
+    """Shown whole when it trips or changes, one line while unchanged; its size on a healthy and a
+    tripped fixture is printed for the change's report."""
+    from ttp import coordinator as coord
+    p = make(env)
+    healthy = coord.digest_size(coord.digest_parts(p, {}, [], [])[0])
+    tid = p.db.add_task("port the kernel", "s", origin="user")
+    for _ in range(3):
+        _course_run(p.db, tid)
+    full, seen = coord.digest_parts(p, {}, [], [])
+    assert "- failing: #" in dict(full)["course_check"]
+    tripped = coord.digest_size(full)
+    short, _ = coord.digest_parts(p, {}, [], [], seen)
+    assert dict(short)["course_check"] == ("## Course check: 1 lines (as last turn; correct course or say why "
+                                           "it is fine)")
+    other = p.db.add_task("another", "s", origin="user")
+    for _ in range(3):
+        _course_run(p.db, other)
+    assert f"#{other}" in dict(coord.digest_parts(p, {}, [], [], seen)[0])["course_check"]
+    print(f"\ncourse check digest tokens: healthy {healthy['tokens']} (section absent), tripped "
+          f"{tripped['tokens']} (section {tripped['sections']['course_check']} chars)")
