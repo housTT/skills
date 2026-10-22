@@ -49,7 +49,6 @@ from . import conflictfix
 from . import credits
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import coordcheck
 from . import coordlimits
 from . import detach
 from . import downtime
@@ -710,8 +709,6 @@ class Daemon:
                     f"commit={r['commit'] or 'none'} instance={r['instance']} provenance={r['provenance']}")
         self.p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname(), "started": time.time(),
                                     "instance": r["instance"]})
-        if self.p.db.kv(unblock.ESCALATION_LOG_KEY) is None:   # timestamped escalation records start here
-            self.p.db.set_kv(unblock.ESCALATION_LOG_KEY, time.time())
         self._check_config()
         self.sync_schedules(start=True)
         from .web import serve
@@ -1815,34 +1812,10 @@ class Daemon:
                        severity="low", every_s=86400)
         return found
 
-    def _coordinator_effort(self, provider: str, tier: str) -> str:
-        """The coordinator's effort before any unblock raise: coordinator.effort, else its tier's."""
-        tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
-        return str((self.cfg.get("coordinator") or {}).get("effort") or "") or tiers.get(tier, {}).get("effort", "")
-
-    def _coord_check(self, provider: str, tier: str, event_ids: list[int], wake_due: str | None,
-                     msg_ids: list[int] | None = None) -> dict | None:
-        """Jev's 'routine or needs thought?' verdict on a turn the rules leave below unblock_effort
-        (coordcheck), 'skipped' when nothing was worth asking, or None: not needed, off, or failed
-        (the rules' choice stands)."""
-        base = self._coordinator_effort(provider, tier)
-        high = coord.raise_effort(base, str(self.cfg["coordinator"].get("unblock_effort", "high") or ""))
-        if high == base:
-            return None   # already at unblock_effort: the check could not change it
-        try:
-            return coordcheck.check(self.p.db, self.cfg, self.jev,
-                                    coordcheck.summary(self.p.db, event_ids, wake_due), base, high,
-                                    event_ids, msg_ids)
-        except JevOutOfFunds:
-            self.alert("jev-funds", JEV_FUNDS_TEXT, "high")
-        except Exception:   # the check must never hold a turn back
-            log(self.p, "coordinator jev check failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
-        return None
-
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
-                  note: dict | None = None, resume: str | None = None, unblock: str = "",
+                  note: dict | None = None, resume: str | None = None,
                   context: str | None = None, cache_ttl: str = "") -> int:
         """`context` (with `system`): stable text that follows the system prompt, sent as a block of
         its own with a cache breakpoint after it where the provider can mark one (else it ends the
@@ -1860,17 +1833,11 @@ class Daemon:
         model = tiers.get(tier, {}).get("model", "")
         effort = tiers.get(tier, {}).get("effort", "")
         if role == "coordinator":
-            # coordinator.model / coordinator.effort pin the coordinator, so moving its tier's model
-            # (say light to a cheaper one for workers) does not move the coordinator with it.
-            c = self.cfg.get("coordinator") or {}
-            mtier = str(c.get("model_tier") or "")
-            if mtier in tiers:
-                model = tiers[mtier].get("model", "")
-            model = str(c.get("model") or "") or model
-            effort = str(c.get("effort") or "") or effort
-            if unblock and not str(c.get("effort") or ""):
-                # A tricky or blocking turn thinks harder (raise only); a pinned effort wins.
-                effort = coord.raise_effort(effort, str(c.get("unblock_effort", "high") or ""))
+            # Every turn at coordinator.effort, else coordinator.DEFAULT_EFFORT, as the provider takes
+            # it; coordinator.model pins the model, so moving its tier's model (say light to a cheaper
+            # one for workers) does not move the coordinator with it. Read from the config as it is now.
+            route = coord.coordinator_route(self.cfg, provider)
+            model, effort = route["model"], route["effort"]
             prompt_bytes = sum(len(text.encode("utf-8")) for text in (prompt, system or "", context or "", append_system or ""))
             timeout_s = coordlimits.turn_timeout(self.cfg, provider, effort, prompt_bytes)
             note = {**(note or {}), "turn": {"prompt_bytes": prompt_bytes, "provider": provider,
@@ -2996,65 +2963,23 @@ class Daemon:
             db.set_kv("last_coordinator_timeout", {"run": r["id"], "at": time.time(), **details})
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
         actions = (out or {}).get("actions")
-        checked = note.get("coord_check") or {}
         lost_to = "sleep" if note.get("lost_to_sleep") else "network" if note.get("lost_to_network") else \
             "reboot" if note.get("lost_to_reboot") and status == "lost" else ""
         if (status == "lost" and not r["dir"]) or status == "shutdown" or lost_to:
             # Never launched, ended by `ttp stop --kill`, or cut by a host sleep, a lost network or a
             # reboot: not a failed turn. Its messages and events stay queued for the next one.
-            self._settle_coord_check(checked, f"lost to {lost_to}" if lost_to else status)
             return
         if status == "auth":
-            self._settle_coord_check(checked, status)
             return   # its breaker holds the next turn until the login is back; the messages stay queued
         if status != "ok" or not isinstance(actions, list):
-            self._settle_coord_check(checked, status, None, [])
             if turnsize.over_budget(status, usage) and self._turn_over_budget(note):
                 return
             self._coordinator_failed(f"{status} {usage.error[:200]}")
             return
         db.set_kv("coordinator_failures", 0)
-        esc = [a for a in actions if isinstance(a, dict) and a.get("type") == "escalate"]
-        refused: list[str] = []
-        requeue = False
-        if esc:
-            actions = [a for a in actions if not (isinstance(a, dict) and a.get("type") == "escalate")]
-            counts = db.kv(coord.ESCALATIONS_KEY, {}) or {}
-            # Once per batch, from a routine turn only, alone, and only when it would raise the effort:
-            # the rerun (or any raised turn) decides, so escalation cannot loop.
-            batch = [sorted(note.get("events") or []), sorted(note.get("messages") or [])]
-            why_not = self._escalate_refusal(r, note, actions, batch, counts)
-            if not why_not:
-                why = str(esc[0].get("why") or esc[0].get("reason") or esc[0].get("text") or "")[:300]
-                db.set_kv(coord.ESCALATE_KEY, {"run": r.get("id"), "why": why, "ts": time.time(),
-                                               **({"due": note["wake_due"]} if note.get("wake_due") else {})})
-                db.set_kv(coord.ESCALATIONS_KEY, {**counts, "n": int(counts.get("n", 0)) + 1, "batch": batch})
-                log(self.p, f"coordinator turn {r.get('id')} escalated to high effort: {why}")
-                # Jev called it routine (if it was asked), and the turn found it was not
-                self._settle_coord_check(checked, "escalated", actions, [])
-                self._log_decided(r, note, 0)
-                return   # its messages and events stay queued for the rerun
-            refused = [f"escalate: refused ({why_not}); decide at this effort"]
-            # A turn that returned only a refused escalate decided nothing: its batch goes to the next
-            # turn once, with the refusal in its digest. An item requeued before is handled as usual.
-            ids = set(batch[0]) | {f"m{i}" for i in batch[1]}
-            before = set(counts.get("requeued") or [])
-            requeue = not _decisions(actions) and bool(ids) and not (ids & before)
-            db.set_kv(coord.ESCALATIONS_KEY, {**counts, "refused": int(counts.get("refused", 0)) + 1,
-                                              "requeued": sorted(ids, key=str) if requeue else
-                                              counts.get("requeued") or []})
-            log(self.p, f"coordinator turn {r.get('id')} escalation refused ({why_not})"
-                + ("; its batch goes to the next turn" if requeue else ""))
-        if requeue:
-            self._record_rejections(refused)
-            self._settle_coord_check(checked, status, actions, refused, float(getattr(usage, "cost_usd", 0) or 0))
-            db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
-            self._log_decided(r, note, 0)
-            return
         default_chat = note.get("default_chat")
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")),
-                               turn=r.get("id"), messages=note.get("messages") or [],
-                               high_effort=bool(note.get("unblock")))
+                               turn=r.get("id"), messages=note.get("messages") or [])
         chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
         problems = list(problems)
@@ -3063,7 +2988,6 @@ class Daemon:
         evs = note.get("events", [])
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
-        problems = refused + problems
         decided = len(_decisions(actions))
         self._log_decided(r, note, decided)
         if not decided:
@@ -3073,7 +2997,6 @@ class Daemon:
                 log(self.p, "coordinator turn gate record failed: "
                     + traceback.format_exc().replace("\n", " | ")[:1000])
         self._record_rejections([x[:500] for x in problems])
-        self._settle_coord_check(checked, status, actions, problems, float(getattr(usage, "cost_usd", 0) or 0))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
         try:
             quietgate.left(db, self._quiet_fp({k: g.as_dict() for k, g in self.gates.items()}), r.get("id"),
@@ -3114,42 +3037,8 @@ class Daemon:
         return True
 
     def _log_decided(self, r: dict, note: dict, decided: int) -> None:
-        """What the turn decided, for the daily review's audit of turns that decided nothing. A turn
-        that escalated, or whose batch was requeued after a refused escalate, decided nothing."""
+        """What the turn decided, for the daily review's audit of turns that decided nothing."""
         self.p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps({**note, "decided": decided}), r.get("id")))
-
-    def _escalate_refusal(self, r: dict, note: dict, actions: list, batch: list, counts: dict) -> str:
-        """Why a turn's `escalate` is refused, or "" when its batch reruns at high effort."""
-        if _decisions(actions):
-            return "it came with other actions; escalate must be returned alone"
-        tier = (self.cfg.get("coordinator") or {}).get("tier", "light")
-        if not coord.can_raise_effort(self.cfg, tier):
-            return "the coordinator's effort is pinned and cannot be raised"
-        if note.get("escalated") or note.get("unblock"):
-            return "this turn already ran at raised effort"
-        if batch == counts.get("batch"):
-            return "this batch was already escalated once"
-        if not coord.can_raise_effort(self.cfg, tier, r.get("effort") or ""):
-            return "this turn already ran at the highest effort a raise gives"
-        return ""
-
-    def _settle_coord_check(self, checked: dict, status: str, actions: list | None = None,
-                            problems: list[str] | None = None, turn_cost: float = 0.0) -> None:
-        """Log what a Jev-checked turn did next to its call (coordcheck.settle). Without `problems` the
-        turn ended with no result to score (lost, shut down, logged out). Bookkeeping never stops a
-        turn from ending."""
-        if not checked.get("jev_call"):
-            return
-        db, cid = self.p.db, int(checked["jev_call"])
-        try:
-            if problems is None:
-                coordcheck.unscored(db, cid, status)
-                return
-            extra = coordcheck.extra_cost(db, self.cfg, cid, turn_cost) if status == "ok" else 0.0
-            coordcheck.settle(db, cid, checked.get("verdict", ""), status, actions, problems, extra_usd=extra)
-        except Exception:
-            log(self.p, f"coordinator jev check {cid} not settled: "
-                + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def _record_rejections(self, problems: list[str]) -> None:
         """Rejected actions reach the next turn's digest; they never start a turn by themselves.
@@ -5400,11 +5289,7 @@ class Daemon:
         evs = [e for e in evs if e["kind"] != sweep.SWEEP_KIND or e["id"] == sweep_event]
         wake: dict = {}
         w: dict | None = None
-        # A routine turn that found its batch harder than it looked: rerun it now, once, at high effort.
-        esc = db.kv(coord.ESCALATE_KEY) or {}
-        if esc:
-            w = {"due": esc.get("due")} if esc.get("due") else None
-        elif not msgs and not evs:
+        if not msgs and not evs:
             last = float(db.kv("last_coordinator_turn", 0))
             if now - last <= min(float(c.get("idle_wake_s", 3600)), float(c.get("starve_wake_s", 300))):
                 return
@@ -5422,7 +5307,7 @@ class Daemon:
                 return
             if not msgs and self._batch_hold(queued, now):
                 return
-        if not msgs and not esc:
+        if not msgs:
             try:
                 # Every open task held by what no turn lifts, and nothing new since the last turn: a
                 # routine batch or wake is settled without a model run (quietgate.py).
@@ -5434,7 +5319,7 @@ class Daemon:
                         return ["unblock kind"]
                     return coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due_now, [], gates_now,
                                                  now, coord.charter_conflicts(self.p))[0]
-                if quietgate.quiet(db, self.cfg, evs, msgs, False, pre, due_now, self._quiet_fp(gates_now), now,
+                if quietgate.quiet(db, self.cfg, evs, msgs, pre, due_now, self._quiet_fp(gates_now), now,
                                    coord.UNBLOCK_KINDS, sweep.SWEEP_KIND):
                     usd = quietgate.skip(db, evs, due_now, now)
                     if not evs:
@@ -5447,7 +5332,7 @@ class Daemon:
             except Exception:   # the gate only saves money: a failure runs the turn
                 log(self.p, "coordinator quiet gate failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         seen_now: dict = {}
-        if evs and not msgs and not esc:
+        if evs and not msgs:
             try:
                 # A batch a turn that decided nothing already met, against the same state, is settled
                 # without a model run (turngate.py). A batch with an effort trigger always runs; the
@@ -5457,7 +5342,7 @@ class Daemon:
                 pre = [] if any(e["kind"] in coord.UNBLOCK_KINDS for e in evs) else \
                     coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], None, [], gates_now, now,
                                           coord.charter_conflicts(self.p))[0]
-                match = turngate.repeat(db, self.cfg, evs, msgs, seen_now, now, sweep.SWEEP_KIND, bool(esc),
+                match = turngate.repeat(db, self.cfg, evs, msgs, seen_now, now, sweep.SWEEP_KIND,
                                         pre, coord.UNBLOCK_KINDS)
                 if match:
                     turngate.skip(db, evs, match, now)
@@ -5482,7 +5367,6 @@ class Daemon:
         logged_out = self._logged_out(provider)
         if logged_out and not self._may_probe(provider, now):
             return   # logged out: one run at a time checks the login, and this turn is not it
-        check = None
         try:
             if sweep_event is not None:
                 sweep.prepare(db, sweep_event, self.cfg, now)
@@ -5491,36 +5375,16 @@ class Daemon:
             triggers, seen = coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due,
                                                    [m["id"] for m in msgs], gates, now,
                                                    coord.charter_conflicts(self.p), lowered)
-            if esc:
-                triggers = [f"escalated: {str(esc.get('why') or '')[:200]}".rstrip(": "), *triggers]
-            can_raise = coord.can_raise_effort(self.cfg, c.get("tier", "light"))
-            # Jev rates only a turn the rules leave routine and that a raise would change.
-            check = self._coord_check(provider, c.get("tier", "light"), [e["id"] for e in evs], due,
-                                      [m["id"] for m in msgs]) if can_raise and not triggers else None
-            if check and check["verdict"] == "needs_thought":
-                triggers.append(f"jev: needs thought ({check['reason']})")
-            checked = {"coord_check": {"jev_call": check["jev_call"], "verdict": check["verdict"],
-                                       **({"skipped": check["reason"]} if check["verdict"] == "skipped" else {})}} \
-                if check else {}
             unblock = ", ".join(triggers)
-            raised = bool(unblock) and can_raise
-            # Every turn, at any effort, sees background sections the previous turn saw as one line each.
+            # Every turn sees background sections the previous turn saw as one line each.
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
                                               db.kv(coord.DIGEST_SEEN_KEY) or {})
             # The sections rendered from the prompt snapshot end the cached context block.
             cached, parts = coord.split_cached(parts)
             prompt = "\n".join(text for _, text in parts)
-            # `escalate` is offered only where the daemon would take it: a routine turn that a raise
-            # would change, not a rerun, over a batch not escalated before (Daemon._escalate_refusal).
-            batch = [sorted(e["id"] for e in evs), sorted(m["id"] for m in msgs)]
-            offer = can_raise and not unblock and not esc and \
-                batch != (db.kv(coord.ESCALATIONS_KEY, {}) or {}).get("batch")
-            prompt += ("\n\nThis turn's effort: raised (" + unblock[:300] + ")." if raised else
-                       "\n\nThis turn's effort: routine. If this batch is harder than routine bookkeeping, "
-                       "return only an `escalate` action: it reruns once at high effort." if offer else "")
             head, context = coord.prompt_parts(self.p)
             context = coord.with_cached(context, cached)
-            run_id = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
+            self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
                            cache_ttl=cachettl.setting(c),
                            budget_usd=budget,
@@ -5529,30 +5393,17 @@ class Daemon:
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
                                  "triggers": triggers, **({"lowered": lowered} if lowered else {}),
                                  **({"wake_due": due} if due else {}),
-                                 **({"escalated": True} if esc else {}), **checked,
-                                 "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {})},
-                           unblock=unblock)
+                                 "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {})})
         except Exception as e:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
             log(self.p, "coordinator start failed: " + traceback.format_exc().replace("\n", " | ")[:2000])
-            if check:
-                self._settle_coord_check({"jev_call": check.get("jev_call")}, "not started")
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
-        if check and check.get("jev_call"):
-            try:
-                jevuse.set_ref(db, check["jev_call"], f"run:{run_id}")
-            except Exception:   # bookkeeping: the turn has started either way
-                log(self.p, "coordinator jev check ref not set: "
-                    + traceback.format_exc().replace("\n", " | ")[:1000])
         db.set_kv("last_coordinator_turn", now)
         quietgate.started(db)
         db.set_kv(coord.EFFORT_SEEN_KEY, seen)
         db.set_kv(coord.DIGEST_SEEN_KEY, shown)
-        if esc:
-            db.x("DELETE FROM kv WHERE key=?", (coord.ESCALATE_KEY,))
-        else:
-            db.set_kv("idle_wake", wake)
+        db.set_kv("idle_wake", wake)
         if logged_out:
             db.set_kv(f"auth_probe:{provider}", now)
 

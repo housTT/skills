@@ -68,9 +68,6 @@ PLANNED_WINDOW = re.compile(
     r"|\b(window|period|delay)\s+(it|I|the task|this task|we)\s+(set|planned|chose)\b"
     r"|\bstart_(after|when)\b", re.I)
 WAIT_KINDS = ("self", "external")
-# kv: when this project's daemon first ran a release that logs escalations and their refusals with
-# timestamps (rerun turns' notes, `rejected_actions` events); a window starting earlier is not covered.
-ESCALATION_LOG_KEY = "escalation_log_since"
 LIVE_WAITS_MAX = 6   # coordinator.live_waits_max: waits on the same live jobs or locks in 24 h that stay routine
 _SHELL_OPS = frozenset({"&&", "||", ";", "|", "&"})
 # A cheap wake that found work and runs again at once: the same wait going on, never a new one.
@@ -687,27 +684,20 @@ def refused_line(db: DB, since: float, flagged: bool = False) -> str:
 
 
 def turns_line(db: DB, since: float) -> str:
-    """The coordinator's high/low turn split and, where its turns log them, escalations and triggers.
-    A note's `triggers` list counts each trigger on its own; an "escalated: <why>" entry counts
-    under "escalated". Notes without that list fall back to `trigger` or `unblock`."""
+    """The coordinator's turns by effort, and its turns by trigger label. Notes without a `triggers`
+    list fall back to `trigger` or `unblock`."""
     rows = db.q("SELECT effort, note FROM runs WHERE role='coordinator' AND started>=?", (since,))
     if not rows:
         return "no coordinator turns"
     split: dict[str, int] = {}
-    escalated, logged, why = 0, False, {}
+    why: dict[str, int] = {}
     for r in rows:
         split[r["effort"] or "default"] = split.get(r["effort"] or "default", 0) + 1
-        note = _note(r["note"])
-        keys = [k for k in note if "escalat" in str(k)]
-        # releases that can escalate write a `triggers` list on every turn, so it marks the log
-        logged = logged or bool(keys) or isinstance(note.get("triggers"), list)
-        escalated += any(bool(note[k]) for k in keys)
-        for t in _triggers(note):
+        for t in _triggers(_note(r["note"])):
             why[t] = why.get(t, 0) + 1
     line = f"{len(rows)} turns: " + ", ".join(f"{n} {k}" for k, n in sorted(split.items(), key=lambda kv: -kv[1]))
-    line += f"; {escalated} escalated low to high" if logged else "; escalations not logged"
     if why:
-        line += "; high-effort triggers: " + ", ".join(f"{k} {n}" for k, n in sorted(why.items(), key=lambda kv: -kv[1])[:5])
+        line += "; triggers: " + ", ".join(f"{k} {n}" for k, n in sorted(why.items(), key=lambda kv: -kv[1])[:5])
     return line
 
 
@@ -720,8 +710,7 @@ def _note(raw: Any) -> dict:
 
 
 def _triggers(note: dict) -> list[str]:
-    """A turn's trigger labels: each entry's text before the first ':' or '(', cut to 40 chars,
-    so "jev: needs thought (stuck 0.80)" counts as "jev" and "escalated: <why>" as "escalated"."""
+    """A turn's trigger labels: each entry's text before the first ':' or '(', cut to 40 chars."""
     trigs = note.get("triggers")
     if not isinstance(trigs, list):
         trig = note.get("trigger") or note.get("unblock")
@@ -731,8 +720,7 @@ def _triggers(note: dict) -> list[str]:
 
 
 def triggers_line(db: DB, since: float) -> str:
-    """Coordinator turns per trigger label, the raised vs routine share with their cost, and the
-    escalations (escalations_part)."""
+    """Coordinator turns per trigger label, and the triggered vs routine share with their cost."""
     rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND started>=?", (since,))
     if not rows:
         return "no coordinator turns"
@@ -747,35 +735,11 @@ def triggers_line(db: DB, since: float) -> str:
         for t in trigs:
             per[t] = per.get(t, 0) + 1
     n = len(rows)
-    line = (f"raised {raised[0]} ({100 * raised[0] / n:.0f}%, ${raised[1]:.2f}), "
+    line = (f"triggered {raised[0]} ({100 * raised[0] / n:.0f}%, ${raised[1]:.2f}), "
             f"routine {routine[0]} ({100 * routine[0] / n:.0f}%, ${routine[1]:.2f})")
     if per:
         line += "; per trigger: " + ", ".join(f"{k} {v}" for k, v in sorted(per.items(), key=lambda kv: (-kv[1], kv[0])))
-    return line + "; " + escalations_part(db, since)
-
-
-def escalations_part(db: DB, since: float) -> str:
-    """Escalations (routine turns rerun at high effort) and refused escalations since `since`, from
-    timestamped records: reruns' run notes and `rejected_actions` events. They count only when those
-    records cover the whole window (ESCALATION_LOG_KEY, set by the daemon's first start on a release
-    that keeps them); otherwise the window's count is unknown. The `escalations` kv counters are
-    cumulative, so they are labelled so and never added into the window."""
-    from .coordinator import ESCALATIONS_KEY
-    since_log = db.kv(ESCALATION_LOG_KEY)
-    if isinstance(since_log, (int, float)) and since_log <= since:
-        n = sum(bool(_note(r["note"]).get("escalated")) for r in db.q(
-            "SELECT note FROM runs WHERE role='coordinator' AND started>=?", (since,)))
-        refused = db.one("SELECT COUNT(*) AS n FROM events WHERE kind='rejected_actions' AND ts>=? AND text LIKE ?",
-                         (since, "%escalate: refused (%"))["n"]
-        part = f"escalations {n} (refused {refused})"
-    else:
-        part = "escalations unknown (not logged for the whole window)"
-    esc = db.kv(ESCALATIONS_KEY)
-    if isinstance(esc, dict) and ("n" in esc or "refused" in esc):
-        part += f"; cumulative (all time, not this window): {int(esc.get('n', 0))} (refused {int(esc.get('refused', 0))})"
-    else:
-        part += "; cumulative: not recorded"
-    return part
+    return line
 
 
 def lines(db: DB, now: float | None = None) -> list[str]:

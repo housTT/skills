@@ -137,24 +137,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "device": {"locks": [], "max_tasks": 2, "runners": {}, "runner_restarts_per_day": 6, "nodes": [],
                "hosts": {}},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
-    # model / effort, when set, override the coordinator tier's for the coordinator only. Unset, the
-    # coordinator runs its tier's effort on model_tier's model ("" = its own tier's), so the cheaper
-    # light-tier model for workers does not move the coordinator.
-    # unblock_effort: the least effort of a tricky or blocking turn (coordinator.effort_triggers);
-    # "" keeps those at the coordinator's usual effort. A task failing repeat_fails_24h times in
+    # model / effort, when set, override the coordinator's defaults. Unset, every coordinator turn
+    # runs at coordinator.DEFAULT_EFFORT (xhigh, or the provider's highest effort below it) on
+    # model_tier's model ("" = its own tier's), so the cheaper light-tier model for workers does not
+    # move the coordinator. A change applies at the next turn (coordinator.coordinator_route).
+    # Triggers (coordinator.effort_triggers) mark a tricky or blocking turn, which the turn gates never
+    # skip. A task failing repeat_fails_24h times in
     # 24 h makes one, and so do its external waits when their reason, probe or owner changes, and once
     # per run of waits when they have gone on for 24 h or reach repeat_waits_24h in 24 h (0 turns
     # either count off). A wait on its own live
     # `ttp detach` jobs or `ttp lock` resources counts only past live_waits_max waits on the same ones
     # in 24 h or once a job's log stops growing (0: every such wait counts as before).
-    # effort_skip_triggers: trigger labels (as recorded in the turn's note) that never raise a turn.
-    "coordinator": {"tier": "light", "model": "", "model_tier": "standard", "effort": "", "unblock_effort": "high",
+    # effort_skip_triggers: trigger labels (as recorded in the turn's note) that never count.
+    "coordinator": {"tier": "light", "model": "", "model_tier": "standard", "effort": "",
                     "repeat_fails_24h": 2, "repeat_waits_24h": 8, "live_waits_max": 6,
                     "effort_skip_triggers": [],
-                    # Jev's check (coordcheck) runs only on new failed or blocked tasks, high or
-                    # critical events, user messages and external waits older than jev_wait_h; any
-                    # reason it rates at jev_threshold or above raises the turn.
-                    "jev_threshold": 0.7, "jev_wait_h": 6,
                     "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,
                     "starve_wake_s": 300,

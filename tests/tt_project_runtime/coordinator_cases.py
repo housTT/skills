@@ -12859,7 +12859,7 @@ def test_quiet_gate_settles_idle_wakes_but_never_unblock_or_sweep_kinds(env):
     ev = {"id": 1, "kind": "idle_capacity", "severity": "normal", "source": "daemon"}
 
     def quiet(evs, due=None, triggers=lambda: [], **k):
-        return quietgate.quiet(p.db, {}, evs, [], False, triggers, due, fp, now, **k)
+        return quietgate.quiet(p.db, {}, evs, [], triggers, due, fp, now, **k)
     assert quietgate.all_held(p.db, {}, now)
     assert quiet([], "idle") and quiet([], "starve") and quiet([ev])
     assert not quiet([]), "no events and no idle wake: nothing to settle"
@@ -12868,7 +12868,6 @@ def test_quiet_gate_settles_idle_wakes_but_never_unblock_or_sweep_kinds(env):
     assert not quiet([ev], unblock_kinds={"idle_capacity"})
     assert not quiet([ev], sweep_kind="idle_capacity")
     assert not quiet([{**ev, "source": "task:3"}])
-    assert not quietgate.quiet(p.db, {}, [ev], [], True, lambda: [], None, fp, now), "an escalation reruns"
     quietgate.started(p.db)
     assert not quiet([ev]), "a turn that started and never finished left nothing to match"
 

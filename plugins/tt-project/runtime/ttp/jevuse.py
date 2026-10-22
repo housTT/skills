@@ -35,8 +35,7 @@ WINDOW_DAYS, MIN_CALLS = 7, 30     # defaults of jev.window_days and jev.min_cal
 IDLE_CALLS = 20                    # default of jev.idle_calls: calls that changed no decision before it goes off
 NO_CHANGE = "no change"            # an outcome: the call changed nothing the rules would not have done
 WAKE_COST_FALLBACK_USD = 0.05      # a coordinator turn's price while none was measured in the window
-LABELS = {"screen": "watcher screening", "effort": "task effort picking",
-          "coord_effort": "coordinator effort check"}
+LABELS = {"screen": "watcher screening", "effort": "task effort picking"}
 
 
 def _jcfg(cfg: dict) -> dict:
@@ -122,14 +121,14 @@ def mean_turn_cost(db: DB, cfg: dict, now: float | None = None, effort: str | No
 
 
 def coordinator_effort(cfg: dict) -> str:
-    """The coordinator's low (unraised) effort: coordinator.effort, else its tier's on the core provider."""
-    c = cfg.get("coordinator") or {}
-    tiers = ((cfg.get("providers") or {}).get(cfg.get("core_provider") or "claude") or {}).get("tiers") or {}
-    return str(c.get("effort") or "") or str((tiers.get(c.get("tier") or "light") or {}).get("effort") or "")
+    """The effort the coordinator's turns run at (coordinator.coordinator_route)."""
+    from .coordinator import coordinator_route
+    return coordinator_route(cfg)["effort"]
 
 
-def low_turn_cost(db: DB, cfg: dict, now: float | None = None) -> float:
-    """The mean cost of a low-effort coordinator turn: what a wake Jev kept from happening would have cost."""
+def turn_cost(db: DB, cfg: dict, now: float | None = None) -> float:
+    """The mean cost of a coordinator turn at its current effort: what a wake Jev kept from happening
+    would have cost."""
     return mean_turn_cost(db, cfg, now, effort=coordinator_effort(cfg))
 
 

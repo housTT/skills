@@ -13,8 +13,8 @@ Then a batch of only routine daemon events (`coordinator.quiet_held_kinds`, defa
 an idle or starve wake with no events, is settled without a model run: its events are handled, a wake
 counts as a repeat (its backoff doubles and the next wake waits from the skip), and the skip is
 logged as QUIET. Never skipped: user
-messages, an escalation rerun, any high or critical event, any other kind, and any batch with an effort
-trigger (a raised turn). The state a turn leaves is stored when it finishes; a turn starting clears the
+messages, any high or critical event, any other kind, and any batch with a trigger
+(coordinator.effort_triggers). The state a turn leaves is stored when it finishes; a turn starting clears the
 old one, so one that never finishes leaves nothing to match. `coordinator.quiet_held_max_s` (a day)
 lets one turn through once the last one started that long ago; 0 sets no such limit (the gate stays on,
 and skipped wakes still back off to one a day). `coordinator.quiet_held` false turns the gate off."""
@@ -104,11 +104,11 @@ def left(db, fp: str, run, start: float | None = None) -> None:
     db.set_kv(LEFT_KEY, {"fp": fp, "ts": start or time.time(), "run": run})
 
 
-def quiet(db, cfg: dict, evs: list[dict], msgs: list, escalated: bool, triggers, due: str | None,
+def quiet(db, cfg: dict, evs: list[dict], msgs: list, triggers, due: str | None,
           fp: str, now: float, unblock_kinds=frozenset(), sweep_kind: str = "") -> bool:
     """Whether this routine turn would meet only what the last one left, with every task held.
-    `triggers`: the turn's effort triggers, or a callable returning them, called only once all else holds."""
-    if not enabled(cfg) or msgs or escalated or (triggers and not callable(triggers)):
+    `triggers`: the turn's triggers, or a callable returning them, called only once all else holds."""
+    if not enabled(cfg) or msgs or (triggers and not callable(triggers)):
         return False
     if evs:
         kinds = routine_kinds(cfg)
@@ -129,8 +129,8 @@ def quiet(db, cfg: dict, evs: list[dict], msgs: list, escalated: bool, triggers,
 
 
 def _turn_usd(db) -> float:
-    """What a routine turn costs: the mean of the last ten low-effort coordinator turns."""
-    rows = db.q("SELECT cost_usd FROM runs WHERE role='coordinator' AND effort='low' AND status!='running' "
+    """What a routine turn costs: the mean of the last ten coordinator turns."""
+    rows = db.q("SELECT cost_usd FROM runs WHERE role='coordinator' AND status!='running' "
                 "AND cost_usd IS NOT NULL ORDER BY id DESC LIMIT 10")
     return round(sum(float(r["cost_usd"] or 0) for r in rows) / len(rows), 4) if rows else 0.0
 

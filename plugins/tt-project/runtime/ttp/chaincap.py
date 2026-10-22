@@ -17,9 +17,9 @@ Caps (`chains` in project.json; 0 turns one off): max_hops (DEFAULTS: 8), max_st
 no-progress hops in a row) and max_usd (40 for the whole lineage). Once one is reached, or while
 the lineage's area is under review.area_fail_cap (a reviewcap.REVIEW_AREA_EVENT within
 reviewcap.AREA_WINDOW_S naming one of its tasks), a task_add that continues the lineage is refused,
-and a CAP_EVENT makes the next coordinator turn a high-effort one (TRIGGER). The only way past is
+and a CAP_EVENT makes the next coordinator turn a triggered one (TRIGGER). The only way past is
 the action's `reason` naming what changed (REASON_RE: a new approach, a rescoped spec, new
-evidence), sent in a high-effort turn; that override is recorded as an OVERRIDE_EVENT.
+evidence); that override is recorded as an OVERRIDE_EVENT.
 
 Model-free hop (`chains.auto`, on by default): a done task whose only proposal is one `continue:`
 follow-up, in a lineage below every cap, that made progress gets the follow-up queued by the daemon
@@ -183,9 +183,9 @@ def reason_ok(reason) -> bool:
     return len(r) >= MIN_REASON and bool(REASON_RE.search(r))
 
 
-def check_add(p, cfg: dict, prev: int, reason, high_effort: bool) -> str:
+def check_add(p, cfg: dict, prev: int, reason) -> str:
     """For a task_add continuing `prev`: '' when its lineage is under every cap, a note when `reason`
-    takes it past one in a high-effort turn; otherwise raises ValueError, with a CAP_EVENT for the
+    takes it past one; otherwise raises ValueError, with a CAP_EVENT for the
     next turn (once per lineage and hop count)."""
     db = p.db
     ch = chain(db, prev)
@@ -193,7 +193,7 @@ def check_add(p, cfg: dict, prev: int, reason, high_effort: bool) -> str:
     if not why:
         return ""
     data = {"root": ch[0]["id"], "tip": prev, "hops": len(ch) - 1, "usd": round(spend(ch), 2), "why": why}
-    if reason_ok(reason) and high_effort:
+    if reason_ok(reason):
         db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
              (time.time(), "coordinator", OVERRIDE_EVENT, "low", f"{why}; passed with reason: {str(reason)[:300]}",
               json.dumps({**data, "reason": str(reason)[:300]}), "handled", prev))
@@ -204,9 +204,8 @@ def check_add(p, cfg: dict, prev: int, reason, high_effort: bool) -> str:
              (time.time(), "coordinator", CAP_EVENT, fp, "normal",
               f"{TRIGGER}: {why}. Another hop is refused. Re-plan: narrow the scope, change the approach, or stop "
               f"and report what is left; a task_add that continues it passes only with a `reason` naming what "
-              f"changed, in a high-effort turn.", json.dumps(data), "queued", prev))
-    hint = ("its `reason` does not name what changed (a new approach, a rescoped spec, new evidence)"
-            if not reason_ok(reason) else "a `reason` passes the cap only in a high-effort turn")
+              f"changed.", json.dumps(data), "queued", prev))
+    hint = "its `reason` does not name what changed (a new approach, a rescoped spec, new evidence)"
     raise ValueError(f"task_add continues #{prev} refused: {why}; {hint}")
 
 

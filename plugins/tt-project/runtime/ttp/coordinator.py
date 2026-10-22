@@ -40,7 +40,7 @@ from .providers.base import NULL_OPERATIONS, normalize_action
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
-                "escalate", "sweep", "obligation", "noop")
+                "sweep", "obligation", "noop")
 
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (in the
 # project's home zone unless it names one). Plain character classes, so every provider's schema engine takes it.
@@ -154,10 +154,8 @@ USER_SETTABLE = {
     "budget.reset_credit_expiry_use_pct": float, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
     "coordinator.tier": str, "coordinator.model": str, "coordinator.model_tier": str, "coordinator.effort": str,
-    "coordinator.unblock_effort": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "runner.pin_verify": pin_verify_mode,
-    # Jev's 'routine or needs thought?' check on coordinator turns (coordcheck): on, off or auto.
-    "jev.uses.coord_effort": lambda v: jevuse.mode({"jev": {"uses": {"x": v}}}, "x"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
     # Where `ttp push` publishes (required; never main, master or the remote's default branch) and
@@ -238,9 +236,9 @@ AGAIN_KEY = "rejected_again"   # kv: hashes of the last turn's rejections that r
 # kv: {"at": ts, "why": text}: a rejected action whose blocking condition clears at a known time.
 # The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
 RETRY_WAKE_KEY = "rejected_retry_wake"
-# What makes a coordinator turn tricky or blocking: such a turn runs at least at
-# coordinator.unblock_effort (effort_triggers). Events of these kinds, by the trigger they count as.
-# Everything else (a task done, notes, follow-ups, a retry wake) is routine and keeps the base effort.
+# What makes a coordinator turn tricky or blocking (effort_triggers): such a turn always runs and
+# its triggers are logged in its note. Events of these kinds, by the trigger they count as.
+# Everything else (a task done, notes, follow-ups, a retry wake) is routine; the gates may settle it.
 EFFORT_EVENT_TRIGGERS = {
     # stuck work
     "task_blocked": "stuck", "task_failed": "stuck", "task_changes_needed": "stuck", "task_review": "stuck",
@@ -278,9 +276,10 @@ EFFORT_SEEN_KEY = "effort_seen"   # kv: state-based triggers already raised once
 STINT_KINDS = ("task_waiting", "task_blocked", "task_review", "task_done", "task_failed", "task_changes_needed",
                "task_queued", "task_requeued", "push_queued")
 STINT_LOOKBACK_S = 14 * 86400
-ESCALATE_KEY = "escalate"   # kv: a routine turn's escalation; the next turn reruns its batch at high effort
-ESCALATIONS_KEY = "escalations"   # kv: {"n": routine turns escalated, "refused": escalations refused}
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
+# Every coordinator turn runs at this effort unless coordinator.effort sets one: the coordinator is
+# where a project going off track or working inefficiently gets noticed (coordinator_route).
+DEFAULT_EFFORT = "xhigh"
 # task_add rejections the next turn cannot fix by resending (fixable_rejection): the work is open,
 # tried or reviewed already, or a cap holds it (its own event or wake follows); and a dropped resource
 # name, which still adds the task.
@@ -1385,12 +1384,12 @@ def _clock(ts: float, where=None) -> str:
 
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
-          turn: int | None = None, messages: list[int] | None = None, high_effort: bool = False) -> list[str]:
+          turn: int | None = None, messages: list[int] | None = None) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
     `messages`: the user messages the daemon started this turn for (a charter change they approved
-    that fails here stays approved for a retry, see _charter_approval). `high_effort`: a raised turn,
-    where a task_add's `reason` may take a continue chain past its cap (chaincap).
+    that fails here stays approved for a retry, see _charter_approval). A task_add's `reason` may
+    take a continue chain past its cap (chaincap).
 
     A turn cut off before its database transaction commits is applied again from its output. Its
     file writes carry `turn`.<action index> so the replay does not repeat them, while the same
@@ -1528,7 +1527,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
                 followup = old if old and old["status"] == "done" else None
                 if old:   # a continue chain over its cap, or in an area under review_area_cap (chaincap)
-                    if past := chaincap.check_add(p, cfg, old["id"], a.get("reason"), high_effort):
+                    if past := chaincap.check_add(p, cfg, old["id"], a.get("reason")):
                         notes.append(past)
                 if followup:
                     # Done work is not taken over: the new task is a follow-up that starts fresh
@@ -2183,8 +2182,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(scr.hold_cap_note(m, a.get("escalate_after_h")))
             elif t == "sweep":
                 sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)), where=p)
-            elif t in ("noop", "escalate", None):
-                pass   # an escalation is the daemon's (Daemon._finish_coordinator); here it changes nothing
+            elif t in ("noop", None):
+                pass
             else:
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
@@ -2608,7 +2607,7 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     rule, so turns can be counted by trigger. `conflicts`: the charter's contradicting Restrictions
     pairs (restriction_pairs); a pair not seen before raises the turn whose digest shows it.
     `lowered`, when given, gets one line per event a lowering rule kept routine (LOWERED_*), for the
-    turn's note next to its outcome; `escalate` stays the way back to high effort."""
+    turn's note next to its outcome."""
     now = now or time.time()
     c = cfg.get("coordinator") or {}
     out: list[str] = []
@@ -2876,25 +2875,25 @@ def wait_stint(db, tid: int, now: float, live: int = unblock.LIVE_WAITS_MAX) -> 
     return rows, stint
 
 
-def can_raise_effort(cfg: dict, tier: str, effort: str | None = None) -> bool:
-    """Whether a tricky turn would run at more than the coordinator's base `effort` (by default its
-    tier's): not when coordinator.effort pins it or coordinator.unblock_effort is empty."""
+def coordinator_route(cfg: dict, provider: str | None = None) -> dict:
+    """The provider, model and effort the coordinator's next turn runs with, read from `cfg` as it is
+    now (so a config change applies at the next turn): coordinator.model, else model_tier's model, else
+    its tier's; coordinator.effort, else DEFAULT_EFFORT, mapped to the provider's nearest effort level
+    (its highest for one above it; "" for a provider that takes none, such as Cursor)."""
+    provider = provider or str(cfg.get("core_provider") or "claude")
     c = cfg.get("coordinator") or {}
-    floor = str(c.get("unblock_effort", "high") or "")
-    if str(c.get("effort") or "") or not floor:
-        return False
-    if effort is None:
-        effort = str(((cfg.get("providers") or {}).get(cfg.get("core_provider", "claude")) or {})
-                      .get("tiers", {}).get(tier, {}).get("effort", "") or "")
-    return raise_effort(effort, floor) != effort
+    tiers = ((cfg.get("providers") or {}).get(provider) or {}).get("tiers") or {}
+    tier = str(c.get("tier") or "light")
+    mtier = str(c.get("model_tier") or "")
+    model = str(c.get("model") or "") or str((tiers.get(mtier if mtier in tiers else tier) or {}).get("model") or "")
+    effort = str(c.get("effort") or "") or DEFAULT_EFFORT
+    return {"provider": provider, "model": model, "effort": failover.kept_effort(provider, effort) or ""}
 
 
-def raise_effort(effort: str, floor: str) -> str:
-    """`effort`, raised to at least `floor`; an empty floor leaves it as is."""
-    if not floor or (effort in EFFORT_ORDER and floor in EFFORT_ORDER
-                     and EFFORT_ORDER.index(effort) >= EFFORT_ORDER.index(floor)):
-        return effort
-    return floor
+def route_line(cfg: dict) -> str:
+    """One line for `ttp status` and the web app: 'coordinator: <provider>/<model> · <effort>'."""
+    r = coordinator_route(cfg)
+    return f"coordinator: {r['provider']}/{r['model'] or 'default model'} · {r['effort'] or 'no effort setting'}"
 
 
 def name_list(v: Any, strict: bool = False, pattern: re.Pattern = MCP_NAME_RE,

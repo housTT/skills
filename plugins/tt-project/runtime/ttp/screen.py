@@ -274,7 +274,7 @@ def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
            floor: int, pin: bool = False) -> tuple[str, str, str, dict]:
     """Severity of a new issue: the watcher's hint, else rules, refined by Jev when configured and
     its screening use is on (see jevuse). Jev may lower a hinted severity but never raise it, nor judge a pinned one. Each Jev call is logged with the coordinator wake it skipped,
-    priced at a low-effort coordinator turn, and settled later (settle_jev)."""
+    priced at a coordinator turn, and settled later (settle_jev)."""
     rules = severity = hint or rule_severity(text)
     verdict_src, reason, info = "rules", f"rule severity {severity}", {}
     if pin:   # the watcher pinned its hint: Jev could only lower it, so it is not asked
@@ -310,7 +310,7 @@ def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
                 # It changed the decision only when it skipped a wake or raised one the rules would not have.
                 info = {"skipped": skipped, "jev_call": jevuse.record(
                     db, JEV_USE, decision, getattr(jev, "last_cost", 0.0),
-                    avoided_usd=jevuse.low_turn_cost(db, cfg) if skipped else 0.0,
+                    avoided_usd=jevuse.turn_cost(db, cfg) if skipped else 0.0,
                     settle_s=JEV_SETTLE_S if skipped else None, changed=rules_wake != jev_wake)}
         except JevOutOfFunds:
             # The rules decide in this same pass: screening again would count earlier items twice.

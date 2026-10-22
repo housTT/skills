@@ -1153,12 +1153,12 @@ def test_jev_screening_skip_is_priced_at_a_low_turn_settles_against_later_wakes_
     # No low-effort turn measured yet: the documented constant prices the skipped wake.
     a = scr.screen(p.db, cfg, "watcher:hw", "box-a: link retry failed", jev=quiet)
     assert not a.wake and p.db.one("SELECT avoided_usd FROM jev_calls")["avoided_usd"] == jevuse.WAKE_COST_FALLBACK_USD
-    # A raised turn does not count: only the coordinator's low (unraised) effort prices a skip.
+    # A turn at another effort does not count: only the coordinator's current effort prices a skip.
     for cost, effort in ((0.2, "low"), (0.4, "low"), (2.0, "high")):
         p.db.x("INSERT INTO runs(role,status,started,ended,cost_usd,effort) VALUES('coordinator','ok',?,?,?,?)",
                (now - 3600, now - 3500, cost, effort))
     assert jevuse.coordinator_effort(cfg) == "low"
-    assert jevuse.low_turn_cost(p.db, cfg) == pytest.approx(0.3)
+    assert jevuse.turn_cost(p.db, cfg) == pytest.approx(0.3)
     b = scr.screen(p.db, cfg, "watcher:hw", "box-b: fan speed check failed", jev=quiet)
     c = scr.screen(p.db, cfg, "watcher:hw", "box-c: disk scrub failed", jev=quiet)
     d = scr.screen(p.db, cfg, "watcher:hw", "box-d: clock sync failed", jev=quiet)
@@ -2221,12 +2221,11 @@ def test_a_batch_a_noop_turn_already_met_is_skipped_without_a_model_run(env, mon
     gate = {"bg": "x", "keys": ["k"]}
     evs = [{"id": 1, "kind": "local_only", "severity": "normal"}]
     p.db.set_kv(turngate.SEEN_KEY, [{"ts": clock[0], "run": 1, "usd": 0.1, "bg": "x", "keys": ["k"]}])
-    assert turngate.repeat(p.db, d.cfg, evs, [], gate, clock[0], sweep.SWEEP_KIND, False)
-    assert not turngate.repeat(p.db, d.cfg, evs, [], gate, clock[0], sweep.SWEEP_KIND, True)
+    assert turngate.repeat(p.db, d.cfg, evs, [], gate, clock[0], sweep.SWEEP_KIND)
     off = {"coordinator": {"skip_repeat_window_s": 0}}
-    assert not turngate.repeat(p.db, off, evs, [], gate, clock[0], sweep.SWEEP_KIND, False)
-    assert not turngate.repeat(p.db, d.cfg, evs, [], gate, clock[0] + 86400, sweep.SWEEP_KIND, False), "records expire"
-    assert not turngate.repeat(p.db, d.cfg, evs, [], {"bg": "y", "keys": ["k"]}, clock[0], sweep.SWEEP_KIND, False)
+    assert not turngate.repeat(p.db, off, evs, [], gate, clock[0], sweep.SWEEP_KIND)
+    assert not turngate.repeat(p.db, d.cfg, evs, [], gate, clock[0] + 86400, sweep.SWEEP_KIND), "records expire"
+    assert not turngate.repeat(p.db, d.cfg, evs, [], {"bg": "y", "keys": ["k"]}, clock[0], sweep.SWEEP_KIND)
 
 
 def test_the_daily_review_never_lifts_a_pause_the_user_set():
