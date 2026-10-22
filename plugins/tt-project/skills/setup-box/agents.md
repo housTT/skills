@@ -12,9 +12,10 @@ admin login, and never as root. `box.py` is `<plugin-root>/skills/setup-box/scri
 box.py agents check <box-alias>                      # read-only: each gap and the command that fixes it
 box.py agents install <box-alias> --run              # Claude Code and Codex CLIs, PATH lines
 box.py agents install <box-alias> --cli none --extensions --run   # editor extensions only
-box.py agents login <box-alias> claude|codex         # a headless login; shows its link and code
+box.py agents login <box-alias> claude|codex         # a headless login; shows its link, code and end time
 box.py agents login <box-alias> claude|codex --status
 box.py agents login <box-alias> claude|codex --mcp glean     # sign the agent in to Glean
+box.py agents login <box-alias> claude|codex --wait <seconds>   # how long a new login's link works
 box.py agents editor-defaults --run                  # on the machine the editor runs on, only on the user's yes
 ```
 
@@ -49,6 +50,11 @@ box.py agents editor-defaults --run                  # on the machine the editor
   key in a prompt, task or file.
 - `check` reports each missing CLI, PATH gap, login and editor extension with the command that
   fixes it; run that command yourself. A login is the one step that needs the user: its code.
+- A login or sign-in link lapses (`--wait <seconds>`; default 15 min for a CLI login, 60 min for
+  Glean), so send it only while the user is likely there. In a tt-project run, first
+  `ttp hours --check --for 1800`: it reads their usual active hours from the times of their own
+  messages (none yet: now). Exit 1: do not start it; hand off `waiting` with that command as
+  `retry_when`. The output names when the link works until, in the user's home zone: pass that on.
 - gh: a distro's packaged gh can be too old for a newer `hosts.yml`; install it from GitHub's own
   apt repository. Its login is the user's (`gh auth login`, a code in their browser).
 
@@ -86,7 +92,7 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
 - Sign-in: `login <box-alias> <cli> --mcp glean` runs the agent's own headless sign-in
   (`claude mcp login glean --no-browser`, `codex mcp login glean --no-browser`) in a tmux session
   on the box (`tmux -L ttp-login`), started over ssh, so outside any agent sandbox. It waits there
-  up to 60 min. Before it hands out the link it checks with `ss` that the sign-in's callback port
+  up to 60 min (`--wait`). Before it hands out the link it checks with `ss` that the sign-in's callback port
   listens on the box; if not, it stops the sign-in and says so, and never hands out a dead link.
   A pending sign-in whose port stopped listening is replaced on the next `login`. The user
   completes it either way: (a) runs the printed `ssh -N -L <port>:<listen address>:<port> <their

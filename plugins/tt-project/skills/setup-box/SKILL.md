@@ -22,7 +22,8 @@ description: "Get a Tenstorrent device box and work on it over ssh: pick a route
 - A project still syncs or mirrors files to a box: `migrate-off-sync.md`.
 - Claude Code or Codex is missing, logged out or absent from the user's editor (Cursor, VS Code)
   on a box: `box.py agents check <box-alias>` names each gap and the command the skill runs to fix
-  it: `agents.md`.
+  it: `agents.md`. A login link lapses: start one only inside the user's usual hours
+  (`ttp hours --check`, see `agents.md`).
 
 ## Route picker
 

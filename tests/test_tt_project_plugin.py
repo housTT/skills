@@ -2105,6 +2105,8 @@ def test_setup_box_agents_login_relays_link_and_code_and_keeps_tokens_on_the_box
     out = subprocess.run(["sh", "-c", ba.login_script("claude")], env=env, capture_output=True, text=True,
                          timeout=60).stdout
     assert ba._state(out) == "started", out
+    until = dict(ln.split("=", 1) for ln in out.splitlines() if ln.startswith("until="))["until"]
+    assert abs(int(until) - time.time() - ba.LOGIN_WAIT) < 60, out
     shown = ba.relay_lines(out)
     assert "visit: https://example.invalid/oauth?x=1" in shown and "Paste code here if prompted >" in shown
     assert not any("sk-aaaa" in ln for ln in shown)
@@ -2113,7 +2115,7 @@ def test_setup_box_agents_login_relays_link_and_code_and_keeps_tokens_on_the_box
     # A second start while it waits reuses the pending login.
     again = subprocess.run(["sh", "-c", ba.login_script("claude")], env=env, capture_output=True, text=True,
                            timeout=60).stdout
-    assert ba._state(again) == "pending"
+    assert ba._state(again) == "pending" and f"until={until}" in again, again
     # The code goes over stdin, never on a command line.
     assert "abc-123" not in ba.code_script("claude")
     sent = subprocess.run(["sh", "-c", ba.code_script("claude")], env=env, input="abc-123\n",
@@ -2134,6 +2136,58 @@ def test_setup_box_agents_login_relays_link_and_code_and_keeps_tokens_on_the_box
     assert not (login_dir / "claude.log").exists() and not (login_dir / "claude.in").exists()
     out = subprocess.run(["sh", "-c", ba.login_script("claude")], env=env, capture_output=True, text=True).stdout
     assert ba._state(out) == "logged-in"
+
+
+def test_setup_box_agents_login_wait_sets_the_window_and_the_message_names_its_end_in_the_home_zone(
+        tmp_path, monkeypatch):
+    import argparse
+    import contextlib
+    import datetime
+    import io
+    import subprocess
+    from zoneinfo import ZoneInfo
+    ba = _agents(monkeypatch)
+    import box
+    # The window is the caller's: --wait sets the box's timeout, else each login's default.
+    assert f"timeout {ba.SIGNIN_WAIT}" in ba.login_script("claude", "glean")
+    assert "timeout 7200" in ba.login_script("codex", "glean", 7200) and "@ttp_until" in ba.login_script("codex", "glean")
+    assert f"timeout {ba.LOGIN_WAIT}" in ba.login_script("claude") and "timeout 1800" in ba.login_script("claude", None, 1800)
+    args = box.build_parser().parse_args(["agents", "login", "<box-alias>", "claude", "--mcp", "glean", "--wait", "7200"])
+    assert args.wait == 7200
+    # The end the box reports is shown in the project's home zone with its abbreviation.
+    proj = tmp_path / "proj"
+    (proj / "harness").mkdir(parents=True)
+    (proj / "harness" / "project.json").write_text(json.dumps({"home_timezone": "Asia/Tokyo"}))
+    monkeypatch.setenv("TTP_PROJECT", str(proj))
+    end = int(datetime.datetime.now().timestamp()) + 7200
+    want = datetime.datetime.fromtimestamp(end, ZoneInfo("Asia/Tokyo")).strftime("%H:%M JST")
+    sent = []
+
+    def ssh(alias, script, timeout, input=None):
+        sent.append(script)
+        return subprocess.CompletedProcess([], 0, f"state=started\nsession=s\nlisten=127.0.0.1:41234\nuntil={end}\n"
+                                               "out=Open https://example.invalid/oauth?x=1\n", "")
+    monkeypatch.setattr(ba, "_ssh", ssh)
+
+    def login(**kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ba.cmd_login(argparse.Namespace(alias="<box-alias>", cli="claude", mcp="glean", status=False,
+                                                 code_stdin=False, **kw))
+        return rc, buf.getvalue()
+    rc, out = login(wait=7200)
+    assert rc == 0 and "timeout 7200" in sent[-1], out
+    assert f"This link works until {want}." in out and f"up to 120 min (until {want})" in out, out
+    # A box that keeps no end (no `timeout` there) gets the length only; a too-short wait starts nothing.
+    monkeypatch.setattr(ba, "_ssh", lambda alias, script, timeout, input=None: subprocess.CompletedProcess(
+        [], 0, "state=pending\nsession=s\nout=Open https://example.invalid/oauth?x=1\n", ""))
+    rc, out = login()
+    assert rc == 0 and "works until" not in out and f"up to {ba.SIGNIN_WAIT // 60} min in tmux" in out, out
+    monkeypatch.setattr(ba, "_ssh", ssh)
+    n = len(sent)
+    rc, out = login(wait=30)
+    assert rc == 2 and len(sent) == n and "at least 60 s" in out
+    assert ba.until_text("") == "" and ba.until_text(end, ZoneInfo("UTC"), now=end - 60).endswith(" UTC")
 
 
 def _glean_fakes(home):

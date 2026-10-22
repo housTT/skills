@@ -39,6 +39,9 @@
   host's, UTC or `Z`: convert times you copy from UTC logs.
 - `ttp notify "<text>"` (`--severity low|normal`) only when your spec says to tell the user; say so
   in your hand-off. `high`: urgent, to the coordinator now (2/run).
+- A step the user must act on in a time limit (a sign-in link, a device code): run
+  `ttp hours --check --for <seconds they need>` first. Exit 1 (outside their usual hours): do not
+  start it; hand off `waiting` with that command as `retry_when`. The notify names when it lapses.
 - Make durable progress early (commit, write files): a killed run keeps what's on disk.
   No git repo: files written as you go to the output folder count.
 - Run builds and test suites as `ttp clip -- <command>`: it shows the failures or head and tail,
