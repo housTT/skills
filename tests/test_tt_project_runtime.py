@@ -4791,9 +4791,10 @@ def test_a_waiting_hand_off_whose_probe_reads_another_tasks_worktree_logs_one_li
     p = make(env)
     from ttp.daemon import Daemon
     other = p.db.add_task("finished job", "s", kind="work", tier="light", origin="user")
+    (p.worktrees / f"t{other}").mkdir(parents=True, exist_ok=True)   # present: the probe sleeps, not broken
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
         {"status": "waiting", "summary": "job runs", "waiting_for": "the job", "retry_after_s": 600,
-         "retry_when": f"cd {p.worktrees / f't{other}'} && ttp detach --check job"}))
+         "retry_when": f"cd {p.worktrees / f't{other}'} && test -e job.done"}))
     tid = p.db.add_task("watch the job", "s", kind="work", tier="light", origin="user")
     d = Daemon(p.base)
     assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "queued" and p.db.task(tid)["not_before"]
