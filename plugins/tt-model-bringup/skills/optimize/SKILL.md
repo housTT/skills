@@ -17,7 +17,7 @@ This guide does not choose a completely new model-level parallelization strategy
 
 Read the advice in `tech_reports/LLMs/llms.md`, particularly section 4 "Best practices and optimizations". In this skill we will strive to optimize *on-device* performance. For decode it is required to always measure the performance of a traced execution run; untraced/eager decode performance is not acceptable optimized evidence. Teacher-forcing decode must also use the traced path. For complete model or serving paths, avoidable host gaps are part of the optimization target and must be removed rather than merely noted. Always perform optimization using real tensor shapes, sequence shapes, batch size, sharding, and dtypes. Do not shrink hidden sizes, head counts, sequence lengths, or weight shapes just to make evidence easier to collect.
 
-Optimize primarily for batch-1 single-user latency, with prefill latency and time-to-first-token (TTFT) as explicit targets alongside decode. Prioritize the measured bottleneck in the requested workload. Preserve larger-batch correctness: do not hard-code batch 1 into the optimized path, trace inputs, cache/page-table handling, sampling, or output formatting. For complete model and serving optimization, keep or add evidence that larger batches/concurrency still work, normally up to 32 when the target hardware, memory, and harness allow it.
+Optimize primarily for batch-1 single-user latency, with prefill latency and time-to-first-token (TTFT) as explicit targets alongside decode. Prioritize the measured bottleneck in the requested workload. Preserve larger-batch correctness: do not hard-code batch 1 into the optimized path, trace inputs, cache/page-table handling, sampling, or output formatting. For complete model and serving optimization, keep or add evidence that larger batches/concurrency still work, at 8 and 16 when the target hardware, memory, and harness allow it.
 
 Optimization must preserve the model's capability and context contract. If a change affects KV-cache dtype, cache layout, trace buffers, activation memory, CCL buffers, or any other persistent allocation, update `models/autoports/<model>/doc/context_contract.json`. Do not improve performance by lowering `max_model_len`, benchmark context, eval context, or any other advertised capability. A reduction is acceptable only when a hard physical device limit prevents the advertised capability from fitting or running, such as device DRAM capacity for weights + KV/cache/state + required persistent buffers. If reduced, record the byte calculation or failed capacity probe, the largest feasible supported value, and the exact construction/serving setting that uses it.
 
@@ -222,7 +222,7 @@ Final optimized evidence checklist - these items MUST be completed:
 -[ ] LM Head is optimized for DRAM-sharded matmuls if present.
 -[ ] Reduced precision/fidelity experiments appropriate to this module-level optimization stage have been carried out and documented using real weights and input activations. For complete full-model top-k tuning, final datatype frontier selection is deferred to `$datatype-sweep`.
 -[ ] Performance accounting reconciled: roofline estimate, device-time decode, and end-to-end decode reported from the same run; avoidable gaps optimized away, and any remaining gap named as a ttnn/runtime/API limitation only after a targeted fix attempt; `perf_summary.json` written when optimizing a complete model or serving path. For vLLM serving stages, use same-harness primary single-user and CI serving-burst serving metrics and set device-time/profile fields to `null` with the no-profiler reason.
--[ ] Batch capability preserved: batch-1 is the primary optimized latency target, and larger-batch or concurrent-serving correctness was tested up to 32 where hardware and memory allow it.
+-[ ] Batch capability preserved: batch-1 is the primary optimized latency target, and larger-batch or concurrent-serving correctness was tested at 8 and 16 where hardware and memory allow it.
 
 If this checklist is not completed, go back and perform those optimization steps. For decoder/module-level work the main focus is on-device performance. For complete model and serving work, host orchestration, synchronizations, readbacks, and input-refresh overhead are also in scope and must be driven out of the measured path where the runtime contract allows it.
 
@@ -254,7 +254,7 @@ Use this reference while optimizing functional TTNN code. It captures repo-local
 - Explicitly configure `memory_config`, `program_config`, and `compute_kernel_config` for important ops. Defaults are often correct but suboptimal.
 - Choose shard specs and core grids that divide tensor dimensions cleanly into tiles. Padding in sharded paths is a common source of bugs or wasted work.
 - For DRAM-sharded decode matmul, weights should be width-sharded in DRAM and activations/outputs width-sharded in L1 on the matching core grid.
-- Keep the primary optimization target single-user batch-1 prefill/decode. This is not permission to remove larger-batch support; preserve correct batch handling and verify up to batch/concurrency 32 for complete model and serving paths when hardware and memory allow it. For MoE decoders on non-Galaxy systems, preserve gate-selected active-expert execution and prefer the GPT-OSS `ttnn.sparse_matmul` path for sparse expert projections plus score weighting and expert reduction. Dense all-expert execution is a debug baseline, not the optimized target.
+- Keep the primary optimization target single-user batch-1 prefill/decode. This is not permission to remove larger-batch support; preserve correct batch handling and verify batch/concurrency 8 and 16 for complete model and serving paths when hardware and memory allow it. For MoE decoders on non-Galaxy systems, preserve gate-selected active-expert execution and prefer the GPT-OSS `ttnn.sparse_matmul` path for sparse expert projections plus score weighting and expert reduction. Dense all-expert execution is a debug baseline, not the optimized target.
 
 ## Optimization Advice
 
@@ -582,3 +582,7 @@ Avoid suppressing advice in the report used to guide optimization. When applicab
 - Optimized stress runs and passes for every representative layer kind and exercised mode; skipped stress is not a passing optimized result.
 - Final perf reports cover warmed prefill and warmed decode separately, except vLLM serving stages where profiler collection is intentionally skipped.
 - Watcher-clean evidence exists for the optimized correctness run.
+
+## Evaluation performance
+
+Before full benchmarks or evaluations, follow the [performance review](../benchmark-model/references/performance-review.md). Compare useful wall time, preserve mixed-length and partial-batch correctness, and keep HTTP concurrency separate from physical device batch size.

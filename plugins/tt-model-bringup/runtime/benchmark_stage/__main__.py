@@ -17,6 +17,7 @@ def main():
     evaluate.add_argument('--base-url', default='http://127.0.0.1:8000')
     evaluate.add_argument('--manifest', type=Path, required=True)
     evaluate.add_argument('--task', required=True)
+    evaluate.add_argument('--concurrency', type=int, choices=(1, 8, 16), default=1)
     evaluate.add_argument('--shared', action='store_true', help='evaluate comma-separated groups in one request pool')
     evaluate.add_argument('--output', type=Path, required=True)
     evaluate.add_argument('--generation', type=json.loads, default={})
@@ -37,7 +38,7 @@ def main():
     else:
         from benchmark_stage.evaluate import evaluate, evaluate_groups
         kwargs = dict(model=args.model, base_url=args.base_url, manifest_path=args.manifest,
-                      output=args.output, generation=args.generation)
+                      output=args.output, generation=args.generation, concurrency=args.concurrency)
         if args.shared:
             result = evaluate_groups(groups=args.task.split(','), **kwargs)
             print(json.dumps({k: v['benchmark_stage'] for k, v in result.items()}, indent=2))

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from benchmark_stage.evidence import PERFORMANCE_METRICS, benchmark_rows, finite_number, validate_performance, validate_server
 from benchmark_stage.roofline import load_roofline
+from benchmark_stage.performance import review_performance, select_accuracy_concurrency
 from benchmark_stage.subsets import digest
 from benchmark_stage.responses import read_jsonl, scoring_response
 
@@ -63,7 +64,7 @@ def check(model_dir, hf_model=''):
         group = manifest['groups'][task]
         if result.get('subset_sha256') != manifest['manifest_sha256']:
             raise ValueError(f'{task}: subset mismatch')
-        if result.get('responses') != group['sample_count'] or result.get('expected_samples') != group['sample_count'] or result.get('concurrency') != 32:
+        if result.get('responses') != group['sample_count'] or result.get('expected_samples') != group['sample_count'] or result.get('concurrency') != summary.get('accuracy_concurrency'):
             raise ValueError(f'{task}: incomplete accuracy requests or wrong concurrency')
         if result.get('model') != identity['model']:
             raise ValueError(f'{task}: accuracy model mismatch')
@@ -124,7 +125,7 @@ def check(model_dir, hf_model=''):
     osl = config.get('output_tokens', 128)
     if not isinstance(osl, int) or osl < 2:
         raise ValueError('performance output length must permit decode timing')
-    for batch in ('1', '32'):
+    for batch in ('1', '8', '16'):
         result = summary.get('performance', {}).get(batch, {})
         server = read(evidence / 'run' / f'perf-b{batch}-server.json')
         validate_server(server, int(batch), config['model'], config['base_url'],
@@ -148,7 +149,19 @@ def check(model_dir, hf_model=''):
         raise ValueError('report metrics/references name a task that was not run')
     for task, raw in results.items():
         benchmark_rows(config, manifest, task, raw)
-    load_roofline(evidence / 'run', required=('1', '32'))
+    review = review_performance(summary['performance'], config.get('performance_expectations'))
+    if any(not row['within_expectation'] for row in review.values()) or summary.get('performance_review') != review:
+        raise ValueError('missing or inconsistent performance review')
+    if read(evidence / 'run/performance_review.json') != review:
+        raise ValueError('performance review artifact differs from measurements')
+    concurrency, speedups = select_accuracy_concurrency(summary['performance'], config.get('accuracy_concurrency'))
+    if summary.get('accuracy_concurrency') != concurrency or summary.get('serial_batch1_speedups') != speedups:
+        raise ValueError('accuracy parallelism does not match measured performance')
+    server = read(evidence / 'run/accuracy-server.json')
+    validate_server(server, concurrency, config['model'], config['base_url'], baseline=identity, output=evidence / 'run')
+    if summary.get('accuracy_server_identity_sha256') != digest(server):
+        raise ValueError('accuracy server identity mismatch')
+    load_roofline(evidence / 'run', required=('1', '8', '16'))
     return evidence
 
 

@@ -11,6 +11,7 @@ import time
 
 from benchmark_stage.evidence import validate_performance, validate_server
 from benchmark_stage.roofline import load_roofline
+from benchmark_stage.performance import PROFILES, review_performance, select_accuracy_concurrency
 from benchmark_stage.subsets import digest
 
 
@@ -79,7 +80,7 @@ def run(*, config_path, output):
     try:
         server_command = config.get('performance_server_command')
         if not isinstance(server_command, list) or not server_command or not all(isinstance(arg, str) for arg in server_command):
-            raise ValueError('performance_server_command is required to select and record 32-slot and one-slot servers')
+            raise ValueError('performance_server_command is required to select and record 1-, 8- and 16-slot servers')
         roofline_command = config.get('roofline_command')
         if not isinstance(roofline_command, list) or not roofline_command or not all(
                 isinstance(arg, str) and arg.strip() for arg in roofline_command):
@@ -91,40 +92,23 @@ def run(*, config_path, output):
             if action == 'collect':
                 load_roofline(output, required=(str(capacity),))
 
-        def select_server(capacity, baseline=None):
-            server_path = output / f'perf-b{capacity}-server.json'
+        def select_server(capacity, baseline=None, *, accuracy=False):
+            server_name = 'accuracy-server' if accuracy else f'perf-b{capacity}-server'
+            server_path = output / f'{server_name}.json'
             command([*server_command, '--max-num-seqs', str(capacity),
                      '--base-url', config['base_url'], '--output', str(server_path)],
-                    output / f'perf-b{capacity}-server.log', deadline)
+                    output / f'{server_name}.log', deadline)
             server = json.loads(server_path.read_text())
             validate_server(server, capacity, config['model'], config['base_url'],
                             baseline=baseline, output=output)
             phase_accounting(capacity, 'check')
             return server
 
-        baseline_server = select_server(32)
-        execution = config.get('accuracy_execution', 'sequential')
-        if execution not in ('sequential', 'shared'):
-            raise ValueError('accuracy_execution must be sequential or shared')
-        summary['accuracy_execution'] = execution
-        batches = [config['tasks']] if execution == 'shared' else [[task] for task in config['tasks']]
-        for batch in batches:
-            generation = config.get('generation', {}).get(batch[0], {})
-            if any(config.get('generation', {}).get(task, {}) != generation for task in batch):
-                raise ValueError('shared accuracy requires identical generation overrides for all groups')
-            task_output = output if execution == 'shared' else output / batch[0]
-            argv = [sys.executable, '-m', 'benchmark_stage', 'evaluate', '--model', config['model'],
-                    '--base-url', config['base_url'], '--manifest', config['manifest'],
-                    '--task', ','.join(batch), '--output', str(task_output),
-                    '--generation', json.dumps(generation)]
-            if execution == 'shared':
-                argv.append('--shared')
-            command(argv, output / ('accuracy-shared.log' if execution == 'shared' else f'{batch[0]}.log'), deadline)
-            for task in batch:
-                result = json.loads((output / task / 'results.json').read_text())
-                summary['accuracy'][task] = result['benchmark_stage']
-        for concurrency in (32, 1):
-            server = baseline_server if concurrency == 32 else select_server(1, baseline_server)
+        baseline_server = None
+        for concurrency in PROFILES:
+            server = select_server(concurrency, baseline_server)
+            if baseline_server is None:
+                baseline_server = server
             for warmup in (True, False):
                 name = f'perf-b{concurrency}' + ('-warmup' if warmup else '')
                 requests = concurrency if warmup else max(8, concurrency * 3)
@@ -156,7 +140,39 @@ def run(*, config_path, output):
             # Flush and retain this server's timings before a profile switch can
             # destroy its in-memory counters or task-local logs.
             phase_accounting(concurrency, 'collect')
-        load_roofline(output, required=('1', '32'))
+        load_roofline(output, required=('1', '8', '16'))
+        review = review_performance(summary['performance'], config.get('performance_expectations'))
+        summary['performance_review'] = review
+        (output / 'performance_review.json').write_text(json.dumps(review, indent=2) + '\n')
+        if any(not row['within_expectation'] for row in review.values()):
+            raise ValueError('serving performance outside expectations; investigate overhead before accuracy')
+        accuracy_concurrency, speedups = select_accuracy_concurrency(
+            summary['performance'], config.get('accuracy_concurrency'))
+        summary['serial_batch1_speedups'] = speedups
+        if config['tasks']:
+            accuracy_server = select_server(accuracy_concurrency, baseline_server, accuracy=True)
+            summary['accuracy_server_identity_sha256'] = digest(accuracy_server)
+        execution = config.get('accuracy_execution', 'sequential')
+        if execution not in ('sequential', 'shared'):
+            raise ValueError('accuracy_execution must be sequential or shared')
+        summary['accuracy_execution'] = execution
+        summary['accuracy_concurrency'] = accuracy_concurrency
+        batches = [config['tasks']] if execution == 'shared' else [[task] for task in config['tasks']]
+        for batch in batches:
+            generation = config.get('generation', {}).get(batch[0], {})
+            if any(config.get('generation', {}).get(task, {}) != generation for task in batch):
+                raise ValueError('shared accuracy requires identical generation overrides for all groups')
+            task_output = output if execution == 'shared' else output / batch[0]
+            argv = [sys.executable, '-m', 'benchmark_stage', 'evaluate', '--model', config['model'],
+                    '--base-url', config['base_url'], '--manifest', config['manifest'],
+                    '--task', ','.join(batch), '--output', str(task_output),
+                    '--generation', json.dumps(generation), '--concurrency', str(accuracy_concurrency)]
+            if execution == 'shared':
+                argv.append('--shared')
+            command(argv, output / ('accuracy-shared.log' if execution == 'shared' else f'{batch[0]}.log'), deadline)
+            for task in batch:
+                result = json.loads((output / task / 'results.json').read_text())
+                summary['accuracy'][task] = result['benchmark_stage']
         summary['status'] = 'completed'
     except BaseException as exc:
         summary['status'] = 'failed'

@@ -28,3 +28,5 @@ Goal completion requirements:
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.
+
+- Before full benchmarks/evals, follow $benchmark-model performance-review; keep batch 1 primary and measure secondary 8/16.

@@ -52,7 +52,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
                 state['active'] += 1
                 state['peak'] = max(state['peak'], state['active'])
                 state['seen'].append((label, time.monotonic()))
-                if state['active'] == 32: filled.set()
+                if state['active'] == 16: filled.set()
             assert filled.wait(3), 'upstream did not fill the shared pool'
             slow = label == 'alpha:001'
             time.sleep(0.7 if slow else 0.02)
@@ -101,7 +101,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
     monkeypatch.setattr(evaluator, 'simple_evaluate', fake_evaluate)
     try:
         kwargs = dict(model='test/model', base_url=f'http://127.0.0.1:{server.server_port}',
-            manifest_path=manifest_path, groups=['alpha', 'beta'], output=tmp_path / 'run',
+            manifest_path=manifest_path, concurrency=16, groups=['alpha', 'beta'], output=tmp_path / 'run',
             generation={'max_gen_toks': 32, 'do_sample': True, 'until': [],
                         'chat_template_kwargs': {'enable_thinking': True}})
         if mutation == 'malformed_response':
@@ -118,7 +118,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
-    assert state['peak'] == 32
+    assert state['peak'] == 16
     assert min(t for label, t in state['seen'] if label.startswith('beta:')) < state['first_done']
     assert result['alpha']['results']['alpha']['exact_match,none'] == 35 / 36
     assert result['beta']['results']['beta']['exact_match,none'] == 1
