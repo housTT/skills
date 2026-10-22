@@ -10,7 +10,7 @@ the project could have saved. Model-free; the review grades it.
   again after a failed attempt, and tasks that continue an earlier one (`continues:<id>`), with the
   spend of each; and per continue chain (chaincap), its hops and spend, the hops the daemon
   queued and the hops a cap refused or a reason passed;
-- coordinator turns that decided nothing (no action but `noop`, or an escalate), and idle and
+- coordinator turns that decided nothing (no action but `noop`), and idle and
   starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost,
   and turns the daemon skipped as repeats of one that decided nothing (turngate.py) or as quiet while
   every open task was held (quietgate.py), with the saving;
@@ -148,7 +148,7 @@ def continued_tasks(db: DB, since: float) -> list[dict]:
 def coordinator_turns(db: DB, since: float) -> dict:
     """Coordinator turns since `since`: all, those that decided nothing, idle wakes and starve wakes,
     with costs. A turn decided nothing when its note says `decided` 0 (turns before that was logged
-    are not counted; an escalated turn decided nothing itself); an idle or starve wake was due to the
+    are not counted); an idle or starve wake was due to the
     idle timer or the idle-slot (starve) timer with no message or event in its batch."""
     rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND status='ok' AND started>=?", (since,))
     out = {"n": len(rows), "usd": 0.0, "noop": 0, "noop_usd": 0.0, "idle": 0, "idle_usd": 0.0,

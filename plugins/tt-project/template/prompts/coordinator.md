@@ -55,7 +55,6 @@ Each field's rules are in the section named; the table only lists them.
 <!-- ttp:if !obligations -->
 | `obligation` | `text`, `owners` (task ids), optional `milestones` (`{key, due, evidence_required}`) | an urgent deliverable the user asked for: record it with the tasks that produce it in the same batch (its full rules show while one is open) |
 <!-- /ttp:if !obligations -->
-| `escalate` | `why` | only where the digest offers it |
 | `sweep` | as the digest's `Blocker sweep` section says | one per item there not marked CARRIED |
 | `noop` | — | nothing to do |
 

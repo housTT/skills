@@ -15,7 +15,7 @@ Assess the last day of this project, then hand off.
    Unblocking quality: if this spec ends with `Unblocking quality` lines, report them in one short
    section: what is stuck now, time in each stuck state (blocked, waiting, review: count, median,
    p90, longest) and whole stuck episodes, asks the user handed back ("decide yourself") with their
-   ids and blocking reasons, and the coordinator's high/low turn split and escalations. Keep their
+   ids and blocking reasons, and the coordinator's turns by effort and by trigger. Keep their
    labels: inventory is not a 24 h count, cumulative counters are not daily totals, and an unknown
    is not zero. A handed-back ask should not have been sent: say what rule
    would have let the coordinator decide it, as a `harness:` follow-up when one is missing.

@@ -228,8 +228,10 @@ prolonged whole-box outage.
   allowance is added to any base. `coordinator.turn_timeout_ceiling_s` defaults to 3600 and can be
   lowered; it caps every result, and the runtime always enforces a one-hour absolute ceiling. Each run records prompt bytes,
   provider, model, effort and chosen timeout; timeouts also leave a daemon log and diagnostic state.
-  A tricky or blocking turn runs at least at `coordinator.unblock_effort` (high; empty turns this
-  off), so it looks harder for a non-disruptive way forward. Its triggers, kept in one table
+  Every coordinator turn runs at xhigh effort unless `coordinator.effort` sets one; either is
+  mapped to the provider's nearest supported level (its highest for one above it, none for a
+  provider that takes no effort setting), and a change applies at the next turn. A tricky or
+  blocking turn always runs (the turn gates never skip it). Its triggers, kept in one table
   (`coordinator.effort_triggers`) and recorded per turn in the run's note: a user message (and a
   change of plan in it); a blocked, failed or needs-review task, a failed review, a dead dependency,
   an expired or broken deferral or a stalled review; a task failing `coordinator.repeat_fails_24h`
@@ -242,23 +244,14 @@ prolonged whole-box outage.
   resource or deferred on purpose (`start_after`, `start_when`), at least one of them held (planned
   deferrals alone are routine); a high or critical event or alert; resource trouble (not waits only); a costly or irreversible step (an ask timing out, a task's budget spent, PR findings
   or a clean PR, a failed push, the budget gate entering or leaving red); an idle wake finding
-  blocked tasks or open asks. Lowering rules keep known or routine events at the base effort, each
+  blocked tasks or open asks. Lowering rules keep known or routine events from counting as triggers, each
   logged in the turn's note (`lowered`): a needs-review hand-off with no follow-ups, findings or notes
   whose review the daemon queues itself; a high or critical event whose fingerprint is a known case
   (an open issue an earlier turn already saw at this severity or higher, a deploy pending on an owned
   merge before its takeover, an open change in the shared machine ledger that expects it: `ttp machines
   change add ... --expect <fingerprint|down|held>`); and a review's failed hand-off counts once, as
-  "failed review". Routine bookkeeping stays at the base effort; such a turn that finds
-  its batch harder than it looked returns `escalate`, and the same batch reruns once at high
-  effort (never twice, and never from a raised turn; kv `escalations` counts them). A pinned
-  `coordinator.effort` wins over all of this. `coordinator.effort_skip_triggers` (none by default)
-  lists trigger labels, as recorded in the note, that never raise a turn. With a Jev key, Jev also rates a turn the triggers
-  leave below high 'routine' or 'needs thought', but only when it has a new failed or blocked task,
-  high or critical event, user message, or an external wait older than `coordinator.jev_wait_h` (6);
-  other turns skip the call and say so in their note. A reason rated at `coordinator.jev_threshold`
-  (0.7) or above raises the turn the same way, and the same events never raise a second turn. Each
-  call is logged with the effort it led to and what the turn did, and reported in the daily review;
-  `jev.uses.coord_effort` = `off` turns the check off.
+  "failed review". `coordinator.effort_skip_triggers` (none by default) lists trigger labels, as
+  recorded in the note, that never count.
 - Blocker sweep: every `coordinator.blocker_sweep_h` (6; 0 turns it off) hours while anything is
   stuck, and sooner (never within `coordinator.blocker_sweep_min_gap_h`, 1) when a pause ends, an
   ask is resolved, a dependency finishes, a provider pause ends or a re-check comes due, a
