@@ -6811,7 +6811,7 @@ COMMAND_GROUPS = (
     ("inside a run", ("note", "notify", "checks", "lock", "detach", "devq", "push", "land", "clip", "sandbox",
                       "skill", "killscan", "svcscan")),
     ("probes (retry_when, start_when)", ("landed", "ci", "ack-wait", "ssh-preflight", "broker-released",
-                                         "deployed", "goal")),
+                                         "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "spend-today", "uninstall")),
@@ -7156,7 +7156,7 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("hours", help="the user's usual active hours, from their own messages in the home zone; "
                                      "--check exits 0 when now is a good time for a step they must act on, 1 not")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true", help="print the window and its data as JSON")
     s.add_argument("--check", action="store_true", help="exit 0 inside the hours (or with no pattern yet), 1 outside")
     s.add_argument("--for", dest="need", type=float, default=0, metavar="SECONDS",
                    help="also need this much of the window left (a step's time to act)")
