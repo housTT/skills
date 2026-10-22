@@ -109,6 +109,8 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
    `❌` row the test launched is printed as a warning to resolve by hand. When the entry test failed,
    add `--entry-fail "<failure line>"` instead: the failure is recorded in `run.json`
    `entry_test_failure` and shown as ❌ on the sheet; statuses stay as they are.
+   Then `python3 <plugin-root>/scripts/diff_reports.py --static <run dir>/op_table.csv --measured <run dir>/measured_ops.csv --profile <source> --out <run dir>/diff.csv`
+   writes where the static trace and Tracy disagree per op code (the sheet's Static vs Tracy tab).
 7. For each `measured` row, fill every destination's status per `target-status.md` (kernel-op
    lookup) and, for Quasar targets, its `<t>:tests` column, then rerun `validate_static.py`.
 8. **Graph capture** (`source:graph`).

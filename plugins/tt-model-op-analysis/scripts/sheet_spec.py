@@ -4,7 +4,7 @@ The sheet is a view of the run's files for human readers. Nothing is invented: t
 op-table columns that hold one value in every row (listed once on Info), merges device op and
 program factory, shortens source paths to their last two components, strips row-number prefixes
 from evidence and orders columns reader-first. Tabs: Info (run, counts, summary.md, constant
-columns), Device ops by factory (one row per device op and program factory), Op table (one row per launching variant), then the
+columns), Device ops by factory (one row per device op and program factory), ttnn calls (one row per launching variant), then the
 other CSVs.
 
 Prints JSON with `tabs` (sheetId, title, source file, values: a 2D array for one write from A1;
@@ -28,13 +28,14 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from sheet_notes import column_note, tab_description  # noqa: E402
 from opa_schema import (  # noqa: E402
-    ALWAYS, CALL_SITE, CONFIDENCE_DISPLAY, GRID_KEYWORDS, KERNEL_OPS_TAB, LAUNCH_PROFILES, METHOD_ITEMS, NOT_TRACED, latest_entry_failure, METHOD_LABELS, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES, TARGET_LABELS,
-    TEST_TARGETS, column_width, confidence, display_header, methods_used, read_csv, read_header, run_targets,
-    split_evidence,
+    ALWAYS, CALL_SITE, CALL_TRACE_TAB, CONFIDENCE_DISPLAY, GRID_KEYWORDS, KERNEL_OPS_TAB, LAUNCH_PROFILES,
+    METHOD_ITEMS, METHOD_LABELS, NOT_TRACED, OP_TABLE_TAB, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES,
+    TAB_METHOD, TARGET_LABELS, TEST_TARGETS, TTSIM_TESTS_TAB, column_width, confidence, display_header,
+    latest_entry_failure, methods_used, read_csv, read_header, run_targets, split_evidence,
 )
 
 HEADER_GREY = {"red": 0.9, "green": 0.9, "blue": 0.9}
-INFO_WIDTHS = (260, 900, 140, 140)
+INFO_WIDTHS = (260, 900, 220, 320)
 NUMBER = re.compile(r"^-?\d+(\.\d+)?$")
 SOURCE_PATH = re.compile(r"[\w.-]+(?:/[\w.-]+){2,}\.(?:py|cpp|hpp|cc|h|yaml)\b")
 # Free-text columns whose source paths and evidence prefixes the view may shorten. Test node ids
@@ -166,8 +167,8 @@ def op_table_view(rows: list[dict], header: list[str], targets: tuple[str, ...])
     headers = [MERGED_HEADER if c == MERGED else display_header(c) for c in columns]
     values = [headers] + [[cell(view_text(c, raw(r, c))) for c in columns] for r in rows]
     widths = [300 if c == MERGED else column_width(c) for c in columns]
-    tab = new_tab("Op table", "op_table.csv", values, widths)
-    tab["notes"] = [column_note("Op table", "program_factory" if c == MERGED else c) for c in columns]
+    tab = new_tab(OP_TABLE_TAB, "op_table.csv", values, widths)
+    tab["notes"] = [column_note(OP_TABLE_TAB, "program_factory" if c == MERGED else c) for c in columns]
     return tab, columns, constant
 
 
@@ -256,7 +257,7 @@ def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str,
         columns.append(("Measured launches (op code)", 110, "measured_launches_op_code"))
     if graphed:
         columns.append(("Graph launches per inference", 110, "graph_launches"))
-    columns += [("Seen by", 140, "sources"), ("Op table rows", 120, "op_table_ids")]
+    columns += [("Seen by", 140, "sources"), ("ttnn call rows", 120, "op_table_ids")]
     for t in targets:
         columns.append((f"{label(t)}: status (rows)", 110, "statuses"))
         if shown[t]:
@@ -294,10 +295,27 @@ def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str,
     return tab
 
 
+REVIEW_MARK = {"gap": "❌ gap", "renamed": "✅ renamed", "not a gap": "✅ not a gap"}
+CANDIDATES = ("missing", "signature differs")
+LONG_TEXT_CHARS = 300
+
+
+def csv_value(column: str, row: dict, source: str) -> str:
+    value = row[column]
+    if column == "review":
+        if value:
+            return REVIEW_MARK.get(value, value)
+        return "⏳ not reviewed" if row.get("quasar_status") in CANDIDATES else ""
+    if column == "attributes" and len(value) > LONG_TEXT_CHARS:
+        # Tracy's attribute dumps run to kilobytes; the sheet keeps the start and points at the file.
+        return value[:LONG_TEXT_CHARS] + f" … (cut; whole in {source})"
+    return view_text(column, value)
+
+
 def csv_view(path: pathlib.Path, title: str) -> dict:
     columns = read_header(path)
     values = [[display_header(c) for c in columns]]
-    values += [[cell(view_text(c, r[c])) for c in columns] for r in read_csv(path)]
+    values += [[cell(csv_value(c, r, path.name)) for c in columns] for r in read_csv(path)]
     tab = new_tab(title, path.name, values, [column_width(c) for c in columns])
     tab["notes"] = [column_note(title, c) for c in columns]
     return tab
@@ -413,7 +431,7 @@ def host_fallback_state(run_dir: pathlib.Path, run: dict) -> str:
     graph = run.get("graph_capture") or {}
     if graph:
         parts.append(f"{graph.get('host_transfers_inside', 0)} host transfers between the first and the last launch "
-                     f"over {graph.get('inferences', 1)} inference(s) (graph capture; Graph host transfers tab)")
+                     f"over {graph.get('inferences', 1)} inference(s) (graph capture; Graph: host transfers tab)")
     host_ops = run_dir / "host_ops.csv"
     if host_ops.exists():
         steps = sum(r["counts_as_host_op"] == "yes" for r in read_csv(host_ops))
@@ -447,8 +465,8 @@ def grid_blockers_state(ops: list[dict], source: str) -> str:
     settings = sorted({site for r in fixed for site in CALL_SITE.findall(r["grid_dependency"])})
     launches = sum(int(r.get(f"{source}:launches") or 0) for r in fixed)
     listed = ", ".join(tidy(s) for s in settings[:8]) + (f" and {len(settings) - 8} more" if len(settings) > 8 else "")
-    return (f"❌ {len(fixed)} of {len(ops)} op table rows ({launches} launches per inference) use hardcoded grids "
-            f"or shard specs, set at {len(settings)} places: {listed} (Op table, Grid dependency){unknown}")
+    return (f"❌ {len(fixed)} of {len(ops)} ttnn call rows ({launches} launches per inference) use hardcoded grids "
+            f"or shard specs, set at {len(settings)} places: {listed} ({OP_TABLE_TAB}, Grid dependency){unknown}")
 
 
 def config_state(run: dict, key: str) -> str:
@@ -499,18 +517,18 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
     rows.append(["Confidence", cell(f"{level}: {CONFIDENCE_TEXT[level]}")])
     bold.append(len(rows) - 1)
 
-    # Counts: formulas over the Op table tab, so a reader can trace every number.
+    # Counts: formulas over the ttnn calls tab, so a reader can trace every number.
     expected: dict[str, int] = {}
     last = len(ops) + 1
 
     def rng(column: str) -> str:
         letter = col_letter(op_columns.index(column))
-        return f"{quote('Op table')}!{letter}2:{letter}{last}"
+        return f"{quote(OP_TABLE_TAB)}!{letter}2:{letter}{last}"
 
     launch_targets = [t for t in targets if t == source or t in LAUNCH_PROFILES]
     rows.append([])
     bold.append(len(rows))
-    rows.append(["Counts", "Op table rows"] + [f"Launches per inference ({label(t)})" for t in launch_targets])
+    rows.append(["Counts", "ttnn call rows"] + [f"Launches per inference ({label(t)})" for t in launch_targets])
     count_rows: list[tuple[str, str | None, str]] = [("All rows", None, "")]
     if "launch_condition" in op_columns:
         count_rows.append((f"Launch condition: {ALWAYS}", "launch_condition", ALWAYS))
@@ -533,10 +551,10 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
 
         def trace_rng(column: str) -> str:
             letter = col_letter(trace_columns.index(column))
-            return f"{quote('Call trace')}!{letter}2:{letter}{end}"
+            return f"{quote(CALL_TRACE_TAB)}!{letter}2:{letter}{end}"
 
         for i, t in enumerate(launch_targets):
-            rows.append([f"Call trace launches ({label(t)})", ""] + [""] * len(launch_targets))
+            rows.append([f"{CALL_TRACE_TAB} launches ({label(t)})", ""] + [""] * len(launch_targets))
             rows[-1][2 + i] = (f'=SUMPRODUCT(({trace_rng("profile")}="{t}")*{trace_rng("repeats")}'
                                f'*{trace_rng("launches_per_repeat")})')
             expected[f"Info!{col_letter(2 + i)}{len(rows)}"] = sum(
@@ -548,7 +566,7 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
     if constant:
         rows.append([])
         bold.append(len(rows))
-        rows.append(["Same in every op table row"])
+        rows.append(["Same in every ttnn call row"])
         rows += [[name, cell(text)] for name, text in constant]
     return new_tab("Info", "run.json, summary.md", rows, list(INFO_WIDTHS), bold, header=False), expected
 
@@ -579,7 +597,7 @@ def _bold(sheet_id: int, row: int, columns: int, grey: bool) -> dict:
                            "cell": {"userEnteredFormat": fmt}, "fields": fields}}
 
 
-def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1) -> dict:
+def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1, max_tab_kb: int = 300) -> dict:
     run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     source, destinations = run_targets(run)
     targets = (source, *destinations)
@@ -595,25 +613,49 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1) -> dict:
         expected[f"{quote(KERNEL_OPS_TAB)}!E{len(kernel_ops) + 2}"] = sum(int(k["static_launches"] or 0)
                                                                        for k in kernel_ops)
     tabs.append(op_tab)
+    # Every tab a run can have, in order: (title, built tab or None, why it is missing).
+    directory: list[tuple[str, dict | None, str]] = [("Info", info_tab, "")]
+    directory += [(t["title"], t, "") for t in tabs[1:]]
+    ran = set(methods_used(run))
     for name, title in SHEET_TABS:
         if name in ("op_table", "kernel_ops"):
             continue
         if name == "kernel_test_results":
-            for path in sorted(run_dir.glob("kernel_test_results_*.csv")):
-                tabs.append(csv_view(path, f"Kernel tests ({label(path.stem.removeprefix('kernel_test_results_'))})"))
-        elif (run_dir / f"{name}.csv").exists():
-            tabs.append(csv_view(run_dir / f"{name}.csv", title))
+            quasar = [t for t in targets if t in TEST_TARGETS]
+            if not quasar:
+                directory.append((TTSIM_TESTS_TAB, None, "not produced: the run has no Quasar target"))
+                continue
+            entries = [(run_dir / f"kernel_test_results_{t}.csv", f"{TTSIM_TESTS_TAB} ({label(t)})") for t in quasar]
+        else:
+            entries = [(run_dir / f"{name}.csv", title)]
+        for path, tab_title in entries:
+            if not path.exists():
+                method = TAB_METHOD[name]
+                why = ("not produced: the TTsim kernel-op tests have not run" if method == "TTsim" else
+                       f"not produced: the {METHOD_LABELS[method][0].lower()}{METHOD_LABELS[method][1:]} has not run" if method not in ran else
+                       f"not produced in this run ({path.name} is missing)")
+                directory.append((tab_title, None, why))
+                continue
+            tab = csv_view(path, tab_title)
+            size_kb = len(json.dumps(tab["values"], ensure_ascii=False).encode()) // 1024
+            if size_kb > max_tab_kb:
+                directory.append((tab_title, None, f"in the run directory only: {path.name}, {len(tab['values']) - 1} "
+                                                   f"rows ({size_kb} KB), too large for the sheet"))
+                continue
+            tabs.append(tab)
+            directory.append((tab_title, tab, ""))
     tabs += [csv_view(run_dir / f"changes_{name}.csv", f"Changes: {title}") for name, title in SHEET_TABS
              if (run_dir / f"changes_{name}.csv").exists()]
+    directory += [(t["title"], t, "") for t in tabs if t["title"].startswith("Changes: ")]
 
     info_rows = info_tab["values"]
     info_rows.append([])
     info_tab["bold"].append(len(info_rows))
-    info_rows.append(["Tabs in this spreadsheet", "What it holds", "Filled by"])
-    for tab in tabs:
-        description = tab_description(tab["title"])
+    info_rows.append(["Tabs", "What it holds", "Filled by", "In this sheet"])
+    for title, tab, why in directory:
+        description = tab_description(title)
         if description:
-            info_rows.append([tab["title"], cell(description[0]), cell(description[1])])
+            info_rows.append([title, cell(description[0]), cell(description[1]), cell("yes" if tab else why)])
 
     # The kept first tab may be smaller than Info needs; size it like the added tabs.
     info_size = {"rowCount": len(info_tab["values"]) + 50, "columnCount": max(len(r) for r in info_tab["values"])}
@@ -646,8 +688,11 @@ def main() -> int:
     parser.add_argument("run_dir", type=pathlib.Path)
     parser.add_argument("--info-sheet-id", type=int, default=0)
     parser.add_argument("--first-sheet-id", type=int, default=1)
+    parser.add_argument("--max-tab-kb", type=int, default=300,
+                        help="a CSV tab larger than this stays in the run directory; Info lists it")
     args = parser.parse_args()
-    print(json.dumps(spec(args.run_dir, args.info_sheet_id, args.first_sheet_id), ensure_ascii=False, indent=1))
+    print(json.dumps(spec(args.run_dir, args.info_sheet_id, args.first_sheet_id, args.max_tab_kb), ensure_ascii=False,
+                     indent=1))
     return 0
 
 

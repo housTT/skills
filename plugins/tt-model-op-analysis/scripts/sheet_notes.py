@@ -14,21 +14,22 @@ TAB_DESCRIPTIONS = {
     "Info": ("Run identity, bring-up checks, analysis methods and confidence, counts and the summary.", "all"),
     "Device ops by factory": ("One row per device op and the program factory it selected (the kernels that run): "
                               "launches, the methods that saw it, and its status and evidence per target.", f"{STATIC}; {TRACY} and {GRAPH} confirm launches"),
-    "Op table": ("One row per launching variant of a ttnn call: call site, dispatch, grid dependency, shapes and "
+    "ttnn calls": ("One row per launching variant of a ttnn call: call site, dispatch, grid dependency, shapes and "
                  "status per target.", f"{STATIC}; {TRACY} adds measured-only rows"),
-    "Kernel tests": ("Quasar kernel-op tests run on the simulator, one row per test with its result.", TTSIM),
-    "Call trace": ("Launch order per model block, with repeats; its launch total must equal the Op table's.", STATIC),
+    "TTsim: tests": ("Quasar kernel-op tests run on the simulator, one row per test with its result.", TTSIM),
+    "Launch order": ("Launch order per model block, with repeats; its launch total must equal the ttnn calls tab's.", STATIC),
     "Port blockers": ("What stops the code from running on a destination, written once and linked to the rows it "
                       "affects.", STATIC),
-    "Host ops": ("Work the model does on the host, and whether it counts as host time inside the forward.",
+    "Host work in code": ("Work the model does on the host, and whether it counts as host time inside the forward.",
                  STATIC),
-    "Measured ops": ("Every op the profiled run executed, in order, with device and host time.", TRACY),
-    "Host fallback": ("Device and host op counts and times in the profiled window.", TRACY),
-    "Footprint": ("Launches and the largest core count per op code.", TRACY),
-    "Static vs measured": ("Where the static trace and the Tracy run disagree.", f"{STATIC} and {TRACY}"),
-    "Graph capture": ("One row per op code and program factory the captured run launched, with launches per "
+    "Tracy: ops": ("Every op the profiled run executed, in order, with device and host time. Attributes longer "
+                   "than 300 characters are cut; measured_ops.csv in the run directory has them whole.", TRACY),
+    "Tracy: host fallback": ("Device and host op counts and times in the profiled window.", TRACY),
+    "Tracy: resource counts": ("Launches, the largest core count and peak DRAM per op code.", TRACY),
+    "Static vs Tracy": ("Where the static trace and the Tracy run disagree, per op code.", f"{STATIC} and {TRACY}"),
+    "Graph: launches": ("One row per op code and program factory the captured run launched, with launches per "
                       "inference.", GRAPH),
-    "Graph host transfers": ("Host transfers between the first and the last launch: next input upload, previous "
+    "Graph: host transfers": ("Host transfers between the first and the last launch: next input upload, previous "
                              "readback, or host work inside the forward.", GRAPH),
     "Cache: compute APIs": ("Every distinct LLK call in the compute kernels the run compiled, with template "
                             "arguments, data formats and math config (the elfray Cache API Analyzer table).", CACHE),
@@ -69,11 +70,11 @@ FIELD_NOTES = {
     "evidence": "The decisive fact behind this target's status, with file:line.",
     "tests": "Quasar kernel-op tests (pytest node ids) that decide the status.",
     "test_result": "Simulator result of those tests: pass, fail, xfail, timeout, error, skip, or not run.",
-    "statuses": "Number of op-table rows with each status. " + STATUS_NOTE,
+    "statuses": "Number of rows in the ttnn calls tab with each status. " + STATUS_NOTE,
     "test_results": "Simulator result of each kernel-op test.",
-    "sources": "Methods that saw this kernel op. tracy (op code): Tracy saw the op code, which several kernel ops "
-               "share, so it does not confirm this factory.",
-    "op_table_ids": "The Op table rows this kernel op covers.",
+    "sources": "Methods that saw this device op and factory. tracy (op code): Tracy saw the op code, which several "
+               "rows here share, so it does not confirm this factory.",
+    "op_table_ids": "The rows of the ttnn calls tab this device op and factory cover.",
     "static_launches": "Launches per inference of these rows, from the static trace.",
     "static_launches_op_code": "Static launches of every factory of this op code.",
     "measured_launches_op_code": "Launches per inference of this op code in the Tracy run (Tracy does not name "
@@ -85,7 +86,7 @@ FIELD_NOTES = {
     "launches_per_repeat": "Launches per run of the block.",
     "notes": "What the trace decided here and why.",
     "blocker": "What stops the code from running on the destination.",
-    "affected_ids": "Op table rows the blocker affects.",
+    "affected_ids": "Rows of the ttnn calls tab the blocker affects.",
     "required_change": "What the port has to change.",
     "host_work": "Work done on the host.",
     "when": "When and how often it runs.",
@@ -110,7 +111,7 @@ FIELD_NOTES = {
     "peak_dram_mb": "Peak DRAM, only when measured.",
     "category": "Kind of disagreement.",
     "measured_launches": "Launches the Tracy run shows.",
-    "static_ids": "Op table rows of the static side.",
+    "static_ids": "Rows of the ttnn calls tab on the static side.",
     "detail": "What differs.",
     "program_factory_type": "Full C++ type of the factory the graph capture recorded.",
     "ttnn_apis": "Top-level ttnn calls that launched it.",
@@ -151,7 +152,8 @@ FIELD_NOTES = {
     "name": "LLK API or data format name.",
     "quasar_status": "Found by name in the Quasar sources: present, signature differs, missing; not an LLK for "
                      "other calls.",
-    "review": "Verdict after reading the Quasar headers: gap, renamed or not a gap. Empty: not reviewed yet.",
+    "review": "Verdict after reading the Quasar headers: ❌ gap, ✅ renamed, ✅ not a gap, ⏳ not reviewed yet. "
+              "Empty when the API was found by name.",
     "review_note": "The Quasar source that decides the verdict.",
     "template_args": "Template arguments the kernels instantiated.",
     "missing_template_args": "Those the closest Quasar definition does not take.",
@@ -166,8 +168,8 @@ FIELD_NOTES = {
 
 # Fields whose meaning differs on one tab.
 TAB_FIELD_NOTES = {
-    "Graph capture": {"launches": "Launches in the whole capture."},
-    "Footprint": {"launches": "Launches of this op code in the Tracy window."},
+    "Graph: launches": {"launches": "Launches in the whole capture."},
+    "Tracy: resource counts": {"launches": "Launches of this op code in the Tracy window."},
     "Cache: kernels": {"kind": "compute or data_movement."},
     "LLK gaps (Quasar)": {"kind": "llk_api or data_format."},
 }

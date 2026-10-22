@@ -175,7 +175,7 @@ has run; batches add to it. `measurements.py` derives item states and estimates 
 
 `op_code`, `launches`, `max_core_count`, `peak_dram_mb` (`not measured` unless supplied).
 
-## diff.csv (optional, `diff_reports.py`)
+## diff.csv (Tracy, `diff_reports.py`)
 
 `category`, `op_code`, `static_launches`, `measured_launches`, `static_ids`, `detail`.
 

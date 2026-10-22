@@ -167,22 +167,31 @@ def kernel_ops_columns(source: str, destinations: list[str]) -> list[str]:
 
 
 # Spreadsheet presentation: tab order, readable headers and column widths in pixels.
+# Tabs from the static trace have plain names; tabs from a measurement start with the method's name.
+OP_TABLE_TAB = "ttnn calls"
+CALL_TRACE_TAB = "Launch order"
+TTSIM_TESTS_TAB = "TTsim: tests"
 SHEET_TABS = (
-    ("op_table", "Op table"), ("kernel_ops", "Device ops by factory"), ("kernel_test_results", "Kernel tests"),
-    ("call_trace", "Call trace"), ("port_blockers", "Port blockers"),
-    ("host_ops", "Host ops"), ("measured_ops", "Measured ops"), ("host_fallback", "Host fallback"),
-    ("footprint", "Footprint"), ("diff", "Static vs measured"), ("graph_ops", "Graph capture"),
-    ("graph_host_transfers", "Graph host transfers"), ("cache_compute", "Cache: compute APIs"),
+    ("op_table", OP_TABLE_TAB), ("kernel_ops", "Device ops by factory"), ("kernel_test_results", TTSIM_TESTS_TAB),
+    ("call_trace", CALL_TRACE_TAB), ("port_blockers", "Port blockers"),
+    ("host_ops", "Host work in code"), ("measured_ops", "Tracy: ops"), ("host_fallback", "Tracy: host fallback"),
+    ("footprint", "Tracy: resource counts"), ("diff", "Static vs Tracy"), ("graph_ops", "Graph: launches"),
+    ("graph_host_transfers", "Graph: host transfers"), ("cache_compute", "Cache: compute APIs"),
     ("cache_dataflow", "Cache: dataflow APIs"), ("cache_kernels", "Cache: kernels"),
     ("llk_gaps_quasar", "LLK gaps (Quasar)"),
 )
+# The method whose run writes each tab's CSV, for saying why a tab is missing.
+TAB_METHOD = {"op_table": "static", "kernel_ops": "static", "call_trace": "static", "port_blockers": "static",
+              "host_ops": "static", "kernel_test_results": "TTsim", "measured_ops": "tracy", "host_fallback": "tracy",
+              "footprint": "tracy", "diff": "tracy", "graph_ops": "graph", "graph_host_transfers": "graph",
+              "cache_compute": "cache", "cache_dataflow": "cache", "cache_kernels": "cache", "llk_gaps_quasar": "cache"}
 FIELD_LABELS = {
     "id": "#", "stage": "Stage", "origin": "Origin (static / measured)", "ttnn_api": "ttnn API", "op_code": "Op code (Tracy)",
     "device_op": "Device op", "program_factory": "Program factory", "call_site": "Call site (file:line)",
     "launch_condition": "Launch condition", "confidence": "Factory choice",
     "dispatch_evidence": "Dispatch evidence", "grid_dependency": "Grid dependency",
-    "launches_per_repeat": "Launches per repeat", "affected_ids": "Affected op table rows",
-    "required_change": "Required change", "op_table_ids": "Op table rows",
+    "launches_per_repeat": "Launches per repeat", "affected_ids": "Affected ttnn call rows",
+    "required_change": "Required change", "op_table_ids": "ttnn call rows",
     "static_launches": "Static launches",
     "static_launches_op_code": "Static launches (all factories of this op code)",
     "measured_launches_op_code": "Measured launches (op code)", "host_work": "Host work", "counts_as_host_op": "Counts as host op",

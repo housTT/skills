@@ -12,7 +12,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from opa_schema import read_csv, write_csv  # noqa: E402
+from opa_schema import LAUNCH_PROFILES, read_csv, write_csv  # noqa: E402
 
 DIFF_COLUMNS = ("category", "op_code", "static_launches", "measured_launches", "static_ids", "detail")
 
@@ -52,7 +52,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--static", type=pathlib.Path, required=True)
     parser.add_argument("--measured", type=pathlib.Path, required=True)
-    parser.add_argument("--profile", required=True, choices=("p100", "p150"))
+    parser.add_argument("--profile", required=True, choices=LAUNCH_PROFILES)
     parser.add_argument("--out", type=pathlib.Path, required=True)
     args = parser.parse_args()
     rows = diff(read_csv(args.static), read_csv(args.measured), args.profile)

@@ -303,14 +303,15 @@ def test_sheet_spec_layout(tmp_path):
     write_rows(run / "changes_op_table.csv", [{"change": "added", "key": "k", "column": "", "old": "", "new": ""}])
     spec = sheet(run, "--info-sheet-id", "7", "--first-sheet-id", "20")
     assert [(t["title"], t["sheetId"]) for t in spec["tabs"]] == [
-        ("Info", 7), ("Op table", 20), ("Call trace", 21), ("Port blockers", 22), ("Host ops", 23),
-        ("Changes: Op table", 24)]
+        ("Info", 7), ("ttnn calls", 20), ("Launch order", 21), ("Port blockers", 22), ("Host work in code", 23),
+        ("Changes: ttnn calls", 24)]
     reqs = spec["requests"]
     info = reqs[0]["updateSheetProperties"]["properties"]
     assert (info["sheetId"], info["title"]) == (7, "Info")
     assert info["gridProperties"]["columnCount"] >= 3
     added = [(r["addSheet"]["properties"]["title"], r["addSheet"]["properties"]["index"]) for r in reqs if "addSheet" in r]
-    assert added == [("Op table", 1), ("Call trace", 2), ("Port blockers", 3), ("Host ops", 4), ("Changes: Op table", 5)]
+    assert added == [("ttnn calls", 1), ("Launch order", 2), ("Port blockers", 3), ("Host work in code", 4),
+                     ("Changes: ttnn calls", 5)]
     assert not any("autoResizeDimensions" in r for r in reqs)
     wrapped = {r["repeatCell"]["range"]["sheetId"] for r in reqs
                if "repeatCell" in r and r["repeatCell"]["cell"]["userEnteredFormat"].get("wrapStrategy") == "WRAP"}
@@ -323,7 +324,7 @@ def test_sheet_spec_op_table_is_a_compact_view(tmp_path):
                    port_ev="Row 1 (encoder 1): fork x at ttnn/cpp/ttnn/operations/q/c.cpp:9"),
             op_row(2, 2, port_ev="fork y")]
     spec = sheet(make_static_run(tmp_path, rows, [trace_row(1, 1, 3)]))
-    ops = tab(spec, "Op table")
+    ops = tab(spec, "ttnn calls")
     headers = ops[0]
     assert headers[:4] == ["#", "Stage", "ttnn API", "Device op / program factory"]
     # one value in every row: dropped from the table, stated once on Info
@@ -355,7 +356,7 @@ def test_sheet_spec_counts_are_formulas_with_expected_values(tmp_path):
     row_number, _ = by_name["Quasar, BF16 projection: ❌"]
     assert spec["expected"][f"Info!B{row_number}"] == 1
     assert "Quasar, BF16 projection: n/a" not in by_name
-    row_number, row = by_name["Call trace launches (P150)"]
+    row_number, row = by_name["Launch order launches (P150)"]
     assert row[2].startswith("=SUMPRODUCT(") and spec["expected"][f"Info!C{row_number}"] == 4
 
 
@@ -1018,7 +1019,7 @@ def test_sheet_spec_view_keeps_meaning(tmp_path):
     data["entry_test_passes"] = {"by": "user", "date": "2026-10-01", "result": "pass"}
     (run / "run.json").write_text(json.dumps(data))
     spec = sheet(run)
-    ops = tab(spec, "Op table")
+    ops = tab(spec, "ttnn calls")
     # different call sites that shorten alike are still shown per row, not reported as constant
     assert "Call site (file:line)" in ops[0]
     info = tab(spec, "Info")
@@ -1066,7 +1067,7 @@ def test_sheet_spec_kernel_ops_tab_groups_evidence(tmp_path):
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 4)])
     assert run_script("kernel_ops.py", str(run)).returncode == 0
     spec = sheet(run)
-    assert [t["title"] for t in spec["tabs"]][:3] == ["Info", "Device ops by factory", "Op table"]
+    assert [t["title"] for t in spec["tabs"]][:3] == ["Info", "Device ops by factory", "ttnn calls"]
     kernel = tab(spec, "Device ops by factory")
     row = dict(zip(kernel[0], kernel[1]))
     assert row["Device op / program factory"] == "prim::a / F"
@@ -1350,7 +1351,7 @@ def test_sheet_spec_one_tab_per_kernel_test_target(tmp_path):
                [{"id": "1", "node_id": "t.py::a", "op_table_ids": "1", "result": "pass", "duration_s": "1",
                  "log": "x", "environment": "run.json"}])
     tabs = [t["title"] for t in sheet(run)["tabs"]]
-    assert "Kernel tests (Quasar, BF16 projection)" in tabs
+    assert "TTsim: tests (Quasar, BF16 projection)" in tabs
 
 
 def test_kernel_tests_status_filter(tmp_path):
@@ -2115,7 +2116,7 @@ def test_info_bring_up_checks(tmp_path):
     assert info["Test hardware"] == "P150: arch blackhole, compute grid 13x10"
     assert info["Peak DRAM"].lstrip("'").startswith("812.5 MiB allocated at once")
     grid = info["Blockers to a smaller grid"]
-    assert grid.startswith("❌ 2 of 3 op table rows (5 launches per inference)") and "set at 2 places" in grid
+    assert grid.startswith("❌ 2 of 3 ttnn call rows (5 launches per inference)") and "set at 2 places" in grid
     assert info["Configurable grid (TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE)"].startswith("✅ yes")
     assert info["Configurable layer count"].startswith("✅ yes: MODEL_NUM_LAYERS")
     # A later local failure wins over an earlier pass.
@@ -2130,9 +2131,13 @@ def test_info_lists_every_tab_and_headers_carry_notes(tmp_path):
     assert run_script("kernel_ops.py", str(run)).returncode == 0
     spec = sheet(run)
     info = tab(spec, "Info")
-    start = info.index(["Tabs in this spreadsheet", "What it holds", "Filled by"])
-    listed = [r[0] for r in info[start + 1:]]
-    assert listed == [t["title"] for t in spec["tabs"]]
+    start = info.index(["Tabs", "What it holds", "Filled by", "In this sheet"])
+    listed = {r[0]: r[3] for r in info[start + 1:]}
+    assert all(listed[t["title"]] == "yes" for t in spec["tabs"])
+    # Tabs this run cannot have yet are listed with the reason.
+    assert listed["Tracy: ops"] == "not produced: the tracy profile of the entry test has not run"
+    assert listed["Graph: launches"].startswith("not produced: the ttnn graph capture")
+    assert listed["TTsim: tests (Quasar, BF16 projection)"] == "not produced: the TTsim kernel-op tests have not run"
     noted = {r["updateCells"]["range"]["sheetId"]: [v.get("note", "") for v in r["updateCells"]["rows"][0]["values"]]
              for r in spec["requests"] if "updateCells" in r}
     for t in spec["tabs"][1:]:
@@ -2273,7 +2278,7 @@ def test_every_llk_gaps_and_cache_column_has_a_note():
                            ("Cache: compute APIs", opa_schema.CACHE_COMPUTE_COLUMNS),
                            ("Cache: dataflow APIs", opa_schema.CACHE_DATAFLOW_COLUMNS),
                            ("Cache: kernels", opa_schema.CACHE_KERNELS_COLUMNS),
-                           ("Graph capture", opa_schema.GRAPH_OPS_COLUMNS),
+                           ("Graph: launches", opa_schema.GRAPH_OPS_COLUMNS),
                            ("Graph host transfers", opa_schema.GRAPH_HOST_TRANSFERS_COLUMNS)):
         assert all(sheet_notes.column_note(title, c) for c in columns), (title, [c for c in columns
                                                                                  if not sheet_notes.column_note(title, c)])
@@ -2288,6 +2293,37 @@ def test_abbreviations_do_not_split_evidence():
 def test_factory_choice_is_shown_in_plain_words(tmp_path):
     rows = [op_row(1, 1, confidence="verified"), op_row(2, 1, confidence="unverified")]
     spec = sheet(make_static_run(tmp_path, rows, [trace_row(1, 1, 2)]))
-    ops = tab(spec, "Op table")
+    ops = tab(spec, "ttnn calls")
     column = ops[0].index("Factory choice")
     assert [r[column] for r in ops[1:]] == ["fixed by the code", "decided at run time"]
+
+
+def test_large_tabs_stay_in_the_run_directory_and_long_attributes_are_cut(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    write_rows(run / "measured_ops.csv", [{"id": str(i), "op_code": "Op1DeviceOperation", "op_type": "tt_dnn_device",
+                                          "attributes": "x" * 400, "inputs": "", "outputs": "", "core_count": "1",
+                                          "device_kernel_ns": "1", "host_ns": "1"} for i in range(1, 4)])
+    spec = sheet(run)
+    ops = tab(spec, "Tracy: ops")
+    assert ops[1][3].endswith(" … (cut; whole in measured_ops.csv)") and len(ops[1][3]) < 400
+    spec = sheet(run, "--max-tab-kb", "0")
+    assert "Tracy: ops" not in [t["title"] for t in spec["tabs"]]
+    info = tab(spec, "Info")
+    row = next(r for r in info if r and r[0] == "Tracy: ops")
+    assert row[3].startswith("in the run directory only: measured_ops.csv, 3 rows")
+
+
+def test_llk_gap_review_carries_an_icon(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    base = {k: "" for k in ("template_args", "missing_template_args", "quasar_template_args", "missing_runtime_args",
+                            "similar_quasar_apis", "quasar_definitions", "configs", "cache_rows", "kernels", "review_note")}
+    write_rows(run / "llk_gaps_quasar.csv", [
+        base | {"id": "1", "kind": "llk_api", "name": "a", "quasar_status": "missing", "review": "gap"},
+        base | {"id": "2", "kind": "llk_api", "name": "b", "quasar_status": "missing", "review": "renamed"},
+        base | {"id": "3", "kind": "llk_api", "name": "c", "quasar_status": "signature differs", "review": ""},
+        base | {"id": "4", "kind": "llk_api", "name": "d", "quasar_status": "present", "review": ""}],
+        ["id", "kind", "name", "quasar_status", "review", "review_note", "template_args", "missing_template_args",
+         "quasar_template_args", "missing_runtime_args", "similar_quasar_apis", "quasar_definitions", "configs",
+         "cache_rows", "kernels"])
+    gaps = tab(sheet(run), "LLK gaps (Quasar)")
+    assert [r[4] for r in gaps[1:]] == ["❌ gap", "✅ renamed", "⏳ not reviewed", ""]
