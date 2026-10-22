@@ -6613,7 +6613,10 @@ def test_a_project_stuck_across_releases_is_one_alert_tracking_the_newest(env, t
     p.set_config('home_timezone', 'America/Los_Angeles')
     _deploy_lib('0.4.9')
     a_base, a_db = _deploy_project(tmp_path, 'alpha', '0.4.8')
-    _deploy_project(tmp_path, 'beta', '0.4.8')
+    b_base, _ = _deploy_project(tmp_path, 'beta', '0.4.8')
+    for base in (a_base, b_base):   # stuck: upgrade.auto off, so no daemon of theirs owns the merge
+        cfg = json.loads((base / 'harness' / 'project.json').read_text())
+        (base / 'harness' / 'project.json').write_text(json.dumps(dict(cfg, upgrade={'auto': False})))
     pages, page = _deploy_pager(p)
     now = time.time()
     versions = [f'0.5.{i}' for i in range(6)]
