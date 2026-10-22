@@ -140,6 +140,11 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
         grid = row["grid_dependency"].strip()
         if not measured_only and grid not in GRID_KEYWORDS and not CALL_SITE.search(grid):
             errors.append(f"{where}: grid_dependency '{grid}' is not {GRID_KEYWORDS} or a value with <file>:<line>")
+        # The sheet counts every value other than a bare keyword as a hardcoded grid.
+        elif not measured_only and grid not in GRID_KEYWORDS and (lead := re.match(r"\w+", grid)) \
+                and lead.group().lower() in GRID_KEYWORDS:
+            errors.append(f"{where}: grid_dependency '{grid}' must be exactly '{lead.group().lower()}'; "
+                          "put the explanation in dispatch_evidence")
         if not measured_only:
             tokens = row["stage"].split()
             if len(tokens) < 2:

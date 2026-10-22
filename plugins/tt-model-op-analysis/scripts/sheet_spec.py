@@ -509,7 +509,7 @@ def peak_dram_state(run_dir: pathlib.Path, run: dict) -> str:
         values = {r["peak_dram_mb"] for r in read_csv(footprint)} - {"not measured", ""}
         if values:
             return f"{values.pop()} MB (measured outside the analysis)"
-    return "not measured; a graph capture records it"
+    return "⏳ not measured; a graph capture records it"
 
 
 def grid_blockers_state(ops: list[dict], source: str) -> str:

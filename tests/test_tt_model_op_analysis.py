@@ -235,11 +235,13 @@ def test_call_site_needs_line(tmp_path):
 
 def test_grid_dependency_values(tmp_path):
     rows = [op_row(1, 1, grid_dependency="profile-derived"), op_row(2, 1, grid_dependency="see bf16 note"),
-            op_row(3, 1, grid_dependency="none"), op_row(4, 1, grid_dependency="8x4 CoreGrid, model.py:29")]
-    out = validate(make_static_run(tmp_path, rows, [trace_row(1, 4, 1)])).stdout
+            op_row(3, 1, grid_dependency="none"), op_row(4, 1, grid_dependency="8x4 CoreGrid, model.py:29"),
+            op_row(5, 1, grid_dependency="automatic: 100 cores via determine_parallel_config conv2d_utils.cpp:201")]
+    out = validate(make_static_run(tmp_path, rows, [trace_row(1, 5, 1)])).stdout
     assert "row 1: grid_dependency 'profile-derived'" in out
     assert "row 2: grid_dependency 'see bf16 note'" in out
     assert "row 3: grid_dependency" not in out and "row 4: grid_dependency" not in out
+    assert "row 5: grid_dependency 'automatic: 100 cores" in out and "must be exactly 'automatic'" in out
 
 
 def test_launch_condition_must_be_exact(tmp_path):
@@ -2141,6 +2143,9 @@ def test_info_bring_up_checks(tmp_path):
     spec = sheet(run)
     assert info_rows(spec)["Configurable layer count"] == "⏳ not checked"
     assert info_rows(spec)["Configurable grid"].startswith("❌ no")
+    del data["graph_capture"]["peak_dram_mib"]
+    (run / "run.json").write_text(json.dumps(data))
+    assert info_rows(sheet(run))["Peak DRAM"] == "⏳ not measured; a graph capture records it"
     grid_note = next(u["rows"][0]["values"][0]["note"] for r in spec["requests"]
                      if (u := r.get("updateCells")) and "TT_METAL_CORE_GRID_OVERRIDE" in str(u["rows"]))
     assert "need a code change" in grid_note
