@@ -13,9 +13,10 @@ checkout. The worktree and branch stay while the task is open (a waiting task's 
 in it, and its next run works there again); they are removed once the task ended (or is gone from the
 database), nothing uncommitted is left in them and no detached job or `ttp push` of it runs (held). A merge that
 conflicts, or that git refuses over uncommitted changes there, is undone and kept for the next
-pass (the daemon retries each tick, sweep), and reported to the coordinator once per branch head
-(a refusal only while no harness run works in the checkout). A merge that changed runtime/ asks
-the daemon to restart, as `ttp restart` would."""
+pass (sweep), and reported to the coordinator once per branch head (a refusal only while no harness
+run works in the checkout). A conflict is merged again only once its branch head or the harness HEAD
+moved: each try briefly leaves MERGE_HEAD in the live checkout, in the way of `ttp upgrade`. A merge
+that changed runtime/ asks the daemon to restart, as `ttp restart` would."""
 from __future__ import annotations
 
 import json
@@ -29,6 +30,8 @@ from .project import Project, durable_write, git_fsync_args
 DIR = "harness-worktrees"
 IDENT = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
 REPORTED_KEY = "harness_merge_reported"   # kv: task id -> the branch head a conflict was reported for
+CONFLICT_KEY = "harness_merge_conflicted"  # kv: task id -> [branch head, harness HEAD, "conflict"|"refused"] last seen
+MERGE_MSG = "tt-project: land harness task"   # the start of land's merge message (MERGE_MSG mid-merge)
 
 
 def path(p: Project, tid: int) -> Path:
@@ -109,7 +112,8 @@ def land(p: Project, tid: int) -> str:
     the task is live); remove the worktree and branch once nothing is left in them and nothing holds
     them (held). Returns what happened: '' (no worktree), 'merged' (and removed), 'kept' (its commits
     landed; the worktree stays, for the open task or its live jobs, or with uncommitted changes for
-    the task's next run), 'busy' (git refused, e.g. over the checkout's own changes) or 'conflict'."""
+    the task's next run), 'busy' (git refused, e.g. over the checkout's own changes), 'conflict' (new)
+    or 'conflict-known' (the same branch head and harness HEAD as last time: not merged again)."""
     own = path(p, tid)
     if not own.exists():
         return ""
@@ -120,7 +124,11 @@ def land(p: Project, tid: int) -> str:
     outcome = ""
     if ahead.returncode == 0 and int(ahead.stdout.strip() or 0) > 0:
         before = _git(p.harness, "rev-parse", "HEAD").stdout.strip()
-        r = _git(p.harness, "merge", "--no-edit", "-m", f"tt-project: land harness task #{tid} ({b})", b, timeout=120)
+        pair = [_git(p.harness, "rev-parse", b).stdout.strip(), before]
+        last = (p.db.kv(CONFLICT_KEY, {}) or {}).get(str(tid))
+        if last == pair + ["conflict"]:
+            return "conflict-known"     # the same two commits conflict again: no merge until one moves
+        r = _git(p.harness, "merge", "--no-edit", "-m", f"{MERGE_MSG} #{tid} ({b})", b, timeout=120)
         if r.returncode != 0:
             said = (r.stdout + r.stderr).strip()
             conflicted = bool(_git(p.harness, "diff", "--name-only", "--diff-filter=U").stdout.strip())
@@ -128,9 +136,15 @@ def land(p: Project, tid: int) -> str:
                 _git(p.harness, "merge", "--abort")
             # a refusal over files another live run is editing passes when it commits; else it needs a hand
             if conflicted or ("would be overwritten" in said and not checkout_busy(p, tid)):
+                # a refusal leaves no MERGE_HEAD and passes once the checkout's changes go: tried each pass
+                seen = pair + ["conflict" if conflicted else "refused"]
+                if last == seen:
+                    return "conflict-known"
+                _set_conflicted(p, tid, seen)
                 _report_conflict(p, tid, said)
                 return "conflict"
             return "busy"
+        _set_conflicted(p, tid, None)
         changed = _git(p.harness, "diff", "--name-only", before, "HEAD").stdout.split()
         if any(f.startswith("runtime/") for f in changed):
             from . import service
@@ -144,7 +158,33 @@ def land(p: Project, tid: int) -> str:
     if r.returncode != 0 and own.exists():
         return outcome or "kept"
     _git(p.harness, "branch", "-d", b)
+    _set_conflicted(p, tid, None)
     return outcome or "merged"
+
+
+def landing_merge(h: Path) -> bool:
+    """True while checkout `h` is mid-merge in a merge land started (MERGE_HEAD set, its message ours)."""
+    if _git(h, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode != 0:
+        return False
+    r = _git(h, "rev-parse", "--git-path", "MERGE_MSG")
+    m = Path(r.stdout.strip())
+    try:
+        return r.returncode == 0 and (m if m.is_absolute() else h / m).read_text().startswith(MERGE_MSG)
+    except OSError:
+        return False
+
+
+def _set_conflicted(p: Project, tid: int, seen: list[str] | None) -> None:
+    """Record (or with None clear) the (branch head, harness HEAD, kind) a merge last failed on."""
+    with p.db.tx():
+        known = p.db.kv(CONFLICT_KEY, {}) or {}
+        if known.get(str(tid)) == seen:
+            return
+        if seen is None:
+            known.pop(str(tid))
+        else:
+            known[str(tid)] = seen
+        p.db.set_kv(CONFLICT_KEY, known)
 
 
 def _report_conflict(p: Project, tid: int, why: str) -> None:
@@ -171,6 +211,8 @@ def sweep(p: Project, running: set[int]) -> dict[int, str]:
     root = p.state / DIR
     if not root.is_dir():
         return {}
+    if _is_repo(p) and landing_merge(p.harness):    # a merge of ours a killed daemon left: undo it first
+        _git(p.harness, "merge", "--abort")
     out = {}
     for d in sorted(root.iterdir()):
         if not (d.is_dir() and d.name.startswith("t") and d.name[1:].isdigit()):

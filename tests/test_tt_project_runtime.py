@@ -8272,7 +8272,78 @@ def test_a_harness_worktree_stays_while_a_detached_job_of_its_ended_task_runs(en
     assert harnesstree.sweep(p, {a}) == {b: "merged"} and not own.exists()
 
 
-def test_a_conflicting_harness_worktree_is_aborted_kept_and_reported_once(env):
+def test_a_conflicting_harness_worktree_is_aborted_kept_and_reported_once(env, monkeypatch):
+    p = make(env)
+    from ttp import harnesstree
+    merges = []
+    git = harnesstree._git
+    monkeypatch.setattr(harnesstree, "_git", lambda cwd, *a, **k: (merges.append(a) if a[:1] == ("merge",) and
+                                                                    "--abort" not in a else None) or git(cwd, *a, **k))
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    a, b = _task_ids(p)[-2:]
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _commit_in_harness_tree(own, "prompts/clash.md", "from b\n", "b")
+    _commit_in_harness_tree(p.harness, "prompts/clash.md", "from a\n", "a")
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    assert harnesstree.sweep(p, set()) == {b: "conflict"}
+    for _ in range(3):   # the same pair is not merged again: each try left MERGE_HEAD in the live checkout
+        assert harnesstree.sweep(p, set()) == {b: "conflict-known"}
+    assert len(merges) == 1
+    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head
+    assert not _hgit(p.harness, "status", "--porcelain").strip()   # merge aborted
+    assert (p.harness / "prompts" / "clash.md").read_text() == "from a\n"
+    assert own.is_dir()
+    ev = p.db.q("SELECT * FROM events WHERE kind='harness_merge_conflict'")
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and ev[0]["task"] == b
+    assert f"ttp/harness-t{b}" in ev[0]["text"] and "keeping both sides' intents" in ev[0]["text"]
+    _commit_in_harness_tree(own, "prompts/clash.md", "from b, again\n", "b2")   # a new head is reported again
+    assert harnesstree.land(p, b) == "conflict" and len(merges) == 2
+    assert len(p.db.q("SELECT id FROM events WHERE kind='harness_merge_conflict'")) == 2
+    assert harnesstree.land(p, b) == "conflict-known" and len(merges) == 2
+    _commit_in_harness_tree(p.harness, "prompts/other.md", "x\n", "a2")   # the harness moved: tried once more
+    assert harnesstree.land(p, b) == "conflict" and len(merges) == 3
+    assert harnesstree.land(p, b) == "conflict-known" and len(merges) == 3
+    assert len(p.db.q("SELECT id FROM events WHERE kind='harness_merge_conflict'")) == 2   # same branch head
+    _hgit(p.harness, "rm", "-q", "prompts/clash.md")   # resolved on the harness side: it merges, the pair goes
+    _hgit(p.harness, "commit", "-qm", "drop clash")
+    _commit_in_harness_tree(own, "prompts/clash.md", "from b, merged\n", "b3")
+    _hgit(own, "merge", "-q", "--no-edit", "-X", "ours", "main")
+    assert harnesstree.land(p, b) == "kept" and len(merges) == 4   # merged; the open task keeps its worktree
+    assert (p.harness / "prompts" / "clash.md").read_text() == "from b, merged\n"
+    assert str(b) not in (p.db.kv(harnesstree.CONFLICT_KEY) or {})
+
+
+def test_the_daemon_logs_a_harness_conflict_once_and_waits_while_an_upgrade_runs(env):
+    p = make(env)
+    from ttp import harnesstree, locks, release
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _harness_task(p, "a")
+    _harness_task(p, "b")
+    a, b = _task_ids(p)[-2:]
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _commit_in_harness_tree(own, "prompts/clash.md", "from b\n", "b")
+    _commit_in_harness_tree(p.harness, "prompts/clash.md", "from a\n", "a")
+    _harness_run(p, a, status="done")
+    p.db.x("UPDATE runs SET status='done'")
+    held = locks.try_take([release.upgrade_lock(p)], "ttp upgrade (pid 1)", "ttp upgrade")
+    try:   # an upgrade runs: nothing is merged in the live checkout meanwhile
+        d.land_harness_worktrees()
+        assert not p.db.q("SELECT id FROM events WHERE kind='harness_merge_conflict'")
+    finally:
+        held.close()
+    for _ in range(3):
+        d.land_harness_worktrees()
+    log = (p.logs / "daemon.log").read_text()
+    assert log.count(f"harness worktree of task {b}: conflict") == 1
+    assert len(p.db.q("SELECT id FROM events WHERE kind='harness_merge_conflict'")) == 1
+    assert not release._taken(release.upgrade_lock(p))   # released after the sweep
+
+
+def test_a_harness_merge_a_killed_daemon_left_is_undone_by_the_next_sweep(env):
     p = make(env)
     from ttp import harnesstree
     _harness_task(p, "a")
@@ -8282,19 +8353,12 @@ def test_a_conflicting_harness_worktree_is_aborted_kept_and_reported_once(env):
     own = harnesstree.workdir(p, b)
     _commit_in_harness_tree(own, "prompts/clash.md", "from b\n", "b")
     _commit_in_harness_tree(p.harness, "prompts/clash.md", "from a\n", "a")
-    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
-    for _ in range(3):   # the daemon retries each tick; the coordinator hears once
-        assert harnesstree.sweep(p, set()) == {b: "conflict"}
-    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head
-    assert not _hgit(p.harness, "status", "--porcelain").strip()   # merge aborted
-    assert (p.harness / "prompts" / "clash.md").read_text() == "from a\n"
-    assert own.is_dir()
-    ev = p.db.q("SELECT * FROM events WHERE kind='harness_merge_conflict'")
-    assert len(ev) == 1 and ev[0]["status"] == "queued" and ev[0]["task"] == b
-    assert f"ttp/harness-t{b}" in ev[0]["text"] and "keeping both sides' intents" in ev[0]["text"]
-    _commit_in_harness_tree(own, "prompts/clash.md", "from b, again\n", "b2")   # a new head is reported again
-    assert harnesstree.land(p, b) == "conflict"
-    assert len(p.db.q("SELECT id FROM events WHERE kind='harness_merge_conflict'")) == 2
+    subprocess.run(["git", "-C", str(p.harness), "merge", "--no-edit", "-m",
+                    f"{harnesstree.MERGE_MSG} #{b} (x)", f"ttp/harness-t{b}"], capture_output=True)
+    assert harnesstree.landing_merge(p.harness)
+    assert harnesstree.sweep(p, set()) == {b: "conflict"}
+    assert not harnesstree.landing_merge(p.harness)
+    assert not _hgit(p.harness, "status", "--porcelain").strip()
 
 
 def test_the_daemon_tick_lands_harness_worktrees_of_ended_runs_only(env):
@@ -10684,6 +10748,55 @@ def test_upgrade_stops_clearly_on_an_unfinished_merge_in_the_live_harness(env, m
     _git_out(h, "merge", "--abort")
     cli.main(["upgrade", "demo"])
     assert restarts == [1] and (h / "prompts" / "worker.md").read_text() != "side change\n"
+
+
+def test_an_upgrade_during_a_daemon_harness_merge_defers_instead_of_failing(env, monkeypatch, capsys):
+    """The daemon's harness worktree merge briefly leaves MERGE_HEAD in the live harness: an upgrade
+    that meets it waits a little, then defers (exit 75) for the daemon to retry; it never fails."""
+    p = make(env)
+    from ttp import cli, harnesstree, release, service
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda p: restarts.append(1) or "restarted")
+    monkeypatch.setattr(cli, "HARNESS_MERGE_WAIT_S", 0.2)
+    h = p.harness
+    _git_out(h, "checkout", "-qb", "ttp/harness-t9")
+    (h / "prompts" / "worker.md").write_text("side change\n")
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "side")
+    _git_out(h, "checkout", "-q", "-")
+    _git_out(h, "merge", "-q", "--no-commit", "--no-ff", "-m", f"{harnesstree.MERGE_MSG} #9 (ttp/harness-t9)",
+             "ttp/harness-t9")
+    assert harnesstree.landing_merge(h)
+    _install_template(env)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    err = capsys.readouterr().err
+    assert e.value.code == 75 and "harness merge in progress" in err and "daemon retries" in err
+    assert "unfinished merge" not in err and not restarts
+    p.db.set_kv(release.KV_AUTO, {"outcome": "running"})
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
+    assert e.value.code == 75 and p.db.kv(release.KV_AUTO)["outcome"] != "failed"
+    # A merge that ends while the upgrade waits lets it go through.
+    import threading
+    monkeypatch.setattr(cli, "HARNESS_MERGE_WAIT_S", 30)
+    t = threading.Timer(0.5, lambda: _git_out(h, "merge", "--abort"))
+    t.start()
+    cli.main(["upgrade", "demo"])
+    t.join()
+    assert restarts == [1]
+
+
+def test_an_upgrade_while_the_daemon_lands_harness_worktrees_is_deferred(env, capsys):
+    p = make(env)
+    from ttp import cli, locks, release
+    held = locks.try_take([release.upgrade_lock(p)], "daemon (pid 1): landing harness worktrees", "x")
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["upgrade", "demo"])
+    finally:
+        held.close()
+    assert e.value.code == 75 and "the daemon is landing harness worktrees of demo" in capsys.readouterr().err
 
 
 def test_the_merge_guard_refuses_update_ref_onto_upstream_without_an_old_value(env, monkeypatch, tmp_path):

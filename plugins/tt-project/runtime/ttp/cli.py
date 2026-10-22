@@ -5667,8 +5667,8 @@ def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
     the daemon's own call (release.py): it records the outcome and sends one low notify when applied.
-    Exit 75 = deferred, nothing changed and the project finishes it itself (another upgrade or a harness
-    task holds it, a push is in flight, or a conflicting merge waits for a harness task or for the daemon's
+    Exit 75 = deferred, nothing changed and the project finishes it itself (another upgrade, a harness
+    task or the daemon landing a harness worktree holds it, a push is in flight, or a conflicting merge waits for a harness task or for the daemon's
     retry, which comes only for a newer version under upgrade.auto). Exit 1 = failed, including a conflict
     nothing will retry (upgrade.auto off, or the same version from another commit). After main moved, the
     restart decides: exit 75 = the restart is deferred (the old daemon runs on and restarts when it takes
@@ -5691,11 +5691,14 @@ def cmd_upgrade(a) -> None:
         print(ln)
     held = locks.try_take([release.upgrade_lock(p)], f"ttp upgrade (pid {os.getpid()})", "ttp upgrade")
     if held is None:
-        if a.auto:
-            release.finish(p, "held", why="another upgrade is running")
         who = locks.holders([release.upgrade_lock(p)], p)
-        die(f"upgrade refused: another upgrade of {p.name} is running"
-            + (f" ({who[0]})" if who else "") + "; nothing was changed", 75)
+        landing = bool(who) and "landing harness worktrees" in who[0]   # the daemon's (harnesstree)
+        if a.auto:
+            release.finish(p, "held", why="the daemon is landing harness worktrees" if landing
+                           else "another upgrade is running")
+        what = (f"the daemon is landing harness worktrees of {p.name}" if landing
+                else f"another upgrade of {p.name} is running")
+        die(f"upgrade refused: {what}" + (f" ({who[0]})" if who else "") + "; nothing was changed", 75)
     try:
         own = _own_run(p)
         if a.apply is not None and own and release.fenced(p, os.environ.get("TTP_TASK") or ""):
@@ -6271,12 +6274,22 @@ def _exit_for_restart(res) -> None:
         sys.exit(code)
 
 
+HARNESS_MERGE_WAIT_S = 15   # how long `ttp upgrade` waits for the daemon's harness worktree merge to end
+
+
 def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
     """A hand-run `git merge` the guard hook refused leaves MERGE_HEAD and the merged files in the live
     harness. Committing them as local changes is that same merge, so the hook would refuse it again:
     stop here and say what is wrong and how to undo it."""
-    from . import release
+    from . import harnesstree, release
     h = p.harness
+    end = time.time() + HARNESS_MERGE_WAIT_S
+    while harnesstree.landing_merge(h) and time.time() < end:   # the daemon lands a harness task's commits
+        time.sleep(0.5)
+    if harnesstree.landing_merge(h):
+        if auto:
+            release.finish(p, "held", why="a harness worktree merge is in progress; the daemon retries")
+        die(f"upgrade deferred: harness merge in progress in {h}, daemon retries; nothing was changed", 75)
     if subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
                       capture_output=True).returncode != 0:
         return

@@ -9479,7 +9479,15 @@ class Daemon:
 
     def land_harness_worktrees(self) -> None:
         """Merge the commits of harness tasks that worked in a worktree of their own, once their run ended
-        (harnesstree.sweep); one that git refused is tried again next tick."""
+        (harnesstree.sweep); one that git refused is tried again next tick, a conflict once its branch or
+        the harness moved. It holds the upgrade lock meanwhile and waits while `ttp upgrade` holds it:
+        either one's merge in the live checkout would leave MERGE_HEAD in the way of the other."""
+        if not (self.p.state / harnesstree.DIR).is_dir():
+            return
+        held = locks.try_take([release.upgrade_lock(self.p)], f"daemon (pid {os.getpid()}): landing harness worktrees",
+                              "harness worktree landing")
+        if held is None:    # an upgrade runs: the next tick lands them
+            return
         try:
             running = {int(r["task"]) for r in self.p.db.q("SELECT task FROM runs WHERE status='running' "
                                                             "AND task IS NOT NULL")}
@@ -9488,6 +9496,8 @@ class Daemon:
                     log(self.p, f"harness worktree of task {tid}: {got}")
         except Exception:  # never in the way of the tick
             log(self.p, "harness worktree landing error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        finally:
+            held.close()
 
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":   # its own worktree of the harness while another works there
