@@ -19,7 +19,8 @@ checkout that has the branch has uncommitted changes; 75 another landing held th
 moves the branch; the scratch worktree is always removed.
 
 `--root <repo>` lands in that repo instead of the current directory's, e.g. a temporary clone with
-its remote removed, to try a landing first. `--dry-run` writes nothing and moves no ref: it replays the
+its remote removed, to try a landing first. A landing in a repo other than the project's (one whose
+git directory is not that of the project root or the current directory) is not recorded. `--dry-run` writes nothing and moves no ref: it replays the
 commits in a throwaway shared clone (so not even the repo's object store changes), says whether they
 conflict, which push checks would run (it does not run them), whether the branch's checkout is dirty,
 and the landing and review records it would write, and exits with the code a landing would get as
@@ -215,9 +216,15 @@ def _record(p: Project, tid: int | None, head: str, new: str, branch: str, say: 
 
 
 def land(p: Project, repo: Path, head: str, tid: int | None = None,
-         say: Callable[[str], None] = lambda m: print(f"ttp land: {m}", file=sys.stderr), dry: bool = False) -> int:
+         say: Callable[[str], None] = lambda m: print(f"ttp land: {m}", file=sys.stderr), dry: bool = False,
+         recorded: bool = True) -> int:
     """Land `head` on the project's local push branch (local_branch); see the module's exit codes.
-    `dry`: only say what it would do (the module's --dry-run)."""
+    `dry`: only say what it would do (the module's --dry-run). `recorded` False (a repo other than the
+    project's): land, but record nothing for the task."""
+    if not recorded:
+        say(("dry run: would not record " if dry else "not recording ") + f"the landing: {repo} is not the "
+            "project's repo, so the project's task records stay as they are")
+        tid = None
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     branch = local_branch(p, repo)
     if not branch:
@@ -363,8 +370,16 @@ def run(p: Project, args) -> int:
     own (TTP_TASK), the repo to the current directory's."""
     tid = args.task if args.task is not None else (int(os.environ["TTP_TASK"]) if re.fullmatch(
         r"[0-9]+", os.environ.get("TTP_TASK", "")) else None)
-    root = Path(args.root).expanduser() if getattr(args, "root", None) else Path.cwd()
+    other = getattr(args, "root", None)
+    root = Path(other).expanduser() if other else Path.cwd()
     if not root.is_dir():
         print(f"ttp land: --root {root}: no such directory", file=sys.stderr)
         return REFUSED
-    return land(p, root, args.head, tid, dry=bool(getattr(args, "dry_run", False)))
+    ours = not other or _common(root) in {_common(Path.cwd()), _common(p.root)} - {""}
+    return land(p, root, args.head, tid, dry=bool(getattr(args, "dry_run", False)), recorded=ours)
+
+
+def _common(path: Path) -> str:
+    """`path`'s git directory shared by all its worktrees (resolved), or "" outside a repo."""
+    out = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return str(Path(out.stdout.strip()).resolve()) if out.returncode == 0 and out.stdout.strip() else ""

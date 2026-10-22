@@ -7205,7 +7205,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("head", help="the reviewed commit (or branch) to land")
     s.add_argument("--task", type=int, help="the task to record the landing for (default: this run's task)")
     s.add_argument("--root", metavar="REPO", help="land in this git repo instead of the current directory's "
-                   "(e.g. a temporary clone with its remote removed, to try it first)")
+                   "(e.g. a temporary clone with its remote removed, to try it first); a landing in a "
+                   "repo other than the project's is not recorded")
     s.add_argument("--dry-run", action="store_true", help="write nothing and move no ref: report the replay, "
                    "a conflict (exit 3), the push checks it would run (without running them) and the records "
                    "it would write; exits as a landing would")

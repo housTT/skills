@@ -9944,9 +9944,13 @@ def test_ttp_land_dry_run_reports_a_clean_landing_or_a_conflict_and_writes_nothi
 def test_ttp_land_root_lands_in_another_repo_and_the_cli_dry_run_changes_nothing(env, monkeypatch, capsys):
     """`ttp land --root <repo>` works on that repo, not the current directory's: a temporary clone
     with its remote removed takes a dry run and then the landing while the project's repo keeps its
-    branch; a missing --root is refused. --help says the push checks run on the replayed head."""
-    from ttp import cli
+    branch; a missing --root is refused. --help says the push checks run on the replayed head. The
+    clone is not the project's repo, so neither run records a landing or a review label for the task
+    in the project's database; --root at the project's own repo still would."""
+    from ttp import cli, reviewreuse
     land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    p.db.update_task(t, labels=reviewreuse.with_head([], head, reviewreuse.check_key(p.config())))
+    labels = p.db.task(t)["labels"]
     tip = _on_proj(repo, "b.txt", "b\n")
     clone = env["tmp"] / "try"
     _git_out(env["tmp"], "clone", "-q", str(repo), str(clone))
@@ -9957,12 +9961,19 @@ def test_ttp_land_root_lands_in_another_repo_and_the_cli_dry_run_changes_nothing
     with pytest.raises(SystemExit) as e:
         cli.main(["land", head, "--root", str(clone), "--task", str(t), "--dry-run"])
     assert e.value.code == 0, capsys.readouterr().err
-    assert "nothing written" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "nothing written" in err and "would not record the landing" in err and "would record" not in err, err
     assert _repo_state(clone) == before and not p.db.q("SELECT * FROM task_landings")
     with pytest.raises(SystemExit) as e:
         cli.main(["land", head, "--root", str(clone), "--task", str(t)])
     assert e.value.code == 0, capsys.readouterr().err
+    assert "not recording the landing" in capsys.readouterr().err
     assert _git_out(clone, "rev-parse", "proj^") == tip and _git_out(repo, "rev-parse", "proj") == tip
+    assert not p.db.q("SELECT * FROM task_landings") and p.db.task(t)["labels"] == labels
+    with pytest.raises(SystemExit) as e:
+        cli.main(["land", head, "--root", str(repo), "--task", str(t), "--dry-run"])
+    err = capsys.readouterr().err
+    assert e.value.code == 0 and "would record a landing of task" in err and "not record" not in err, err
     with pytest.raises(SystemExit) as e:
         cli.main(["land", head, "--root", str(env["tmp"] / "nope")])
     assert e.value.code == 2 and "no such directory" in capsys.readouterr().err
