@@ -11058,7 +11058,7 @@ def test_blocker_sweep_lists_every_kind_of_stuck_item_with_age_reason_and_last_c
                      f"task:{deferred}": ("deferred", 0.2), "resource:rig": ("paused", 2.0)}
     eid = sweep.start(db, p.config(), "every 6h", now)
     text = coord.digest(p, {}, [eid], [])
-    assert "## Blocker sweep (high effort): 6 item(s)" in text
+    assert "## Blocker sweep: 6 item(s)" in text
     line = next(ln for ln in text.splitlines() if ln.startswith(f"- #{blocked} "))
     assert "| blocked 5.0h | needs the vendor's key | never re-checked" in line
     assert "after the window" in text and "resource rig | paused 2.0h | by coordinator: flaky" in text

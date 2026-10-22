@@ -744,7 +744,7 @@ def _last_check(o: dict | None, now: float) -> str:
 
 
 def _header(n: int, carry: int = 0) -> str:
-    return (f"## Blocker sweep (high effort): {n} item(s)" + (f", {carry} CARRIED" if carry else "")
+    return (f"## Blocker sweep: {n} item(s)" + (f", {carry} CARRIED" if carry else "")
             + ". Return exactly one `sweep` action per item not marked CARRIED, "
             "with `id` (task), `promise` (its id) or `resource`, and `outcome`: unblocked | rerouted | retired | closed (merged or "
             "closed) | still_blocked (both required: `until_probe` or `until`, the concrete condition, AND "

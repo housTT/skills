@@ -141,7 +141,7 @@ def ensure(db, rec: Any, where=None, now: float | None = None) -> int | None:
                 "Check the machine and recover it within the charter's restrictions (record every live change "
                 "with `ttp machines change add`), or record a known outage with `ttp machines outage` and hand "
                 "off naming who must act. If it already recovered, say so and finish. Still open past its due "
-                "time, this task wakes the coordinator at high effort, then alerts the user.")
+                "time, this task wakes the coordinator (at its configured effort, xhigh by default), then alerts the user.")
         return db.add_task(f"Outage: {rec['alias']} {rec['condition']} (recovery owner did not act)", spec,
                            kind="work", priority=1, origin="daemon", labels=[rec["label"], f"{DUE}{int(rec['due'])}"])
 
