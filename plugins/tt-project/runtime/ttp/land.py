@@ -21,7 +21,9 @@ moves the branch; the scratch worktree is always removed.
 
 `--root <repo>` lands in that repo instead of the current directory's, e.g. a temporary clone with
 its remote removed, to try a landing first. A landing in a repo other than the project's (one whose
-git directory is not that of the project root or the current directory) is not recorded. `--dry-run` writes nothing and moves no ref: it replays the
+git directory is not that of the project root or the current directory) is not recorded, and lands
+on a main/master push branch without delivery.allow_protected_push_branch: it has no git remote,
+so nothing is published; the project's own main/master still needs that setting. `--dry-run` writes nothing and moves no ref: it replays the
 commits in a throwaway shared clone (so not even the repo's object store changes), says whether they
 conflict, which push checks would run (it does not run them), whether the branch's checkout is dirty,
 and the landing and review records it would write, and exits with the code a landing would get as
@@ -53,17 +55,28 @@ def _git(repo: Path, *args: str, timeout: float = 120) -> subprocess.CompletedPr
                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANGUAGE": ""})
 
 
-def local_branch(p: Project, repo: Path) -> str:
+def local_branch(p: Project, repo: Path, scratch: bool = False) -> str:
     """The push branch `ttp land` lands on: delivery.push_branch, when pushing is allowed, `repo`
     has no git remote and has that local branch (main/master only with
-    delivery.allow_protected_push_branch); "" otherwise."""
+    delivery.allow_protected_push_branch, or in a `scratch` repo); "" otherwise."""
+    return _target(p, repo, scratch)[0]
+
+
+def _target(p: Project, repo: Path, scratch: bool = False) -> tuple[str, str]:
+    """(local_branch, why it is "" when it is). `scratch`: `repo` is not the project's (a temporary
+    clone, --root): its main/master may be landed on without delivery.allow_protected_push_branch,
+    since `repo` has no git remote, so the landing publishes nothing."""
     d = p.config().get("delivery") or {}
     if not (push_allowed(d) and str(d.get("push_branch") or "").strip()) or not push.remote_less(repo):
-        return ""
+        return "", ""
     branch = push.target(p, repo)[1]
-    if branch in push.PROTECTED and not push.allow_protected(d):
-        return ""
-    return branch if push._local_tip(repo, branch) else ""
+    if branch == "HEAD" or branch in push.PROTECTED and not (scratch or push.allow_protected(d)):
+        return "", (f"refusing to land on {branch}: delivery.push_branch is {branch}, a protected branch that "
+                    f"`ttp land` moves in the project's own repo only when delivery.allow_protected_push_branch "
+                    f"is set (only on the user's word). Name a push branch of its own, or try the landing in "
+                    f"a temporary clone with its remote removed (`ttp land <head> --root <clone>`)"
+                    if branch != "HEAD" else "")
+    return (branch if push._local_tip(repo, branch) else ""), ""
 
 
 def step(branch: str, head: str) -> str:
@@ -232,7 +245,10 @@ def land(p: Project, repo: Path, head: str, tid: int | None = None,
             "project's repo, so the project's task records stay as they are")
         tid = None
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
-    branch = local_branch(p, repo)
+    branch, why = _target(p, repo, scratch=not recorded)
+    if why:
+        say(why)
+        return REFUSED
     if not branch:
         say("nothing to land on: `ttp land` is for a push branch (delivery.push_branch) that is a local branch "
             "of a code repo with no git remote; elsewhere use `ttp push`")

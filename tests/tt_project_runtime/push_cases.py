@@ -10028,3 +10028,58 @@ def test_ttp_land_root_lands_in_another_repo_and_the_cli_dry_run_changes_nothing
         cli.main(["land", "--help"])
     out = capsys.readouterr().out
     assert "--dry-run" in out and "--root" in out and "push checks" in out
+
+
+def test_ttp_land_root_lands_on_master_in_a_temp_clone_and_the_projects_own_master_needs_the_flag(
+        env, monkeypatch, capsys):
+    """delivery.push_branch master without delivery.allow_protected_push_branch: `ttp land` in the
+    project's own repo refuses, naming the setting and why. `--root` at a remote-less temporary clone
+    lands on the clone's master (from the CLI, recording nothing), a conflict there exits 3 and a
+    master moving under the checks starts over; the project's master keeps its tip. A clone that
+    has a remote is still refused, so nothing is ever published to a protected branch."""
+    from ttp import cli
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "branch", "-f", "master", "proj")
+    p.set_config("delivery.push_branch", "master")
+    tip = _git_out(repo, "rev-parse", "master")
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 2, said
+    assert "delivery.allow_protected_push_branch" in said[-1] and "master" in said[-1] \
+        and "--root" in said[-1] and "nothing to land on" not in said[-1], said
+    clone = env["tmp"] / "try"
+    _git_out(env["tmp"], "clone", "-q", str(repo), str(clone))
+    _git_out(clone, "remote", "remove", "origin")
+    _git_out(clone, "branch", "master", tip)
+    monkeypatch.chdir(env["tmp"])
+    with pytest.raises(SystemExit) as e:
+        cli.main(["land", head, "--root", str(clone), "--task", str(t)])
+    assert e.value.code == 0, capsys.readouterr().err
+    assert "not recording the landing" in capsys.readouterr().err
+    assert _git_out(clone, "rev-parse", "master^") == tip and _git_out(repo, "rev-parse", "master") == tip
+    assert not p.db.q("SELECT * FROM task_landings")
+
+    def on_master(name, text):
+        _git_out(clone, "checkout", "-q", "master")
+        _commit(clone, name, text)
+        _git_out(clone, "checkout", "-q", "work")
+        return _git_out(clone, "rev-parse", "master")
+    _git_out(clone, "branch", "-f", "master", tip)
+    other = on_master("a.txt", "other\n")
+    said = []
+    assert land.land(p, clone, head, t, said.append, recorded=False) == 3, said
+    assert "conflict replaying" in " ".join(said) and _git_out(clone, "rev-parse", "master") == other
+    _git_out(clone, "branch", "-f", "master", tip)
+    real, moves = land._checks, []
+
+    def moving(p_, wt, new, base, say):
+        if not moves:
+            moves.append(on_master("m.txt", "m\n"))
+        return real(p_, wt, new, base, say)
+    monkeypatch.setattr(land, "_checks", moving)
+    said = []
+    assert land.land(p, clone, head, t, said.append, recorded=False) == 0, said
+    assert "starting over" in " ".join(said) and _git_out(clone, "rev-parse", "master^") == moves[0]
+    _git_out(clone, "remote", "add", "origin", str(repo))
+    said = []
+    assert land.land(p, clone, head, t, said.append, recorded=False) == 2, said
+    assert _git_out(repo, "rev-parse", "master") == tip and not p.db.q("SELECT * FROM task_landings")
