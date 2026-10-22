@@ -638,7 +638,7 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
             if time.time() - told >= 120:
                 with open(run_dir / "progress.md", "a") as pf:
                     pf.write(f"{_clock(env)} waiting for {res['resource']} "
-                             f"(held by {', '.join(locks.holders(paths, where)) or 'another task'})\n")
+                             f"(held by {', '.join(locks.holders_now(paths, where)) or 'another task'})\n")
                 told = time.time()
             time.sleep(poll_s(2))
     return held

@@ -32841,6 +32841,57 @@ def test_lock_probe_outside_a_project_answers_for_a_machine_shared_lock(env, tmp
     assert r.returncode == 75 and "paused (repair)" in r.stdout, r.stdout + r.stderr
 
 
+def test_lock_wait_messages_name_only_live_holders_with_their_pid(env, tmp_path, monkeypatch):
+    """A free slot keeps the JSON label of its last holder: a wait message never names it. A live
+    holder shows its pid and whether that pid lives; a pid this process cannot judge (another PID
+    namespace) shows bare."""
+    from ttp import locks, push, runner
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    slot = tmp_path / "locks" / "dev.0.lock"
+    slot.parent.mkdir()
+    slot.write_text(json.dumps({"holder": "task #1 (run 1), whole run", "since": time.time() - 60,
+                                "command": "exclusive", "pid": 1, "node": os.uname().nodename}))
+    assert locks.holders_now([slot]) == [], "a free slot's old label counted as a holder"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    env_ = {"TTP_TASK": "5", "TTP_RUN_ID": "7"}
+
+    def wait_line() -> str:
+        (run_dir / "progress.md").unlink(missing_ok=True)
+        got = runner._take_exclusive(run_dir, [{"resource": "dev", "paths": [str(slot)]}], env_, time.time() + 0.2)
+        assert got is None
+        return (run_dir / "progress.md").read_text()
+
+    # A shared holder keeps the exclusive take out while the slot still carries the old label.
+    sh = locks.try_take_shared([slot], "task #2 (run 3)", "read")
+    try:
+        line = wait_line()
+    finally:
+        sh.close()
+    assert "task #1" not in line and "task #2 (run 3) (shared) since" in line, line
+    assert f"pid {os.getpid()} alive" in line, line
+    held = locks.try_take([slot], "task #4 (run 8)", "exclusive")
+    try:
+        line = wait_line()
+        assert "task #1" not in line and "task #4 (run 8) since" in line, line
+        assert f"pid {os.getpid()} alive)" in line, line
+        said = []
+        monkeypatch.setattr(push, "lock_paths", lambda *_a: [slot])
+        monkeypatch.setattr(push, "free_probe", lambda _p: "probe")
+        assert push.take(None, "origin", "b", 0, say=said.append, who="me") is None
+        assert all(f"task #4 (run 8) since" in m and f"pid {os.getpid()} alive" in m for m in said), said
+        # A keeper the slot was handed to is named as its holder; one that died shows gone.
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        locks.label_pid(held, dead.pid)
+        assert locks.holders_now([slot])[0].endswith(f"pid {dead.pid} gone"), locks.holders_now([slot])
+        monkeypatch.setattr(locks, "_pid_ns", lambda: None)
+        assert locks.holders_now([slot])[0].endswith(f"pid {dead.pid}"), locks.holders_now([slot])
+    finally:
+        held.close()
+    assert locks.holders_now([slot]) == [] and locks.holders([slot]), "released: no live holder, label kept"
+
+
 def test_lock_probe_busy_while_reserved_under_any_device_name(env):
     p = _device_project(env)
     from ttp import locks as lk

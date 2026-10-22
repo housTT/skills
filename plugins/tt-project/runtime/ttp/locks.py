@@ -74,10 +74,55 @@ def try_take(paths: list[Path], holder: str, what: str = "", key: str = ""):
             continue
         f.seek(0)
         f.truncate()
-        f.write(json.dumps({"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {})}))
+        f.write(json.dumps({"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {}),
+                            **_owner(os.getpid())}))
         f.flush()
         return f
     return None
+
+
+def _pid_ns() -> str | None:
+    """This process's PID namespace ("" on hosts without them); None when it cannot tell."""
+    if not sys.platform.startswith("linux"):
+        return ""
+    try:
+        if int(os.readlink("/proc/self")) != os.getpid():
+            return None
+        return os.readlink("/proc/self/ns/pid")
+    except (OSError, ValueError):
+        return None
+
+
+def _owner(pid: int) -> dict:
+    """The fields a slot label gives the process that holds it: its pid, and where that pid means
+    something (host and PID namespace), so a reader elsewhere does not judge it."""
+    return {"pid": int(pid), "node": os.uname().nodename, "pidns": _pid_ns()}
+
+
+def label_pid(f, pid: int) -> None:
+    """Names `pid` as the holder process of the held slot file `f` (a keeper it was handed to)."""
+    try:
+        f.seek(0)
+        h = json.loads(f.read() or "{}")
+        f.seek(0)
+        f.truncate()
+        f.write(json.dumps({**h, **_owner(pid)}))
+        f.flush()
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _pid_note(h: dict) -> str:
+    """", pid N alive" (or "gone") for a label naming its holder process; only the pid when this
+    process cannot judge it (another host or PID namespace, or a label from before pids)."""
+    try:
+        pid = int(h.get("pid") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if pid <= 0:
+        return ""
+    here = h.get("node") == os.uname().nodename and h.get("pidns") is not None and h.get("pidns") == _pid_ns()
+    return f", pid {pid}" + ((" alive" if _alive(pid) else " gone") if here else "")
 
 
 SHARED_MARK = " (shared)"   # ends a shared holder's label
@@ -126,7 +171,8 @@ def try_take_shared(paths: list[Path], holder: str, what: str = "") -> SharedHol
         tmp = d / f".{name}.tmp"
         lf = open(tmp, "a+")
         fcntl.flock(lf, fcntl.LOCK_EX)
-        lf.write(json.dumps({"holder": holder + SHARED_MARK, "since": time.time(), "command": what[:300]}))
+        lf.write(json.dumps({"holder": holder + SHARED_MARK, "since": time.time(), "command": what[:300],
+                             **_owner(os.getpid())}))
         lf.flush()
         os.rename(tmp, d / name)
     except OSError:
@@ -174,16 +220,19 @@ def any_free(paths: list[Path]) -> bool:
     return False
 
 
-def holders(paths: list[Path], where=None) -> list[str]:
-    """Each slot's holder label and since when, in the zone of `where` (the project; None is UTC)."""
+def holders(paths: list[Path], where=None, pids: bool = False) -> list[str]:
+    """Each slot's holder label and since when, in the zone of `where` (the project; None is UTC),
+    with its holder's pid and whether it lives when `pids`. A free slot keeps its last label: for who
+    holds a slot now, use holders_now."""
     out = []
     for path in paths:
         try:
             h = json.loads(path.read_text() or "{}")
         except (OSError, ValueError):
             continue
-        if h:
-            out.append(f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}")
+        if isinstance(h, dict) and h:
+            out.append(f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}"
+                       + (_pid_note(h) if pids else ""))
     return out
 
 
@@ -194,9 +243,10 @@ def held_labels(paths: list[Path]) -> list[str]:
 
 
 def holders_now(paths: list[Path], where=None) -> list[str]:
-    """`holders`, of only the slots whose lock is taken right now, then the shared holders."""
-    out = holders([x for x in paths if _slot_labels([x])], where)
-    return out + [f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}"
+    """`holders` with pids, of only the slots whose lock is taken right now, then the shared holders:
+    what a wait or busy message names."""
+    out = holders([x for x in paths if _slot_labels([x])], where, pids=True)
+    return out + [f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}{_pid_note(h)}"
                   for h in (shared_holders(paths) if paths else [])]
 
 

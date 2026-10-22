@@ -5727,7 +5727,7 @@ def cmd_upgrade(a) -> None:
         print(ln)
     held = locks.try_take([release.upgrade_lock(p)], f"ttp upgrade (pid {os.getpid()})", "ttp upgrade")
     if held is None:
-        who = locks.holders([release.upgrade_lock(p)], p)
+        who = locks.holders_now([release.upgrade_lock(p)], p)
         landing = bool(who) and "landing harness worktrees" in who[0]   # the daemon's (harnesstree)
         if a.auto:
             release.finish(p, "held", why="the daemon is landing harness worktrees" if landing

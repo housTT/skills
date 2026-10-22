@@ -142,6 +142,8 @@ def keep(run_dir: Path, spec: dict, held: list, wanted: list[dict], inherited: l
     durable_write(Path(registry) / f"{run}.json", json.dumps({"run_dir": str(Path(run_dir).resolve())}))
     try:
         rec["keeper"] = _spawn(run_dir, [lock.fileno(), *(f.fileno() for f in held)])
+        for f in held:
+            locks.label_pid(f, rec["keeper"])
     except OSError as e:
         rec.update(state="released", ended=time.time(), why=f"its keeper could not start: {e}")
         _write(run_dir, rec)
@@ -282,6 +284,8 @@ def tend(registry: Path) -> list[dict]:
                 if all(slots):
                     try:
                         rec["keeper"] = _spawn(rd, [lock.fileno(), *(s.fileno() for s in slots)])
+                        for s in slots:
+                            locks.label_pid(s, rec["keeper"])
                         rec["rebuilt"] = int(rec.get("rebuilt") or 0) + 1
                         _write(rd, rec)
                         out.append({**rec, "state": "rebuilt"})
