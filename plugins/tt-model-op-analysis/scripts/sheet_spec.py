@@ -480,7 +480,7 @@ def config_state(run: dict, key: str) -> str:
 
 
 def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_columns: list[str],
-              constant: list[tuple[str, str]], ops: list[dict], trace_path: pathlib.Path):
+              constant: list[tuple[str, str]], ops: list[dict]):
     source, destinations = targets[0], targets[1:]
     title, summary, summary_headings = summary_rows(run_dir / "summary.md")
     rows: list[list] = [[title or f"{run.get('model', 'Model')} kernel op analysis"]]
@@ -547,22 +547,6 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
             rows[-1].append(f"=SUM({launches})" if column is None else f'=SUMIFS({launches},{rng(column)},"{value}")')
             expected[f"Info!{col_letter(2 + i)}{len(rows)}"] = sum(int(m[f"{t}:launches"] or 0) for m in members)
 
-    trace = read_csv(trace_path) if trace_path.exists() else []
-    if trace:
-        trace_columns = read_header(trace_path)
-        end = len(trace) + 1
-
-        def trace_rng(column: str) -> str:
-            letter = col_letter(trace_columns.index(column))
-            return f"{quote(CALL_TRACE_TAB)}!{letter}2:{letter}{end}"
-
-        for i, t in enumerate(launch_targets):
-            rows.append([f"{CALL_TRACE_TAB} launches ({label(t)})", ""] + [""] * len(launch_targets))
-            rows[-1][2 + i] = (f'=SUMPRODUCT(({trace_rng("profile")}="{t}")*{trace_rng("repeats")}'
-                               f'*{trace_rng("launches_per_repeat")})')
-            expected[f"Info!{col_letter(2 + i)}{len(rows)}"] = sum(
-                int(x["repeats"]) * int(x["launches_per_repeat"]) for x in trace if x["profile"] == t)
-
     offset = len(rows)
     rows += summary
     bold += [offset + h for h in summary_headings]
@@ -606,7 +590,7 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1, max_tab_kb:
     targets = (source, *destinations)
     ops = read_csv(run_dir / "op_table.csv")
     op_tab, op_columns, constant = op_table_view(ops, read_header(run_dir / "op_table.csv"), targets)
-    info_tab, expected = info_view(run_dir, run, targets, op_columns, constant, ops, run_dir / "call_trace.csv")
+    info_tab, expected = info_view(run_dir, run, targets, op_columns, constant, ops)
 
     tabs = [info_tab]
     kernel_ops_path = run_dir / "kernel_ops.csv"

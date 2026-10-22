@@ -198,7 +198,7 @@ FIELD_LABELS = {
     "sources": "Seen by", "graph_launches": "Graph launches per inference",
     "program_factory_type": "Program factory (full type)", "ttnn_apis": "ttnn API",
     "launches_per_inference": "Launches per inference", "cache_misses": "Program cache misses",
-    "after_op_code": "After op code", "before_op_code": "Before op code", "compile_hash": "Compile hash",
+    "after_op_code": "Previous launch (op code)", "before_op_code": "Next launch (op code)", "compile_hash": "Compile hash",
     "api_calls": "API calls", "quasar_status": "Quasar (by name)", "review": "Review",
     "review_note": "Review note", "template_args": "Template args (cache)",
     "missing_template_args": "Not taken on Quasar", "quasar_template_args": "Quasar template args",

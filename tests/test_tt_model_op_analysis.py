@@ -356,8 +356,8 @@ def test_sheet_spec_counts_are_formulas_with_expected_values(tmp_path):
     row_number, _ = by_name["Quasar, BF16 projection: ❌"]
     assert spec["expected"][f"Info!B{row_number}"] == 1
     assert "Quasar, BF16 projection: n/a" not in by_name
-    row_number, row = by_name["Launch order launches (P150)"]
-    assert row[2].startswith("=SUMPRODUCT(") and spec["expected"][f"Info!C{row_number}"] == 4
+    # The launch-order total equals the ttnn calls total by the validator; Info does not repeat it.
+    assert "Launch order launches (P150)" not in by_name
 
 
 def test_sheet_spec_info_reads_summary_sections(tmp_path):
