@@ -8555,6 +8555,45 @@ def test_task_cancel_refuses_unknown_and_finished_tasks_and_changes_nothing(env,
     assert p.db.task(queued)["status"] == "cancelled" and capsys.readouterr().out.startswith("cancelled")
 
 
+def test_task_list_finds_old_tasks_by_status_or_all_and_says_when_it_cuts(env, capsys):
+    p = make(env)
+    from ttp import cli
+    old = p.db.add_task("old queued", "s", kind="work", tier="light", origin="user")
+    review = p.db.add_task("asked for changes", "s", kind="review", tier="light", origin="user")
+    p.db.update_task(review, status="failed", result=json.dumps({"status": "changes_needed"}))
+    for i in range(60):
+        p.db.update_task(p.db.add_task(f"t{i}", "s", kind="work", tier="light", origin="user"), status="done")
+    cli.main(["task", "demo", "list", "--json"])   # the default stays capped, and says so
+    out = capsys.readouterr()
+    rows = json.loads(out.out)
+    assert len(rows) == 50 and old not in {r["id"] for r in rows}
+    assert "showing newest 50 of 62 tasks; use --all, --limit N or --status" in out.err
+    cli.main(["task", "demo", "list"])
+    out = capsys.readouterr()
+    assert len(out.out.splitlines()) == 50 and "showing newest 50 of 62" in out.err
+    cli.main(["task", "demo", "list", "--json", "--status", "queued"])   # filtered before any cap
+    out = capsys.readouterr()
+    assert [r["id"] for r in json.loads(out.out)] == [old] and out.err == ""
+    cli.main(["task", "demo", "list", "--status", "changes_needed,queued"])
+    assert [line.split("\t")[:2] for line in capsys.readouterr().out.splitlines()] == \
+        [[f"#{review}", "changes_needed"], [f"#{old}", "queued"]]
+    cli.main(["task", "demo", "list", "--json", "--status", "failed"])   # the shown status, not the stored one
+    assert json.loads(capsys.readouterr().out) == []
+    cli.main(["task", "demo", "list", "--json", "--all"])
+    out = capsys.readouterr()
+    assert len(json.loads(out.out)) == 62 and old in {r["id"] for r in json.loads(out.out)} and out.err == ""
+    cli.main(["task", "demo", "list", "--json", "--status", "done", "--limit", "5"])
+    out = capsys.readouterr()
+    assert len(json.loads(out.out)) == 5 and "showing newest 5 of 60 tasks" in out.err
+    for args, said in ((["--all", "--limit", "3"], "do not go together"), (["--limit", "0"], "1 or more")):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["task", "demo", "list", *args])
+        assert e.value.code == 2 and said in capsys.readouterr().err
+    with pytest.raises(SystemExit) as e:
+        cli.main(["task", "demo", "show", str(old), "--status", "queued"])
+    assert e.value.code == 2 and "go with list" in capsys.readouterr().err
+
+
 def test_project_name_is_optional_from_the_run_or_the_current_folder(env, monkeypatch, capsys):
     p = make(env)
     from ttp import cli

@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 from . import __version__, poll_s
-from .db import chat_floor, task_outcome
+from .db import CHANGES_NEEDED, chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
 from . import sshcmd, timefmt
@@ -4400,6 +4400,26 @@ def cmd_adopt(a) -> None:
     print(MARKER.format(name=a.name, host=host, dir=a.dir))
 
 
+TASK_LIST_LIMIT = 50   # newest tasks `ttp task list` shows when given no --status, --all or --limit
+
+
+def list_tasks(p, a) -> tuple[list[dict], int, int | None]:
+    """The rows `ttp task list` shows, newest first, how many matched and the cap applied (None: none).
+    --status filters on the shown status (changes_needed included) before any cap, and with no --limit
+    returns every match; with no filter only the newest TASK_LIST_LIMIT are shown unless --all."""
+    cols = "SELECT id,status,kind,result,tier,title,labels FROM tasks"
+    want = {s.strip() for s in (a.status or "").split(",") if s.strip()}
+    limit = None if a.all else a.limit if a.limit is not None else None if want else TASK_LIST_LIMIT
+    if want:
+        stored = sorted(want | ({"failed"} if CHANGES_NEEDED in want else set()))
+        rows = [t for t in p.db.q(f"{cols} WHERE status IN ({','.join('?' * len(stored))}) ORDER BY id DESC",
+                                  stored) if task_outcome(t) in want]
+        return rows[:limit] if limit is not None else rows, len(rows), limit
+    total = p.db.one("SELECT COUNT(*) AS n FROM tasks")["n"]
+    return p.db.q(f"{cols} ORDER BY id DESC" + (" LIMIT ?" if limit is not None else ""),
+                  [limit] if limit is not None else []), total, limit
+
+
 def cmd_task(a) -> None:
     p = need(a.name, sys.argv[1:])
     if a.action != "add" and (a.start_when, a.start_after, a.why) != (None, None, None):
@@ -4410,6 +4430,12 @@ def cmd_task(a) -> None:
         die("--on-pass-cmd goes with set-when")
     if a.action != "superseded" and (a.ref is not None or a.repo is not None):
         die("--ref and --repo go with superseded")
+    if a.action != "list" and (a.status, a.all, a.limit) != (None, False, None):
+        die("--status, --all and --limit go with list")
+    if a.all and a.limit is not None:
+        die("--all and --limit do not go together")
+    if a.limit is not None and a.limit < 1:
+        die("--limit needs a number of 1 or more")
     if a.action == "add":
         try:
             tid, note = add_task(p, a)
@@ -4417,7 +4443,9 @@ def cmd_task(a) -> None:
             die(str(e))
         print(f"task #{tid} queued" + note)
     elif a.action == "list":
-        rows = p.db.q("SELECT id,status,kind,result,tier,title,labels FROM tasks ORDER BY id DESC LIMIT 50")
+        rows, total, limit = list_tasks(p, a)
+        if limit is not None and total > limit:   # never cut silently: a caller would miss older tasks
+            print(f"showing newest {limit} of {total} tasks; use --all, --limit N or --status", file=sys.stderr)
         if a.json:
             print(json.dumps([{"id": t["id"], "status": task_outcome(t), "kind": t["kind"], "tier": t["tier"],
                                "title": t["title"], **task_timing(t)} for t in rows], indent=2))
@@ -7406,6 +7434,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--repo", help="superseded: a repository path to search first for the branch and the commit "
                    "(then the repository of the current directory, the repositories the task's runs worked in, the project root)")
     s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record")
+    s.add_argument("--status", help="list: only tasks in these statuses, comma-separated (queued,running,waiting,"
+                   "blocked,review,done,failed,changes_needed,cancelled, ...); filtered before any cap, so every match "
+                   "shows unless --limit is given")
+    s.add_argument("--all", action="store_true", help="list: every task, not only the newest 50")
+    s.add_argument("--limit", type=int, help="list: at most this many, newest first (default 50 with no --status; "
+                   "a cut list says so on stderr)")
     s.add_argument("--spec", help="add: what the task should do, in full (the worker reads only this)")
     s.add_argument("--kind", default="work",
                    help="add: one of " + ", ".join(TASK_KINDS) + " (default work)")
