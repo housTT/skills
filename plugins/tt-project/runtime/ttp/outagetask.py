@@ -23,7 +23,7 @@ state. The task is labeled `outage:<alias>:<condition>@<start>` (one per episode
 machine, the outage start, who was paged and why the owner was passed over.
 
 Escalation, from the same route: past its due time with the task still open (not closed(), so a failed
-task counts; or unreadable), one high `machine_outage_overdue` page to the task's project (an event at high effort when that is the routing daemon's
+task counts; or unreadable), one high `machine_outage_overdue` page to the task's project (an event for a tricky turn when that is the routing daemon's
 own project, else a high note), and after a second budget (`heal.outage_escalate_min`, default 30) one
 normal-severity user alert. The task shows in `ttp status`, the web app and the blocker sweep as an
 outage item with its age and due time (lines, sweep.items). Observation mutes never touch any of this:

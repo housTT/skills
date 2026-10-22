@@ -434,7 +434,7 @@ def test_coordinator_runaway_guard_counts_only_self_started_turns(env):
         g = bud.evaluate(p.db, p.config(), "claude", wins, now=now)
         return g, [r for r in g.reasons if "coordinator spent" in r]
 
-    # (1) an hour of 12 user-message turns at high effort, $7.20 against a $4/h limit
+    # (1) an hour of 12 user-message turns (tricky turns), $7.20 against a $4/h limit
     for i in range(12):
         turn(0.60, [100 + i], 60 + i * 250)
     g, hit = coord_reasons()
@@ -2933,7 +2933,7 @@ def _bk_deferral(task):
 def test_a_plan_to_billed_switch_releases_old_holds_and_wakes_the_coordinator_once(env, monkeypatch):
     """The dogfooding case: the login switched from a plan account to a usage-billed one while the
     coordinator held work until the 7d window resets. The daemon notices, releases the limit pause,
-    the schedule held for budget and the 'until reset' deferrals at once, and queues one high-effort
+    the schedule held for budget and the 'until reset' deferrals at once, and queues one tricky-turn
     event listing what it released and the waits that are the coordinator's to re-point."""
     from ttp import budget as bud, budgetkind, coordinator as coord
     from ttp.daemon import Daemon
@@ -2976,7 +2976,7 @@ def test_a_plan_to_billed_switch_releases_old_holds_and_wakes_the_coordinator_on
     assert _bk_deferral(p.db.task(by_why)) == {} and p.db.task(by_why)["not_before"] is None
     assert _bk_deferral(p.db.task(by_time)) == {}
     assert _bk_deferral(p.db.task(other)).get("why") == "after the tag is cut", "a deferral for something else stays"
-    # one high-effort turn, one feed line that never needs the user
+    # one tricky turn, one feed line that never needs the user
     assert budgetkind.KIND in coord.effort_triggers(p.db, p.config(), [ev[0]["id"]], None)[0]
     feed = [m for m in p.db.q("SELECT * FROM messages WHERE direction='out'") if "budget changed" in m["text"]]
     assert len(feed) == 1 and feed[0]["kind"] == "info" and feed[0]["severity"] == "low", feed

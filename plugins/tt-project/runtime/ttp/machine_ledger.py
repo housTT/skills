@@ -10,7 +10,7 @@ Recovery owner. machines.json gives a machine a `recovery_owner` project and a `
 down or held past its grace (a command watcher's observation with `machine` and `condition`, or `report`)
 records the condition in the shared routes file; the first daemon to tick routes it, model-free, to the
 owner: a high-severity note in its inbox (`upstream.send`), or an event when the owner is the daemon's own
-project, which the coordinator takes at high effort. When the owner cannot act (its daemon stopped or
+project, which the coordinator takes as a tricky turn. When the owner cannot act (its daemon stopped or
 stale, the project paused, its coordinator logged out or failing) for UNAVAILABLE_S, the condition goes to
 the fallback, then to the user as an outage. Before each page, the ledger reads the owner's (then the
 fallback's) own heal checks naming the machine, read-only (responsibilities.healthy_checks): while one that

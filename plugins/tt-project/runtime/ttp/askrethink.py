@@ -5,7 +5,7 @@
 An open ask whose `blocking` is restriction, irreversible or human, that holds at least one blocked
 task (its anchor `waits:ask:<id>`, or the task's blocked reason cites `ask <id>`), and that has been
 open longer than coordinator.ask_rethink_h (default 2; 0 off) raises one KIND event. Its kind is a
-'stuck' effort trigger (coordinator.EFFORT_EVENT_TRIGGERS), so the turn it wakes runs at high effort
+'stuck' effort trigger (coordinator.EFFORT_EVENT_TRIGGERS), so the turn it wakes is a tricky one
 and either decides the ask itself or records why only the user can (the blocker sweep's
 `human_indispensable`). Each ask raises it once, across daemon restarts (kv RAISED_KEY). A review,
 merge, access, funds or spend ask is never raised: only the user can answer those. The blocker sweep

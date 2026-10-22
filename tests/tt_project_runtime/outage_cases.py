@@ -180,7 +180,7 @@ def test_every_outage_hand_off_path_creates_a_task_row_never_only_a_note(env):
 def test_outage_replay_held_box_paused_owner_muted_watcher_reaches_a_task_in_time(env, monkeypatch):
     """(f) Incident replay: a box held for 4 h, its owner paused, the watcher that sees it muted. The routing
     project's daemon files the task within budgets()['due_s'] of the grace, the overdue page at its due time
-    goes to its coordinator at high effort, and the user's alert follows once."""
+    goes to its coordinator as a tricky turn, and the user's alert follows once."""
     from ttp import coordinator as coord
     from ttp import daemon as dm
     from ttp import outagetask

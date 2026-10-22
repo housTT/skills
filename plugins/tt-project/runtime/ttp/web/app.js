@@ -239,6 +239,7 @@ function pushQueueHtml(q, now) {
 
 function healthHtml(h) {
   const c = h.coordinator, parts = [];
+  if (c.route_line) parts.push(esc(c.route_line));
   parts.push(c.last_turn ? `last turn ${agoH(c.last_turn)} ago${c.last_status ? ` (${esc(c.last_status)})` : ""}` : "no turn yet");
   if (c.failures) parts.push(`<span class="lv-red">${c.failures} failed in a row</span>`);
   if (c.backoff_until) parts.push(`retry at ${at(c.backoff_until)}`);

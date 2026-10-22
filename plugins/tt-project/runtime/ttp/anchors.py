@@ -14,7 +14,7 @@ blocked: a trigger in db.py drops it from any write that leaves it on a task in 
 Blocks the daemon or a worker made carry no anchor, nor do holds from before anchors. A hold with no
 anchor is stale once held past coordinator.hold_max_h, or once the user wrote after it was held (that
 message may be what it waited for). A stale set with a member not in the last one raises one
-`stale_holds` event: a high-effort coordinator turn that lists them.
+`stale_holds` event: a tricky coordinator turn (one the turn gates never skip) that lists them.
 """
 from __future__ import annotations
 

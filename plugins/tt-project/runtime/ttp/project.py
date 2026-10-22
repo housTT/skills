@@ -204,7 +204,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "turn_timeout_ceiling_s": 3600, "sweep_prompt_chars": 12000,
                     "ask_timeout_h": 1,
                     # An open restriction, irreversible or human ask that holds a blocked task longer
-                    # than this goes back to a high-effort turn once to decide it (askrethink.py); 0 off.
+                    # than this goes back to a tricky turn once to decide it (askrethink.py); 0 off.
                     "ask_rethink_h": 2,
                     # A task deferred with `start_when` that has not started after this long is raised
                     # to the coordinator once.
@@ -248,7 +248,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                "unreviewed_per_pass": 2, "unreviewed_max_age_h": 72},
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under
-    # review.area_fail_cap, is refused unless its `reason` names what changed in a high-effort turn.
+    # review.area_fail_cap, is refused unless its `reason` names what changed in a tricky turn.
     # With auto, a done hop with progress whose only proposal is the next `continue:` hop gets it
     # queued by the daemon, with no coordinator turn.
     "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True},

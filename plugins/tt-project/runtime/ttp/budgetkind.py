@@ -28,7 +28,7 @@ On a change (`apply`, in the gate update's transaction):
   plan-window red-alert markers, the schedules its gate held ('waiting for budget', core provider
   only) and task deferrals on it whose reason is a window, reset, limit, cap or budget. Each is
   evaluated against the new gate on the same tick and held again only if that gate holds it;
-- one KIND event (queued, normal) for the coordinator's next turn, at high effort
+- one KIND event (queued, normal) for the coordinator's next turn, a tricky one
   (coordinator.EFFORT_EVENT_TRIGGERS); it batches (coordinator.BATCH_KINDS), so it never wakes a
   turn alone. It brings the blocker sweep forward (sweep.signal), says old -> new kind and the new
   limits, lists what was released, and the open tasks still tied to the old limits that are the

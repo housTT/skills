@@ -69,15 +69,19 @@ Check `ttp secret show`. No Jev entry → tell the user, in plain words:
 ## 5. Create
 
 ```bash
-ttp new <name> [--dir <root>] [--host <ssh-alias>] --describe-file <brief.md>
+ttp new <name> [--dir <root>] [--host <ssh-alias>] [--coordinator-effort <level>] --describe-file <brief.md>
 ```
 
+- The coordinator runs at xhigh effort by default (each provider takes its nearest level). Pass
+  `--coordinator-effort` only if the user asks for another; later,
+  `ttp config <name> coordinator.effort <level>` changes it from the next turn.
 - Remote host: the command ships the runtime over ssh and creates it there.
 - The daemon installs as a service: systemd user unit (+ linger) or launchd; cron fallback.
 - Print the `tt-project://…` line and the verified web app link from the output. For a remote
   project the command already opened the kept local forward and checked the link through it.
-- Relay the defaults lines it prints (spending caps, the 90% plan line, free Codex resets, Jev) in
-  plain words, once; the user changes any with `ttp config <name> KEY VALUE`.
+- Relay the defaults lines it prints (spending caps, the 90% plan line, free Codex resets, Jev, the
+  coordinator's model and effort) in plain words, once; the user changes any with
+  `ttp config <name> KEY VALUE`.
 - A `web app: NOT AVAILABLE (…)` line (exit 3) means the project was created but its web app did
   not answer after repair. Say what it names as broken; give no link.
 

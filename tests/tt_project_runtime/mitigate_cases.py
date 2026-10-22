@@ -85,7 +85,7 @@ def test_an_overdue_mitigation_wakes_the_coordinator_and_a_done_fix_lists_its_me
     assert "OVERDUE" not in item["reason"]
     assert f"#{m['id']} queued, mitigation due " in status_text(p)
     assert mitigate.tend(p.db, p.name, now=now) == []
-    # Past due and not done: one high event that wakes the coordinator at high effort, once.
+    # Past due and not done: one high event that wakes the coordinator for a tricky turn, once.
     late = rec["due"] + 1
     assert mitigate.tend(p.db, p.name, now=late) == [f"mitigation #{m['id']} overdue"]
     assert mitigate.tend(p.db, p.name, now=late + 600) == []

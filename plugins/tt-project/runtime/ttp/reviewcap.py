@@ -16,7 +16,7 @@ spawned many tasks joins none.
 
 With review.area_fail_cap (default 3; 0 off) or more reviews of one area failed or asking for
 changes within AREA_WINDOW_S, the daemon queues no automatic fix for it and raises a
-REVIEW_AREA_EVENT, which makes the coordinator's turn a high-effort one (TRIGGER) that re-plans.
+REVIEW_AREA_EVENT, which makes the coordinator's turn a tricky one (TRIGGER) that re-plans.
 A review whose hand-off says `review_failure: check_only` (daemon.review_failure) found no code
 problem, only a missing or inapplicable check, so it does not count toward the cap; nor does one
 the push queue failed because only its batch checks failed (pushq._settle writes check_only too).

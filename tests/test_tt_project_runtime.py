@@ -30489,7 +30489,7 @@ def test_repeated_review_failures_across_stacks_stop_auto_fixes_and_raise_a_re_p
     assert data["root"] == code_a and data["reviews"] == [rev_a["id"], rev_b["id"], rev_c["id"]]
     assert {code_a, code_b, code_c} <= set(data["tasks"]) and set(data["files"]) == {"a.py", "b.py", "c.py"}
     assert f"#{code_a}" in ev["text"] and "Re-plan" in ev["text"] and "edge-case fix" in ev["text"]
-    # The coordinator's turn is a high-effort one, counted by trigger, and the daily review lists the area.
+    # The coordinator's turn is a tricky one, counted by trigger, and the daily review lists the area.
     labels, _ = coord.effort_triggers(p.db, p.config(), [ev["id"]], None)
     assert reviewcap.TRIGGER in labels
     assert f"{reviewcap.TRIGGER}: 3 reviews failed" in coord.digest(p, {}, [ev["id"]], [])
@@ -45678,7 +45678,7 @@ def test_ask_rethink_never_for_user_only_asks_or_a_resolved_ask_or_one_holding_n
     assert not db.q("SELECT id FROM events WHERE kind=?", (askrethink.KIND,))
 
 
-def test_ask_rethink_raises_once_across_a_daemon_restart_at_high_effort(env):
+def test_ask_rethink_raises_once_across_a_daemon_restart_as_a_tricky_turn(env):
     p = make(env)
     from ttp import askrethink, coordinator as coord
     from ttp.daemon import Daemon

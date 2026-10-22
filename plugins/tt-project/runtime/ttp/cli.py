@@ -733,6 +733,9 @@ def cmd_new(a) -> None:
     root = Path(a.dir).expanduser().resolve() if a.dir else _default_root()
     p = bootstrap(root, a.name, brief, a.provider or detect_provider(), a.home_tz, a.home_from or "")
     register(a.name, {"host": hostname(), "dir": str(p.root)})
+    from . import coordinator as coord
+    if a.coordinator_effort != coord.DEFAULT_EFFORT:   # before the daemon starts, so its first turn has it
+        p.set_config("coordinator.effort", a.coordinator_effort)
     ident = subprocess.run(["git", "-C", str(p.root), "config", "user.email"], capture_output=True, text=True)
     if ident.returncode != 0 or not ident.stdout.strip():
         print("warning: git has no user.email here, so workers cannot commit. Set one "
@@ -746,6 +749,7 @@ def cmd_new(a) -> None:
     print(f"created {a.name} in {p.base} · daemon via {how}")
     for ln in defaults_lines(p.config()["budget"], bool((load_secrets().get("jev") or {}).get("key")), a.name):
         print(ln)
+    print(coord.route_line(p.config()) + f" (change it: ttp config {a.name} coordinator.effort LEVEL)")
     if a.no_service:
         print(f"daemon: not started (--no-service). Start it by hand with `{hand_start_cmd(p)}`, "
               f"or `ttp start {a.name}` installs a service that keeps it running")
@@ -834,6 +838,9 @@ def new_remote(a, brief: str) -> None:
         args += ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
     if a.no_service:
         args.append("--no-service")
+    from . import coordinator as coord
+    if a.coordinator_effort != coord.DEFAULT_EFFORT:
+        args += ["--coordinator-effort", a.coordinator_effort]
     remote = " ".join(shlex.quote(x) if not x.startswith("~/") else x for x in args) + " --describe-file -"
     from . import weblink
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, remote], input=brief, text=True, stdout=subprocess.PIPE)
@@ -1261,6 +1268,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     elif c["idle_held"]:
         coord += f" · idle check {c['idle_held']}"
     lines.append(coord)
+    lines.append(c["route_line"])
     from . import budget
     cache = budget.coordinator_cache(db, now)["24h"] if verbose else {}
     if cache.get("turns"):
@@ -6915,6 +6923,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--provider", choices=[*PROVIDER_CHOICES, "fake"], metavar="{" + ",".join(shown) + "}",
                    help="the agent CLI that runs the project (default: the one found on this machine)")
     s.add_argument("--no-service", action="store_true", help="do not install a boot-time service")
+    # coordinator.DEFAULT_EFFORT and EFFORT_ORDER, spelt out: importing coordinator here slows every command.
+    s.add_argument("--coordinator-effort", default="xhigh", choices=("minimal", "low", "medium", "high", "xhigh", "max"),
+                   help="the effort the coordinator's turns run at (default: xhigh; each provider "
+                        "takes its nearest level; later: ttp config <name> coordinator.effort LEVEL)")
     s.add_argument("--no-secrets", action="store_true", help="with --host: do not copy your saved keys there")
     s.add_argument("--home-tz", help=argparse.SUPPRESS)     # with --host there: the workstation's zone
     s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name

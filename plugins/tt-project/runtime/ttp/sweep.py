@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Blocker sweep: a regular high-effort re-check of everything that is not moving.
+"""Blocker sweep: a regular tricky-turn re-check of everything that is not moving.
 
 Every coordinator.blocker_sweep_h hours (default 6; 0 off), and sooner on a signal, the daemon queues
-one SWEEP_KIND event while anything is stuck. That event makes the coordinator's turn a high-effort
+one SWEEP_KIND event while anything is stuck. That event makes the coordinator's turn a tricky
 one (coordinator.EFFORT_EVENT_TRIGGERS) and adds a 'Blocker sweep' section to its digest: every
 blocked, waiting, in-review, setting-held and deferred task and every paused resource, with its age,
 its reason and its last re-check. The coordinator records exactly one outcome per item with the

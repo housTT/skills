@@ -685,7 +685,7 @@ def test_a_hold_mute_never_stays_silent_past_its_cap(env):
 
 def test_mute_replay_of_a_held_box_wakes_the_coordinator_an_hour_in(env, monkeypatch):
     """The post-mortem timeline: muted at 10:01 for 24 h, the watcher reports the held box every 30 min.
-    Before, nothing woke for 24 h; now the coordinator wakes at high effort at about 11:01 (the hold cap)."""
+    Before, nothing woke for 24 h; now the coordinator wakes for a tricky turn at about 11:01 (the hold cap)."""
     p = make(env)
     from ttp import coordinator as coord
     from ttp import daemon as dm
@@ -3991,7 +3991,7 @@ def test_a_task_in_review_whose_latest_review_failed_with_no_fix_is_raised_once_
     d._raise_unhandled_failed_reviews(now + 3 * 3600)
     d.tick()
     assert len(raised()) == 1
-    # It makes the coordinator's turn a high-effort one.
+    # It makes the coordinator's turn a tricky one.
     assert "review_failed_unhandled" in coord.UNBLOCK_KINDS
     assert "review_failed_unhandled" in coord.effort_triggers(db, p.config(), [rows[0]["id"]], None)[0]
 
@@ -7560,7 +7560,7 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
         return row
 
     # Unset: the coordinator keeps the standard tier's model at xhigh (coordinator.DEFAULT_EFFORT), so
-    # the cheaper light-tier model of workers and its tier's effort do not move it.
+    # the cheaper light-tier model of workers and the tiers' efforts do not move it.
     standard = p.config()["providers"]["claude"]["tiers"]["standard"]
     assert p.config()["coordinator"]["model_tier"] == "standard" and light["model"] != standard["model"]
     d = Daemon(p.base)
@@ -7638,6 +7638,51 @@ def test_a_coordinator_effort_change_applies_at_the_next_turn(env):
     p.set_config("coordinator.model", "")
     d._load_config()
     assert turn() == (model, "xhigh")
+
+
+def test_new_status_and_the_web_app_show_the_coordinators_model_and_effort(env, monkeypatch, capsys):
+    """`ttp new` says what the coordinator runs with and takes --coordinator-effort (set only when it is
+    not the default, also on another machine); `ttp status` and the web app's health show the same line."""
+    import subprocess
+    from ttp import cli, coordinator as coord, machines, web, weblink
+    from ttp.project import Project
+
+    def never(*a, **k):
+        raise AssertionError("no daemon or web app here")
+    monkeypatch.setattr(cli, "_wait_for_daemon", never)
+    monkeypatch.setattr(weblink, "local", never)
+    cli.main(["new", "solo", "--dir", str(env["repo"]), "--provider", "fake", "--no-service"])
+    p = Project(env["repo"])
+    out = capsys.readouterr().out
+    assert "effort" not in p.raw_config().get("coordinator", {})   # the default stays unset
+    assert coord.route_line(p.config()) in out and "coordinator.effort LEVEL" in out, out
+    cli.main(["new", "solo", "--dir", str(env["repo"]), "--provider", "fake", "--no-service",
+              "--coordinator-effort", "high"])
+    assert p.config()["coordinator"]["effort"] == "high"
+    assert coord.route_line(p.config()) in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        cli.main(["new", "solo", "--coordinator-effort", "bogus"])
+    err = capsys.readouterr().err
+    assert all(level in err for level in coord.EFFORT_ORDER) and "default: xhigh" not in err   # same levels
+    assert coord.DEFAULT_EFFORT == "xhigh"   # the parser's spelt-out default
+    # status and web
+    line = coord.route_line(p.config())
+    assert line.endswith(" · high")
+    assert line in cli.status_text(p).splitlines()
+    h = web.health(p, p.db)["coordinator"]
+    assert h["route_line"] == line and h["route"] == coord.coordinator_route(p.config())
+    assert "c.route_line" in (web.STATIC / "app.js").read_text()
+    # another machine: the remote `ttp new` gets the flag only when it is not the default
+    seen = []
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: "~/.tt-project/lib/current/bin/ttp")
+    monkeypatch.setattr(cli, "load_secrets", lambda: {})
+    monkeypatch.setattr(machines, "push", lambda host: "machines: none")
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k: seen.append(argv[-1]) or subprocess.CompletedProcess(
+        argv, 0, "created far\n", None))
+    for flags in ([], ["--coordinator-effort", "max"]):
+        cli.main(["new", "far", "--host", "host-a", "--dir", "/srv/far", "--no-service", *flags])
+    made = [x for x in seen if isinstance(x, str) and " new far " in x]
+    assert len(made) == 2 and "--coordinator-effort" not in made[0] and "--coordinator-effort max" in made[1], seen
 
 
 def test_unblocking_turns_name_their_trigger_and_routine_turns_do_not(env, monkeypatch):
@@ -10262,7 +10307,7 @@ def test_setting_setup_question_fires_once_per_setting_state(env):
     assert len(got) == 1 and "delivery.allow_protected_push_branch" in got[0]["text"], got
     assert "origin/main" in got[0]["text"] and got[0]["ref"] == f"{prguard.BLOCKING_REF}restriction"
     assert got[0]["severity"] == "high" and not got[0]["handled"]
-    assert settinghold.SETUP_EVENT not in coord.EFFORT_EVENT_TRIGGERS   # asked already: no high-effort turn
+    assert settinghold.SETUP_EVENT not in coord.EFFORT_EVENT_TRIGGERS   # asked already: no tricky turn
     ev = p.db.q("SELECT * FROM events WHERE kind=?", (settinghold.SETUP_EVENT,))
     assert len(ev) == 1 and f"#{got[0]['id']}" in ev[0]["text"] and ev[0]["severity"] == "low"
     assert not p.config()["delivery"].get("allow_protected_push_branch")   # never turned on by itself
@@ -11022,7 +11067,7 @@ def test_blocker_sweep_lists_every_kind_of_stuck_item_with_age_reason_and_last_c
 
 
 
-def test_blocker_sweep_turn_runs_at_high_effort(env, monkeypatch):
+def test_blocker_sweep_turn_is_a_tricky_turn(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord, sweep
     assert coord.EFFORT_EVENT_TRIGGERS[sweep.SWEEP_KIND] == "stuck"
@@ -12075,7 +12120,7 @@ def _probe_says(db, tid, rc, at):
 
 def test_blocker_sweep_skips_watched_holds_whose_probe_and_fingerprint_are_unchanged(env):
     """The upstream note's case: holds whose end a model-free probe already watches were re-judged at
-    every sweep (each a high-effort turn answering still_blocked again). While the probe still says not
+    every sweep (each a tricky turn answering still_blocked again). While the probe still says not
     yet and nothing about the hold changed, the outcome carries past its next check and no sweep starts,
     not on the interval and not on an unrelated signal."""
     from ttp import sweep
@@ -12199,7 +12244,7 @@ def test_blocker_sweep_daily_re_check_signal_and_pause_probe_verdicts_are_kept(e
 def test_blocker_sweep_replay_of_a_day_of_signals_over_probe_watched_holds(env):
     """The upstream note's day: holds a probe watches (pauses with end_when, tasks with start_when),
     their next checks every 2h, and budget changes and resolved notes every few hours. Before, each
-    next check and signal brought a high-effort sweep that answered still_blocked again; now only the
+    next check and signal brought a tricky-turn sweep that answered still_blocked again; now only the
     daily re-check does."""
     from ttp import sweep
     p = make(env)
@@ -12366,7 +12411,7 @@ I_WILL_DELIVER = "I'll deliver a dogfood-2 candidate sha with checks by around 1
 def test_promise_replay_671_recorded_listed_overdue_and_raised_once(env, monkeypatch):
     """Reply #671 at 11:00 PDT promises a candidate by 15:00 PDT with no task behind it: one promise
     record due 15:00 PDT, shown OVERDUE at 17:20 in the digest section and the blocker sweep, and exactly
-    one high promise_overdue event across repeated checks, which is a high-effort trigger."""
+    one high promise_overdue event across repeated checks, which is a tricky-turn trigger."""
     from ttp import coordinator as coord
     from ttp import obligations as ob
     from ttp import sweep

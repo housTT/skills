@@ -17,7 +17,7 @@ a heal check). It is due coordinator.mitigation_due_h hours after it was filed (
 off). One open mitigation per resource: a later report for the same resource adds none.
 
 tend(), every tick: an open mitigation past its due time (not done or cancelled) raises one high
-OVERDUE event, which wakes the coordinator at high effort; none once its fix task is done (the fix,
+OVERDUE event, which wakes the coordinator for a tricky turn; none once its fix task is done (the fix,
 not the workaround, ends the impact). Once the fix task is done too, the mitigation's
 temporary measures (its hand-off's `temporary_measures` [{what, undo}], and the open change-ledger
 entries it recorded) are listed for undo in one UNDO event. The blocker sweep (sweep.items) and

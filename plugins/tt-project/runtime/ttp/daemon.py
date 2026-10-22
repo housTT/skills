@@ -2516,7 +2516,7 @@ class Daemon:
         """A task left in 'review' whose latest review failed or asked for changes, with no fix or
         re-review open for it, waits on a decision nobody is making. Past
         coordinator.review_failed_unhandled_s after that review ended it is raised once per failed
-        review, as a high-effort trigger; the coordinator queues the fix, never this check."""
+        review, as a tricky-turn trigger; the coordinator queues the fix, never this check."""
         db = self.p.db
         try:
             wait_s = float(self.cfg["coordinator"].get("review_failed_unhandled_s", 3600) or 0)
@@ -5216,7 +5216,7 @@ class Daemon:
                        severity="low", every_s=0)
 
     def rethink_asks(self) -> None:
-        """Hand an open ask that has held work past coordinator.ask_rethink_h back to a high-effort
+        """Hand an open ask that has held work past coordinator.ask_rethink_h back to a tricky
         turn to decide (askrethink.py), once per ask. Checked once a minute."""
         now = time.time()
         if now - getattr(self, "_rethink_checked", 0.0) < 60:
@@ -5229,7 +5229,7 @@ class Daemon:
             log(self.p, "ask rethink failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def blocker_sweep(self) -> None:
-        """Queue a blocker sweep (sweep.py) when one is due: a high-effort turn that re-checks every
+        """Queue a blocker sweep (sweep.py) when one is due: a tricky turn that re-checks every
         stuck item. Model-free until then; checked once a minute."""
         now = time.time()
         if now - getattr(self, "_sweep_checked", 0.0) < 60:
