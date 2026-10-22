@@ -187,6 +187,10 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
             warnings.append(f"run.json has no {key}; record it (static-phase.md, step 6)")
         elif not isinstance(entry, dict) or entry.get("value") not in CONFIG_VALUES or not str(entry.get("evidence", "")).strip():
             errors.append(f"run.json {key} must be {{\"value\": one of {CONFIG_VALUES}, \"evidence\": \"...\"}}")
+    layers = run.get("configurable_layers")
+    if isinstance(layers, dict) and layers.get("value") in ("yes", "partial") and not str(layers.get("setting", "")).strip():
+        errors.append("run.json configurable_layers needs \"setting\": the environment variable or test parameter "
+                      "that sets the layer count")
 
     if latest_entry_failure(run):
         warnings.append("run.json records a local failure of the entry test after its last pass: source statuses "

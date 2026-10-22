@@ -2100,7 +2100,8 @@ def test_info_bring_up_checks(tmp_path):
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 6)])
     data = json.loads((run / "run.json").read_text())
     data.update({"tracy_mode": "live", "profile_values": {"arch": "blackhole", "compute_grid": "13x10"},
-                 "configurable_layers": {"value": "yes", "evidence": "MODEL_NUM_LAYERS read at models/a/tt/model.py:5"},
+                 "configurable_layers": {"value": "yes", "evidence": "MODEL_NUM_LAYERS read at models/a/tt/model.py:5",
+                                         "setting": "MODEL_NUM_LAYERS"},
                  "entry_test_passes": {"by": "source:tracy on a local p150 device", "date": "2026-10-20",
                                        "result": "PCC 0.99"},
                  "graph_capture": {"inferences": 2, "host_transfers_inside": 3, "peak_dram_mib": 812.5,
@@ -2111,7 +2112,8 @@ def test_info_bring_up_checks(tmp_path):
                                            "total_time_ms": "10", "host_pct_of_total": "4.20"}])
     write_rows(run / "host_ops.csv", [{"id": "1", "host_work": "torch.cat", "when": "per inference",
                                       "counts_as_host_op": "yes", "reason": "in forward"}], HOST_FIELDS)
-    info = info_rows(sheet(run))
+    spec = sheet(run)
+    info = info_rows(spec)
     assert info["End-to-end test"] == "✅ passed: PCC 0.99 (source:tracy on a local p150 device, 2026-10-20)"
     host = info["Host fallback"].lstrip("'")
     assert host.startswith("⚠️ 5 of 100 ops on the host (5.0%), 4.20% of the time (Tracy live")
@@ -2119,8 +2121,32 @@ def test_info_bring_up_checks(tmp_path):
     assert info["Peak DRAM"].lstrip("'").startswith("812.5 MiB allocated at once")
     grid = info["Blockers to a smaller grid"]
     assert grid.startswith("❌ 2 of 3 ttnn call rows (5 launches per inference)") and "set at 2 places" in grid
-    assert info["Configurable grid (TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE)"].startswith("✅ yes")
+    assert info["Configurable grid"].startswith("✅ yes")
     assert info["Configurable layer count"].startswith("✅ yes: MODEL_NUM_LAYERS")
+    values = tab(spec, "Info")
+    notes = {values[u["range"]["startRowIndex"]][0]: u["rows"][0]["values"][0]["note"]
+             for r in spec["requests"] if (u := r.get("updateCells")) and u["range"]["sheetId"] == 0
+             and u["range"]["endRowIndex"] - u["range"]["startRowIndex"] == 1 and u["range"]["startColumnIndex"] == 0
+             and u["range"]["endColumnIndex"] == 1}
+    assert "TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE" in notes["Configurable grid"]
+    assert notes["Configurable layer count"].startswith("Setting: MODEL_NUM_LAYERS")
+    for name in ("Static trace of the model code", "Tracy profile of the entry test",
+                 "ttnn graph capture of the entry test", "Kernel cache of the entry test (elfray)"):
+        assert "What it does:" in notes[name] and "Confidence:" in notes[name]
+    assert notes["Confidence"].startswith("Confidence in the kernel-op list")
+    del data["configurable_layers"]
+    (run / "run.json").write_text(json.dumps(data))
+    data["configurable_grid"] = {"value": "no", "evidence": "8x4 CoreGrid at models/a/tt/model.py:12"}
+    (run / "run.json").write_text(json.dumps(data))
+    spec = sheet(run)
+    assert info_rows(spec)["Configurable layer count"] == "⏳ not checked"
+    assert info_rows(spec)["Configurable grid"].startswith("❌ no")
+    grid_note = next(u["rows"][0]["values"][0]["note"] for r in spec["requests"]
+                     if (u := r.get("updateCells")) and "TT_METAL_CORE_GRID_OVERRIDE" in str(u["rows"]))
+    assert "need a code change" in grid_note
+    layer_note = next(u["rows"][0]["values"][0]["note"] for r in spec["requests"]
+                      if (u := r.get("updateCells")) and "_NUM_LAYERS" in str(u["rows"]))
+    assert "<MODEL>_NUM_LAYERS" in layer_note and "not checked yet" in layer_note
     # A later local failure wins over an earlier pass.
     data["entry_test_failure"] = {"by": "source:graph on a local p150 device", "date": "2026-10-21",
                                   "result": "PCC 0.71 < 0.90"}
@@ -2208,15 +2234,47 @@ def test_graph_report_records_peak_dram_and_entry_failure(tmp_path):
                       "--entry-pass", "y").returncode == 2
 
 
+def test_status_legend_moves_to_count_notes(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1), op_row(2, 2, port="❌")], [trace_row(1, 1, 3)])
+    (run / "summary.md").write_text(
+        "# M\n\n## Status legend\n\n- ✅: P150 - the entry test passed. Quasar BF16 - a Quasar test runs it.\n"
+        "- ❌: Quasar BF16 - directly blocked.\n\n## Findings\n\n- **Launches**: 3.\n")
+    spec = sheet(run)
+    values = tab(spec, "Info")
+    assert ["Status legend"] not in values and ["Findings"] in values
+    notes = {values[u["range"]["startRowIndex"]][0]: u["rows"][0]["values"][0]["note"]
+             for r in spec["requests"] if (u := r.get("updateCells")) and u["range"]["sheetId"] == 0
+             and u["range"]["endRowIndex"] - u["range"]["startRowIndex"] == 1}
+    assert notes["P150: ✅"] == "The entry test passed."
+    assert notes["Quasar, BF16 projection: ⚠️"] == "The code path exists but nothing tests it."
+    assert notes["Quasar, BF16 projection: ❌"] == "Directly blocked."
+
+
+
+def test_legend_note_picks_the_closest_target():
+    sys.path.insert(0, str(SCRIPTS))
+    from sheet_spec import legend_note
+    labels = ["P150", "Quasar", "Quasar, BF16 projection"]
+    text = "P150 - passed. Ops with fixed grids - none. Quasar - runs on Quasar. Quasar BF16 - runs with BF16."
+    assert legend_note(text, "Quasar, BF16 projection", labels) == "Runs with BF16."
+    assert legend_note(text, "Quasar", labels) == "Runs on Quasar."
+    assert legend_note(text, "P150", labels) == "Passed. Ops with fixed grids - none."
+    assert legend_note("Quasar BF16 - directly blocked.", "P150", labels) is None
+    assert legend_note("blocked everywhere.", "P150", labels) == "blocked everywhere."
+
+
 def test_validator_checks_configurability_fields(tmp_path):
     run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
     data = json.loads((run / "run.json").read_text())
     data["configurable_grid"] = {"value": "maybe", "evidence": ""}
-    del data["configurable_layers"]
+    data["configurable_layers"] = {"value": "yes", "evidence": "NUM_LAYERS read at m.py:3"}
     (run / "run.json").write_text(json.dumps(data))
     r = validate(run)
     assert r.returncode == 1 and "configurable_grid must be" in r.stdout
-    assert "run.json has no configurable_layers" in r.stdout
+    assert "configurable_layers needs \"setting\"" in r.stdout
+    del data["configurable_layers"]
+    (run / "run.json").write_text(json.dumps(data))
+    assert "run.json has no configurable_layers" in validate(run).stdout
 
 
 def test_destination_question_lists_plain_quasar():

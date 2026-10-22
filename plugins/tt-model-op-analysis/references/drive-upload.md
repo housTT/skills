@@ -16,7 +16,8 @@ blockers, Host work in code, the Tracy, graph-capture and kernel-cache tables an
 Info lists every tab a run can have and says why one is missing: its method has not run, or its CSV
 is larger than `--max-tab-kb` (default 300) and stays in the run directory.
 Every column header carries a note that says what the column holds (`sheet_notes.py`); the
-`requests` set them. Never assemble a tab's values by hand.
+`requests` set them, and also notes on Info labels: each analysis method, the confidence, the
+configurability settings and each status count. Never assemble a tab's values by hand.
 
 1. Ask for the Drive folder only when `run.json` has no `drive_url` (link or name). Create a
    subfolder named after the model if the user wants one. With a `drive_url`, say which

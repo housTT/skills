@@ -26,7 +26,7 @@ import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from sheet_notes import column_note, tab_description  # noqa: E402
+from sheet_notes import CONFIDENCE_NOTE, METHOD_NOTES, STATUS_NOTES, column_note, tab_description  # noqa: E402
 from opa_schema import (  # noqa: E402
     ALWAYS, CALL_SITE, CALL_TRACE_TAB, LLK_GAPS_TAB, CONFIDENCE_DISPLAY, GRID_KEYWORDS, KERNEL_OPS_TAB, LAUNCH_PROFILES,
     METHOD_ITEMS, METHOD_LABELS, NOT_TRACED, OP_TABLE_TAB, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES,
@@ -405,7 +405,50 @@ def summary_rows(path: pathlib.Path) -> tuple[str, list[list], list[int]]:
     return title, rows, headings
 
 
-CONFIG_MARK = {"yes": "✅ yes", "no": "❌ no", "partial": "⚠️ partial", "n/a": "n/a"}
+LEGEND_HEADING = "Status legend"
+
+
+def take_section(rows: list[list], headings: list[int], name: str) -> tuple[list[list], list[int], dict[str, str]]:
+    """Remove one summary section; returns the rows and headings left and the section's label -> text."""
+    start = next((h for h in headings if rows[h][0].lower() == name.lower()), None)
+    if start is None:
+        return rows, headings, {}
+    end = next((h - 1 for h in headings if h > start), len(rows))
+    taken = {str(r[0]).replace("\ufe0f", ""): str(r[1]).removeprefix("'") for r in rows[start + 1:end]
+             if len(r) > 1 and r[0]}
+    removed = end - (start - 1)
+    kept = rows[:start - 1] + rows[end:]
+    return kept, [h if h < start else h - removed for h in headings if h != start], taken
+
+
+LEGEND_PART = re.compile(r"(?:^|(?<=\. ))([A-Z][\w ,()]{0,40}?) - ")
+
+
+def words(text: str) -> set[str]:
+    return set(re.findall(r"\w+", text.lower()))
+
+
+def legend_note(text: str, target_label: str, all_labels: list[str]) -> str | None:
+    """The part of a legend bullet ("P100 - ... Quasar BF16 - ...") that defines the status for one target.
+
+    Only names that fit one of the run's targets start a part, so a definition may hold "<words> - ".
+    None when the bullet defines the status for other targets only.
+    """
+    def name(m: re.Match) -> set[str]:
+        return words(m.group(1)) - {"source", "destination"}
+
+    starts = [m for m in LEGEND_PART.finditer(text) if name(m) and any(name(m) <= words(t) for t in all_labels)]
+    if not starts:
+        return text
+    best, best_score = None, 0
+    for m, nxt in zip(starts, starts[1:] + [None]):
+        if name(m) <= words(target_label) and len(name(m)) > best_score:
+            best, best_score = text[m.end():nxt.start() if nxt else len(text)].strip(), len(name(m))
+    return best[:1].upper() + best[1:] if best else None
+
+
+CONFIG_MARK = {"yes": "✅ yes", "no": "❌ no", "partial": "⚠️ partial", "n/a": "✅ n/a"}
+GRID_OVERRIDE = "TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE"
 
 
 def entry_test_state(run: dict) -> str:
@@ -488,14 +531,42 @@ def grid_blockers_state(ops: list[dict], source: str) -> str:
 def config_state(run: dict, key: str) -> str:
     entry = run.get(key)
     if not entry:
-        return "not checked"
+        return "⏳ not checked"
     return f"{CONFIG_MARK.get(entry.get('value', ''), entry.get('value', ''))}: {tidy(entry.get('evidence', ''))}"
+
+
+def config_notes(run: dict) -> dict[str, str]:
+    """Info label -> the setting that changes it, as a note on the label."""
+    layers = run.get("configurable_layers") or {}
+    model_var = re.sub(r"\W+", "_", str(run.get("model", "model"))).upper() + "_NUM_LAYERS"
+    layer_note = ("Setting: an environment variable the model reads, by convention <MODEL>_NUM_LAYERS (here "
+                  f"{model_var}), or a test parameter; tt-metal has no shared one.")
+    if layers.get("setting"):
+        layer_note = f"Setting: {layers['setting']}, which the model reads to build fewer layers."
+    elif layers.get("value") == "n/a":
+        layer_note += " Not needed: the model has no repeated layer stack."
+    elif layers.get("value") == "no":
+        layer_note += " This model reads none, so its layer count is fixed in the code."
+    else:
+        layer_note += " Whether this model reads one is not checked yet."
+    grid_value = (run.get("configurable_grid") or {}).get("value")
+    grid_note = f"Setting: the environment variable {GRID_OVERRIDE}, which overrides the worker core grid at run time."
+    if grid_value == "yes":
+        grid_note += " Every grid the model uses follows it without a code change."
+    elif grid_value in ("no", "partial"):
+        grid_note += " Grids hardcoded in the model do not follow it; they need a code change."
+    else:
+        grid_note += " Whether the model's grids follow it is not checked yet."
+    return {"Configurable grid": grid_note,
+            "Configurable layer count": layer_note}
 
 
 def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_columns: list[str],
               constant: list[tuple[str, str]], ops: list[dict]):
     source, destinations = targets[0], targets[1:]
     title, summary, summary_headings = summary_rows(run_dir / "summary.md")
+    # The legend defines statuses for this run's targets; on the sheet it is a note on each status count.
+    summary, summary_headings, legend = take_section(summary, summary_headings, LEGEND_HEADING)
     rows: list[list] = [[title or f"{run.get('model', 'Model')} kernel op analysis"]]
     bold = [0]
     profile = ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in run.get("profile_values", {}).items()
@@ -519,7 +590,7 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
         ("Test hardware", f"{label(source)}: {profile}" if profile else label(source)),
         ("Peak DRAM", peak_dram_state(run_dir, run)),
         ("Blockers to a smaller grid", grid_blockers_state(ops, source)),
-        ("Configurable grid (TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE)", config_state(run, "configurable_grid")),
+        ("Configurable grid", config_state(run, "configurable_grid")),
         ("Configurable layer count", config_state(run, "configurable_layers")),
     ]
     rows += [[name, cell(value)] for name, value in checks]
@@ -532,6 +603,9 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
     rows += [[METHOD_LABELS[m], cell(method_state(run, m))] for m in SOURCE_METHODS]
     rows.append(["Confidence", cell(f"{level}: {CONFIDENCE_TEXT[level]}")])
     bold.append(len(rows) - 1)
+    label_notes = config_notes(run) | {METHOD_LABELS[m]: METHOD_NOTES[m] for m in SOURCE_METHODS}
+    label_notes["Confidence"] = CONFIDENCE_NOTE
+    cell_notes = [(n, 0, label_notes[r[0]]) for n, r in enumerate(rows) if r and r[0] in label_notes]
 
     # Counts: formulas over the ttnn calls tab, so a reader can trace every number.
     expected: dict[str, int] = {}
@@ -554,6 +628,10 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
     for name, column, value in count_rows:
         members = ops if column is None else [r for r in ops if r[column] == value]
         rows.append([name, f"=COUNTA({rng('id')})" if column is None else f'=COUNTIF({rng(column)},"{value}")'])
+        if column and column.endswith(":status"):
+            text = legend.get(value.replace("\ufe0f", ""))
+            note = legend_note(text, label(column.split(":")[0]), [label(t) for t in targets]) if text else None
+            cell_notes.append((len(rows) - 1, 0, note or STATUS_NOTES[value]))
         expected[f"Info!B{len(rows)}"] = len(members)
         for i, t in enumerate(launch_targets):
             launches = rng(f"{t}:launches")
@@ -600,7 +678,9 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
         bold.append(len(rows))
         rows.append(["Same in every ttnn call row"])
         rows += [[name, cell(text)] for name, text in constant]
-    return new_tab("Info", "run.json, summary.md", rows, list(INFO_WIDTHS), bold, header=False), expected
+    info = new_tab("Info", "run.json, summary.md", rows, list(INFO_WIDTHS), bold, header=False)
+    info["cell_notes"] = cell_notes
+    return info, expected
 
 
 def _wrap_all(sheet_id: int) -> dict:
@@ -718,6 +798,10 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1, max_tab_kb:
                 "range": {"sheetId": tab["sheetId"], "startRowIndex": 0, "endRowIndex": 1,
                           "startColumnIndex": 0, "endColumnIndex": len(notes)},
                 "rows": [{"values": [{"note": n} for n in notes]}], "fields": "note"}})
+        requests += [{"updateCells": {
+            "range": {"sheetId": tab["sheetId"], "startRowIndex": r, "endRowIndex": r + 1,
+                      "startColumnIndex": c, "endColumnIndex": c + 1},
+            "rows": [{"values": [{"note": note}]}], "fields": "note"}} for r, c, note in tab.pop("cell_notes", [])]
     return {"tabs": tabs, "requests": requests, "expected": expected}
 
 

@@ -40,8 +40,11 @@ TAB_DESCRIPTIONS = {
     "Changes": ("What changed in a table between two runs of the same model.", "comparison of two runs"),
 }
 
-STATUS_NOTE = ("✅ supported: a test or recorded run shows it. ⚠️ the code path exists but nothing tests it. "
-               "❌ shown not to work. n/a: never launched on this target.")
+STATUS_NOTES = {"✅": "Supported: a test or recorded run shows it.",
+                "⚠️": "The code path exists but nothing tests it.",
+                "❌": "Shown not to work.",
+                "n/a": "Never launched on this target."}
+STATUS_NOTE = " ".join(f"{k}{':' if k == 'n/a' else ''} {v[0].lower()}{v[1:]}" for k, v in STATUS_NOTES.items())
 
 # Notes by column field, shared by every tab unless a tab overrides it below.
 FIELD_NOTES = {
@@ -174,6 +177,56 @@ TAB_FIELD_NOTES = {
     "Cache: kernels": {"kind": "compute or data_movement."},
     "LLK gaps (Quasar)": {"kind": "llk_api or data_format."},
 }
+
+
+# Analysis method (opa_schema.SOURCE_METHODS) -> a note on its Info label: what it does, what it is for,
+# what it sees and misses, and the confidence it gives.
+METHOD_NOTES = {
+    "static": (
+        "What it does: reads the model code at the pinned tt-metal commit and follows every ttnn call through "
+        "its C++ dispatch to the device op and the program factory chosen for the call's shapes, data types, "
+        "layouts and memory configs. Nothing runs.\n"
+        "What it is for: the only method that says why each op is launched and where the code sets a grid, "
+        "shard spec or program config. Every status per target, the grid blockers and the configurability "
+        "checks rest on it, so it is always done.\n"
+        "Sees: every ttnn call site, its arguments as written, dispatch conditions, hardcoded grids.\n"
+        "Misses: values known only at run time (a factory chosen from input shapes is marked 'decided at run "
+        "time'), how often an op runs when that depends on run-time values, host work outside the code it "
+        "follows.\n"
+        "Confidence: low on its own."),
+    "tracy": (
+        "What it does: runs the entry test once on the source device under the Tracy profiler, calling the "
+        "forward live; a replayed device trace would hide host work.\n"
+        "What it is for: confirms which ops really launch and how often per inference, measures device time "
+        "per op, and counts ops that ran on the host instead of the device (host fallback).\n"
+        "Sees: op code per launch, launch counts, device and host op time, op attributes and tensor shapes.\n"
+        "Misses: the program factory (it names only the op code), the kernels compiled, memory use.\n"
+        "Confidence: medium; program factories still come from the static trace."),
+    "graph": (
+        "What it does: runs the entry test once on the source device with ttnn graph capture, which records "
+        "every device op call, the program factory it used, each buffer allocation and free, and each "
+        "host-device transfer.\n"
+        "What it is for: the exact list of kernel ops (device op and program factory per launch), peak DRAM "
+        "allocated at once, and transfers inside the forward.\n"
+        "Sees: device op, program factory, launch counts, program cache misses, DRAM buffer sizes, copies to "
+        "and from the device.\n"
+        "Misses: time, kernel source and the LLK calls inside kernels.\n"
+        "Confidence: high."),
+    "cache": (
+        "What it does: runs the entry test once on the source device with an empty kernel cache "
+        "(TT_METAL_CACHE) and debug info (TT_METAL_RISCV_DEBUG_INFO=1), then reads every compiled kernel ELF "
+        "with elfray.\n"
+        "What it is for: which compute (LLK) and dataflow APIs each kernel calls, with template arguments, "
+        "data formats and math config; the Quasar LLK gap check compares these with the Quasar LLK.\n"
+        "Sees: every kernel compiled during the test, the APIs inlined into it, data formats, tile "
+        "dimensions, math fidelity.\n"
+        "Misses: how often each kernel launches, which program factory built it, time.\n"
+        "Confidence: medium; it confirms compiled kernels, not the factory of each launch."),
+}
+
+CONFIDENCE_NOTE = ("Confidence in the kernel-op list (device op and program factory per launch). high: a graph "
+                   "capture ran. medium: Tracy or the kernel cache ran, no graph capture. low: only the static "
+                   "trace.")
 
 
 def tab_description(title: str) -> tuple[str, str] | None:

@@ -44,8 +44,12 @@ Reads code only; never touches a device. Every count must survive
      shrinks it with no code change (every row's `grid_dependency` is `automatic` or `none`); `no`
      when grids are hardcoded (give how many places and one example); `partial` when some are.
    - `configurable_layers`: `yes` when the model or its test reads a layer count it can be given,
-     such as an environment variable `<MODEL>_NUM_LAYERS` or a test parameter (name it); `no` when the
+     such as an environment variable `<MODEL>_NUM_LAYERS` or a test parameter; `partial` when that
+     count covers some of the repeated stacks but not all (an encoder but not the decoder); `no` when the
      model has a repeated layer stack with a fixed count; `n/a` when it has no repeated layer stack.
+     For `yes` and `partial` add `"setting"`: the environment variable or test parameter that sets
+     the count (`HY_NUM_LAYERS`, `test parameter num_layers`). The sheet puts it in a note on the
+     Info row.
 7. **Gate.** Run `python3 <plugin-root>/scripts/validate_static.py <run dir>`. Fix and rerun until
    it prints `OK`. Resolve every warning (shorten the evidence, drop row-number prefixes). No
    output, summary or upload before that.
@@ -60,7 +64,9 @@ Reads code only; never touches a device. Every count must survive
      what was run and what was not.
    - `Targets`: one bullet per target: the question it answers (for a destination, what it
      assumes) and the profile facts that change dispatch (grid, dtypes, batch).
-   - `Status legend`: one bullet per status value used, defined for this run's targets.
+   - `Status legend`: one bullet per status value used, defined for this run's targets as
+     `- <status>: <target> - <definition>. <target> - <definition>.` The sheet leaves this section off
+     Info and puts each target's definition in a note on its status count.
    - `Findings`: three to six bullets a reader acts on, each with its numbers: launches per
      inference as the validator's range and the tighter executable range when known, status counts
      where they matter, the port blockers that decide the outcome. For a Quasar target, how many

@@ -140,7 +140,9 @@ later `entry_test_failure`), host fallback (host op count and time share from `h
 live Tracy run, `run.json` `tracy_mode`: ✅ 0% of ops on the host, ⚠️ up to 5%, ❌ above), test hardware
 (`profile_values`), peak DRAM (`graph_capture.peak_dram_mib`, else a measured `footprint.csv`
 value), blockers to a smaller grid (op_table rows whose `grid_dependency` is a hardcoded value, with
-the places they are set), and `configurable_grid` and `configurable_layers` from `run.json`.
+the places they are set), and `configurable_grid` and `configurable_layers` from `run.json` (✅ yes
+or n/a, ⚠️ partial, ❌ no, ⏳ not checked). A note on each of the last two labels names the setting:
+`TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE` for the grid, `configurable_layers.setting` for the layers.
 
 ## Analysis methods and confidence
 
@@ -152,7 +154,11 @@ compiled kernels and the APIs inside them). `opa_schema.methods_used` lists the 
 factory per launch): `high` with a graph capture, the only method that names the factory of each
 launch; `medium` with Tracy or the kernel cache, which confirm op codes or compiled kernels but not
 factories; `low` with the static trace only. The
-spreadsheet's Info tab and `summary.md` both state the methods and the confidence.
+spreadsheet's Info tab and `summary.md` both state the methods and the confidence, and a note on each method's
+Info label (`sheet_notes.METHOD_NOTES`) says what the method does, what it is for, what it sees and
+misses, and the confidence it gives. Info also carries notes on the configurability labels (the
+setting that changes each) and on each `<target>: <status>` count (that target's definition from the
+summary's `Status legend`, which Info does not repeat as a section).
 
 ## kernel_tests_plan_<target>.csv and kernel_test_results_<target>.csv (TTsim)
 
