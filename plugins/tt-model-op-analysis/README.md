@@ -53,9 +53,8 @@ or starts a new one, and never repeats work a run already has.
 - **Measurements**, as items picked one or more at a time and resumable across sessions: from one
   run of the entry test on a local source device, its ttnn graph capture (`source:graph`) and its
   kernel cache (`source:cache`, needs the elfray engine); from a second run, its Tracy profile
-  (`source:tracy`); the entry test on TTsim for a
-  Quasar source (`source:ttsim-e2e`), and TTsim runs of Quasar kernel-op tests grouped by row
-  status (`<target>:kernel-tests ❌`). Each item shows its state and a time estimate.
+  (`source:tracy`); and TTsim runs of Quasar kernel-op tests, one node at a time, grouped by row
+  status (`<target>:kernel-tests ❌`). An entry test never runs on TTsim. Each item shows its state and a time estimate.
 
 Outputs in the run directory:
 

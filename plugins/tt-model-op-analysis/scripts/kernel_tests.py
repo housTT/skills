@@ -4,7 +4,7 @@ The target is a Quasar source or destination (--target, implied when the run has
 files are kernel_tests_plan_<target>.csv and kernel_test_results_<target>.csv.
 
 plan:  collect unique pytest node ids from <target>:tests, with the statuses of the rows that cite
-       them. For a Quasar source the entry test comes first, as kind `entry`.
+       them. Only kernel-op tests: an entry test never runs on TTsim.
 check: collect the plan's test files with pytest and list the node ids pytest does not find.
 run:   run each node with plain pytest under the run's TTsim environment, one process per node.
        Refuses a checkout that is not the run's commit, and refuses to start while a selected node
@@ -12,8 +12,7 @@ run:   run each node with plain pytest under the run's TTsim environment, one pr
        --timeout is given (references/ttsim.md); a --timeout kill is recorded as `timeout`. Nodes
        with a pass, fail, xfail or skip are skipped unless --rerun; error and timeout nodes run
        again. --only and --env-json run one batch of nodes under its own environment and keep the
-       other batches' results. --status runs the nodes of rows with that status, --entry the entry
-       test.
+       other batches' results. --status runs the nodes of rows with that status.
 apply: set <target>:test_result and status per op_table row. A fail or xfail of any of its tests
        gives ❌; ✅ needs every test to pass; a timeout, an error or an unrun test decides nothing.
 
@@ -42,7 +41,7 @@ from opa_schema import (  # noqa: E402
 from same_commit import mismatch  # noqa: E402
 
 KERNEL_TEST_COLUMNS = ("id", "node_id", "op_table_ids", "result", "duration_s", "log", "environment")
-PLAN_COLUMNS = ("id", "node_id", "op_table_ids", "row_statuses", "kind")
+PLAN_COLUMNS = ("id", "node_id", "op_table_ids", "row_statuses")
 SEVERITY = (*FAILING_RESULTS, *UNDECIDED_RESULTS, "pass", "skip", "not run")
 # Wall-clock limits are meaningless on TTsim; the pinned tt-metal pytest.ini sets one.
 NO_PYTEST_TIMEOUT = ("-p", "no:timeout")
@@ -78,18 +77,21 @@ def _tests(cell: str) -> list[str]:
 
 
 def plan_rows(run_info: dict, rows: list[dict], target: str) -> list[dict]:
-    """Unique test nodes of a target in op_table order; a Quasar source's entry test comes first."""
+    """Unique test nodes of a target in op_table order."""
     order: dict[str, dict] = {}
-    if target == run_info["source"] and run_info.get("test"):
-        order[run_info["test"]] = {"ids": [], "statuses": set(), "kind": "entry"}
     for row in rows:
         for node in _tests(row[f"{target}:tests"]):
-            item = order.setdefault(node, {"ids": [], "statuses": set(), "kind": "kernel"})
+            item = order.setdefault(node, {"ids": [], "statuses": set()})
             item["ids"].append(row["id"])
             item["statuses"].add(row[f"{target}:status"])
     return [{"id": str(n), "node_id": node, "op_table_ids": ",".join(v["ids"]),
-             "row_statuses": ";".join(sorted(v["statuses"])), "kind": v["kind"]}
+             "row_statuses": ";".join(sorted(v["statuses"]))}
             for n, (node, v) in enumerate(order.items(), 1)]
+
+
+def read_plan(path: pathlib.Path) -> list[dict]:
+    # A plan from an earlier plugin version may list the entry test, which cites no row; it never runs on TTsim.
+    return [item for item in read_csv(path) if item["op_table_ids"]]
 
 
 def plan(run_dir: pathlib.Path, target: str | None) -> int:
@@ -235,7 +237,7 @@ def check(run_dir: pathlib.Path, target: str | None, tt_metal: pathlib.Path, pyt
     environment = _environment(run_dir, env_json)
     if environment is None:
         return EXIT_ENVIRONMENT
-    nodes = [p["node_id"] for p in read_csv(_plan_path(run_dir, target))]
+    nodes = [p["node_id"] for p in read_plan(_plan_path(run_dir, target))]
     found, missing_nodes = _collection(nodes, pytest_cmd or _default_pytest(tt_metal), tt_metal, environment[0])
     if fix_node_ids and missing_nodes:
         replacements = _fix_node_ids(run_dir, target, missing_nodes, found)
@@ -251,7 +253,7 @@ def check(run_dir: pathlib.Path, target: str | None, tt_metal: pathlib.Path, pyt
 
 def run(run_dir: pathlib.Path, target: str | None, tt_metal: pathlib.Path, timeout: int | None,
         pytest_cmd: str | None, rerun: bool, only: str | None, env_json: pathlib.Path | None,
-        status: str | None = None, entry: bool = False) -> int:
+        status: str | None = None) -> int:
     target = _target(_run_json(run_dir), target)
     problem = mismatch(run_dir, tt_metal)
     if problem:
@@ -264,11 +266,10 @@ def run(run_dir: pathlib.Path, target: str | None, tt_metal: pathlib.Path, timeo
     pytest_cmd = pytest_cmd or _default_pytest(tt_metal)
     results_path = _results_path(run_dir, target)
     kept = {r["node_id"]: r for r in read_results(results_path)} if results_path.exists() else {}
-    planned = read_csv(_plan_path(run_dir, target))
+    planned = read_plan(_plan_path(run_dir, target))
     selected = [item for item in planned
                 if (not only or only in item["node_id"])
-                and (not status or status in item["row_statuses"].split(";"))
-                and (not entry or item["kind"] == "entry")]
+                and (not status or status in item["row_statuses"].split(";"))]
     todo = [item for item in selected if rerun or item["node_id"] not in kept
             or kept[item["node_id"]]["result"] in UNDECIDED_RESULTS]
     if not_collected([item["node_id"] for item in todo], pytest_cmd, tt_metal, env):
@@ -359,7 +360,6 @@ def main() -> int:
     p_run.add_argument("--rerun", action="store_true")
     p_run.add_argument("--only", help="run only plan nodes whose id contains this text")
     p_run.add_argument("--status", choices=("✅", "⚠️", "❌"), help="run only nodes cited by rows with this status")
-    p_run.add_argument("--entry", action="store_true", help="run only the entry test of a Quasar source")
     args = parser.parse_args()
     if args.cmd == "plan":
         return plan(args.run_dir, args.target)
@@ -367,7 +367,7 @@ def main() -> int:
         return check(args.run_dir, args.target, args.tt_metal, args.pytest_cmd, args.env_json, args.fix_node_ids)
     if args.cmd == "run":
         return run(args.run_dir, args.target, args.tt_metal, args.timeout, args.pytest_cmd, args.rerun, args.only,
-                   args.env_json, args.status, args.entry)
+                   args.env_json, args.status)
     return apply(args.run_dir, args.target)
 
 

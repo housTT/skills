@@ -5,7 +5,6 @@ Items:
 - `source:graph`: ttnn graph capture of the entry test on that device.
 - `source:cache`: the kernel cache of the entry test on that device, decomposed with elfray.
   One run of the entry test can produce all three (measured-source.md).
-- `source:ttsim-e2e`: entry test on TTsim for a Quasar source.
 - `source:kernel-tests <status>`: kernel-op tests of a Quasar source's rows with that status.
 - `<dest>:kernel-tests <status>`: the same for a Quasar destination.
 
@@ -28,7 +27,7 @@ import statistics
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from kernel_tests import plan_rows  # noqa: E402
+from kernel_tests import plan_rows, read_plan  # noqa: E402
 from opa_schema import (  # noqa: E402
     LAUNCH_PROFILES, METHOD_ITEMS, TEST_TARGETS, UNDECIDED_RESULTS, read_csv, read_results, run_targets,
 )
@@ -68,13 +67,15 @@ def _derived(run_dir: pathlib.Path, run: dict) -> list[dict]:
         if target not in TEST_TARGETS:
             continue
         prefix = "source" if target == source else target
-        plan_path = run_dir / f"kernel_tests_plan_{target}.csv"
-        plan = (read_csv(plan_path) if plan_path.exists()
-                else plan_rows(run, read_csv(run_dir / "op_table.csv"), target))
-        groups = [(f"{prefix}:ttsim-e2e", [p for p in plan if p["kind"] == "entry"])]
-        for status in STATUS_ORDER:
-            groups.append((f"{prefix}:kernel-tests {status}",
-                           [p for p in plan if p["kind"] == "kernel" and status in p["row_statuses"].split(";")]))
+        plan_path, op_path = run_dir / f"kernel_tests_plan_{target}.csv", run_dir / "op_table.csv"
+        if plan_path.exists():
+            plan = read_plan(plan_path)
+        elif op_path.exists():
+            plan = plan_rows(run, read_csv(op_path), target)
+        else:
+            continue
+        groups = [(f"{prefix}:kernel-tests {status}", [p for p in plan if status in p["row_statuses"].split(";")])
+                  for status in STATUS_ORDER]
         for name, nodes in groups:
             if nodes:
                 recorded = [results.get((target, p["node_id"]), {}).get("result") for p in nodes]

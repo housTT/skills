@@ -6,8 +6,11 @@ Reads code only; never touches a device. Every count must survive
 ## Steps
 
 1. **Source and blocks.** Load `<plugin-root>/references/targets.md`, confirm the source profile's
-   values at the pinned SHA, and write `source`, `destinations` (empty), `implementation`,
-   `profile_values` and `entry_test_passes` to `run.json`. Write `stage_blocks`: the model's
+   values at the pinned SHA, and add `kind` (`static`), `destinations` (empty) and
+   `profile_values` to the `run.json` written at setup, and `entry_test_passes` (`{}`) only when
+   it is absent. Never overwrite what the preflight recorded (`entry_test_passes`,
+   `entry_test_failure`, `graph_capture`, `kernel_cache`, `measurements`; run-setup.md, "Entry
+   test preflight"). Write `stage_blocks`: the model's
    top-level blocks in forward order, from its structure (for ResNet50 `stem`, `layer1` …
    `layer4`, `head`).
 2. **Inventory.** Read the model file and the test once, by range, noting line numbers. List every
@@ -52,7 +55,10 @@ Reads code only; never touches a device. Every count must survive
      Info row.
 7. **Gate.** Run `python3 <plugin-root>/scripts/validate_static.py <run dir>`. Fix and rerun until
    it prints `OK`. Resolve every warning (shorten the evidence, drop row-number prefixes). No
-   output, summary or upload before that.
+   output, summary or upload before that. When the preflight's capture run passed, run
+   `python3 <plugin-root>/scripts/graph_report.py <run dir> --decide`: it reads `graph_ops.csv`
+   and the recorded pass, not the capture, and decides the source rows the run launched. Then the
+   gate again.
 8. **Kernel ops and summary.** Run `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`. Write
    `summary.md` for a reader who opens it cold; the spreadsheet's Info tab is this file plus the
    run details from `run.json` and counts computed from the CSVs, so do not repeat those here.

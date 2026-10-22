@@ -14,7 +14,8 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    ALWAYS, CALL_SITE, CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, CONFIG_KEYS, CONFIG_VALUES, GRID_KEYWORDS,
+    ALWAYS, CALL_SITE, CALL_TRACE_COLUMNS, CI_KEY, CI_VALUES, CONFIDENCE_VALUES, CONFIG_KEYS, CONFIG_VALUES,
+    GRID_KEYWORDS,
     latest_entry_failure, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_PROFILES,
     LEGACY_RESULTS, NOT_TRACED, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, RESULT_STATUS, ROW_PREFIX,
     SOURCE_TARGETS, STATUS_VALUES, TARGETS, TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header, run_targets, split_evidence,
@@ -192,6 +193,11 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
             warnings.append(f"run.json has no {key}; record it (static-phase.md, step 6)")
         elif not isinstance(entry, dict) or entry.get("value") not in CONFIG_VALUES or not str(entry.get("evidence", "")).strip():
             errors.append(f"run.json {key} must be {{\"value\": one of {CONFIG_VALUES}, \"evidence\": \"...\"}}")
+    ci = run.get(CI_KEY)
+    if ci is None:
+        warnings.append(f"run.json has no {CI_KEY}; record it (run-setup.md, setup order)")
+    elif not isinstance(ci, dict) or ci.get("value") not in CI_VALUES or not str(ci.get("evidence", "")).strip():
+        errors.append(f"run.json {CI_KEY} must be {{\"value\": one of {CI_VALUES}, \"evidence\": \"...\"}}")
     layers = run.get("configurable_layers")
     if isinstance(layers, dict) and layers.get("value") in ("yes", "partial") and not str(layers.get("setting", "")).strip():
         errors.append("run.json configurable_layers needs \"setting\": the environment variable or test parameter "

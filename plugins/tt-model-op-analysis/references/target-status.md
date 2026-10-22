@@ -41,9 +41,8 @@ The code runs as written on that profile, as source or as a destination.
 ## quasar as the source
 
 The analysed implementation is Quasar code (for example a model's Quasar port). Status follows
-"Quasar status by kernel op" for each row's own kernel op. The entry test's TTsim result
-(`source:ttsim-e2e`) is reported in `summary.md`; it does not set row statuses, because one
-whole-model pass or failure does not say which kernel op caused it.
+"Quasar status by kernel op" for each row's own kernel op. The entry test never runs on TTsim;
+one whole-model pass or failure would not say which kernel op caused it.
 
 ## quasar as a destination (code unchanged)
 

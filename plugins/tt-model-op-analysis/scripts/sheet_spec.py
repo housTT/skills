@@ -26,9 +26,9 @@ import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from sheet_notes import CONFIDENCE_NOTE, METHOD_NOTES, STATUS_NOTES, column_note, tab_description  # noqa: E402
+from sheet_notes import CI_NOTE, CONFIDENCE_NOTE, METHOD_NOTES, STATUS_NOTES, column_note, tab_description  # noqa: E402
 from opa_schema import (  # noqa: E402
-    ALWAYS, CALL_SITE, CALL_TRACE_TAB, LLK_GAPS_TAB, CONFIDENCE_DISPLAY, GRID_KEYWORDS, KERNEL_OPS_TAB, LAUNCH_PROFILES,
+    ALWAYS, CALL_SITE, CALL_TRACE_TAB, CI_KEY, ci_job, LLK_GAPS_TAB, CONFIDENCE_DISPLAY, GRID_KEYWORDS, KERNEL_OPS_TAB, LAUNCH_PROFILES,
     METHOD_ITEMS, METHOD_LABELS, NOT_TRACED, OP_TABLE_TAB, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES,
     TAB_METHOD, TARGET_LABELS, TEST_TARGETS, TTSIM_TESTS_TAB, column_width, confidence, display_header,
     latest_entry_failure, methods_used, read_csv, read_header, run_targets, split_evidence,
@@ -454,14 +454,14 @@ GRID_OVERRIDE = "TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE"
 def entry_test_state(run: dict) -> str:
     passes, failure = run.get("entry_test_passes") or {}, latest_entry_failure(run)
     if failure:
-        ci = f"; CI: {passes['ci']}" if passes.get("ci") else ""
+        ci = f"; CI: {ci_job(run)}" if ci_job(run) else ""
         return f"❌ failed: {failure['result']} ({failure['by']}, {failure['date']}){ci}"
     if passes:
         parts = []
         if passes.get("result"):
             parts.append(f"{passes['result']} ({passes.get('by', '')}, {passes.get('date', '')})")
-        if passes.get("ci"):
-            parts.append(f"CI: {passes['ci']}")
+        if ci_job(run):
+            parts.append(f"CI: {ci_job(run)}")
         return "✅ passed: " + "; ".join(parts)
     return "not run on a device in this analysis"
 
@@ -528,6 +528,17 @@ def grid_blockers_state(ops: list[dict], source: str) -> str:
             f"or shard specs, set at {len(settings)} places: {listed} ({OP_TABLE_TAB}, Grid dependency){unknown}")
 
 
+CI_MARK = {"yes": "✅ yes", "no": "⚠️ no", "n/a": "n/a"}
+
+
+def ci_state(run: dict, source: str) -> str:
+    entry = run.get(CI_KEY)
+    if isinstance(entry, dict) and entry.get("value") in CI_MARK:
+        return f"{CI_MARK[entry['value']]} on {label(source)}: {entry.get('evidence', '')}"
+    job = ci_job(run)
+    return f"✅ yes on {label(source)}: {job}" if job else "⏳ not checked"
+
+
 def config_state(run: dict, key: str) -> str:
     entry = run.get(key)
     if not entry:
@@ -576,7 +587,8 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
     if detail:
         commit += f" ({', '.join(detail)})"
     meta = [("Model", run.get("model")), ("Implementation", run.get("implementation")),
-            ("Entry test", run.get("test")), ("Source", label(source)),
+            ("Entry test", run.get("test")), ("Entry test in CI", run.get("test") and ci_state(run, source)),
+            ("Source", label(source)),
             ("Destinations", ", ".join(label(d) for d in destinations)), ("tt-metal commit", commit),
             ("TTsim commit", run.get("ttsim_commit"))]
     rows += [[name, cell(str(v))] for name, v in meta if v]
@@ -605,6 +617,7 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
     bold.append(len(rows) - 1)
     label_notes = config_notes(run) | {METHOD_LABELS[m]: METHOD_NOTES[m] for m in SOURCE_METHODS}
     label_notes["Confidence"] = CONFIDENCE_NOTE
+    label_notes["Entry test in CI"] = CI_NOTE
     cell_notes = [(n, 0, label_notes[r[0]]) for n, r in enumerate(rows) if r and r[0] in label_notes]
 
     # Counts: formulas over the ttnn calls tab, so a reader can trace every number.

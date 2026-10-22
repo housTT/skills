@@ -228,6 +228,10 @@ METHOD_NOTES = {
         "Confidence: medium; it confirms compiled kernels, not the factory of each launch."),
 }
 
+CI_NOTE = ("Whether a CI workflow or pipeline list runs the entry test on the source profile at the pinned commit. "
+           "✅ yes: the job is named. ⚠️ no: nothing in CI guards this test on this profile, so a pass rests on "
+           "local runs only, and a later commit can break it unnoticed. n/a: a Quasar source, whose entry test "
+           "is read, never run.")
 CONFIDENCE_NOTE = ("Confidence in the kernel-op list (device op and program factory per launch). high: a graph "
                    "capture ran. medium: Tracy or the kernel cache ran, no graph capture. low: only the static "
                    "trace.")

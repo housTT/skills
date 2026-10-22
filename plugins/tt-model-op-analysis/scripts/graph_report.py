@@ -18,6 +18,9 @@ With --entry-pass the entry test passed in the captured run: like merge_measured
 it records the pass in run.json `entry_test_passes` and decides every source `⚠️` row of
 op_table.csv again from the op codes the run launched. --entry-fail records a failed run.
 
+`graph_report.py <run dir> --decide` does only that decision, from the graph_ops.csv and the pass
+already recorded, without the capture: for a preflight capture taken before op_table.csv existed.
+
 Peak DRAM is the largest total of DRAM buffers allocated at once on one device during the capture,
 which starts after the device opens; buffers allocated before that are not counted.
 
@@ -36,7 +39,8 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from merge_measured import decide_source_statuses, record_entry_result  # noqa: E402
 from opa_schema import (  # noqa: E402
-    GRAPH_HOST_TRANSFERS_COLUMNS, GRAPH_OPS_COLUMNS, op_table_columns, read_csv, run_targets, write_csv,
+    GRAPH_HOST_TRANSFERS_COLUMNS, GRAPH_OPS_COLUMNS, ci_job, latest_entry_failure, op_table_columns, read_csv,
+    run_targets, write_csv,
 )
 
 FACTORY = "program_factory_type"
@@ -162,11 +166,34 @@ def transfer_rows(launches: list[dict], transfers: list[dict]) -> list[dict]:
             for n, ((kind, after, before), c) in enumerate(counts.items(), 1)]
 
 
+def decide(run_dir: pathlib.Path) -> int:
+    run_path, op_path, graph_path = run_dir / "run.json", run_dir / "op_table.csv", run_dir / "graph_ops.csv"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    capture, passes = run.get("graph_capture"), run.get("entry_test_passes") or {}
+    if not capture or not graph_path.exists() or not op_path.exists():
+        print("ERROR: --decide needs run.json graph_capture, graph_ops.csv and op_table.csv")
+        return 2
+    if not passes.get("result") or latest_entry_failure(run):
+        print("ERROR: run.json records no local pass of the entry test that is newer than its last failure")
+        return 2
+    source, destinations = run_targets(run)
+    launched = [{"op_type": "tt_dnn_device", "op_code": g["op_code"]}
+                for g in read_csv(graph_path) for _ in range(int(g["launches"]))]
+    ops = read_csv(op_path)
+    for warning in decide_source_statuses(ops, launched, source, capture["inferences"], passes, ci_job(run),
+                                          how="under a graph capture"):
+        print(f"WARNING: {warning}")
+    write_csv(op_path, op_table_columns(source, destinations), ops)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("capture", type=pathlib.Path, help="graph capture JSON written by opa_graph_capture")
+    parser.add_argument("capture", type=pathlib.Path, nargs="?", help="graph capture JSON written by opa_graph_capture")
     parser.add_argument("run_dir", type=pathlib.Path)
-    parser.add_argument("--inferences", type=int, required=True,
+    parser.add_argument("--decide", action="store_true",
+                        help="decide source rows from graph_ops.csv and the recorded pass; no capture")
+    parser.add_argument("--inferences", type=int,
                         help="forward passes the test dispatched through ttnn (trace replays excluded)")
     parser.add_argument("--date", default=datetime.date.today().isoformat(), help="date of the captured run")
     parser.add_argument("--entry-pass", metavar="RESULT",
@@ -174,6 +201,11 @@ def main() -> int:
     parser.add_argument("--entry-fail", metavar="RESULT",
                         help="the entry test failed in this run; RESULT is its failure line")
     args = parser.parse_args()
+    if args.decide:
+        return decide(args.run_dir)
+    if args.capture is None or args.inferences is None:
+        print("ERROR: give the capture file and --inferences, or --decide")
+        return 2
     if args.entry_pass and args.entry_fail:
         print("ERROR: give --entry-pass or --entry-fail, not both")
         return 2
@@ -214,7 +246,7 @@ def main() -> int:
         ops = read_csv(op_path)
         launched = [{"op_type": "tt_dnn_device", "op_code": launch["op_code"]} for launch in launches]
         for warning in decide_source_statuses(ops, launched, source, args.inferences, run["entry_test_passes"],
-                                              how="under a graph capture"):
+                                              ci_job(run), how="under a graph capture"):
             print(f"WARNING: {warning}")
         write_csv(op_path, op_table_columns(source, destinations), ops)
     run_path.write_text(json.dumps(run, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

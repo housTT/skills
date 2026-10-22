@@ -65,6 +65,19 @@ def latest_entry_failure(run: dict) -> dict | None:
 # Whether the model runs on a smaller core grid and with fewer layers (static-phase.md, step 6).
 CONFIG_KEYS = ("configurable_grid", "configurable_layers")
 CONFIG_VALUES = ("yes", "no", "partial", "n/a")
+# Whether a CI job runs the entry test on the source profile, recorded at setup (run-setup.md).
+# n/a: a Quasar source, whose entry test is never run.
+CI_KEY = "entry_test_ci"
+CI_VALUES = ("yes", "no", "n/a")
+
+
+def ci_job(run: dict) -> str:
+    """The CI job that runs the entry test on the source profile, or "" when none does."""
+    entry = run.get(CI_KEY)
+    if isinstance(entry, dict) and entry.get("value") in CI_VALUES:
+        return str(entry.get("evidence", "")) if entry["value"] == "yes" else ""
+    # Runs set up before entry_test_ci existed name the job in their pass record.
+    return (run.get("entry_test_passes") or {}).get("ci", "")
 
 # The four ways a run learns what the model launches, least to most exact. A graph capture names
 # every launch's device op and program factory with the call's real arguments; a kernel cache holds

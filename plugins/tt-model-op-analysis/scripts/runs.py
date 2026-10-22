@@ -47,6 +47,11 @@ def _entry(run_dir: pathlib.Path, run: dict) -> dict:
     else:
         entry["format"] = "current"
         entry["implementation"] = impl_slug(run.get("implementation", ""))
+        if run.get("kind") != "static" and isinstance(run.get("destinations", []), list):
+            # Written at setup; a preflight run may already have done source measurement items.
+            entry["static"] = "not started"
+            entry["measurements"] = measurements.items(run_dir)
+            return entry
         errors, _, _ = validate(run_dir)
         entry["static"] = "done" if not errors else f"{len(errors)} validator errors"
         # Measurement items are derived from valid tables only.

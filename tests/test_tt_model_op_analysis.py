@@ -27,7 +27,7 @@ def test_plugin_skills_and_phase_references():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.8.0"
+    assert claude["version"] == codex["version"] == "0.9.0"
 
 
 def test_shared_setup_is_step_by_step():
@@ -65,7 +65,8 @@ def test_destination_is_a_projection_of_source_rows():
     status = (PLUGIN / "references" / "target-status.md").read_text()
     assert "neither drops the row nor makes it `n/a`" in status
     measured = (PLUGIN / "references" / "measured-destination.md").read_text()
-    assert "with the\nparameters the source model passes at each row" in measured
+    assert "each with\nthe parameters written in the test" in measured
+    assert "no script compares them" in measured
 
 
 def test_setup_traps_cover_fit_by_code_not_name():
@@ -132,7 +133,8 @@ def make_static_run(tmp_path: pathlib.Path, op_rows: list[dict], trace_rows: lis
                                               "destinations": [destination] if destination else [],
                                               "stage_blocks": ["encoder", "s1", "s2"],
                                               "configurable_grid": {"value": "yes", "evidence": "m.py:1 grid from device"},
-                                              "configurable_layers": {"value": "n/a", "evidence": "no layer stack"}}))
+                                              "configurable_layers": {"value": "n/a", "evidence": "no layer stack"},
+                                              "entry_test_ci": {"value": "no", "evidence": "no workflow runs it on P150"}}))
     write_rows(run / "op_table.csv", op_rows)
     write_rows(run / "call_trace.csv", trace_rows)
     write_rows(run / "port_blockers.csv", blockers or [], BLOCKER_FIELDS)
@@ -861,8 +863,8 @@ def test_kernel_tests_plan_dedups_nodes(tmp_path):
     run, _ = kernel_test_run(tmp_path, ["t.py::pass_a", "t.py::pass_a; t.py::fail_b"])
     assert run_script("kernel_tests.py", "plan", str(run)).returncode == 0
     plan = read(run / "kernel_tests_plan_quasar-bf16.csv")
-    assert [(p["node_id"], p["op_table_ids"], p["row_statuses"], p["kind"]) for p in plan] == [
-        ("t.py::pass_a", "1,2", "⚠️", "kernel"), ("t.py::fail_b", "2", "⚠️", "kernel")]
+    assert [(p["node_id"], p["op_table_ids"], p["row_statuses"]) for p in plan] == [
+        ("t.py::pass_a", "1,2", "⚠️"), ("t.py::fail_b", "2", "⚠️")]
 
 
 def test_kernel_tests_run_and_apply(tmp_path):
@@ -1192,6 +1194,7 @@ def test_merge_entry_pass_decides_source_statuses_again(tmp_path):
 def test_merge_entry_pass_keeps_ci_record(tmp_path):
     run = make_static_run(tmp_path, [no_pass_row(1, "A")], [trace_row(1, 1, 1)])
     data = json.loads((run / "run.json").read_text())
+    del data["entry_test_ci"]
     data["entry_test_passes"] = {"ci": "perf.yaml: p150"}
     (run / "run.json").write_text(json.dumps(data))
     run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A"])), "--entry-pass", "PCC 0.99")
@@ -1429,19 +1432,22 @@ def test_kernel_tests_unknown_target_refused(tmp_path):
     assert r.returncode != 0 and "has no kernel-op tests" in (r.stdout + r.stderr)
 
 
-def test_quasar_source_plans_entry_test(tmp_path):
+def test_quasar_source_never_runs_its_entry_test_on_ttsim(tmp_path):
     run, cmd = kernel_test_run(tmp_path, ["t.py::pass_a"])
     to_quasar_source(run)
     (tmp_path / "collected.txt").write_text("e2e.py::pass_e2e\nt.py::pass_a")
     assert run_script("kernel_tests.py", "plan", str(run)).returncode == 0
-    plan = read(run / "kernel_tests_plan_quasar.csv")
-    assert [(p["node_id"], p["kind"]) for p in plan] == [("e2e.py::pass_e2e", "entry"), ("t.py::pass_a", "kernel")]
-    r = run_script("kernel_tests.py", "run", str(run), "--tt-metal", str(run.parent / "tt-metal"),
-                   "--pytest-cmd", cmd, "--entry")
+    assert [p["node_id"] for p in read(run / "kernel_tests_plan_quasar.csv")] == ["t.py::pass_a"]
+    tt_metal = str(run.parent / "tt-metal")
+    assert run_script("kernel_tests.py", "run", str(run), "--tt-metal", tt_metal, "--pytest-cmd", cmd,
+                      "--entry").returncode != 0
+    # A plan from an earlier plugin version still lists the entry test; run skips it.
+    write_rows(run / "kernel_tests_plan_quasar.csv",
+               [{"id": "1", "node_id": "e2e.py::pass_e2e", "op_table_ids": "", "row_statuses": "", "kind": "entry"},
+                {"id": "2", "node_id": "t.py::pass_a", "op_table_ids": "1", "row_statuses": "⚠️", "kind": "kernel"}])
+    r = run_script("kernel_tests.py", "run", str(run), "--tt-metal", tt_metal, "--pytest-cmd", cmd)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert [x["node_id"] for x in read(run / "kernel_test_results_quasar.csv")] == ["e2e.py::pass_e2e"]
-    assert run_script("kernel_tests.py", "apply", str(run)).returncode == 0
-    assert read(run / "op_table.csv")[0]["quasar:test_result"] == "not run"
+    assert [x["node_id"] for x in read(run / "kernel_test_results_quasar.csv")] == ["t.py::pass_a"]
 
 
 def test_measurement_items_for_bh_source(tmp_path):
@@ -1468,7 +1474,7 @@ def test_quasar_source_entry_item(tmp_path):
     to_quasar_source(run)
     run_script("kernel_tests.py", "plan", str(run))
     names = [i["item"] for i in json.loads(run_script("measurements.py", "list", str(run), "--json").stdout)]
-    assert names == ["source:ttsim-e2e", "source:kernel-tests ⚠️"]
+    assert names == ["source:kernel-tests ⚠️"]
 
 
 def test_marked_items_and_pending_filter(tmp_path):
@@ -1519,6 +1525,17 @@ def test_impl_slug_accepts_module_file_tt_dir_and_implementation_dir():
     assert runs.impl_slug(f"{base}/blackhole") == "blackhole"
 
 
+def test_runs_list_setup_only_run_is_not_started(tmp_path):
+    run = tmp_path / "op-analysis" / "m" / "impl" / "p150" / "abc1234"
+    run.mkdir(parents=True)
+    (run / "run.json").write_text(json.dumps({"source": "p150", "implementation": "models/m/impl/tt/m.py",
+                                              "tt_metal_commit": "abc1234", "date": "2026-10-22",
+                                              "graph_capture": {"path": "g.json", "inferences": 1}}))
+    runs = json.loads(run_script("runs.py", "list", str(tmp_path), "m", "--json").stdout)
+    assert runs[0]["static"] == "not started"
+    assert {m["item"]: m["state"] for m in runs[0]["measurements"]}["source:graph"] == "done"
+
+
 def test_runs_list_validated_run_is_done(tmp_path):
     run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
     target = tmp_path / "op-analysis" / "m" / "impl" / "p150" / "abc1234"
@@ -1543,7 +1560,7 @@ def test_measurement_items_without_plan_file(tmp_path):
     to_quasar_source(run)
     assert not (run / "kernel_tests_plan_quasar.csv").exists()
     names = [i["item"] for i in json.loads(run_script("measurements.py", "list", str(run), "--json").stdout)]
-    assert names == ["source:ttsim-e2e", "source:kernel-tests ⚠️"]
+    assert names == ["source:kernel-tests ⚠️"]
 
 
 @pytest.mark.parametrize("undecided", ["error", "timeout"])
@@ -1663,14 +1680,14 @@ def test_skill_asks_output_root_before_listing_runs():
 
 
 def test_skill_reprobes_device_before_offering_tracy():
-    step = _skill_step(7)
+    step = _skill_step(8)
     assert "probe the source device again" in step
     assert "measurements.py mark <run dir> <item> failed" in step
     assert "`source:tracy`, `source:graph` and `source:cache` come from" in step
 
 
 def test_skill_destination_step_names_quasar_code_modes():
-    step = _skill_step(6)
+    step = _skill_step(7)
     assert "`quasar`" in step and "`quasar-bf16`" in step
 
 
@@ -2068,7 +2085,7 @@ def test_source_methods_lists_all_four_with_reasons(tmp_path):
 
 
 def test_skill_offers_the_method_menu():
-    step = _skill_step(7)
+    step = _skill_step(8)
     assert "<plugin-root>/scripts/source_methods.py" in step and "multi-select" in step
     assert "<plugin-root>/scripts/llk_gaps.py" in step
     source = (PLUGIN / "references" / "measured-source.md").read_text(encoding="utf-8")
@@ -2343,7 +2360,7 @@ def test_validator_checks_configurability_fields(tmp_path):
 
 
 def test_destination_question_lists_plain_quasar():
-    step = _skill_step(6)
+    step = _skill_step(7)
     assert "`quasar` (the code as\n   written, on Quasar)" in step or "`quasar` (the code as written" in step
     assert "`quasar-bf16`" in step
 
@@ -2375,6 +2392,7 @@ def test_untraced_rows_keep_grid_blockers_unknown_and_ci_pass_stays_visible(tmp_
                                      stage="measured only Op2DeviceOperation")]
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 1)])
     data = json.loads((run / "run.json").read_text())
+    del data["entry_test_ci"]
     data["entry_test_passes"] = {"ci": "w.yml: job"}
     data["entry_test_failure"] = {"by": "source:graph on a local p150 device", "date": "2026-10-22", "result": "bad"}
     (run / "run.json").write_text(json.dumps(data))
@@ -2518,3 +2536,90 @@ def test_host_fallback_needs_a_live_tracy_run(tmp_path):
         assert info_rows(sheet(run))["Host fallback"].lstrip("'").startswith(start)
     m = measured_seq(tmp_path / "m.csv", ["Op1DeviceOperation"])
     assert run_script("merge_measured.py", str(run), str(m)).returncode == 2
+
+
+# Entry test preflight and CI coverage (0.9.0)
+
+
+def test_validator_wants_entry_test_ci(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    del data["entry_test_ci"]
+    (run / "run.json").write_text(json.dumps(data))
+    r = validate(run)
+    assert r.returncode == 0 and "run.json has no entry_test_ci" in r.stdout
+    data["entry_test_ci"] = {"value": "maybe"}
+    (run / "run.json").write_text(json.dumps(data))
+    r = validate(run)
+    assert r.returncode != 0 and "entry_test_ci must be" in r.stdout
+
+
+@pytest.mark.parametrize("ci, shown", [
+    ({"value": "yes", "evidence": ".github/workflows/perf.yaml: p150"}, "✅ yes on P150: .github/workflows/perf.yaml: p150"),
+    ({"value": "no", "evidence": "only on n150"}, "⚠️ no on P150: only on n150"),
+    ({"value": "n/a", "evidence": "never run"}, "n/a on P150: never run"),
+    (None, "⏳ not checked"),
+    ("yes", "⏳ not checked"),
+])
+def test_info_shows_entry_test_ci_below_entry_test(tmp_path, ci, shown):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data.update({"test": "t.py::e2e", "entry_test_ci": ci})
+    (run / "run.json").write_text(json.dumps(data))
+    info = tab(sheet(run), "Info")
+    labels = [r[0] for r in info if r]
+    assert labels.index("Entry test in CI") == labels.index("Entry test") + 1
+    assert next(r for r in info if r and r[0] == "Entry test in CI")[1] == shown
+
+
+def test_legacy_ci_pass_record_shows_as_ci(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    del data["entry_test_ci"]
+    data.update({"test": "t.py::e2e", "entry_test_passes": {"ci": "w.yml: job"}})
+    (run / "run.json").write_text(json.dumps(data))
+    info = tab(sheet(run), "Info")
+    assert next(r for r in info if r and r[0] == "Entry test in CI")[1] == "✅ yes on P150: w.yml: job"
+
+
+def test_graph_decide_uses_recorded_capture_and_ci(tmp_path):
+    rows = [op_row(1, 1, op_code="Op1DeviceOperation", **{"p150:status": "⚠️", "p150:evidence": "no passing run"}),
+            op_row(2, 1, op_code="Op2DeviceOperation", **{"p150:status": "⚠️", "p150:evidence": "no passing run"})]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 2)])
+    data = json.loads((run / "run.json").read_text())
+    data["entry_test_ci"] = {"value": "yes", "evidence": "perf.yaml: p150"}
+    (run / "run.json").write_text(json.dumps(data))
+    ops_before = (run / "op_table.csv").read_text()
+    (run / "op_table.csv").rename(run / "op_table.keep")
+    capture = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::Op1Factory")])
+    # Preflight: before the static phase there is no op_table.csv, so the pass decides nothing yet.
+    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-pass", "PCC 0.99",
+                   "--date", "2026-10-22")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not (run / "op_table.csv").exists()
+    (run / "op_table.keep").rename(run / "op_table.csv")
+    assert (run / "op_table.csv").read_text() == ops_before
+    capture.unlink()
+    r = run_script("graph_report.py", str(run), "--decide")
+    assert r.returncode == 0, r.stdout + r.stderr
+    ops = read(run / "op_table.csv")
+    assert [o["p150:status"] for o in ops] == ["✅", "⚠️"]
+    assert ops[0]["p150:evidence"].startswith("in CI (perf.yaml: p150) and on a local P150 under a graph capture")
+
+
+def test_graph_decide_needs_a_recorded_pass(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    r = run_script("graph_report.py", str(run), "--decide")
+    assert r.returncode == 2 and "--decide needs" in r.stdout
+    assert run_script("graph_report.py", str(run)).returncode == 2
+
+
+def test_preflight_is_documented_and_ttsim_runs_kernel_ops_only():
+    setup = (PLUGIN / "references" / "run-setup.md").read_text()
+    assert "## Entry test preflight" in setup and "Never for a Quasar source" in setup
+    flow = (PLUGIN / "skills" / "model-op-analysis" / "SKILL.md").read_text()
+    heads = ["**New run.**", "**Entry test preflight.**", "**Static.**"]
+    assert [flow.index(h) for h in heads] == sorted(flow.index(h) for h in heads)
+    assert "never an entry test or any whole-model test" in flow
+    for path in [PLUGIN / "README.md", *(PLUGIN / "references").glob("*.md"), *SCRIPTS.glob("*.py")]:
+        assert "ttsim-e2e" not in path.read_text(encoding="utf-8"), path.name

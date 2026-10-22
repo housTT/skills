@@ -22,8 +22,8 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    ALWAYS, LAUNCH_PROFILES, NOT_TRACED, TARGET_LABELS, TEST_TARGETS, op_table_columns, read_csv, run_targets,
-    write_csv,
+    ALWAYS, LAUNCH_PROFILES, NOT_TRACED, TARGET_LABELS, TEST_TARGETS, ci_job, op_table_columns, read_csv,
+    run_targets, write_csv,
 )
 
 
@@ -111,15 +111,14 @@ def record_entry_result(run: dict, source: str, date: str, item: str, passed: st
 
 
 def decide_source_statuses(rows: list[dict], measured: list[dict], source: str, inferences: int,
-                           entry_passes: dict, how: str = "under Tracy") -> list[str]:
+                           entry_passes: dict, ci: str, how: str = "under Tracy") -> list[str]:
     """Upgrade source `⚠️` rows the passing entry test covers; return warnings for `❌` rows it ran.
 
     Only `⚠️` is revisited: it is what a profile gets while no passing run is recorded. `✅`, `❌`
     and `n/a` rest on other evidence and stay.
     """
     label = TARGET_LABELS[source]
-    where = (f"in CI ({entry_passes['ci']}) and " if "ci" in entry_passes
-             else f"No CI workflow runs the entry test on {label}; it passed ")
+    where = f"in CI ({ci}) and " if ci else f"No CI workflow runs the entry test on {label}; it passed "
     passed = (f"{where}on a local {label} {how} ({entry_passes['result']}, {entry_passes['date']})")
     counts = collections.Counter(m["op_code"] for m in measured if m["op_type"] == "tt_dnn_device")
     static_launches: collections.Counter = collections.Counter()
@@ -179,7 +178,8 @@ def main() -> int:
         return 2
     record_entry_result(run, source, args.date, "source:tracy", args.entry_pass, args.entry_fail)
     if args.entry_pass:
-        for warning in decide_source_statuses(merged, measured, source, args.inferences, run["entry_test_passes"]):
+        for warning in decide_source_statuses(merged, measured, source, args.inferences, run["entry_test_passes"],
+                                              ci_job(run)):
             print(f"WARNING: {warning}")
     write_csv(op_path, op_table_columns(source, destinations), merged)
     run["measured_ops"] = str(args.measured_ops)

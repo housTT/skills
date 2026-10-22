@@ -30,15 +30,21 @@ resolve every `<plugin-root>/...` path against it.
 4. **New run.** Follow `<plugin-root>/references/run-setup.md`: ref, then the implementation
    (every implementation directory of the model, each marked whether it fits the source), then an
    end-to-end entry test from that directory. If the same identity exists, say so and continue that
-   run instead of tracing again.
-5. **Static.** Follow `<plugin-root>/references/static-phase.md`; it ends when
+   run instead of tracing again. Then write `run.json` with the identity and the test's CI coverage
+   (`entry_test_ci`).
+5. **Entry test preflight.** For a Blackhole or Wormhole source with a matching local device, ask
+   whether to run the entry test once before the static phase, with its cost and what skipping
+   risks (`<plugin-root>/references/run-setup.md`, "Entry test preflight"). The run is the
+   graph-and-cache capture run of the measured phase, so it is not repeated later. Never for a
+   Quasar source: an entry test never runs on TTsim.
+6. **Static.** Follow `<plugin-root>/references/static-phase.md`; it ends when
    `python3 <plugin-root>/scripts/validate_static.py <run dir>` prints `OK`. Skipped for a run whose
    static analysis is done.
-6. **Destinations.** Ask whether to add a destination; repeat while the user wants more. Offer every
+7. **Destinations.** Ask whether to add a destination; repeat while the user wants more. Offer every
    choice but the source in one list: `p100`, `p150`, `n150`, `n300-1chip`, `quasar` (the code as
    written, on Quasar) and, for a non-Quasar source, `quasar-bf16` (BF16 projection). Each one is
    added to the same run from the existing source trace (static-phase.md, "Adding a destination").
-7. **Measurements.** First the source methods: probe the source device again, then run
+8. **Measurements.** First the source methods: probe the source device again, then run
    `python3 <plugin-root>/scripts/source_methods.py <run dir> --device <probed profile or none> --tt-metal <checkout>`
    and show all four analysis methods (static trace, Tracy, graph capture, kernel cache) with
    their state: done, available, available to read later, read an existing cache, or unavailable
@@ -57,7 +63,7 @@ resolve every `<plugin-root>/...` path against it.
    `<plugin-root>/scripts/llk_gaps.py` for the items picked); Quasar test items follow
    `<plugin-root>/references/measured-destination.md` (`python3 <plugin-root>/scripts/kernel_tests.py`).
    Unpicked items stay pending for a later session.
-8. **Report.** `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`, the validator again, and
+9. **Report.** `python3 <plugin-root>/scripts/kernel_ops.py <run dir>`, the validator again, and
    `summary.md` with the per-kernel-op table first. `summary.md` names the methods the run used and
    the confidence they give (`<plugin-root>/references/schemas.md`, "Analysis methods and
    confidence"). Say where the results are; uploading them to Google Drive is the
@@ -72,6 +78,7 @@ resolve every `<plugin-root>/...` path against it.
 - Measurements run on the run's `tt_metal_commit` only; `same_commit.py` is the gate.
 - Physical-device commands go through `tt-device-mcp`; TTsim runs on the host with Bash, never
   through `tt-device-mcp`, even under a rule that routes all pytest there (`ttsim.md`).
+- TTsim runs only kernel-op tests, one node at a time; never an entry test or any whole-model test.
 - Device runs are sequential: one device job at a time (probe, capture run, Tracy run), each started
   only after the previous one has finished and the device reports healthy. Never submit a second
   device job while one runs or is queued, and never give device runs to parallel subagents: two

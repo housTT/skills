@@ -51,6 +51,10 @@ whole configuration in one message.
    Measurements rerun this same test.
 7. If a run with this identity (model, implementation, entry test, source, commit) already exists,
    say so and continue it; never trace it again.
+8. Write `run.json` with the run's identity (section 3) and `entry_test_ci`, the CI coverage that
+   discovery found for the chosen test on the source profile. Leave out `kind`: the static phase
+   sets it.
+9. Entry test preflight (below), for a Blackhole or Wormhole source.
 
 Destinations are asked after static analysis (static-phase.md, "Adding a destination"), never
 during setup.
@@ -81,7 +85,8 @@ Candidates: end-to-end PCC tests and demo tests, plus perf tests (device-perf: t
 `command = f"pytest ..."` string in `*perf_device*.py` or `*device_perf*.py`; e2e perf such as
 `test_*perf_e2e*.py`) whose test body runs the whole model, so one test serves static analysis and
 measurements. For a Quasar source, candidates are whole-model tests of that implementation that run
-on TTsim; no CI requirement.
+on TTsim; no CI requirement. The entry test of a Quasar source is read, never run: not on a
+device, not on TTsim.
 
 An implementation is a directory of the model: one with its own `tt/` code, or a per-arch
 directory (`blackhole/`, `wormhole/`, `t3000/`) whose tests and demo run another directory's `tt/`
@@ -147,6 +152,43 @@ Record it in `run.json` as `"test": "<run dir>/temp_test_<model>.py::<test name>
 `"temporary_test": true`, and state in `summary.md` that the entry test is temporary and not part
 of tt-metal.
 
+## Entry test preflight
+
+The static phase is the expensive part of a run, and the entry test and the commit are part of the
+run's identity. A test found to fail on the source device only after the static phase means a new
+run and a second trace when the user then changes the test or the commit. The static analysis itself
+stays valid either way: it reads code.
+
+Offer the preflight only for a Blackhole or Wormhole source whose profile the local device probed
+as. Never for a Quasar source: its entry test never runs, on a device or on TTsim. Without a
+matching device, do not offer it; say that the test's state then rests on `entry_test_ci` alone and
+continue with the static phase.
+
+Ask one question: run the entry test once now, or skip. Recommend running it when `entry_test_ci`
+is `no`, and skipping it when a CI job runs the test on this profile. With the question, state:
+
+- the cost: the checkout must be at the pinned commit and built (`same_commit.py`; otherwise a
+  checkout and a rebuild first), and the run compiles every kernel from nothing, up to
+  `ci_pytest_timeout_s` or 1400 s;
+- the risk of skipping: the static phase goes ahead on a test nobody ran here; if it later fails on
+  this device, the measurements have nothing to read, and moving to another test or commit is a
+  new run, traced again.
+
+The preflight is the capture run of measured-source.md (steps 1 to 4, `source:graph` and
+`source:cache` in one run; the cache is built even without the elfray engine and read later), so it
+costs no extra run. One job through `tt-device-mcp`. Then:
+
+- **Passed.** `python3 <plugin-root>/scripts/graph_report.py <capture file> <run dir> --inferences <n> --date <YYYY-MM-DD> --entry-pass "<pass line>"`
+  records the pass in `entry_test_passes` and the capture in `graph_capture`; with no
+  `op_table.csv` yet it decides no row. Run `cache_report.py` (measured-source.md, step 9) when the
+  engine is available. Continue with the static phase.
+- **Failed.** Show the failure line and ask: another entry test (step 6), another commit (step 4),
+  or the static phase anyway. For the last, record the failure with `graph_report.py ... --entry-fail "<failure line>"`
+  when the capture file was written, otherwise with
+  `python3 <plugin-root>/scripts/measurements.py mark <run dir> source:graph failed --note "<failure line>"`.
+  For another test or commit, delete this `run.json` and the capture and cache with the user's
+  approval, and set the run up again.
+
 When a model has a Blackhole and a Quasar implementation (for example
 `models/demos/vision/classification/resnet50/ttnn_resnet` and `.../resnet50/quasar`), each is its
 own run with its own source. Comparing the two is a separate step on two runs.
@@ -185,8 +227,15 @@ Root: current working directory unless the user names one; never inside the tt-m
 {"kind": "static", "model": "resnet50", "implementation": "<module path>", "test": "<node id>",
  "source": "p150", "destinations": ["quasar-bf16"], "stage_blocks": ["stem", "layer1", "head"],
  "profile_values": {}, "tt_metal_ref": "origin/main", "tt_metal_commit": "<40-char sha>",
- "date": "YYYY-MM-DD", "drive_url": null, "entry_test_passes": {}}
+ "date": "YYYY-MM-DD", "drive_url": null, "entry_test_passes": {},
+ "entry_test_ci": {"value": "yes", "evidence": "tests/pipeline_reorg/models.yaml: resnet50 (skus p150)"}}
 ```
+
+`entry_test_ci`, written at setup: whether a CI workflow or pipeline list runs the entry test on the
+source profile at the pinned commit. `value` is `yes` or `no`; `evidence` names the workflow or
+pipeline file and job for `yes`, and for `no` what discovery found (no job, or jobs on other
+profiles only, named). For a Quasar source `n/a`, with the evidence that its entry test is read,
+never run.
 
 Static analysis adds `configurable_grid` and `configurable_layers` (static-phase.md, step 6).
 `entry_test_failure` (`{"by", "date", "result"}`) records a failed local run of the entry test

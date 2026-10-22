@@ -1,6 +1,6 @@
 # TTsim for Quasar measurements
 
-Read this reference for the Quasar measurement items: kernel-op tests of a Quasar target and the entry test of a Quasar source, all on TTsim.
+Read this reference for the Quasar measurement items: kernel-op tests of a Quasar target on TTsim, one node at a time. An entry test (a whole-model test) never runs on TTsim.
 
 ## Discovery and selection
 

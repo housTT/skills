@@ -164,8 +164,7 @@ summary's `Status legend`, which Info does not repeat as a section).
 
 One pair per Quasar target. The plan, written by `kernel_tests.py plan`: `id`, `node_id`,
 `op_table_ids`, `row_statuses` (`;`-separated statuses of the rows citing the node, used to select
-`<target>:kernel-tests <status>` items), `kind` (`entry` for a Quasar source's entry test, otherwise
-`kernel`).
+`<target>:kernel-tests <status>` items).
 
 The results: `id`, `node_id`, `op_table_ids`, `result` (`pass`, `fail`, `xfail`, `timeout`, `error`,
 `skip`), `duration_s`, `log` (path of the pytest log), `environment` (`run.json` or the
