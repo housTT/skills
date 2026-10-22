@@ -1063,10 +1063,10 @@ def test_a_coordinator_turn_records_its_digest_size_and_routine_turns_collapse(e
     assert "## Recurring (as last turn)" in prompt, "an unchanged section was repeated on a routine turn"
     assert k["note"]["digest"]["sections"]["recurring"] < 200
     prompt, k = turn("task_failed")
-    assert k["unblock"] and "## Recurring (as last turn)" in prompt, "a raised turn repeated an unchanged section"
+    assert k["note"]["triggers"] and "## Recurring (as last turn)" in prompt, "a triggered turn repeated an unchanged section"
     p.db.x("UPDATE schedules SET enabled=0 WHERE name='daily-review'")
     prompt, k = turn("task_failed")
-    assert k["unblock"] and "## Recurring\n" in prompt, "a raised turn must see a changed section whole"
+    assert k["note"]["triggers"] and "## Recurring\n" in prompt, "a triggered turn must see a changed section whole"
 
 
 
@@ -1098,11 +1098,11 @@ def test_an_unchanged_machine_ledger_is_one_line_unless_a_machine_event_or_a_led
     prompt, _ = turn("task_failed")
     assert "disabled auto power cycle" in prompt
     prompt, k = turn("task_failed")
-    assert k["unblock"], "the turn was not raised"
+    assert k["note"]["triggers"], "the turn had no trigger"
     assert "## Shared machines in your Resources: 1 open (as last turn)" in prompt
     assert "zzzz" not in prompt and k["note"]["digest"]["sections"]["machine_ledger"] < 200
     prompt, k = turn("task_failed", "the run on box-c lost its device")
-    assert k["unblock"] and "disabled auto power cycle" not in prompt, "an event only naming a machine expanded it"
+    assert k["note"]["triggers"] and "disabled auto power cycle" not in prompt, "an event only naming a machine expanded it"
     assert "## Shared machines in your Resources: 1 open (as last turn)" in prompt
     prompt, _ = turn("machine_condition", "a condition opened")
     assert "disabled auto power cycle" in prompt, "a machine event shows the ledger"
@@ -7559,17 +7559,17 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
             assert argv[argv.index("--model") + 1] == row["model"], "the CLI got another model than recorded"
         return row
 
-    # Unset: the coordinator keeps the standard tier's model at its own tier's effort, so the cheaper
-    # light-tier model of workers does not move it.
+    # Unset: the coordinator keeps the standard tier's model at xhigh (coordinator.DEFAULT_EFFORT), so
+    # the cheaper light-tier model of workers and its tier's effort do not move it.
     standard = p.config()["providers"]["claude"]["tiers"]["standard"]
     assert p.config()["coordinator"]["model_tier"] == "standard" and light["model"] != standard["model"]
     d = Daemon(p.base)
     row = run(d, "coordinator")
-    assert (row["model"], row["effort"]) == (standard["model"], light["effort"])
-    # model_tier "" follows its own tier.
+    assert (row["model"], row["effort"]) == (standard["model"], "xhigh") and light["effort"] != "xhigh"
+    # model_tier "" follows its own tier's model.
     p.set_config("coordinator.model_tier", "")
     row = run(Daemon(p.base), "coordinator")
-    assert (row["model"], row["effort"]) == (light["model"], light["effort"])
+    assert (row["model"], row["effort"]) == (light["model"], "xhigh")
     # The light tier moves; a pinned coordinator stays put, workers follow the tier.
     p.set_config("providers.claude.tiers.light.model", "cheap-model")
     p.set_config("providers.claude.tiers.light.effort", "low")
@@ -7580,21 +7580,72 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
     assert (row["model"], row["effort"]) == ("pinned-model", "high")
     row = run(d, "worker")
     assert (row["model"], row["effort"]) == ("cheap-model", "low")
-    # Only the model pinned: effort still follows the tier.
+    # Only the model pinned: the effort is the xhigh default again, never the tier's.
     p.set_config("coordinator.effort", "")
     d = Daemon(p.base)
     row = run(d, "coordinator")
-    assert (row["model"], row["effort"]) == ("pinned-model", "low")
+    assert (row["model"], row["effort"]) == ("pinned-model", "xhigh")
 
 
 
-def test_unblocking_turns_run_at_high_effort_and_routine_turns_do_not(env, monkeypatch):
+def test_coordinator_route_defaults_to_xhigh_and_an_explicit_effort_wins_as_each_provider_takes_it():
+    """Every coordinator turn runs at coordinator.DEFAULT_EFFORT (xhigh) unless coordinator.effort sets
+    one; either reaches each provider as its nearest supported level (failover.kept_effort), never a
+    value it does not take, and none for a provider that takes no effort setting."""
+    from ttp import coordinator as coord
+    from ttp.project import DEFAULT_CONFIG
+    from ttp.providers import get_provider
+    assert coord.DEFAULT_EFFORT == "xhigh" and DEFAULT_CONFIG["coordinator"]["effort"] == ""
+    route = coord.coordinator_route(DEFAULT_CONFIG)
+    assert route["provider"] == "claude" and route["effort"] == "xhigh"
+    assert route["model"] == DEFAULT_CONFIG["providers"]["claude"]["tiers"]["standard"]["model"]
+    want = {"claude": {"": "xhigh", "xhigh": "xhigh", "max": "max", "low": "low", "minimal": "low"},
+            "codex": {"": "xhigh", "xhigh": "xhigh", "max": "xhigh", "low": "low", "minimal": "minimal"},
+            "cursor": {"": "", "xhigh": "", "max": "", "low": "", "minimal": ""}}
+    for provider, cases in want.items():
+        takes = get_provider(provider).efforts
+        for pin, got in cases.items():
+            cfg = {**DEFAULT_CONFIG, "coordinator": {**DEFAULT_CONFIG["coordinator"], "effort": pin}}
+            effort = coord.coordinator_route(cfg, provider)["effort"]
+            assert effort == got, (provider, pin, effort)
+            assert effort in takes or (not takes and effort == ""), (provider, pin, effort)
+    assert coord.route_line(DEFAULT_CONFIG) == (
+        f"coordinator: claude/{DEFAULT_CONFIG['providers']['claude']['tiers']['standard']['model']} · xhigh")
+    cursor = {**DEFAULT_CONFIG, "core_provider": "cursor"}
+    assert coord.route_line(cursor).endswith(" · no effort setting")
+
+
+def test_a_coordinator_effort_change_applies_at_the_next_turn(env):
+    """The daemon reads coordinator_route from its config as it is at each turn: a changed
+    coordinator.effort or model reaches the next turn of the same daemon, and clearing it goes back to xhigh."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+
+    def turn():
+        rid = d.start_run("coordinator", "go", "claude", "light", str(p.base), read_only=True)
+        (p.runs / str(rid) / "STOP").touch()
+        row = p.db.one("SELECT model, effort FROM runs WHERE id=?", (rid,))
+        return row["model"], row["effort"]
+
+    model, effort = turn()
+    assert effort == "xhigh"
+    p.set_config("coordinator.effort", "medium")
+    p.set_config("coordinator.model", "pinned-model")
+    d._load_config()   # what each daemon tick does
+    assert turn() == ("pinned-model", "medium")
+    p.set_config("coordinator.effort", "")
+    p.set_config("coordinator.model", "")
+    d._load_config()
+    assert turn() == (model, "xhigh")
+
+
+def test_unblocking_turns_name_their_trigger_and_routine_turns_do_not(env, monkeypatch):
     """A turn started by stuck work (a blocked or failed task, resource trouble, an ask timing out)
-    or an idle wake that finds blocked work runs at coordinator.unblock_effort; others keep theirs."""
+    or an idle wake that finds blocked work names its trigger in the run's note; others name none."""
     p = make(env)
     from ttp.daemon import Daemon
     from ttp import coordinator as coord
-    assert p.config()["coordinator"]["unblock_effort"] == "high"
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     d = Daemon(p.base)
     d.update_gates()
@@ -7612,48 +7663,30 @@ def test_unblocking_turns_run_at_high_effort_and_routine_turns_do_not(env, monke
         d.maybe_coordinate()
         assert len(calls) == n + 1, f"no turn for {kind}"
         p.db.x("UPDATE events SET status='handled'")
-        return calls[-1].get("unblock", "")
+        return calls[-1]["note"].get("unblock", "")
 
     for kind in ("task_blocked", "task_failed", "resource_trouble", "ask_timeout", "deferral_expired"):
-        assert turn(kind) == kind and calls[-1]["note"]["unblock"] == kind
+        assert turn(kind) == kind and kind in calls[-1]["note"]["triggers"]
     for kind in ("task_done", "task_notes", "followup_proposed", "retry_wake"):
         assert turn(kind) == "", f"{kind} is a routine turn"
     p.db.post("in", "status?", chat="c1", kind="user")
     clock[0] += 120
     d.maybe_coordinate()
-    assert calls[-1]["unblock"] == "user message", "a turn carrying user messages runs at unblock effort"
+    assert calls[-1]["note"]["unblock"] == "user message", "a turn carrying user messages names it"
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
-    # The turn after a rejected ask_user retries it at unblock effort, and so does any other rejection.
+    # The turn after a rejected ask_user names it, and so does one after any other rejection.
     p.db.set_kv(coord.REJECTED_KEY, ["ask_user: ask_user rejected: decide it yourself"])
     assert turn("task_done") == "retry after a rejected ask_user"
     p.db.set_kv(coord.REJECTED_KEY, ["task_add: task_add rejected: depends on #1 which is failed"])
     assert turn("task_done") == "rejected action"
     p.db.set_kv(coord.REJECTED_KEY, [])
-    assert turn("task_done") == "", "a routine task_done turn keeps the base effort"
+    assert turn("task_done") == "", "a routine task_done turn names no trigger"
     # An idle wake that finds a blocked task is a stall, not a routine check.
     tid = p.db.add_task("stuck", "s", origin="user")
     p.db.update_task(tid, status="blocked", blocked_reason="waiting for a window")
     clock[0] += float(p.config()["coordinator"]["idle_wake_s"]) + 60
     d.maybe_coordinate()
-    assert calls[-1]["unblock"] == "stalled on blocked tasks"
-    # The effort is raised, never lowered, and an empty unblock_effort turns it off.
-    assert coord.raise_effort("low", "high") == "high"
-    assert coord.raise_effort("max", "high") == "max"
-    assert coord.raise_effort("", "high") == "high"
-    assert coord.raise_effort("low", "") == "low"
-    monkeypatch.undo()
-    p.set_config("providers.claude.tiers.light.effort", "low")
-    for floor, want in (("high", ["low", "high"]), ("", ["low", "low"])):
-        p.set_config("coordinator.unblock_effort", floor)
-        d = Daemon(p.base)
-        got = []
-        for unblock in ("", "task_blocked"):
-            rid = d.start_run("coordinator", "go", "claude", "light", str(p.base), read_only=True, unblock=unblock)
-            (p.runs / str(rid) / "STOP").touch()
-            argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
-            got.append(argv[argv.index("--effort") + 1])
-            assert p.db.one("SELECT effort FROM runs WHERE id=?", (rid,))["effort"] == got[-1]
-        assert got == want, (floor, got)
+    assert calls[-1]["note"]["unblock"] == "stalled on blocked tasks"
 
 
 
@@ -7950,7 +7983,7 @@ def test_a_plain_needs_review_hand_off_the_daemon_reviews_raises_no_effort(env, 
         m.setattr(time, "time", lambda: later)
         d.maybe_coordinate()
     (_, k), = calls
-    assert k["unblock"] == "" and k["note"]["triggers"] == [] and plain["id"] in k["note"]["events"]
+    assert "unblock" not in k["note"] and k["note"]["triggers"] == [] and plain["id"] in k["note"]["events"]
     assert k["note"]["lowered"] == [f"{coord.LOWERED_REVIEW}: event {plain['id']} "
                                     "(the daemon's review sweep queues its review)"]
     low: list = []
@@ -7967,136 +8000,6 @@ def test_a_plain_needs_review_hand_off_the_daemon_reviews_raises_no_effort(env, 
     noted = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_review'", (tid2,))
     assert noted["data"] is None
     assert coord.effort_triggers(p.db, p.config(), [noted["id"]], None)[0] == ["task_review"]
-
-
-
-def test_a_routine_turn_escalates_once_and_the_rerun_cannot_escalate(env, monkeypatch):
-    p = make(env)
-    from types import SimpleNamespace
-    from ttp.daemon import Daemon
-    from ttp import coordinator as coord
-    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
-    d = Daemon(p.base)
-    d.update_gates()
-    clock = [time.time()]
-    calls = []
-    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append((a, k)) or len(calls))
-    monkeypatch.setattr(time, "time", lambda: clock[0])
-    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-           (clock[0], "daemon", "task_done", "normal", "#1 done", "queued"))
-    clock[0] += 600
-    d.maybe_coordinate()
-    (args, k), = calls
-    assert k["unblock"] == "" and k["note"]["triggers"] == [] and "effort: routine" in args[1] \
-        and "`escalate`" in args[1]
-    esc = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "the hand-off contradicts the plan"},
-                                                  {"type": "noop"}], "summary": ""},
-                          error="", final_text="")
-    d._finish_coordinator({"dir": "x", "id": 1, "effort": "low"}, esc, "ok", k["note"])
-    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 1, "its batch stays queued"
-    assert not p.db.kv(coord.REJECTED_KEY), "a taken escalation is no rejection"
-    assert p.db.kv(coord.ESCALATIONS_KEY)["n"] == 1
-    # The rerun starts at once (no debounce, batch hold or idle wait), raised, with the same batch.
-    d.maybe_coordinate()
-    args, k = calls[-1]
-    assert len(calls) == 2 and k["note"]["escalated"] is True and k["note"]["events"] == calls[0][1]["note"]["events"]
-    assert k["unblock"].startswith("escalated: the hand-off contradicts the plan") and "effort: raised" in args[1]
-    assert not p.db.kv(coord.ESCALATE_KEY)
-    # The rerun asking to escalate again is refused: the rest of its actions apply, nothing reruns.
-    d._finish_coordinator({"dir": "x", "id": 2, "effort": "high"}, SimpleNamespace(structured={"actions": [
-        {"type": "escalate", "why": "again"}, {"type": "notify", "text": "decided"}], "summary": ""},
-        error="", final_text=""), "ok", k["note"])
-    assert p.db.one("SELECT id FROM messages WHERE text='decided'")
-    assert not p.db.kv(coord.ESCALATE_KEY) and p.db.kv(coord.ESCALATIONS_KEY)["refused"] == 1
-    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 0
-    assert p.db.kv(coord.REJECTED_KEY) == [
-        "escalate: refused (it came with other actions; escalate must be returned alone); decide at this effort"]
-    # A routine turn over a batch already escalated once, or a raised turn, cannot escalate either.
-    for note in ({**calls[0][1]["note"]}, {"events": [99], "unblock": "task_failed"}):
-        d._finish_coordinator({"dir": "x", "id": 3, "effort": "low"}, esc, "ok", note)
-        assert not p.db.kv(coord.ESCALATE_KEY), note
-    got = p.db.kv(coord.ESCALATIONS_KEY)
-    assert (got["n"], got["refused"], got["batch"]) == (1, 3, [calls[0][1]["note"]["events"], []])
-    assert p.db.kv(coord.REJECTED_KEY) == ["escalate: refused (this turn already ran at raised effort); "
-                                           "decide at this effort"]
-    clock[0] += 600
-    n = len(calls)
-    d.maybe_coordinate()
-    assert len(calls) == n, "nothing queued, no escalation: no turn"
-    # A pinned coordinator.effort wins: nothing raises it, so a routine turn may not escalate.
-    p.set_config("coordinator.effort", "low")
-    d.cfg = p.config()
-    assert not coord.can_raise_effort(d.cfg, "light")
-    d._finish_coordinator({"dir": "x", "id": 4, "effort": "low"}, esc, "ok", {"events": [100]})
-    assert not p.db.kv(coord.ESCALATE_KEY)
-
-
-
-def test_a_pinned_routine_turn_is_not_offered_escalate_and_a_returned_one_is_rejected(env, monkeypatch):
-    from types import SimpleNamespace
-    from ttp import coordinator as coord
-    p, d, clock, calls = _escalate_turn(env, monkeypatch, pin="low")
-    d.maybe_coordinate()
-    (args, k), = calls
-    assert "`escalate`" not in args[1] and "effort: routine" not in args[1], "a pinned effort cannot be raised"
-    only = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}], "summary": ""},
-                           error="", final_text="")
-    d._finish_coordinator({"dir": "x", "id": 1, "effort": "low"}, only, "ok", k["note"])
-    assert not p.db.kv(coord.ESCALATE_KEY)
-    rejected = p.db.kv(coord.REJECTED_KEY)
-    assert rejected == ["escalate: refused (the coordinator's effort is pinned and cannot be raised); "
-                        "decide at this effort"]
-    assert p.db.one("SELECT id FROM events WHERE kind='rejected_actions'")
-    # It decided nothing, so its batch is not lost: the next turn gets it, with the refusal in STATE.
-    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 1
-    parts, _ = coord.digest_parts(p, {}, k["note"]["events"], [], None)
-    assert "escalate: refused (the coordinator's effort is pinned" in "\n".join(t for _, t in parts), \
-        "the next digest shows the refusal"
-
-
-
-def test_escalate_is_not_offered_on_a_raised_batch_or_one_escalated_before(env, monkeypatch):
-    from ttp import coordinator as coord
-    p, d, clock, calls = _escalate_turn(env, monkeypatch)
-    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-           (clock[0] - 600, "daemon", "task_blocked", "normal", "#2 blocked", "queued"))
-    d.maybe_coordinate()
-    (args, k), = calls
-    assert k["unblock"] and "effort: raised" in args[1] and "`escalate`" not in args[1]
-    # A routine batch that was escalated once (its rerun handed it back) is not offered it again.
-    p.db.x("UPDATE events SET status='handled'")
-    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-           (clock[0], "daemon", "task_done", "normal", "#3 done", "queued"))
-    eid = p.db.one("SELECT MAX(id) id FROM events WHERE status='queued'")["id"]
-    p.db.set_kv(coord.ESCALATIONS_KEY, {"n": 1, "batch": [[eid], []]})
-    clock[0] += 600
-    d.maybe_coordinate()
-    args, k = calls[-1]
-    assert len(calls) == 2 and not k["unblock"] and "`escalate`" not in args[1]
-
-
-
-@pytest.mark.parametrize("extra", [[], [{"type": "noop"}]])
-def test_a_repeated_refused_escalate_requeues_its_batch_once(env, monkeypatch, extra):
-    from types import SimpleNamespace
-    from ttp import coordinator as coord
-    p, d, clock, calls = _escalate_turn(env, monkeypatch, pin="low")
-    only = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}, *extra], "summary": ""},
-                           error="", final_text="")
-    queued = lambda: p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"]
-    d.maybe_coordinate()
-    d._finish_coordinator({"dir": "x", "id": 1, "effort": "low"}, only, "ok", calls[-1][1]["note"])
-    assert queued() == 1, "requeued once"
-    clock[0] += 600
-    d.maybe_coordinate()
-    assert len(calls) == 2 and calls[-1][1]["note"]["events"] == calls[0][1]["note"]["events"]
-    d._finish_coordinator({"dir": "x", "id": 2, "effort": "low"}, only, "ok", calls[-1][1]["note"])
-    assert queued() == 0, "the same batch refused again is handled, not requeued forever"
-    assert p.db.kv(coord.ESCALATIONS_KEY)["refused"] == 2
-    assert p.db.one("SELECT id FROM events WHERE kind='rejected_repeat'"), "the repeat is flagged once"
-    clock[0] += 600
-    d.maybe_coordinate()
-    assert len(calls) == 2, "no loop: nothing queued, no new turn"
 
 
 
@@ -9905,7 +9808,7 @@ def test_a_review_that_asks_for_changes_is_its_own_outcome_not_a_failure(env):
     retries, shows and counts as changes_needed, and raises no repeated-failure or resource trigger.
     The change stays gated: its fix and re-review follow, and the re-review runs standard."""
     p = make(env)
-    from ttp import coordinator as coord, coordcheck, effort, machines
+    from ttp import coordinator as coord, effort, machines
     from ttp.cli import status_text
     from ttp.db import task_outcome
     from ttp.web import state_payload
@@ -9931,14 +9834,13 @@ def test_a_review_that_asks_for_changes_is_its_own_outcome_not_a_failure(env):
     counts = p.db.status_counts()
     assert counts.get("changes_needed") == 1 and "failed" not in counts, counts
     assert "changes_needed 1" in status_text(p).splitlines()[0]
-    assert coordcheck.summary(p.db, []).count("changes_needed 1") == 1
     st = state_payload(p, p.db)
     assert st["task_counts"].get("changes_needed") == 1
     assert next(x for x in st["tasks"] if x["id"] == rev["id"])["outcome"] == "changes_needed"
     p.db.set_kv("last_coordinator_turn", before)
     assert f"- #{rev['id']} changes_needed:" in coord.digest(p, {}, [], [])
     # Not a failure for the coordinator's repeated-failure or resource-trouble rules; its findings
-    # still make a turn that handles them a high-effort one.
+    # still make a turn that handles them a triggered one.
     fails = p.db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_failed'", (rev["id"],))["n"]
     assert fails == 0
     trig = coord.effort_triggers(p.db, {"coordinator": {"repeat_fails_24h": 1}}, [ev["id"]], None)[0]

@@ -1212,8 +1212,8 @@ def test_jev_use_called_rarely_is_judged_once_its_first_call_is_a_window_old(env
 
 def test_jev_use_that_never_changes_the_rules_decision_is_switched_off_after_idle_calls(env):
     """A use whose idle_calls known calls all made the rules' own decision goes off, with that reason in
-    the daily line; one call that changed a decision keeps it on; a raised coordinator turn scored
-    'no change' changed nothing. Screening records whether it skipped or raised a wake."""
+    the daily line; one call that changed a decision keeps it on. Screening records whether it skipped
+    or raised a wake."""
     p = make(env)
     from ttp import jevuse
     from ttp import screen as scr
@@ -1234,14 +1234,6 @@ def test_jev_use_that_never_changes_the_rules_decision_is_switched_off_after_idl
     line = next(x for x in jevuse.lines(p.db, cfg) if x.startswith("watcher screening"))
     assert "switched off (no call changed the rules' decision in 20 calls)" in line
     assert "changed the rules' decision 0/20" in line
-    # Coordinator effort: every call raised the turn, and every raised turn only did routine work.
-    for _ in range(20):
-        cid = jevuse.record(p.db, "coord_effort", {"verdict": "needs_thought", "escalated": True}, 0.001,
-                            avoided_usd=0.05, changed=True)
-        assert jevuse.review(p.db, cfg) == [], "an unsettled raise counts as a change"
-        _settle_routine_raise(p.db, cid)
-    [(use, s)] = jevuse.review(p.db, cfg)
-    assert use == "coord_effort" and s["no_change"] == 20 and s["saved"] == pytest.approx(-0.2)
     p.set_config("jev.uses.screen", "on")   # forced on: no idle switch-off
     assert jevuse.allowed(p.db, p.config(), "screen")
     # Screening: agreeing with the rules is no change; raising a wake the rules would not is one.
@@ -1275,11 +1267,6 @@ def test_jev_never_raises_a_watcher_lines_explicit_severity_hint_but_may_lower_i
     # A line without a hint keeps today's behaviour: Jev may raise it.
     v = screen(p.db, cfg, "watcher:hw", "box-d: all fine", jev=loud)
     assert v.severity == "critical" and v.wake and "capped" not in v.reason
-
-
-def _settle_routine_raise(db, cid):
-    from ttp import coordcheck
-    coordcheck.settle(db, cid, "needs_thought", "ok", [{"type": "task_add"}, {"type": "reply"}], [], extra_usd=0.01)
 
 
 def test_daemon_reports_a_jev_use_switched_off_once_and_feeds_the_daily_review(env):
@@ -1793,37 +1780,28 @@ def test_unblock_asks_handed_back_and_turn_split(env):
     assert line.startswith(f"3 sent, 2 with a linked answer (1 named, 1 in its thread), 1 handed back "
                            f"(33% of asks): ask {a1} (restriction"), line
     assert unblock.asks_line([]) == "no asks sent"
-    for effort, note in (("low", None), ("low", '{"escalated": true}'), ("high", '{"trigger": "task_blocked"}')):
+    for effort, note in (("xhigh", None), ("xhigh", '{"triggers": []}'), ("high", '{"trigger": "task_blocked"}')):
         db.x("INSERT INTO runs(role,status,started,effort,note) VALUES('coordinator','ok',?,?,?)", (now - 60, effort, note))
-    assert unblock.turns_line(db, now - 86400) == ("3 turns: 2 low, 1 high; 1 escalated low to high; "
-                                                   "high-effort triggers: task_blocked 1")
-    db.x("UPDATE runs SET note=NULL")   # fields not logged yet: still a report
-    assert unblock.turns_line(db, now - 86400) == "3 turns: 2 low, 1 high; escalations not logged"
-    db.x("UPDATE runs SET note=? WHERE effort='low'", ('{"triggers": []}',))   # logged, none escalated
-    assert unblock.turns_line(db, now - 86400) == "3 turns: 2 low, 1 high; 0 escalated low to high"
+    assert unblock.turns_line(db, now - 86400) == "3 turns: 2 xhigh, 1 high; triggers: task_blocked 1"
+    db.x("UPDATE runs SET note=NULL")   # no triggers logged: the split alone
+    assert unblock.turns_line(db, now - 86400) == "3 turns: 2 xhigh, 1 high"
 
 
-def test_unblock_counts_each_logged_trigger_and_the_escalated_bucket(env):
+def test_unblock_counts_each_logged_trigger_and_the_triggered_share(env):
     p = make(env)
     from ttp import unblock
     db, now = p.db, time.time()
-    for effort, note, cost in (
-            ("high", '{"triggers": ["task_blocked", "user_message"], "unblock": "task_blocked, user_message"}', 0.5),
-            ("high", '{"triggers": ["escalated: harder than it looked", "task_blocked"], "escalated": true}', 0.25),
-            ("high", '{"unblock": "alert_high"}', 0.25),   # an older note: no list
-            ("high", '{"triggers": ["jev: needs thought (stuck 0.80)"]}', 0.05),
-            ("high", '{"triggers": ["jev: routine (stuck 0.10)"]}', 0.05),
-            ("low", '{"triggers": []}', 0.1)):
+    for note, cost in (
+            ('{"triggers": ["task_blocked", "user_message"], "unblock": "task_blocked, user_message"}', 0.5),
+            ('{"triggers": ["task_blocked (#4)"]}', 0.25),
+            ('{"unblock": "alert_high"}', 0.25),   # an older note: no list
+            ('{"triggers": []}', 0.1)):
         db.x("INSERT INTO runs(role,status,started,effort,note,cost_usd) VALUES('coordinator','ok',?,?,?,?)",
-             (now - 60, effort, note, cost))
+             (now - 60, "xhigh", note, cost))
     assert unblock.turns_line(db, now - 86400) == (
-        "6 turns: 5 high, 1 low; 1 escalated low to high; "
-        "high-effort triggers: task_blocked 2, jev 2, user_message 1, escalated 1, alert_high 1")
-    db.set_kv("escalations", {"n": 2, "refused": 1})
+        "4 turns: 4 xhigh; triggers: task_blocked 2, user_message 1, alert_high 1")
     assert unblock.triggers_line(db, now - 86400) == (
-        "raised 5 (83%, $1.10), routine 1 (17%, $0.10); per trigger: jev 2, task_blocked 2, alert_high 1, "
-        "escalated 1, user_message 1; escalations unknown (not logged for the whole window); "
-        "cumulative (all time, not this window): 2 (refused 1)")
+        "triggered 3 (75%, $1.00), routine 1 (25%, $0.10); per trigger: task_blocked 2, alert_high 1, user_message 1")
     assert unblock.triggers_line(db, now + 10) == "no coordinator turns"
 
 
@@ -1884,51 +1862,6 @@ def test_unblock_reports_state_intervals_whole_episodes_and_what_is_stuck_now_ap
     assert "stuck episodes, 24 h (started in window, all stuck states, full age): 2 (2 still open, 1 changed state), " \
            f"median 1.5 h, p90 3.0 h, longest #{a} blocked, then up for review 3.0 h (still open)" in lines
 
-
-def test_unblock_cumulative_escalation_counters_are_not_reported_as_24h(env):
-    p = make(env)
-    from ttp import unblock
-    db, now = p.db, time.time()
-    for ago, note in ((60, '{"triggers": ["escalated: harder than it looked"], "escalated": true}'),
-                      (120, '{"triggers": []}'), (2 * 86400, '{"escalated": true}')):
-        db.x("INSERT INTO runs(role,status,started,effort,note) VALUES('coordinator','ok',?,?,?)",
-             (now - ago, "high", note))
-    for ago, text in ((3600, "escalate: refused (this batch was already escalated once); decide at this effort"),
-                      (1800, "send: no such chat"), (3 * 86400, "escalate: refused (it came with other actions)")):
-        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-             (now - ago, "daemon", "rejected_actions", "normal", text, "handled"))
-    since = now - 86400
-    # Nothing tells when timestamped records began, and no counters: both unknown, never zero
-    assert unblock.escalations_part(db, since) == (
-        "escalations unknown (not logged for the whole window); cumulative: not recorded")
-    db.set_kv("escalations", {"n": 9, "refused": 7, "batch": [[], []]})
-    db.set_kv(unblock.ESCALATION_LOG_KEY, now - 3600)   # records begin inside the window: still unknown
-    assert unblock.escalations_part(db, since) == (
-        "escalations unknown (not logged for the whole window); cumulative (all time, not this window): 9 (refused 7)")
-    db.set_kv(unblock.ESCALATION_LOG_KEY, now - 2 * 86400)   # the whole window is covered: counted from records
-    assert unblock.escalations_part(db, since) == (
-        "escalations 1 (refused 1); cumulative (all time, not this window): 9 (refused 7)")
-    assert unblock.triggers_line(db, since).endswith(
-        "; escalations 1 (refused 1); cumulative (all time, not this window): 9 (refused 7)")
-
-
-@pytest.mark.parametrize("marked", [None, 1000.0])
-def test_the_first_daemon_start_marks_when_timestamped_escalation_records_begin(env, monkeypatch, marked):
-    from ttp import daemon as dm, unblock, web
-    p = make(env)
-    if marked:
-        p.db.set_kv(unblock.ESCALATION_LOG_KEY, marked)
-    d = dm.Daemon(p.base)
-    monkeypatch.setattr(d, "tick", lambda: setattr(d, "stopping", True))
-    monkeypatch.setattr(web, "serve", lambda daemon: None)
-    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
-    monkeypatch.setattr(dm.time, "sleep", lambda s: None)
-    before = time.time()
-    assert d.run() == 0
-    if marked:
-        assert p.db.kv(unblock.ESCALATION_LOG_KEY) == marked, "a later start keeps the first mark"
-    else:
-        assert before <= p.db.kv(unblock.ESCALATION_LOG_KEY) <= time.time()
 
 @pytest.mark.parametrize("result,want", [
     ({"retry_when": "/x/bin/ttp checks --result /runs/7"}, ("self", "checks")),
@@ -25532,7 +25465,7 @@ def test_spending_caps_default_to_100_a_day_200_a_week_and_200_global(env, tmp_p
     assert "Jev (optional add-on): on" in on and "outside paid service" in on and "jev.enabled false" in on
 
 
-def _escalate_turn(env, monkeypatch, pin=""):
+def _routine_turn(env, monkeypatch, pin=""):
     """A daemon whose turns are recorded instead of started, with one queued routine event."""
     p = make(env)
     from ttp.daemon import Daemon
@@ -25551,29 +25484,7 @@ def _escalate_turn(env, monkeypatch, pin=""):
     return p, d, clock, calls
 
 
-@pytest.mark.parametrize("pin", ["", "low"])
-def test_an_escalated_or_requeued_turn_is_logged_as_deciding_nothing(env, monkeypatch, pin):
-    """A turn that escalated (pin "") or whose only escalate was refused and its batch requeued
-    (pin "low") decided nothing: its run note says decided 0, so the audit counts it."""
-    from types import SimpleNamespace
-    from ttp import audit
-    from ttp import coordinator as coord
-    p, d, clock, calls = _escalate_turn(env, monkeypatch, pin=pin)
-    d.maybe_coordinate()
-    (_, k), = calls
-    rid = p.db.x("INSERT INTO runs(role,started,status,cost_usd,note) VALUES('coordinator',?,'ok',0.1,'{}')",
-                 (clock[0],))
-    only = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}], "summary": ""},
-                           error="", final_text="")
-    d._finish_coordinator({"dir": "x", "id": rid, "effort": "low"}, only, "ok", k["note"])
-    assert bool(p.db.kv(coord.ESCALATE_KEY)) == (not pin)
-    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 1, "its batch stays queued"
-    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["decided"] == 0
-    turns = audit.coordinator_turns(p.db, clock[0] - 60)
-    assert (turns["logged"], turns["noop"]) == (1, 1) and turns["noop_usd"] == pytest.approx(0.1)
-
-
-def test_a_pinned_coordinator_effort_wins_over_the_triggers(env):
+def test_a_pinned_coordinator_effort_wins_over_the_xhigh_default(env):
     p = make(env)
     from ttp.daemon import Daemon
     p.set_config("providers.claude.tiers.light.effort", "low")
@@ -25581,301 +25492,11 @@ def test_a_pinned_coordinator_effort_wins_over_the_triggers(env):
     for pin in ("", "low", "medium"):
         p.set_config("coordinator.effort", pin)
         d = Daemon(p.base)
-        rid = d.start_run("coordinator", "go", "claude", "light", str(p.base), read_only=True,
-                          unblock="user message")
+        rid = d.start_run("coordinator", "go", "claude", "light", str(p.base), read_only=True)
         (p.runs / str(rid) / "STOP").touch()
         argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
         got.append(argv[argv.index("--effort") + 1])
-    assert got == ["high", "low", "medium"]
-
-
-class _ThoughtJev:
-    """Stands in for providers.jev.Jev on the coordinator check: rates every reason `p`, or raises `err`."""
-
-    def __init__(self, p=0.1, err=None, cost=0.00005):
-        self.p, self.err, self.last_cost, self.calls = p, err, cost, []
-
-    def enabled(self):
-        return True
-
-    def decide(self, state, questions, purpose="decide", timeout=20.0):
-        self.calls.append(state)
-        if self.err:
-            raise self.err
-        return {k: {"noul": self.p} for k in questions}
-
-
-def test_jev_coordinator_check_raises_routine_turns_and_logs_each_call_with_its_outcome(env, monkeypatch):
-    """Jev's 'routine or needs thought?' check runs only on turns the rules leave below unblock_effort:
-    needs thought raises the turn, routine and errors keep the rules' choice, out of funds alerts."""
-    p = make(env)
-    from types import SimpleNamespace
-    from ttp.daemon import Daemon
-    from ttp import coordcheck, jevuse
-    from ttp.providers.jev import JevOutOfFunds, JevUnavailable
-    p.set_config("providers.fake.tiers.light.effort", "low")
-    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
-    d = Daemon(p.base)
-    d.update_gates()
-    clock = [time.time()]
-    calls = []
-    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append(k) or 70 + len(calls))
-    monkeypatch.setattr(time, "time", lambda: clock[0])
-
-    # Jev is asked only about something worth escalating that the rules leave routine: here task #4's
-    # external wait, which began 7 h ago (past coordinator.jev_wait_h, short of the 24 h rule).
-    p.set_config("coordinator.repeat_waits_24h", 0)
-    d.cfg = p.config()
-    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-           (clock[0] - 7 * 3600, "daemon", "task_waiting", "normal", "#4 deploy: task_waiting", "handled", 4))
-
-    def turn(jev, kind="task_waiting"):
-        d.jev = jev
-        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-               (clock[0], "daemon", kind, "normal", f"#4 deploy: {kind}", "queued", 4))
-        clock[0] += 400
-        d.maybe_coordinate()
-        p.db.x("UPDATE events SET status='handled'")
-        return calls[-1]
-
-    def last_call():
-        return p.db.one("SELECT * FROM jev_calls WHERE use='coord_effort' ORDER BY id DESC LIMIT 1")
-
-    jev = _ThoughtJev(p=0.8)
-    k = turn(jev)
-    assert k["unblock"].startswith("jev: needs thought (") and k["note"]["coord_check"]["verdict"] == "needs_thought"
-    assert "event task_waiting [normal]: #4 deploy: task_waiting" in jev.calls[-1] and "tasks:" in jev.calls[-1]
-    row = last_call()
-    dec = json.loads(row["decision"])
-    assert dec["verdict"] == "needs_thought" and dec["effort"] == "high" and dec["escalated"]
-    assert dec["rules_effort"] == "low" and row["ref"] == f"run:{70 + len(calls)}"
-    assert row["cost_usd"] == pytest.approx(0.00005) and row["avoided_usd"] > 0
-    p.db.set_kv(coordcheck.RAISED_KEY, [])   # task #4's stint raised once; forget it so later turns ask again
-    k = turn(_ThoughtJev(p=0.1))
-    assert k["unblock"] == "" and k["note"]["coord_check"]["verdict"] == "routine"
-    dec = json.loads(last_call()["decision"])
-    assert dec["verdict"] == "routine" and dec["effort"] == "low" and not dec["escalated"]
-    assert last_call()["avoided_usd"] == 0
-    n = p.db.one("SELECT COUNT(*) n FROM jev_calls")["n"]
-    for err in (JevUnavailable("HTTP 500"), ValueError("bad answer")):
-        k = turn(_ThoughtJev(err=err))
-        assert k["unblock"] == "" and "coord_check" not in k["note"], "an error keeps the rules' choice"
-    assert p.db.one("SELECT COUNT(*) n FROM jev_calls")["n"] == n
-    k = turn(_ThoughtJev(err=JevOutOfFunds("no credits")))
-    assert k["unblock"] == "" and p.db.one("SELECT id FROM messages WHERE ref='jev-funds'"), "out of funds alerts"
-    # A turn the rules already raise, or a check switched off, costs no call.
-    jev = _ThoughtJev(p=0.8)
-    assert turn(jev, "task_blocked")["unblock"] == "task_blocked" and not jev.calls
-    p.set_config("jev.uses.coord_effort", "off")
-    d.cfg = p.config()
-    assert turn(jev)["unblock"] == "" and not jev.calls
-    # Each call is settled with what its turn did: a raised turn that acted beyond routine bookkeeping
-    # was right, one that only did what a low-effort turn does was no change, one that did nothing was
-    # wrong; a routine turn with rejected actions was wrong.
-    for verdict, actions, problems, right in (("needs_thought", [{"type": "charter_update"}], [], "right"),
-                                              ("needs_thought", [{"type": "notify"}, {"type": "task_add"}], [],
-                                               "no change"),
-                                              ("needs_thought", [], [], "wrong"),
-                                              ("routine", [{"type": "task_add"}], ["task_add rejected: x"], "wrong"),
-                                              ("routine", [], [], "right")):
-        cid = jevuse.record(p.db, "coord_effort", {"verdict": verdict}, 0.00005)
-        coordcheck.settle(p.db, cid, verdict, "ok", actions, problems)
-        row = p.db.one("SELECT outcome, note FROM jev_calls WHERE id=?", (cid,))
-        assert row["outcome"] == right and row["note"].startswith("turn ok;"), (verdict, row)
-    cid = jevuse.record(p.db, "coord_effort", {"verdict": "needs_thought"}, 0.00005)
-    usage = SimpleNamespace(structured={"actions": [{"type": "noop_unknown"}]}, final_text="", error="")
-    monkeypatch.setattr("ttp.coordinator.apply", lambda *a, **k: [])
-    d._finish_coordinator({"id": 9, "dir": "x"}, usage, "ok",
-                          {"coord_check": {"jev_call": cid, "verdict": "needs_thought"}})
-    row = p.db.one("SELECT outcome, note FROM jev_calls WHERE id=?", (cid,))
-    assert row["outcome"] == "right" and "noop_unknown" in row["note"]
-    cid = jevuse.record(p.db, "coord_effort", {"verdict": "needs_thought"}, 0.00005)
-    d._finish_coordinator({"id": 10, "dir": "x"}, SimpleNamespace(structured=None, final_text="", error="boom"),
-                          "failed", {"coord_check": {"jev_call": cid, "verdict": "needs_thought"}})
-    row = p.db.one("SELECT outcome, note FROM jev_calls WHERE id=?", (cid,))
-    assert row["outcome"] is None and row["note"] == "turn failed; no actions", "a failed turn is not scored"
-    assert any(x.startswith("coordinator effort check [coord_effort]:") for x in jevuse.lines(p.db, p.config()))
-    assert coord_settable("jev.uses.coord_effort", "off") == "off" and coord_settable("jev.uses.coord_effort", "on") == "on"
-    # A routine call whose turn escalates was wrong; a pinned coordinator.effort is never raised, so no call.
-    cid = jevuse.record(p.db, "coord_effort", {"verdict": "routine"}, 0.00005)
-    usage = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}]}, final_text="", error="")
-    d._finish_coordinator({"id": 11, "dir": "x", "effort": "low"}, usage, "ok",
-                          {"events": [991], "coord_check": {"jev_call": cid, "verdict": "routine"}})
-    row = p.db.one("SELECT outcome, note FROM jev_calls WHERE id=?", (cid,))
-    assert p.db.kv("escalate") and row["outcome"] == "wrong" and row["note"].startswith("turn escalated")
-    p.db.x("DELETE FROM kv WHERE key='escalate'")
-    p.set_config("jev.uses.coord_effort", "on")
-    p.set_config("coordinator.effort", "low")
-    d.cfg = p.config()
-    jev = _ThoughtJev(p=0.8)
-    assert turn(jev)["unblock"] == "" and not jev.calls
-
-
-def test_jev_coordinator_check_skips_routine_events_never_raises_twice_and_uses_its_threshold(env, monkeypatch):
-    """Jev is called only on new escalation-worthy events (a skip is logged in the turn's note, not as a
-    call), never raises a second turn for the same events or the same stint of waits, and raises at
-    coordinator.jev_threshold (0.7)."""
-    p = make(env)
-    from ttp.daemon import Daemon
-    from ttp import coordcheck
-    p.set_config("providers.fake.tiers.light.effort", "low")
-    p.set_config("coordinator.repeat_waits_24h", 0)
-    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
-    d = Daemon(p.base)
-    d.update_gates()
-    clock = [time.time()]
-    calls = []
-    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append(k) or 70 + len(calls))
-    monkeypatch.setattr(time, "time", lambda: clock[0])
-
-    def event(kind, task=5, ago=0.0, severity="normal", status="queued"):
-        return p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                      (clock[0] - ago, "daemon", kind, severity, f"#{task} build: {kind}", status, task))
-
-    def turn(jev, handle=True):
-        d.jev = jev
-        clock[0] += 400
-        d.maybe_coordinate()
-        if handle:
-            p.db.x("UPDATE events SET status='handled'")
-        return calls[-1]
-
-    def n_calls():
-        return p.db.one("SELECT COUNT(*) n FROM jev_calls WHERE use='coord_effort'")["n"]
-
-    # Routine events (done, follow-ups, a fresh or short wait) cost no call; the note says it was skipped.
-    jev = _ThoughtJev(p=0.9)
-    for kind in ("task_done", "followup_proposed", "task_waiting"):
-        event(kind)
-        k = turn(jev)
-        assert k["unblock"] == "" and not jev.calls, kind
-        assert k["note"]["coord_check"]["verdict"] == "skipped" and k["note"]["coord_check"]["jev_call"] is None
-        assert k["note"]["coord_check"]["skipped"].startswith("no failed or blocked task")
-    assert n_calls() == 0, "a skipped check is not logged as a call, so it is neither charged nor scored"
-    # A wait older than coordinator.jev_wait_h is worth asking about; one under it is not.
-    p.db.x("DELETE FROM events")
-    event("task_waiting", task=6, ago=3 * 3600, status="handled")
-    event("task_waiting", task=6)
-    assert turn(jev)["note"]["coord_check"]["verdict"] == "skipped" and not jev.calls
-    p.set_config("coordinator.jev_wait_h", 2)
-    d.cfg = p.config()
-    event("task_waiting", task=6)
-    k = turn(jev, handle=False)
-    assert k["unblock"].startswith("jev: needs thought (") and len(jev.calls) == 1 and n_calls() == 1
-    # The same events (still queued: the raised turn failed or escalated) never raise a second turn.
-    k = turn(jev, handle=False)
-    assert k["unblock"] == "" and len(jev.calls) == 1 and n_calls() == 1
-    assert k["note"]["coord_check"] == {"jev_call": None, "verdict": "skipped",
-                                        "skipped": "already raised for these events"}
-    # Another re-wait in the same stint is the same long wait: keyed by task and stint start, it was
-    # raised already, so the turn skips the call.
-    start = p.db.one("SELECT MIN(ts) t FROM events WHERE task=6")["t"]
-    assert f"w6:{start}" in p.db.kv(coordcheck.RAISED_KEY)
-    event("task_waiting", task=6)
-    k = turn(jev)
-    assert k["unblock"] == "" and len(jev.calls) == 1 and n_calls() == 1
-    assert k["note"]["coord_check"]["skipped"] == "already raised for these events"
-
-    def long_wait(task):
-        event("task_waiting", task=task, ago=3 * 3600, status="handled")
-        event("task_waiting", task=task)
-
-    # Another task's long wait is new and asked about again.
-    long_wait(7)
-    assert turn(jev)["unblock"].startswith("jev: needs thought (") and len(jev.calls) == 2
-    # The threshold: 0.6 is routine at the default 0.7 and needs thought at a configured 0.5.
-    assert coordcheck.THRESHOLD == 0.7
-    long_wait(8)
-    k = turn(_ThoughtJev(p=0.6))
-    assert k["unblock"] == "" and k["note"]["coord_check"]["verdict"] == "routine"
-    p.set_config("coordinator.jev_threshold", 0.5)
-    d.cfg = p.config()
-    event("task_waiting", task=8)
-    assert turn(_ThoughtJev(p=0.6))["note"]["coord_check"]["verdict"] == "needs_thought"
-    # Failed or blocked tasks, high events and user messages are worth asking about too (the rules
-    # already raise such turns, so they are checked on worth_asking directly).
-    cfg = p.config()
-    for kind, sev in (("task_failed", "normal"), ("task_blocked", "normal"), ("observation", "high")):
-        keys, why = coordcheck.worth_asking(p.db, cfg, [event(kind, severity=sev)])
-        assert len(keys) == 1 and why, (kind, sev)
-    assert coordcheck.worth_asking(p.db, cfg, [], [42]) == (["m42"], "user message")
-    assert coordcheck.worth_asking(p.db, cfg, [event("task_done")])[0] == []
-
-
-def test_jev_coordinator_check_claims_no_saving_it_did_not_make_and_bookkeeping_never_stops_a_turn(env, monkeypatch):
-    """A needs_thought call claims no saving when its turn is lost, shut down, logged out or failed;
-    an escalated turn's extra cost over a routine one comes off its saving (all of it when wrong);
-    and a failing settle or set_ref never stops a turn from ending or starting."""
-    p = make(env)
-    from types import SimpleNamespace
-    from ttp.daemon import Daemon
-    from ttp import coordcheck, jevuse
-    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
-    d = Daemon(p.base)
-    now = time.time()
-    for effort, cost in (("low", 0.02), ("low", 0.04), ("high", 0.20)):
-        p.db.x("INSERT INTO runs(role,provider,effort,started,ended,status,cost_usd) VALUES(?,?,?,?,?,?,?)",
-               ("coordinator", "fake", effort, now - 60, now - 30, "ok", cost))
-    dec = {"verdict": "needs_thought", "escalated": True, "rules_effort": "low", "effort": "high"}
-
-    def call():
-        return jevuse.record(p.db, "coord_effort", dec, 0.0001, avoided_usd=0.05)
-
-    def finish(cid, status, r=None, note=None, usage=None):
-        d._finish_coordinator({"id": 9, "dir": "x", **(r or {})},
-                              usage or SimpleNamespace(structured=None, final_text="", error="boom", cost_usd=0.0),
-                              status, {"coord_check": {"jev_call": cid, "verdict": "needs_thought"}, **(note or {})})
-        return p.db.one("SELECT outcome, avoided_usd, note FROM jev_calls WHERE id=?", (cid,))
-
-    for status, r, note in (("lost", {"dir": ""}, {}), ("shutdown", {}, {}), ("auth", {}, {}),
-                            ("ok", {}, {"lost_to_sleep": True}), ("failed", {}, {})):
-        row = finish(call(), status, r, note)
-        assert row["outcome"] is None and row["avoided_usd"] == 0, (status, dict(row))
-    assert jevuse.stats(p.db, p.config())["coord_effort"]["saved"] == 0, "unscored calls save nothing"
-    monkeypatch.setattr("ttp.coordinator.apply", lambda *a, **k: [])
-    acted = SimpleNamespace(structured={"actions": [{"type": "config_set"}]}, final_text="", error="", cost_usd=0.11)
-    routine = SimpleNamespace(structured={"actions": [{"type": "task_add"}, {"type": "memory_add"}]},
-                              final_text="", error="", cost_usd=0.11)
-    idle = SimpleNamespace(structured={"actions": []}, final_text="", error="", cost_usd=0.11)
-    row = finish(call(), "ok", usage=acted)   # routine turns cost 0.03 on average: 0.08 extra
-    assert row["outcome"] == "right" and row["avoided_usd"] == pytest.approx(0.05 - 0.08)
-    row = finish(call(), "ok", usage=idle)
-    assert row["outcome"] == "wrong" and row["avoided_usd"] == pytest.approx(-0.08)
-    s = jevuse.stats(p.db, p.config())["coord_effort"]
-    assert s["saved"] == pytest.approx(-0.11) and s["net"] < 0, "the extra cost counts against the use"
-    # A raised turn that only did what a low-effort turn does: no change, saves nothing, pays the extra.
-    row = finish(call(), "ok", usage=routine)
-    assert row["outcome"] == "no change" and row["avoided_usd"] == pytest.approx(-0.08)
-    s = jevuse.stats(p.db, p.config())["coord_effort"]
-    assert s["saved"] == pytest.approx(-0.19) and s["no_change"] == 1 and s["right"] == 1
-    assert "no change 1" in jevuse.lines(p.db, p.config())[0]
-    # A call that did not raise its turn is charged nothing extra.
-    cid = jevuse.record(p.db, "coord_effort", {**dec, "escalated": False}, 0.0001, avoided_usd=0.05)
-    assert finish(cid, "ok", usage=acted)["avoided_usd"] == pytest.approx(0.05)
-    # Bookkeeping errors are logged; the failed turn still counts, the turn still starts.
-
-    def boom(*a, **k):
-        raise RuntimeError("db locked")
-    monkeypatch.setattr(coordcheck, "settle", boom)
-    monkeypatch.setattr(coordcheck, "unscored", boom)
-    p.db.set_kv("coordinator_failures", 0)
-    finish(call(), "failed")
-    assert int(p.db.kv("coordinator_failures", 0)) == 1
-    finish(call(), "auth")
-    finish(call(), "ok", usage=acted)
-    assert p.db.kv("last_coordinator_summary") is not None
-    monkeypatch.setattr(jevuse, "set_ref", boom)
-    monkeypatch.setattr(d, "_coord_check", lambda *a, **k: {"jev_call": call(), "verdict": "routine",
-                                                             "reason": "stuck 0.10"})
-    monkeypatch.setattr(d, "start_run", lambda *a, **k: 77)
-    p.set_config("providers.fake.tiers.light.effort", "low")
-    d.cfg = p.config()
-    d.update_gates()
-    p.db.x("DELETE FROM kv WHERE key IN ('last_coordinator_turn','coordinator_backoff_until')")
-    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-           (time.time() - 100, "daemon", "task_done", "normal", "#4 done", "queued"))
-    d.maybe_coordinate()
-    assert p.db.kv("last_coordinator_turn") and int(p.db.kv("coordinator_failures", 0)) == 0, "a started turn is no failure"
+    assert got == ["xhigh", "low", "medium"], "the tier's effort never sets the coordinator's"
 
 
 def coord_settable(key, value):
@@ -31127,7 +30748,7 @@ def _chain(p, n, status="done"):
     return ids
 
 
-def test_a_continue_chain_over_its_cap_is_refused_unless_a_raised_turn_names_what_changed(env):
+def test_a_continue_chain_over_its_cap_is_refused_unless_its_reason_names_what_changed(env):
     p = make(env)
     from ttp import audit, chaincap
     from ttp import coordinator as coord
@@ -31145,11 +30766,9 @@ def test_a_continue_chain_over_its_cap_is_refused_unless_a_raised_turn_names_wha
     coord.apply(p, [act])
     assert len(p.db.q("SELECT id FROM events WHERE kind=?", (chaincap.CAP_EVENT,))) == 1, "one event per lineage and hop"
     why = "new approach: parse the header once instead of per line"
-    problems = coord.apply(p, [dict(act, reason=why)])
-    assert any("only in a high-effort turn" in x for x in problems), "a routine turn passed the cap"
-    problems = coord.apply(p, [dict(act, reason="keep going, it is almost there")], high_effort=True)
+    problems = coord.apply(p, [dict(act, reason="keep going, it is almost there")])
     assert any("does not name what changed" in x for x in problems)
-    assert coord.apply(p, [dict(act, reason=why)], high_effort=True) == []
+    assert coord.apply(p, [dict(act, reason=why)]) == []
     (new,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tip,))
     assert p.db.one("SELECT 1 FROM events WHERE kind=?", (chaincap.OVERRIDE_EVENT,))
     assert any("past its cap" in x for x in p.db.kv(coord.NOTES_KEY))
@@ -40921,7 +40540,7 @@ def test_blocker_sweep_batches_fit_budget_and_cover_every_item_once(env):
     assert eid
 
 
-@pytest.mark.parametrize("pin,expected", [("", "high"), ("xhigh", "xhigh"), ("low", "low")])
+@pytest.mark.parametrize("pin,expected", [("", "xhigh"), ("xhigh", "xhigh"), ("low", "low")])
 def test_coordinator_launch_uses_resolved_effort_and_records_timeout(env, monkeypatch, pin, expected):
     from types import SimpleNamespace
     from ttp import daemon
@@ -40938,7 +40557,7 @@ def test_coordinator_launch_uses_resolved_effort_and_records_timeout(env, monkey
     logs = []
     monkeypatch.setattr(daemon, "log", lambda p, text: logs.append(text))
     rid = d.start_run("coordinator", "digest é", "fake", "light", str(p.base), read_only=True,
-                      system="system", context="context", unblock="blocker_sweep")
+                      system="system", context="context")
     row = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
     spec = json.loads((pathlib.Path(row["dir"]) / "run.json").read_text())
     details = json.loads(row["note"])["turn"]
@@ -40957,7 +40576,7 @@ def test_coordinator_launch_uses_resolved_effort_and_records_timeout(env, monkey
 
 def test_coordinator_dispatch_keeps_sweep_continuations_in_separate_turns(env, monkeypatch):
     from ttp import sweep
-    p, d, clock, calls = _escalate_turn(env, monkeypatch)
+    p, d, clock, calls = _routine_turn(env, monkeypatch)
     p.db.x("DELETE FROM events")
     p.set_config("coordinator.sweep_prompt_chars", 2048)
     d.cfg = p.config()
@@ -44927,7 +44546,6 @@ def _turn_budget_rig(p, monkeypatch, cost_of, flaky=lambda note: False):
     from ttp.daemon import Daemon
     p.set_config("coordinator.max_turns_per_hour", 100000)
     d = Daemon(p.base)
-    monkeypatch.setattr(d, "_coord_check", lambda *a, **k: None)
     turns = []
 
     def start_run(role, prompt, provider, tier, cwd, **kw):
