@@ -3177,16 +3177,27 @@ def memory_budget_line(p: Project) -> str:
             f"entry is only shortened (a standing `memory_add` that supersedes it), never retired for space")
 
 
-def worker_pinned_line(p: Project) -> str:
+def worker_pinned_line(p: Project, use: dict | None = None) -> str:
     """One line, for `ttp doctor` and the daily review, while memory pinned for workers outgrows its
-    room in their prompt, so some of it reaches them only as a pointer to memory/."""
+    room in their prompt, so some of it reaches them only as a pointer to memory/. `use`: a
+    worker_context usage already at hand."""
     from .prompts import worker_context
-    use = worker_context(p)[2]
+    use = use or worker_context(p)[2]
     if not use["pinned_dropped"]:
         return ""
     return (f"pinned worker memory over budget: {use['pinned_chars']} chars for {use['memory_limit']} of room "
             f"leaves {use['pinned_dropped']} of {use['pinned']} pinned entries out of worker prompts (they get "
             f"a pointer to memory/); merge or shorten restrictions, resources and entries for workers")
+
+
+def worker_pinned_total(p: Project) -> tuple[str, str]:
+    """For `ttp memory` once it adds an entry: (the memory pinned for workers against the room their
+    prompt leaves it, the warning worker_pinned_line gives once it outgrows that room, else "")."""
+    from .prompts import worker_context
+    use = worker_context(p)[2]
+    total = (f"pinned worker memory: {use['pinned_chars']} of {use['memory_limit']} chars "
+             f"({use['pinned']} entr{'y' if use['pinned'] == 1 else 'ies'})")
+    return total, worker_pinned_line(p, use)
 
 
 MEMORY_PINNED_HALF_KEY = "memory_pinned_half"   # kv: set once pinned memory alone takes over half the coordinator's

@@ -13793,6 +13793,39 @@ def test_memory_cli_takes_a_title_and_an_audience_for_an_entry_and_a_merge(env, 
         cli.main(["memory", "demo", "text", "--audience", "everyone"])
 
 
+def test_memory_cli_add_prints_the_pinned_worker_total_and_warns_once_it_outgrows_its_room(env, capsys):
+    """`ttp memory` adding an entry (or merging with --supersedes) prints the memory pinned for workers
+    against the room their prompt leaves it, from worker_context's own accounting; once it is over, a
+    warning names the totals and how many pinned entries fall out of worker prompts. A --forget alone
+    prints neither."""
+    p = make(env)
+    from ttp import cli
+    from ttp.prompts import worker_context
+    cli.main(["memory", "demo", "Never push to main.", "--kind", "restriction"])
+    out = capsys.readouterr()
+    use = worker_context(p)[2]
+    assert use["pinned"] == 1 and not use["pinned_dropped"]
+    assert f"pinned worker memory: {use['pinned_chars']} of {use['memory_limit']} chars (1 entry)" in out.out
+    assert "warning" not in out.out + out.err
+    old = _memories(p, [("restriction", f"RULE-{i:02} " + "r" * 900) for i in range(30)])
+    capsys.readouterr()
+    cli.main(["memory", "demo", "RULE-00 and RULE-01 merged. " + "m" * 900, "--kind", "restriction",
+              "--supersedes", old[0].stem, old[1].stem])
+    out = capsys.readouterr()
+    use = worker_context(p)[2]
+    n, total = use["pinned_dropped"], use["pinned_chars"]
+    assert n > 0 and total > use["memory_limit"]
+    assert f"pinned worker memory: {total} of {use['memory_limit']} chars ({use['pinned']} entries)" in out.out
+    assert out.err.startswith("warning: pinned worker memory over budget: "
+                              f"{total} chars for {use['memory_limit']} of room leaves {n} of {use['pinned']} "
+                              "pinned entries out of worker prompts"), out.err
+    cli.main(["memory", "demo", "A plain fact for workers.", "--kind", "fact"])
+    assert "warning: pinned worker memory over budget" in capsys.readouterr().err
+    cli.main(["memory", "demo", "--forget", old[2].stem])
+    out = capsys.readouterr()
+    assert "pinned worker memory" not in out.out + out.err
+
+
 def test_worker_policies_keep_their_own_room_beside_long_goals_and_large_pinned_memory(env):
     """Goals that take most of the workers' budget, a long Policies section and pinned memory several
     times its room: every Policies item for workers stays (they have room of their own, never less

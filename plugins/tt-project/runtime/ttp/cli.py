@@ -4605,6 +4605,15 @@ def cmd_prune(a) -> None:
     print(line)
 
 
+def _memory_room(p) -> None:
+    """After an entry is added: the pinned worker-memory total, and a warning once it is over its room."""
+    from .coordinator import worker_pinned_total
+    total, over = worker_pinned_total(p)
+    print(total)
+    if over:
+        print(f"warning: {over}", file=sys.stderr)
+
+
 def cmd_memory(a) -> None:
     from .coordinator import memory_budget_check
     p = need(a.name, sys.argv[1:])
@@ -4649,6 +4658,7 @@ def cmd_memory(a) -> None:
         for dst in done:
             print(f"retired to {dst}")
         memory_budget_check(p)
+        _memory_room(p)
         return
     try:
         if a.text:
@@ -4659,6 +4669,8 @@ def cmd_memory(a) -> None:
     for dst in done:
         print(f"retired to {dst}")
     memory_budget_check(p)
+    if a.text:
+        _memory_room(p)
     if spaced := [n for n in a.forget or [] if len(n.split()) > 1]:
         # --forget takes every word after it, so text written after it was read as an entry name.
         errors.append(f"{spaced[0]!r} is no entry name (names have no spaces): --forget takes every word "
