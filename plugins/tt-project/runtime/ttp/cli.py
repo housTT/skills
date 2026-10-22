@@ -4482,7 +4482,7 @@ def add_task(p, a) -> tuple[int, str]:
     tid = p.db.add_task(a.title, a.spec or "", kind=a.kind, tier=a.tier, priority=a.priority, origin="user",
                         budget_usd=budget if budget is not None else task_default_usd(p.config(), a.tier),
                         labels=defer_labels(after, when, start_why(d, {}, when)), not_before=after)
-    stale = marker_only_probe(when)
+    stale = marker_only_probe(when, p.root)
     return tid, (f"; starts when: {when}" if when else "") \
         + (f"; starts after {timefmt.long(after, p)}" if after else "") + (f"; flagged: {stale}" if stale else "")
 
@@ -4494,7 +4494,8 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
     model-free completion command; `probe` None then keeps its retry_when. The first rewrite keeps
     what the run's result.json says as retry_when_orig / on_pass_cmd_orig, so the daemon still
     takes that result.json as the hand-off the task waits on (daemon._same_probe)."""
-    from .coordinator import _start_args, check_probe, check_task_refs, defer_labels, marker_only_probe, start_why
+    from .coordinator import (_start_args, check_probe, check_task_refs, defer_labels, marker_only_probe,
+                              missing_file_probe, start_why)
     from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result, without_deferral
     if probe is None and on_pass_cmd is None:
         raise ValueError("set-when needs the probe command (\"\" clears it) or --on-pass-cmd")
@@ -4524,7 +4525,7 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
             db.update_task(tid, result=dump_result(prev))
             if probe is not None:
                 from .waitheal import probe_flag
-                end = probe_flag(probe)
+                end = probe_flag(probe) or missing_file_probe(probe, p.root if p else None, "retry_when")
                 said.append("retry_when " + (f"set: {probe.strip()}" if probe.strip()
                                              else "cleared; it wakes at its retry timer")
                             + (f"; flagged: {end}" if end else ""))
@@ -4538,7 +4539,7 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
         after, when = _start_args({"start_when": probe}, cur, p)
         db.update_task(tid, labels=without_deferral(json.loads(task["labels"] or "[]"))
                        + defer_labels(after, when, start_why({}, cur, when)), not_before=after)
-        stale = marker_only_probe(when) if when != cur.get("when") else None
+        stale = marker_only_probe(when, p.root if p else None) if when != cur.get("when") else None
         return f"task #{tid} start_when " + (f"set: {when}" if when else "cleared") \
             + (f"; flagged: {stale}" if stale else "")
 

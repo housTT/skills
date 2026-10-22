@@ -1182,14 +1182,73 @@ _FILE_TEST = r"(?:test\s+-[efs]\s+\S+|\[\[?\s+-[efs]\s+\S+\s+\]\]?)"
 _MARKER_ONLY = re.compile(rf"\s*{_FILE_TEST}(?:\s*&&\s*{_FILE_TEST})*\s*")
 
 
-def marker_only_probe(probe: str | None) -> str | None:
+# Commands that fail (grep: exit 2) on a file that is not there, rather than answering "not yet". A
+# file test (`test -e`) is left out: waiting for a file to appear is a valid probe.
+_FILE_READERS = frozenset(("grep", "egrep", "fgrep", "cat", "head", "tail", "jq", "sed", "awk", "wc", "diff",
+                           "cmp", "sh", "bash", "python", "python3", "source", "."))
+_REL_FILE = re.compile(r"(?:\.{1,2}/)*[\w.-]+(?:/[\w.@+-]+)*/[\w@+-][\w.@+-]*\.\w+|[\w@+-][\w.@+-]*\.\w+")
+_LOCAL_ONLY_NOT = re.compile(r"\b(?:ssh|scp|rsync|cd|pushd|docker|kubectl|srun|sbatch)\b|--remote\b|--host\b")
+
+
+def missing_file_probe(probe: str | None, root: Path | str | None, what: str = "start_when") -> str | None:
+    """A hint when a probe reads (grep, cat, jq, ...) a project-relative file that does not exist under
+    `root`, the folder the daemon runs probes in: such a probe never passes, and `... || exit 1` hides
+    grep's exit 2 (broken) as 1 (not yet), so the daemon cannot see it is broken. Only clear cases:
+    a relative path with a folder and a file extension, read by a local command (no ssh, cd or remote
+    runner), never a pattern, script or filter. None otherwise."""
+    if not probe or not root or landed.LANDED_PROBE.fullmatch(probe) or _LOCAL_ONLY_NOT.search(probe):
+        return None
+    try:
+        lex = shlex.shlex(probe, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return None
+    cmds, cur = [], []
+    for w in words + [";"]:
+        if w in ("&&", "||", "|", ";", "&", "(", ")", ";;"):
+            cmds.append(cur)
+            cur = []
+        elif w not in ("!", "{", "}") and not re.fullmatch(r"\d*[<>&]+\d*-?", w):   # redirects stay out
+            cur.append(w)
+    for cmd in cmds:
+        while cmd and (re.fullmatch(r"\w+=\S*", cmd[0]) or cmd[0] in ("env", "nice", "command", "exec")):
+            cmd = cmd[1:]
+        if cmd and cmd[0] == "timeout" and len(cmd) > 2:
+            cmd = cmd[2:]
+        if not cmd or Path(cmd[0]).name not in _FILE_READERS:
+            continue
+        args = list(cmd[1:])
+        name = Path(cmd[0]).name
+        if name == "jq" or name in ("grep", "egrep", "fgrep", "sed", "awk") and not any(
+                re.fullmatch(r"-[a-zA-Z]*[ef]", w) or w.startswith(("--regexp", "--file", "--expression"))
+                for w in args):
+            pos = [i for i, w in enumerate(args) if not w.startswith("-")]
+            if pos:
+                del args[pos[0]]   # the pattern, script or filter
+        for w in args:
+            if w.startswith("-") or not _REL_FILE.fullmatch(w) or "/" not in w.lstrip("./"):
+                continue
+            if not Path(root, w).exists():
+                return (f"{what} {clip(probe, 120)!r} reads {w}, which does not exist under the project root (the "
+                        f"folder probes run in): it never passes, and `|| exit 1` would hide grep's exit 2 "
+                        f"(broken) as 1 (not yet). Fix the path (relative to the project root) or use an "
+                        f"absolute one")
+    return None
+
+
+def marker_only_probe(probe: str | None, root: Path | str | None = None) -> str | None:
     """A hint when a start_when only checks that a readiness marker file exists, or waits over ssh
     only for an end marker with no dead-driver check (waitheal.end_marker_only), or greps a status
-    section header that is always printed (waitheal.header_grep), else None."""
+    section header that is always printed (waitheal.header_grep), or (with the project `root`) reads
+    a project-relative file that does not exist (missing_file_probe), else None."""
     from .waitheal import probe_flag
     end = probe_flag(probe)
     if end:
         return f"start_when {clip(probe, 120)!r} {end}"
+    missing = missing_file_probe(probe, root)
+    if missing:
+        return missing
     if not probe or not _MARKER_ONLY.fullmatch(probe) or not re.search(r"ready", probe, re.I):
         return None
     return (f"start_when {clip(probe, 120)!r} only checks a readiness marker file, which can outlive the "
@@ -1518,7 +1577,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 except MissingTaskRef as e:
                     raise MissingTaskRef(f"{json.dumps(title, ensure_ascii=False)}: {e}") from None
                 labels += defer_labels(after, when, start_why(a, {}, when))
-                stale = marker_only_probe(when)
+                stale = marker_only_probe(when, p.root)
                 why = prguard.spec_problem(db, a.get("spec") or "")
                 if why:
                     raise DraftGateRejection(f"task_add rejected: {why}")
@@ -1669,7 +1728,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
                     upd["labels"] = without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
                     upd["not_before"] = after
-                    stale = marker_only_probe(when) if when != cur.get("when") else None
+                    stale = marker_only_probe(when, p.root) if when != cur.get("when") else None
                     if stale:
                         notes.append(f"task_update: #{task['id']} flagged: {stale}")
                 # The daemon blocks a queued task on a dead dependency at once, so accepting this
@@ -1736,6 +1795,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 db.update_task(task["id"], **upd)
                 if waits == anchors.label("ask", anchors.NEW_ASK):
                     new_ask_holds.append((k, task, upd))
+                held_on = anchors.label("when", "")
+                if waits and waits.startswith(held_on) and waits not in json.loads(task["labels"] or "[]"):
+                    if bad := missing_file_probe(waits[len(held_on):], p.root, "waits_on when"):
+                        notes.append(f"task_update: #{task['id']} flagged: {bad}")
                 if spec and task["status"] == "running":
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
                         if r["dir"]:

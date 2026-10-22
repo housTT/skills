@@ -8400,7 +8400,8 @@ def test_a_start_when_probe_waits_for_start_after(env, monkeypatch):
 # Defer time does not run the probe (check_start_when): one that cannot work (127, a bare `git
 # cat-file -e`'s 128) is accepted then, and raised by the daemon's first run of it.
 @pytest.mark.parametrize("probe, why", [("exit 3", "exit 3"), ("sleep 30", "timeout"), ("now-ish", "exit 127"),
-                                        ("git cat-file -e 0123456789abcdef", "exit 128")])
+                                        ("git cat-file -e 0123456789abcdef", "exit 128"),
+                                        ("grep -q ready no-such-dir/status.md", "exit 2")])
 def test_a_broken_start_when_raises_one_event_and_never_a_worker_run(env, monkeypatch, probe, why):
     p = make(env)
     from ttp import coordinator as coord
@@ -8420,6 +8421,68 @@ def test_a_broken_start_when_raises_one_event_and_never_a_worker_run(env, monkey
     assert len(ev) == 1 and ev[0]["status"] == "queued" and f"broken ({why}" in ev[0]["text"], ev
     assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
     assert not p.db.q("SELECT id FROM runs WHERE task=?", (tid,))
+
+
+
+@pytest.mark.parametrize("probe, why", [("grep -q ready no-such-dir/status.md", "exit 2"),
+                                        ("no-such-command-here", "exit 127")])
+def test_a_broken_waits_on_when_probe_raises_one_event_and_a_log_line(env, monkeypatch, probe, why):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid = _hold_task(p)
+    coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": f"when:{probe}"}])
+    for _ in range(4):   # several polls: still one event
+        d.sweep_holds()
+        if tid in d._probes:
+            d._probes[tid][0].wait(30)
+        d.probe_waiting()
+    ev = p.db.q("SELECT text, status FROM events WHERE kind='hold_probe_broken' AND task=?", (tid,))
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and f"broken ({why};" in ev[0]["text"], ev
+    assert p.db.task(tid)["status"] == "blocked"
+    log_text = (p.logs / "daemon.log").read_text()
+    assert log_text.count(f"task {tid} hold_probe_broken ({why})") == 1, log_text[-2000:]
+
+
+
+@pytest.mark.parametrize("probe, flagged", [
+    ("grep -q 'Device broker' harness/CHARTER.md || exit 1", True),   # the path is not under the project root
+    ("cat out/a/state.json | grep -q done", True),
+    ("! grep -q done logs/run.log && exit 1", True),
+    ("grep -q tt-project tt-project/harness/CHARTER.md || exit 1", False),   # there
+    ("test -e out/job.rc", False),                                           # waiting for a file to appear
+    ("ssh box grep -q done out/run.log", False),                             # remote, not under the root
+    ("cd sub && grep -q x a/b.md", False),                                   # another folder
+    ("grep -q 'a/b.md' tt-project/harness/CHARTER.md", False),               # a pattern, not a file
+    ("jq -e .ok $HOME/out/state.json", False),
+    ("landed:#1", False),
+])
+def test_a_probe_reading_a_missing_project_relative_file_is_flagged(env, probe, flagged):
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    (p.root / "tt-project" / "harness").mkdir(parents=True, exist_ok=True)
+    (p.root / "tt-project" / "harness" / "CHARTER.md").write_text("# charter\n")
+    hit = coord.missing_file_probe(probe, p.root)
+    assert bool(hit) is flagged, hit
+    if not flagged:
+        return
+    assert "does not exist under the project root" in hit and "exit 2" in hit
+    assert coord.apply(p, [{"type": "task_add", "title": "deferred", "spec": "s", "start_when": probe}]) == []
+    tid = _added(p, "deferred")
+    notes = p.db.kv(coord.NOTES_KEY)
+    assert len(notes) == 1 and f"#{tid} added; flagged: start_when" in notes[0] and "does not exist" in notes[0]
+    assert f"start_when:{probe}" in _labels(p, tid)   # a flag, never a refusal
+    held = _hold_task(p)
+    assert coord.apply(p, [{"type": "task_update", "id": held, "status": "blocked", "waits_on": f"when:{probe}"}]) == []
+    notes = p.db.kv(coord.NOTES_KEY)
+    assert len(notes) == 1 and f"#{held} flagged: waits_on when" in notes[0], notes
+    cli.set_when(p.db, tid, "", p)
+    assert "; flagged: start_when" in cli.set_when(p.db, tid, probe, p)
+    waiting = _due_waiting_task(p, "exit 1")
+    assert "; flagged: retry_when" in cli.set_when(p.db, waiting, probe, p)
 
 
 

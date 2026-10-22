@@ -6818,6 +6818,7 @@ class Daemon:
                                  f"({why}; only 0 = over and 1, 75 or 255 = not yet are valid): {probe[:300]}. It "
                                  f"keeps running; decide: task_update waits_on with a fixed probe, requeue the "
                                  f"task, or cancel it.", "queued", tid))
+                    log(self.p, f"task {tid} hold_probe_broken ({why}); raised to the coordinator")
         if tid not in self._probes and now - self._probed.get(tid, 0) >= PROBE_EVERY_S:
             self._start_probe(tid, probe, now, "waits_on when")
         return ""
