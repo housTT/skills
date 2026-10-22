@@ -90,7 +90,8 @@ FIELD_NOTES = {
     "required_change": "What the port has to change.",
     "host_work": "Work done on the host.",
     "when": "When and how often it runs.",
-    "counts_as_host_op": "yes: runs on the host once per inference inside the forward, so it adds to host time.",
+    "counts_as_host_op": "⚠️ yes: runs on the host once per inference inside the forward, so it adds to host time. "
+                         "✅ no: outside the forward (test setup, weight preparation, reference computation).",
     "reason": "Why it counts or not.",
     "op_type": "tt_dnn_device for a device op; tt_dnn_cpu or python_fallback for host work.",
     "attributes": "Op attributes Tracy recorded (program config and others).",

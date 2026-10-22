@@ -296,6 +296,7 @@ def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str,
 
 
 REVIEW_MARK = {"gap": "❌ gap", "renamed": "✅ renamed", "not a gap": "✅ not a gap"}
+HOST_OP_MARK = {"yes": "⚠️ yes", "no": "✅ no"}
 CANDIDATES = ("missing", "signature differs")
 LONG_TEXT_CHARS = 300
 
@@ -306,6 +307,8 @@ def csv_value(column: str, row: dict, source: str) -> str:
         if value:
             return REVIEW_MARK.get(value, value)
         return "⏳ not reviewed" if row.get("quasar_status") in CANDIDATES else ""
+    if column == "counts_as_host_op":
+        return HOST_OP_MARK.get(value, value)
     if column == "attributes" and len(value) > LONG_TEXT_CHARS:
         # Tracy's attribute dumps run to kilobytes; the sheet keeps the start and points at the file.
         return value[:LONG_TEXT_CHARS] + f" … (cut; whole in {source})"

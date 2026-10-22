@@ -2327,3 +2327,11 @@ def test_llk_gap_review_carries_an_icon(tmp_path):
          "cache_rows", "kernels"])
     gaps = tab(sheet(run), "LLK gaps (Quasar)")
     assert [r[4] for r in gaps[1:]] == ["❌ gap", "✅ renamed", "⏳ not reviewed", ""]
+
+
+def test_host_work_flag_carries_an_icon(tmp_path):
+    host = [{"id": "1", "host_work": "torch.cat", "when": "per inference", "counts_as_host_op": "yes", "reason": "r"},
+            {"id": "2", "host_work": "weights", "when": "once", "counts_as_host_op": "no", "reason": "r"}]
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)], host_ops=host)
+    rows = tab(sheet(run), "Host work in code")
+    assert [r[3] for r in rows[1:]] == ["⚠️ yes", "✅ no"]
