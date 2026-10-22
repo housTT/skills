@@ -41,6 +41,10 @@ def run_script(name: str, *args: str) -> subprocess.CompletedProcess[str]:
                           capture_output=True, text=True)
 
 
+def run_merge(*args: str) -> subprocess.CompletedProcess[str]:
+    return run_script("merge_measured.py", *args, "--tracy-mode", "live")
+
+
 def write_rows(path: pathlib.Path, rows: list[dict], fieldnames: list[str] | None = None) -> None:
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames or list(rows[0].keys()))
@@ -726,7 +730,7 @@ def test_merge_marks_static_rows_seen(tmp_path):
     rows = [op_row(1, 1, op_code="A"), op_row(2, 1, op_code="B")]
     run = make_static_run(tmp_path, rows, [trace_row(1, 2, 1)])
     m = measured_seq(tmp_path / "m.csv", ["A"])
-    assert run_script("merge_measured.py", str(run), str(m)).returncode == 0
+    assert run_merge(str(run), str(m)).returncode == 0
     got = read(run / "op_table.csv")
     assert [r["origin"] for r in got] == ["static+measured", "static"]
 
@@ -735,7 +739,7 @@ def test_merge_inserts_measured_only_in_order(tmp_path):
     rows = [op_row(1, 1, op_code="A"), op_row(2, 1, op_code="B")]
     run = make_static_run(tmp_path, rows, [trace_row(1, 2, 1)])
     m = measured_seq(tmp_path / "m.csv", ["A", "X", "X", "B"])
-    assert run_script("merge_measured.py", str(run), str(m)).returncode == 0
+    assert run_merge(str(run), str(m)).returncode == 0
     got = read(run / "op_table.csv")
     assert [(r["id"], r["op_code"], r["origin"], r["p150:launches"]) for r in got] == [
         ("1", "A", "static+measured", "1"), ("2", "X", "measured", "2"), ("3", "B", "static+measured", "1")]
@@ -749,8 +753,8 @@ def test_merge_is_idempotent(tmp_path):
     rows = [op_row(1, 1, op_code="A")]
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 1)])
     m = measured_seq(tmp_path / "m.csv", ["A", "X"])
-    run_script("merge_measured.py", str(run), str(m))
-    run_script("merge_measured.py", str(run), str(m))
+    run_merge(str(run), str(m))
+    run_merge(str(run), str(m))
     assert [r["op_code"] for r in read(run / "op_table.csv")] == ["A", "X"]
 
 
@@ -1093,17 +1097,17 @@ def test_merge_inserts_after_the_occurrence_that_ran(tmp_path):
             op_row(3, 1, op_code="A", stage="s2 a"), op_row(4, 1, op_code="C", stage="s2 c")]
     run = make_static_run(tmp_path, rows, [trace_row(1, 4, 1)])
     m = measured_seq(tmp_path / "m.csv", ["A", "X", "B", "A", "C"])
-    run_script("merge_measured.py", str(run), str(m))
+    run_merge(str(run), str(m))
     assert [r["stage"] for r in read(run / "op_table.csv")] == ["s1 a", "measured only X", "s1 b", "s2 a", "s2 c"]
 
 
 def test_merge_divides_by_inferences(tmp_path):
     run = make_static_run(tmp_path, [op_row(1, 1, op_code="A")], [trace_row(1, 1, 1)])
     m = measured_seq(tmp_path / "m.csv", ["A", "X", "A", "X"])
-    assert run_script("merge_measured.py", str(run), str(m), "--inferences", "2").returncode == 0
+    assert run_merge(str(run), str(m), "--inferences", "2").returncode == 0
     assert read(run / "op_table.csv")[1]["p150:launches"] == "1"
     bad = measured_seq(tmp_path / "m3.csv", ["A", "X", "X", "X"])
-    r = run_script("merge_measured.py", str(run), str(bad), "--inferences", "2")
+    r = run_merge(str(run), str(bad), "--inferences", "2")
     assert r.returncode == 2 and "not divisible" in r.stdout
 
 
@@ -1117,7 +1121,7 @@ def test_merge_entry_pass_decides_source_statuses_again(tmp_path):
             op_row(5, 1, op_code="C", **{"p150:status": "❌", "p150:evidence": "TT_FATAL at x.cpp:1"})]
     run = make_static_run(tmp_path, rows, [trace_row(1, 5, 1)])
     m = measured_seq(tmp_path / "m.csv", ["A", "M", "C"])
-    r = run_script("merge_measured.py", str(run), str(m), "--entry-pass", "PCC 0.99", "--date", "2026-10-13")
+    r = run_merge(str(run), str(m), "--entry-pass", "PCC 0.99", "--date", "2026-10-13")
     assert r.returncode == 0, r.stdout
     assert "row 5: p150 status is ❌ but the passing entry test launched C" in r.stdout
     got = {x["id"]: (x["p150:status"], x["p150:evidence"]) for x in read(run / "op_table.csv")}
@@ -1138,14 +1142,14 @@ def test_merge_entry_pass_keeps_ci_record(tmp_path):
     data = json.loads((run / "run.json").read_text())
     data["entry_test_passes"] = {"ci": "perf.yaml: p150"}
     (run / "run.json").write_text(json.dumps(data))
-    run_script("merge_measured.py", str(run), str(measured_seq(tmp_path / "m.csv", ["A"])), "--entry-pass", "PCC 0.99")
+    run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A"])), "--entry-pass", "PCC 0.99")
     assert json.loads((run / "run.json").read_text())["entry_test_passes"]["ci"] == "perf.yaml: p150"
     assert "in CI (perf.yaml: p150) and on a local P150" in read(run / "op_table.csv")[0]["p150:evidence"]
 
 
 def test_merge_without_entry_pass_leaves_statuses_and_validator_warns(tmp_path):
     run = make_static_run(tmp_path, [no_pass_row(1, "A")], [trace_row(1, 1, 1)])
-    run_script("merge_measured.py", str(run), str(measured_seq(tmp_path / "m.csv", ["A"])))
+    run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A"])))
     assert read(run / "op_table.csv")[0]["p150:status"] == "⚠️"
     assert "WARNING" not in validate(run).stdout
     data = json.loads((run / "run.json").read_text())
@@ -1163,14 +1167,14 @@ def test_merge_with_blackhole_destination_validates(tmp_path):
         del rows[0][col]
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 1), trace_row(2, 1, 1, profile="p100")],
                           destination="p100")
-    run_script("merge_measured.py", str(run), str(measured_seq(tmp_path / "m.csv", ["A", "X"])))
+    run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A", "X"])))
     v = validate(run)
     assert v.returncode == 0, v.stdout
 
 
 def test_kernel_ops_reads_measured_from_run_json(tmp_path):
     run = make_static_run(tmp_path, [op_row(1, 1, op_code="A")], [trace_row(1, 1, 1)])
-    run_script("merge_measured.py", str(run), str(measured_seq(tmp_path / "m.csv", ["A", "A"])))
+    run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A", "A"])))
     run_script("kernel_ops.py", str(run))
     got = read(run / "kernel_ops.csv")[0]
     assert (got["origin"], got["measured_launches_op_code"]) == ("static+measured", "2")
@@ -1314,7 +1318,7 @@ def test_kernel_ops_has_statuses_per_target(tmp_path):
 
 def test_add_destination_after_merge(tmp_path):
     run = make_static_run(tmp_path, [op_row(1, 1, op_code="A")], [trace_row(1, 1, 1)])
-    run_script("merge_measured.py", str(run), str(measured_seq(tmp_path / "m.csv", ["A", "X"])))
+    run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A", "X"])))
     data = json.loads((run / "run.json").read_text())
     data["destinations"].append("p100")
     (run / "run.json").write_text(json.dumps(data))
@@ -1338,7 +1342,7 @@ def test_merge_fills_every_destination(tmp_path):
     data = json.loads((run / "run.json").read_text())
     data["destinations"] = ["quasar-bf16", "p100"]
     (run / "run.json").write_text(json.dumps(data))
-    run_script("merge_measured.py", str(run), str(measured_seq(tmp_path / "m.csv", ["A", "X"])))
+    run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A", "X"])))
     added = read(run / "op_table.csv")[1]
     assert (added["p100:shapes"], added["quasar-bf16:test_result"]) == ("not traced", "not run")
     result = validate(run)
@@ -2095,7 +2099,7 @@ def test_info_bring_up_checks(tmp_path):
             op_row(3, 2, grid_dependency="shard spec at models/a/tt/model.py:12 and models/a/tt/model.py:40")]
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 6)])
     data = json.loads((run / "run.json").read_text())
-    data.update({"profile_values": {"arch": "blackhole", "compute_grid": "13x10"},
+    data.update({"tracy_mode": "live", "profile_values": {"arch": "blackhole", "compute_grid": "13x10"},
                  "configurable_layers": {"value": "yes", "evidence": "MODEL_NUM_LAYERS read at models/a/tt/model.py:5"},
                  "entry_test_passes": {"by": "source:tracy on a local p150 device", "date": "2026-10-20",
                                        "result": "PCC 0.99"},
@@ -2110,9 +2114,7 @@ def test_info_bring_up_checks(tmp_path):
     info = info_rows(sheet(run))
     assert info["End-to-end test"] == "✅ passed: PCC 0.99 (source:tracy on a local p150 device, 2026-10-20)"
     host = info["Host fallback"].lstrip("'")
-    assert host.startswith("⚠️ 5 of 100 ops on the host (5.0%), 4.20% of the time")
-    assert "3 host transfers between the first and the last launch over 2 inference(s)" in host
-    assert "1 host steps per inference" in host
+    assert host.startswith("⚠️ 5 of 100 ops on the host (5.0%), 4.20% of the time (Tracy live")
     assert info["Test hardware"] == "P150: arch blackhole, compute grid 13x10"
     assert info["Peak DRAM"].lstrip("'").startswith("812.5 MiB allocated at once")
     grid = info["Blockers to a smaller grid"]
@@ -2338,11 +2340,14 @@ def test_host_work_flag_carries_an_icon(tmp_path):
 
 
 @pytest.mark.parametrize("device_ops,host_ops,code_steps,mark", [
-    (100, 0, 0, "✅"), (100, 0, 1, "⚠️"), (95, 5, 0, "⚠️"), (90, 10, 0, "❌")])
+    (100, 0, 0, "✅"), (100, 0, 1, "✅"), (95, 5, 0, "⚠️"), (90, 10, 0, "❌")])
 def test_host_fallback_icon(tmp_path, device_ops, host_ops, code_steps, mark):
     host = [{"id": str(i), "host_work": "w", "when": "per inference", "counts_as_host_op": "yes", "reason": "r"}
             for i in range(1, code_steps + 1)]
     run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)], host_ops=host)
+    data = json.loads((run / "run.json").read_text())
+    data["tracy_mode"] = "live"
+    (run / "run.json").write_text(json.dumps(data))
     write_rows(run / "host_fallback.csv", [{"scope": "model", "window": "warm", "device_ops": str(device_ops),
                                            "host_ops": str(host_ops), "device_op_time_ms": "1", "host_op_time_ms": "0",
                                            "total_time_ms": "1", "host_pct_of_total": "0.00"}])
@@ -2375,3 +2380,18 @@ def test_info_counts_llk_gaps(tmp_path):
     info = tab(spec, "Info")
     start = info.index(["LLK gaps (Quasar)", "Count"])
     assert info[start + 1][1] == 3
+
+
+def test_host_fallback_needs_a_live_tracy_run(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    write_rows(run / "host_fallback.csv", [{"scope": "model", "window": "warm", "device_ops": "100", "host_ops": "0",
+                                           "device_op_time_ms": "1", "host_op_time_ms": "0", "total_time_ms": "1",
+                                           "host_pct_of_total": "0.00"}])
+    assert info_rows(sheet(run))["Host fallback"].startswith("not decided")
+    data = json.loads((run / "run.json").read_text())
+    for mode, start in (("trace", "⚠️ not measured"), ("live", "✅ 0 of 100 ops on the host")):
+        data["tracy_mode"] = mode
+        (run / "run.json").write_text(json.dumps(data))
+        assert info_rows(sheet(run))["Host fallback"].lstrip("'").startswith(start)
+    m = measured_seq(tmp_path / "m.csv", ["Op1DeviceOperation"])
+    assert run_script("merge_measured.py", str(run), str(m)).returncode == 2

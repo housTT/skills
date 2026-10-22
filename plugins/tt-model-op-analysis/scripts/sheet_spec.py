@@ -426,37 +426,33 @@ def entry_test_state(run: dict) -> str:
 HOST_SHARE_WARN = 5.0
 
 
-def host_fallback_mark(share: float | None, code_steps: int) -> str:
-    """✅ no host op, ⚠️ up to 5% of ops, ❌ above. Tracy does not see torch calls in the model code, so host steps
-    the static trace found keep a 0% run at ⚠️."""
-    if share is None:
-        return ""
+def host_fallback_mark(share: float) -> str:
+    """✅ no host op, ⚠️ up to 5% of ops, ❌ above."""
     if share > HOST_SHARE_WARN:
         return "❌ "
-    if share > 0 or code_steps:
-        return "⚠️ "
-    return "✅ "
+    return "⚠️ " if share > 0 else "✅ "
 
 
 def host_fallback_state(run_dir: pathlib.Path, run: dict) -> str:
-    parts, share = [], None
+    """Host fallback from the Tracy run, which must call the forward live: a replayed device trace never
+    re-enters the forward, so it shows no host op whatever the model does."""
     path = run_dir / "host_fallback.csv"
-    if path.exists():
-        for row in read_csv(path):
-            device, host = int(row["device_ops"] or 0), int(row["host_ops"] or 0)
-            row_share = 100 * host / (device + host) if device + host else 0.0
-            share = max(share or 0.0, row_share)
-            parts.append(f"{host} of {device + host} ops on the host ({row_share:.1f}%), {row['host_pct_of_total']}% of "
-                         f"the time (Tracy, {row['window']})")
-    graph = run.get("graph_capture") or {}
-    if graph:
-        parts.append(f"{graph.get('host_transfers_inside', 0)} host transfers between the first and the last launch "
-                     f"over {graph.get('inferences', 1)} inference(s) (graph capture; Graph: host transfers tab)")
-    host_ops = run_dir / "host_ops.csv"
-    steps = sum(r["counts_as_host_op"] == "yes" for r in read_csv(host_ops)) if host_ops.exists() else 0
-    if host_ops.exists():
-        parts.append(f"{steps} host steps per inference in the model code (static trace)")
-    return host_fallback_mark(share, steps) + "; ".join(parts) if parts else "not measured"
+    if not path.exists():
+        return "not measured: needs a Tracy run of the entry test in live mode"
+    mode = run.get("tracy_mode")
+    if mode == "trace":
+        return ("⚠️ not measured: the Tracy run replayed a device trace, which never re-enters the forward; "
+                "run it live")
+    if mode != "live":
+        return "not decided: the Tracy run does not record whether it ran live or replayed a trace"
+    parts, share = [], 0.0
+    for row in read_csv(path):
+        device, host = int(row["device_ops"] or 0), int(row["host_ops"] or 0)
+        row_share = 100 * host / (device + host) if device + host else 0.0
+        share = max(share, row_share)
+        parts.append(f"{host} of {device + host} ops on the host ({row_share:.1f}%), {row['host_pct_of_total']}% of "
+                     f"the time (Tracy live, {row['window']})")
+    return host_fallback_mark(share) + "; ".join(parts)
 
 
 def peak_dram_state(run_dir: pathlib.Path, run: dict) -> str:

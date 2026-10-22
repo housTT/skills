@@ -61,7 +61,7 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
    | Run | Items | Command |
    |---|---|---|
    | capture | `source:graph`, `source:cache` | `TT_METAL_CACHE=<cache dir> TT_METAL_RISCV_DEBUG_INFO=1 OPA_GRAPH_CAPTURE=<capture file> PYTHONPATH=<plugin-root>/pytest_plugins:$PYTHONPATH pytest -p opa_graph_capture --timeout <s> <node id>` |
-   | profile | `source:tracy` | `python -m tracy -p -r -v -m "pytest --timeout <s> <node id>"` (needs a profiler build) |
+   | profile | `source:tracy` | `python -m tracy -p -r -v -m "pytest --timeout <s> <node id>"` (needs a profiler build), live |
 
    With only `source:cache`, drop `OPA_GRAPH_CAPTURE`, `PYTHONPATH` and `-p opa_graph_capture`;
    with only `source:graph`, drop `TT_METAL_CACHE` and `TT_METAL_RISCV_DEBUG_INFO`.
@@ -79,6 +79,14 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
    broker killing it. A capture run that times out leaves a partial cache and capture file:
    ask the user before deleting them, then rerun into an empty directory.
 
+   Tracy runs the forward **live**: the test calls the model's forward in the profiled window. A test
+   that captures a device trace and replays it never re-enters the forward during the replay, so Tracy
+   then shows no host dispatch and no host fallback, whatever the model does. When the entry test
+   has a live and a trace variant (`-k live`), pick the live one; when it only replays a trace,
+   profile the model's live test instead (a PCC test of the same implementation) or an approved
+   temporary copy that calls the forward directly (run-setup.md), and record which. The sheet's host
+   fallback comes from this run only.
+
    The empty cache directory makes every kernel compile in the capture run, so the cache holds
    this test's kernels only. Debug info adds DWARF to the ELFs and does not change the kernel
    code. If the test has `op-analysis-start` / `op-analysis-end` signposts the Tracy window is warm;
@@ -92,7 +100,8 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
    `python3 <plugin-root>/scripts/tracy_report.py <csv> <run dir> [--start op-analysis-start --end op-analysis-end]`
    writes `measured_ops.csv`, `host_fallback.csv` and `footprint.csv`. Pass `--peak-dram-mb` only
    with a measured value. Record the raw CSV path in `run.json` (`ops_csv`).
-6. `python3 <plugin-root>/scripts/merge_measured.py <run dir> <run dir>/measured_ops.csv --inferences <n>`,
+6. `python3 <plugin-root>/scripts/merge_measured.py <run dir> <run dir>/measured_ops.csv --tracy-mode live --inferences <n>`
+   (`--tracy-mode trace` only to record an old traced run; its host fallback is then shown as not measured),
    where `<n>` is the number of forward passes in the measured window (1 for a warm signposted
    window; a cold window over the whole test counts every forward the test runs). Static rows seen
    in Tracy become `static+measured`; op codes only Tracy shows become `measured` rows after the

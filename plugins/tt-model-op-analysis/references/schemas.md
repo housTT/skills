@@ -136,8 +136,8 @@ template configurations), `cache_rows`, `kernels`.
 ## Bring-up checks (Info tab)
 
 `sheet_spec.py` derives them, never by hand: end-to-end test (✅ from `entry_test_passes`, ❌ from a
-later `entry_test_failure`), host fallback (host op count and time share from `host_fallback.csv`,
-host transfers from `graph_capture`, host steps from `host_ops.csv`), test hardware
+later `entry_test_failure`), host fallback (host op count and time share from `host_fallback.csv` of a
+live Tracy run, `run.json` `tracy_mode`: ✅ 0% of ops on the host, ⚠️ up to 5%, ❌ above), test hardware
 (`profile_values`), peak DRAM (`graph_capture.peak_dram_mib`, else a measured `footprint.csv`
 value), blockers to a smaller grid (op_table rows whose `grid_dependency` is a hardcoded value, with
 the places they are set), and `configurable_grid` and `configurable_layers` from `run.json`.

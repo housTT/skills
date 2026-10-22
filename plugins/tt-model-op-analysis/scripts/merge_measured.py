@@ -154,6 +154,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=pathlib.Path)
     parser.add_argument("measured_ops", type=pathlib.Path)
+    parser.add_argument("--tracy-mode", choices=("live", "trace"), required=True,
+                        help="live: the test called the forward in the profiled window; trace: it replayed a trace")
     parser.add_argument("--inferences", type=int, default=1,
                         help="forward passes inside the measured window (1 for a warm signposted window)")
     parser.add_argument("--entry-pass", metavar="RESULT",
@@ -182,6 +184,7 @@ def main() -> int:
     write_csv(op_path, op_table_columns(source, destinations), merged)
     run["measured_ops"] = str(args.measured_ops)
     run["measured_inferences"] = args.inferences
+    run["tracy_mode"] = args.tracy_mode
     run_path.write_text(json.dumps(run, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"{len(merged)} rows, {sum(r['origin'] == 'measured' for r in merged)} measured-only")
     if args.entry_pass:

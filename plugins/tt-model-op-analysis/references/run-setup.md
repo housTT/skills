@@ -173,7 +173,7 @@ for a run the user reports or a passing Tracy run (`merge_measured.py --entry-pa
 `target-status.md`.
 
 Measurements add: `measured_ops` (path of `measured_ops.csv`, set by `merge_measured.py`),
-`measured_inferences`, `ops_csv` (the raw Tracy report), `window` (`warm` or `cold`),
+`measured_inferences`, `tracy_mode` (`live` or `trace`), `ops_csv` (the raw Tracy report), `window` (`warm` or `cold`),
 `ci_pytest_timeout_s` (the CI `pytest_timeout` of the entry test, when it has one), `graph_capture`
 (set by `graph_report.py`: capture path, date, inferences, launch and kernel-op counts, host
 transfers inside the forward, capturing commit), `kernel_cache` (set by `cache_report.py`: cache
