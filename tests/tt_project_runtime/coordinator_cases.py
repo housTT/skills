@@ -2459,7 +2459,7 @@ def test_a_charter_conflicts_pair_settles_as_both_holding_by_its_key(env):
 
 
 
-def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
+def test_charter_conflicts_show_in_the_digest_trigger_a_turn_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm
     db, cfg = p.db, p.config()
