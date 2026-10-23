@@ -66,12 +66,22 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 - `compute`.
 
 `compute` is the hardware the operator grants. Without it, use the local device only. With it,
-`max_parallel` sets how many runs may be in flight, and operator-supplied `submit`, `status` and
-`collect` commands dispatch runs. Keep every granted slot busy. Re-plan when the grant changes.
+`max_parallel` sets how many runs may be in flight. Keep every granted slot busy, and treat
+`max_parallel` as a ceiling, not a quota: use the slots the plan needs and leave the rest idle.
+Re-plan when the grant changes.
+
+A grant dispatches runs one of two ways. `commands` takes operator-supplied `submit`, `status` and
+`collect` shell commands and is the general form. `kind: "github_actions"` dispatches a workflow in
+a CI repository, which needs the implementation pushed where the runners can fetch it; see
+[CI compute](references/ci-compute.md) for the input shape, the publish contract and the polling
+loop. Either way, record the grant you actually used in `doc/agentic_evals/compute.json` so a
+reader can tell a thin result from a small grant.
 
 Work from cheap to expensive:
 
-1. Prove the harness end to end on every runner, with a few tasks per eval.
+1. Prove the harness end to end on every runner, with a few tasks per eval. On a CI grant this is
+   also what proves the published refs: a run that fetches the pushed branches and serves the model
+   is the only evidence the publish was complete.
 2. Run small seeded samples at the stage-11 configuration with caching on. Measure the workload and
    noise, and check the invariants on the real traffic. Send failures back to the stage that owns
    them.
@@ -90,6 +100,8 @@ Write these to `doc/agentic_evals/`:
 - `full/<eval>/results.json` with `actual_hours` next to the prediction
 - `serving_config.json`: the measured `max_concurrency`, `prefix_caching`, `max_num_seqs` and agent
   timeouts that a release spec should use
+- `compute.json`: the grant as used — `max_parallel`, peak runs in flight, and for a CI grant the
+  published refs and every dispatched run id, so each result traces back to a run
 - `REPORT.md`
 
 Update `workload` with the measured values.
