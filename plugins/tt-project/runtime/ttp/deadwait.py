@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Waits with no way to end, raised to the coordinator model-free.
 
-- A failed review the daemon queued no fix for (a third failed round, no fix follow-ups, findings
-  on branches that are not one stack, a task cap): one `review_nofix` event per review, naming the
-  review, its branch and what waits on it (Daemon._fix_failed_review says why).
+- A failed review whose fixes the daemon could not queue (a third failed round, findings on
+  branches that are not one stack, a task cap): one `review_nofix` event per review, naming the
+  review, its branch and what waits on it (Daemon._fix_failed_review says why). One with no fix
+  follow-ups says the same in its own task_failed event, which already wakes the coordinator.
 - A `landed:#X` start_when whose producer X is done, its work not landed, and nothing open can land
   it: no open review, fix, rebase or continue hop carrying X's change (landed.carriers), no open task
   on X's branch, and no push queue row. One `landed_wait_dead` event per X names the held tasks;

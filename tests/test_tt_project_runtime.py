@@ -30967,17 +30967,23 @@ def test_a_failed_review_whose_spec_names_another_branch_still_gets_one_fix_pair
 
 
 def test_a_failed_review_the_daemon_cannot_fix_wakes_the_coordinator_once(env):
-    """No fix follow-ups, or findings over branches that are not one stack: one review_nofix event
-    (queued: it wakes the coordinator) names the review, the branch and what waits; never two."""
+    """No fix follow-ups: its task_failed event (queued: it wakes the coordinator) names why, the branch
+    and what waits, with no second event. Fixes over branches that are not one stack: one review_nofix
+    event (queued) names the review, the branches and what waits; never two."""
     p = make(env)
     from ttp import deadwait
     code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
     held = p.db.add_task("build on it", "s", origin="coordinator", labels=[f"start_when:landed:#{code}"])
     failed = _fail_review(env, p, rev["id"])
+    assert failed["status"] == "queued" and not p.db.q("SELECT id FROM events WHERE kind='review_nofix'")
+    assert "No automatic fix: it proposed no fix follow-ups" in failed["text"]
+    assert branch in failed["text"] and f"#{held} (queued)" in failed["text"]
+    # Fixes the daemon could not queue raise their own event, once per review.
+    deadwait.raise_nofix(p.db, p.db.task(rev["id"]), "it proposed no fix follow-ups", branch)
     (ev,) = p.db.q("SELECT * FROM events WHERE kind='review_nofix'")
     assert ev["status"] == "queued" and ev["task"] == rev["id"]
     assert "it proposed no fix follow-ups" in ev["text"] and branch in ev["text"] and f"#{held} (queued)" in ev["text"]
-    assert f"Review #{rev['id']}" in ev["text"] and "No automatic fix: it proposed no fix follow-ups" in failed["text"]
+    assert f"Review #{rev['id']}" in ev["text"]
     assert deadwait.raise_nofix(p.db, p.db.task(rev["id"]), "again", branch) is None
     assert len(p.db.q("SELECT id FROM events WHERE kind='review_nofix'")) == 1
     # A review that depends on two changes that are not one stack: the coordinator decides which.

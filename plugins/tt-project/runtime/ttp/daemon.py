@@ -3910,11 +3910,20 @@ class Daemon:
             if new == "failed" and task["kind"] == "review" and fixes and len(fups) <= MAX_FOLLOWUPS \
             and not area and not check_only else None
         # A failed review left with no fix (a capped round, no fix follow-ups, findings on branches
-        # that are not one stack) wakes the coordinator with its own event, never silently.
+        # that are not one stack) wakes the coordinator, never silently.
         nofix = "" if fix or area or check_only or new != "failed" or task["kind"] != "review" else \
             getattr(self, "_nofix", "") if fixes and len(fups) <= MAX_FOLLOWUPS else \
             f"it proposed more than {MAX_FOLLOWUPS} follow-ups" if fixes else "it proposed no fix follow-ups"
-        if nofix:
+        # With no fix follow-ups the task_failed event below is the wake (it is queued): it says why,
+        # the branch and what waits. Fixes the daemon could not queue get their own review_nofix event.
+        reviewed = next((c["branch"] for i in dependency_ids(task) if isinstance(i, int)
+                         and (c := db.task(i)) and c.get("branch")), "") if nofix else ""
+        if nofix and not fixes and not approval:
+            held = deadwait.waiters(db, {i for i in dependency_ids(task) if isinstance(i, int)} | {task["id"]})
+            text += (f"\nNo automatic fix: {nofix}. Branch: {reviewed or 'none found'}. "
+                     f"Waiting on it or its change: {deadwait.names(held)}.")
+            nofix = ""
+        elif nofix:
             text += f"\nNo automatic fix: {nofix} ({deadwait.NOFIX_EVENT} raised)."
         folded = {id(f) for f in fixes} if fix else set()
         if fix:
@@ -3959,8 +3968,6 @@ class Daemon:
                  (time.time(), f"task:{task['id']}", f"task_{outcome}", sev, text, data,
                   "handled" if quiet or routine else "queued", task["id"]))
         if nofix:
-            reviewed = next((c["branch"] for i in dependency_ids(task) if isinstance(i, int)
-                             and (c := db.task(i)) and c.get("branch")), "")
             if deadwait.raise_nofix(db, db.task(task["id"]) or dict(task, **upd), nofix, reviewed):
                 log(self.p, f"review {task['id']}: no fix queued ({nofix}); raised to the coordinator")
         if area:
