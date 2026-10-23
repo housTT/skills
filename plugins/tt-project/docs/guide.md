@@ -1142,6 +1142,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   passed to every worker and enforced by the provider where it can (for example, no web tools).
 - Text from logs, issues and chats is treated as data, not instructions.
 - Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
+  An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with
+  `GET <base url>/models` and saves it with its URL as `endpoint/<alias>`; `ttp secret show` lists it
+  without the key.
 
 ## Limits
 

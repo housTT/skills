@@ -5524,6 +5524,8 @@ def cmd_config(a) -> None:
 
 
 def cmd_secret(a) -> None:
+    if a.alias is not None and a.kind != "endpoint":
+        die(f"`ttp secret {a.kind}` takes no alias (only `ttp secret endpoint <alias>` does)")
     if a.kind == "jev":
         key = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass("Jev key: ")
         from .providers.jev import verify
@@ -5545,13 +5547,32 @@ def cmd_secret(a) -> None:
             die(f"Slack check failed: {e}")
         save_secret("slack", {"bot_token": tok, "user_id": uid, "user_email": a.email})
         print(f"saved Slack bot for user {uid}")
+    elif a.kind == "endpoint":
+        from . import endpoint
+        try:
+            name = endpoint.slot(a.alias or "")
+            url = endpoint.base_url(a.url or "")
+        except ValueError as e:
+            die(str(e) if a.alias else "give an alias: `ttp secret endpoint <alias> --url <base url>`")
+        key = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass(f"API key for {a.alias}: ")
+        if not key:
+            die("no key given; not saved")
+        ok, msg = endpoint.verify(url, key)
+        if not ok and not a.force:
+            die(f"the key did not work at {url}/models ({msg}); not saved. Use --force to save anyway.")
+        endpoint.save(a.alias, url, key, ok, msg)
+        print(f"saved {name} for this user ({url}; check: {msg})")
     elif a.kind == "push":
         if not a.host:
             die("--host is required")
         print(push_secrets(a.host))
     elif a.kind == "show":
+        from . import endpoint
         sec = load_secrets()
-        print(json.dumps({k: sorted(v.keys()) if isinstance(v, dict) else "set" for k, v in sec.items()}))
+        print(json.dumps({k: sorted(v.keys()) if isinstance(v, dict) else "set" for k, v in sec.items()
+                          if not k.startswith(endpoint.PREFIX)}))
+        for line in endpoint.show_lines():
+            print(line)
 
 
 def cmd_logs(a) -> None:
@@ -7702,17 +7723,23 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")
-    s.add_argument("kind", choices=["jev", "slack", "show", "push"],
+    s.add_argument("kind", choices=["jev", "slack", "endpoint", "show", "push"],
                    help="jev: a key for Jev, the optional add-on that sends log and alert text to an "
                         "outside paid service; slack: a Slack bot token; "
-                        "show: list what is saved; push: copy your saved keys to --host")
+                        "endpoint <alias> --url <base url>: an API key for an OpenAI-compatible endpoint, "
+                        "checked with GET <base url>/models and saved with its URL as endpoint/<alias>; "
+                        "show: list what is saved (never the keys); push: copy your saved keys to --host. "
+                        "Keys go to secrets.json in your ttp home (~/.tt-project, mode 0600)")
+    s.add_argument("alias", nargs="?", help="with endpoint: a name for it (letters, digits, '-' and '_')")
     s.add_argument("--host", help="with push: the machine to copy your saved keys to")
     s.add_argument("--via", default="typesafe", choices=["typesafe", "openrouter"],
                    help="with jev: the service the key is for (default typesafe)")
-    s.add_argument("--url", help="with jev: the service's address, if not its usual one")
+    s.add_argument("--url", help="with jev: the service's address, if not its usual one; with endpoint "
+                                 "(required): its base URL, e.g. https://api.example.com/v1")
     s.add_argument("--email", help="with slack: your Slack email, to find your user")
     s.add_argument("--user-id", help="with slack: your Slack user id (instead of --email)")
-    s.add_argument("--force", action="store_true", help="with jev: save the key even if the check fails")
+    s.add_argument("--force", action="store_true",
+                   help="with jev or endpoint: save the key even if the check fails")
     s.set_defaults(fn=cmd_secret)
 
     s = sub.add_parser("setup", help="install ttp for this user (stable copy + shim on PATH)")
