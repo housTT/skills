@@ -10737,3 +10737,25 @@ def test_own_push_honors_the_pr_branch_an_update_records(env, monkeypatch, capsy
     push.own_gate(p, repo, remote, branch)
     with pytest.raises(ValueError, match="has no branch"):
         push.own_gate(p, repo, remote, "feature/new")
+
+
+def test_own_push_publishes_another_tasks_branch_checked_out_when_only_an_update_names_it(env, monkeypatch):
+    """A reported case: a task's pr_branch was set to another task's ttp/t<id>-... branch only by an
+    update (task_update's `pr_branch`, or a `pr_branch:` line appended to its spec), never by its
+    original spec, and its worktree had that branch checked out. `ttp push --own` refused it as not
+    the task's own branch; it now publishes it under its name. Without the update it is still refused."""
+    from ttp import coordinator as coord, push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    owner = p.db.add_task("Speed up the loader", "s", kind="code")
+    theirs = f"ttp/t{owner}-speed-up-the-loader"
+    p.db.update_task(owner, status="done", branch=theirs)
+    _git_out(other, "push", "-q", "origin", f"HEAD:refs/heads/{theirs}")
+    _git_out(repo, "checkout", "-q", "-B", theirs)
+    for how in ({"pr_branch": theirs}, {"spec": f"Deliver onto its PR.\npr_branch: `{theirs}`"}):
+        tid = p.db.add_task("Fix the loader PR", "Fix its CI.", kind="code")
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        with pytest.raises(ValueError, match="only this task's own branch"):
+            push.own_target(p, repo)
+        assert coord.apply(p, [{"type": "task_update", "id": tid, **how}]) == []
+        p.db.update_task(tid, status="running", branch=theirs)
+        assert push.own_target(p, repo) == ("origin", theirs), how
