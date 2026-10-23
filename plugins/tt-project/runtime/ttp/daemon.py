@@ -251,6 +251,8 @@ with open(os.path.join(d, "out"), "wb") as out:
         rc = 127
 with open(os.path.join(d, "rc.tmp"), "w") as f:
     f.write(f"{rc}\n")
+    f.flush()
+    os.fsync(f.fileno())
 os.replace(os.path.join(d, "rc.tmp"), os.path.join(d, "rc"))
 subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", wt], capture_output=True)
 '''
