@@ -21,6 +21,17 @@ Record `workload`: `target_concurrency`, `working_set_tokens` (live conversation
 and say so; goal 12 replaces them with measured values. Every stage that reports performance reports
 the target workload next to batch 1, which stays as a regression row.
 
+## Decode batches
+
+Decode runs on a set of device batches: `batch_sizes` from `bringup/agentic_evals/inputs.json`,
+default 1, 8, 16 and 32. Every stage that optimizes or measures decode works against that set, not
+one shape. Layouts, sharding and traces chosen for batch 1 alone are often wrong for the largest
+batch, and by the serving stages they are already fixed.
+
+Weight the effort: batch 1 first, then the largest, then the ones between. Batch 1 stays the
+regression row. Record any batch the device cannot hold and why — active users pad up to the next
+supported batch, so an omitted batch is served by the one above it.
+
 ## Memory
 
 Decode on large models is usually weight-read bound, so extra rows are cheap in time and expensive
@@ -61,11 +72,9 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 
 - evals: default `r1_gpqa_diamond`, `swe_bench_verified`, `terminal_bench_2`, the release-spec
   names; the default subset is 10 tasks each;
-- `batch_sizes`, default 1, 8, 16, 32: the device decode batches to support. Stage 10 validates a
-  tuned configuration per batch and drops any the device cannot hold, stage 11 measures a profile
-  for each surviving one, and evals run once on the largest — 16 rather than 32 is an acceptable
-  recorded outcome. Active users pad up to the next supported batch, so a batch the set omits is
-  served by the one above it;
+- `batch_sizes`, see [Decode batches](#decode-batches): stage 10 validates a tuned configuration
+  per batch, stage 11 measures a profile for each surviving one, and evals run once on the largest
+  — 16 rather than 32 is an acceptable recorded outcome;
 - `stage_budget_hours` (default 24) and `suite_budget_hours` (default 8);
 - reference scores;
 - the eval harness: default the tt-inference-server agentic runner;
