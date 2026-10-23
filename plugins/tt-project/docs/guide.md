@@ -305,8 +305,8 @@ prolonged whole-box outage.
   in that turn or says why it is fine.
 - Corrections: a user or chat message that points out a miss is a likely correction, flagged
   model-free when it matches a short generic phrase list ("why didn't", "keeps failing", "stuck for",
-  "you missed", "nobody noticed", ...) or arrives while a stall event, a Course check or Resource
-  trouble line, or an earlier correction is open. The digest tags it; the coordinator fixes the case
+  "you missed", "nobody noticed", ...) or arrives while a stall event or a Course check line is
+  open. The digest tags it; the coordinator fixes the case
   and adds a `harness` task for the class (the detector or default that would have caught it). A turn
   that added neither that nor an `upstream:` task, and gave no `correction #<id>: <why>` in its
   summary, gets one Course check line in the next digest. The daily review's efficiency audit lists

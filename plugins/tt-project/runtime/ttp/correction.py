@@ -6,8 +6,9 @@ detector, rule or default that would have caught it), so the next case is not le
 
 Model-free, no model calls. At a coordinator turn's start the daemon flags each new inbound message
 that is a likely correction (`flag`): one matching a small generic phrase list (PHRASES), or any
-message that arrives while something says the project is stuck (`open_stall`: a stall event, a
-Course check or Resource trouble line, or a correction still without a class fix). The digest tags
+message that arrives while something says the project is stuck (`open_stall`: a stall event or a
+Course check line; a correction still without a class fix is not one, or it would flag every later
+message, and neither is Resource trouble, a machine fault rather than a miss). The digest tags
 the message `[likely correction: <why>]`. After the turn (`settle`), each flagged message is recorded
 with its class fix: a `harness` task (or one titled `upstream: ...`) the turn added, or the turn's
 `summary` naming `correction #<id>` with its reason. One with neither gets a Course check line in the
@@ -73,19 +74,21 @@ def open_stall(db: DB, cfg: dict | None, now: float | None = None) -> str:
     if db.one(f"SELECT 1 FROM events WHERE status!='handled' AND kind IN ({','.join('?' * len(STALL_KINDS))})",
               STALL_KINDS):
         return "open stall"
-    if _pending(db, now):
-        return "open correction"
-    from . import course, machines
+    from . import course
     if course.digest_lines(db, cfg, now)[0]:
         return "open Course check"
-    if machines.trouble(db, now):
-        return "open Resource trouble"
     return ""
 
 
 def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -> dict[int, str]:
-    """{message id: why} for the inbound messages in `msgs` that are likely corrections."""
+    """{message id: why} for the inbound messages in `msgs` that are likely corrections. Rows without
+    a `text` column (the daemon's turn-sizing query) get theirs read here."""
     out, stall = {}, None
+    bare = [int(m["id"]) for m in msgs if "text" not in m]
+    if bare:
+        full = {r["id"]: r for r in db.q(f"SELECT id, direction, text FROM messages WHERE id IN "
+                                         f"({','.join('?' * len(bare))})", bare)}
+        msgs = [full.get(int(m["id"]), m) if "text" not in m else m for m in msgs]
     for m in msgs:
         if m.get("direction", "in") != "in":
             continue

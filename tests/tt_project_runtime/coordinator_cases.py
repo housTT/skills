@@ -14401,6 +14401,49 @@ def test_correction_flags_a_phrase_or_any_message_during_an_open_stall_but_not_a
     assert ev is not None
 
 
+def test_correction_phrase_is_flagged_on_the_daemons_turn_start_path(env, monkeypatch):
+    """The daemon's turn start reads messages without their text: flag() reads it, so a phrase is
+    tagged in the prompt and recorded in the turn's note."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d = Daemon(p.base)
+    d.update_gates()
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, *a, **k: calls.append((prompt, k)) or 1)
+    mid = p.db.post("in", "Why didn't anyone restart the watcher?", chat="c1")
+    later = time.time() + 600   # past the debounce
+    monkeypatch.setattr(time, "time", lambda: later)
+    d.maybe_coordinate()
+    prompt, k = calls[-1]
+    assert "[likely correction: phrase 'why didn't']" in prompt
+    assert k["note"]["corrections"] == {str(mid): "phrase 'why didn't'"}
+
+
+def test_an_unhandled_correction_or_resource_trouble_does_not_flag_the_next_plain_message(env):
+    """Only a phrase, a stall event or a Course check line flags a message: a correction left without a
+    class fix would otherwise flag every later message, and Resource trouble is no miss."""
+    from types import SimpleNamespace
+    from ttp import correction, machines
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    mid = p.db.post("in", "You missed that the queue was stuck for a day", chat="c1")
+    flagged = correction.flag(p.db, p.config(), _rows(p, mid))
+    d._finish_coordinator({"id": 1, "dir": "x", "started": time.time()},
+                          SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": "ok"}, error="",
+                                          final_text=""), "ok", {"messages": [mid], "corrections":
+                                                                 {str(mid): flagged[mid]}})
+    assert correction._pending(p.db, time.time()), "the correction has no class fix"
+    thanks = p.db.post("in", "Thanks, approved", chat="c1")
+    machines_trouble = machines.trouble
+    try:
+        machines.trouble = lambda *a, **k: ["- box: 3 failures"]
+        assert correction.flag(p.db, p.config(), _rows(p, thanks)) == {}
+    finally:
+        machines.trouble = machines_trouble
+
+
 def test_correction_without_a_class_fix_gets_one_course_check_line_that_a_harness_task_clears(env):
     from types import SimpleNamespace
     from ttp import coordinator as coord, correction, course
