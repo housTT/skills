@@ -272,6 +272,14 @@ def restrictions_block(p: Project) -> str:
             "rules and your own judgement; if a step would break one, do not take it)\n" + body)
 
 
+def restrictions_pointer(p: Project) -> str:
+    """The line that closes a worker's task prompt in place of a second copy of restrictions_block():
+    the block itself leads worker_system(), which every worker run gets once, as its system prompt or
+    leading its prompt."""
+    return ("The BINDING RESTRICTIONS block in your instructions binds this task: it overrides the task, "
+            "the harness rules and your own judgement; if a step would break one, do not take it.") if restrictions_block(p) else ""
+
+
 def _resource_line(task: dict) -> str:
     labels = json.loads(task["labels"] or "[]") if task["labels"] else []
     shared = [lb.split(":", 1)[1] for lb in labels if lb.startswith("resource:")]
@@ -515,7 +523,8 @@ def worker_system(p: Project, task: dict | None = None) -> str:
     entries' choice may read the task; the memory comes last, so on a project whose memory does not fit
     whole only it differs between tasks and everything before it still caches."""
     parts = [restrictions_block(p), _read(p, "worker.md", worker_features(p, task))]
-    # The restrictions open and close the prompt; a third copy inside the charter only costs tokens.
+    # The one copy of the restrictions (the task prompt only points back at it); a second inside the
+    # charter only costs tokens.
     # The rest of the charter and memory is mostly the coordinator's: workers get their digest of it.
     charter, mem, use = worker_context(p, task)
     p.note_memory_shown([e["name"] for e in mem])
@@ -568,7 +577,7 @@ RUN_DIR_MARK = "<this run's dir>"
 def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict | None = None,
                 conflict: dict | None = None) -> str:
     """The per-task part of a worker's prompt, after worker_system(): the rules for its kind, the
-    task itself, and the restrictions again at the end. `wake` (the daemon's run note) marks a run
+    task itself, and a pointer back at the restrictions at the end. `wake` (the daemon's run note) marks a run
     that wakes a waiting task, at a tier that may be below the task's own. `conflict` (the run
     note's conflict_fix) marks a push-conflict fix: a light one gets conflict_fix_task's short prompt."""
     cfg = p.config()
@@ -685,7 +694,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         replymsg.prompt_block(dict(task)),
         settled.prompt_block(p, dict(task)),
         taskfacts.prompt_block(p, dict(task)),
-        restrictions_block(p)]
+        restrictions_pointer(p)]
     return "\n\n".join(x for x in parts if x.strip())
 
 
@@ -721,7 +730,7 @@ def conflict_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: 
         "change's intent, or the tests fail for a reason you cannot settle in the resolution: stop and hand off "
         "`failed` saying what it is. The task then runs again at once at standard, at no attempt.\n"
         "Never run `ttp push` or `git push`, never bump versions or write a changeset.",
-        restrictions_block(p)])
+        restrictions_pointer(p)])
 
 
 def _trim_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: dict, head: str, onto: str,
@@ -754,7 +763,7 @@ def _trim_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: dic
         "If the change cannot fit without dropping a rule, stop and hand off `failed` saying so. The task then "
         "runs again at once at standard, at no attempt.\n"
         "Never run `ttp push` or `git push`, never bump versions or write a changeset.",
-        restrictions_block(p)])
+        restrictions_pointer(p)])
 
 
 # A fetch of the push branch in the project root, for root_behind_line: bounded, and at most once per
@@ -824,8 +833,9 @@ def spec_digest(task: dict) -> str:
 
 def worker_resume(p: Project, task: dict, lost: dict) -> str:
     """The prompt that continues the agent session of a run the host took away (`lost`, from the
-    daemon): what happened, what is gone, what changed since, then the restrictions again. The
-    session already holds the task and its own work."""
+    daemon): what happened, what is gone, what changed since, then the pointer back at the restrictions
+    (worker_system(), which holds them, comes with it again). The session already holds the task and its
+    own work."""
     at = lost.get("ended")
     when = timefmt.long(at, timefmt.home(p)) if isinstance(at, (int, float)) else "recently"
     why = {"reboot": "the host rebooted", "sleep": "the host slept",
@@ -851,7 +861,7 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
     if update:
         text += ("\nUpdate for your task from the project coordinator. Where it differs from the spec, it wins:\n"
                  + "\n".join(update) + "\n")
-    return "\n\n".join(x for x in (text, restrictions_block(p)) if x.strip())
+    return "\n\n".join(x for x in (text, restrictions_pointer(p)) if x.strip())
 
 
 def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:

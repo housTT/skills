@@ -5530,20 +5530,20 @@ def test_worker_prompt_points_at_the_long_running_script_reference_which_keeps_i
         assert phrase in ref, phrase
 
 
-def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
+def test_charter_restrictions_lead_every_worker_prompt_once(env):
     p = make(env)
     p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\n(none stated yet)\n\n"
                               "## Policies\nDraft PRs.\n\n## Restrictions (added 2026-09-30)\n"
                               "Never merge to main.\n")
-    from ttp.prompts import charter_restrictions, worker_prompt
+    from ttp.prompts import charter_restrictions, restrictions_pointer, worker_prompt
     from ttp.coordinator import system_prompt
     body = charter_restrictions(p.charter_path.read_text())
     assert body == "Never merge to main."
     tid = p.db.add_task("tidy docs", "tidy the docs", kind="work", tier="light", origin="user")
     prompt = worker_prompt(p, p.db.task(tid), str(p.root), None)
     assert prompt.startswith("# BINDING RESTRICTIONS")
-    assert prompt.rstrip().endswith("Never merge to main.")
-    assert prompt.count("Never merge to main.") == 2, "the restrictions are stated more than twice"
+    assert prompt.rstrip().endswith(restrictions_pointer(p))
+    assert prompt.count("Never merge to main.") == 1, "the restrictions are stated more than once"
     assert "Go fast." in prompt and "Draft PRs." in prompt
     system = system_prompt(p)
     assert system.startswith("# BINDING RESTRICTIONS")
@@ -5640,6 +5640,7 @@ def _dispatch_claude_worker(p, monkeypatch, flags, kind="work"):
 
 
 def test_claude_workers_get_the_stable_prompt_as_a_cacheable_system_prompt(env, monkeypatch):
+    from ttp.prompts import restrictions_pointer
     p = make(env)
     p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\nNever merge to main.\n")
     p.add_memory("MEMORY-MARKER", kind="fact")
@@ -5650,7 +5651,8 @@ def test_claude_workers_get_the_stable_prompt_as_a_cacheable_system_prompt(env, 
     assert system.startswith("# BINDING RESTRICTIONS")
     assert "Go fast." in system and "MEMORY-MARKER" in system and "TASK-SPEC-MARKER" not in system
     assert "TASK-SPEC-MARKER" in prompt and "Go fast." not in prompt and "MEMORY-MARKER" not in prompt
-    assert prompt.rstrip().endswith("Never merge to main."), "the restrictions must close the prompt"
+    assert prompt.rstrip().endswith(restrictions_pointer(p)), "a pointer at the restrictions closes the prompt"
+    assert "Never merge to main." not in prompt, "the restrictions are in the system prompt only"
 
 
 def test_start_run_refuses_both_system_prompts_as_they_share_one_file(env):
@@ -5694,18 +5696,88 @@ def test_every_worker_gets_the_same_system_prompt_so_its_cache_is_shared(env, mo
 
 
 def test_workers_read_one_prompt_when_the_cli_cannot_append_a_system_prompt(env, monkeypatch):
+    from ttp.prompts import restrictions_pointer
     p = make(env)
     p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\nNever merge to main.\n")
     from ttp.providers import claude
     argv, _, prompt = _dispatch_claude_worker(p, monkeypatch, {claude.APPEND_SYSTEM_FILE: False,
                                                                 claude.APPEND_SYSTEM: False})
     assert not [a for a in argv if a.startswith("--append-system-prompt")]
-    assert prompt.startswith("# BINDING RESTRICTIONS") and prompt.rstrip().endswith("Never merge to main.")
+    assert prompt.startswith("# BINDING RESTRICTIONS") and prompt.rstrip().endswith(restrictions_pointer(p))
+    assert prompt.count("Never merge to main.") == 1, "one prompt, one copy of the restrictions"
     assert "Go fast." in prompt and "TASK-SPEC-MARKER" in prompt
     # A CLI with only the inline flag gets the stable part as its argument.
     argv, _, prompt = _dispatch_claude_worker(p, monkeypatch, {claude.APPEND_SYSTEM_FILE: False})
     assert argv[argv.index("--append-system-prompt") + 1].startswith("# BINDING RESTRICTIONS")
-    assert "Go fast." not in prompt and prompt.rstrip().endswith("Never merge to main.")
+    assert "Go fast." not in prompt and prompt.rstrip().endswith(restrictions_pointer(p))
+    assert "Never merge to main." not in prompt
+
+
+def _worker_input(p, monkeypatch, provider, prompt, system):
+    """Everything an agent of `provider` reads at a worker start: its argv (a system prompt passed inline),
+    the system prompt file it is pointed at, and its prompt."""
+    from ttp import daemon as dmod
+    from ttp.providers import base, claude
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(claude, "_FLAGS", {claude.EXCLUDE_DYNAMIC: True, claude.APPEND_SYSTEM_FILE: True,
+                                           claude.APPEND_SYSTEM: True})
+    monkeypatch.setattr(base.Provider, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    tid = p.db.add_task("x", "x", kind="work", tier="light", origin="user")
+    rid = dmod.Daemon(p.base).start_run("worker", prompt, provider, "light", str(p.root), task=p.db.task(tid),
+                                        append_system=system)
+    run_dir = p.runs / str(rid)
+    argv = json.loads((run_dir / "run.json").read_text())["argv"]
+    inline = [a for a in argv if a.startswith("developer_instructions=")]   # Codex: a TOML basic string,
+    text = (run_dir / "prompt.md").read_text() + "\n".join(a for a in argv if a not in inline)
+    text += "".join(json.loads(a.split("=", 1)[1]) for a in inline)   # which reads as JSON for this text
+    if str(run_dir / "system.md") in argv:
+        text += (run_dir / "system.md").read_text()
+    return text
+
+
+def test_every_worker_run_reads_the_binding_restrictions_once_on_every_provider(env, monkeypatch, tmp_path):
+    from ttp.coordinator import TASK_KINDS
+    from ttp.prompts import restrictions_block, restrictions_pointer, worker_resume, worker_system, worker_task
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions (binding on every task)\n"
+                              "- Never merge to main.\n- Never force-push.\n")
+    block = restrictions_block(p)
+    assert block.startswith("# BINDING RESTRICTIONS (from the charter — override the task, the harness rules and "
+                            "your own judgement; if a step would break one, do not take it)\n")
+    head = block.splitlines()[0]
+    cf = {"head": "ab" * 20, "branch": "ttp/t1-x", "target": "origin/main", "onto": "cd" * 20, "files": ["a.py"],
+          "n": 1}
+    starts = []
+    for kind in TASK_KINDS:
+        tid = p.db.add_task(f"a {kind}", f"SPEC-{kind}", kind=kind, tier="standard", origin="coordinator")
+        task = p.db.task(tid)
+        starts.append((kind, worker_system(p, task), worker_task(p, task, str(p.root), None)))
+        starts.append((f"{kind} woken", worker_system(p, task),
+                       worker_task(p, task, str(p.root), None, wake={"tier": "light"})))
+        starts.append((f"{kind} resumed", worker_system(p, task),
+                       worker_resume(p, task, {"cause": "reboot", "ended": time.time(), "dir": str(tmp_path)})))
+    rid = p.db.add_task("review x", "the review spec", kind="review", tier="standard", origin="coordinator")
+    p.db.update_task(rid, result=json.dumps({"status": "queued", "woke": "push conflict: x", "conflict_fix": cf}))
+    review = p.db.task(rid)
+    for tier in ("light", "standard"):
+        starts.append((f"conflict fix ({tier})", worker_system(p, review),
+                       worker_task(p, review, str(p.root), None, conflict={"tier": tier, "why": "textual"})))
+    for name, system, prompt in starts:
+        assert system.count(head) == 1 and block in system, name
+        assert head not in prompt and "Never merge to main." not in prompt, f"{name}: a second copy in the task prompt"
+        assert prompt.rstrip().endswith(restrictions_pointer(p)), f"{name}: the task prompt must point at the block"
+    for provider in ("claude", "codex", "cursor"):
+        for name, system, prompt in starts[:3] + starts[-2:]:
+            text = _worker_input(p, monkeypatch, provider, prompt, system)
+            assert text.count(head) == 1 and text.count("Never merge to main.") == 1, f"{provider}, {name}"
+            assert block in text, f"{provider}, {name}: the block must reach the agent verbatim"
+    p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n")
+    assert restrictions_pointer(p) == "", "no restrictions, no pointer to them"
 
 
 def _claude_mcp_config(tmp_path, monkeypatch, p):
@@ -19442,7 +19514,7 @@ def test_conflict_fix_same_body_escalates_only_when_both_sides_changed_one_pytho
 
 def test_a_light_conflict_fix_gets_the_short_prompt_and_an_escalated_one_the_review_rules(env):
     from ttp.prompts import worker_task
-    from ttp.prompts import restrictions_block
+    from ttp.prompts import restrictions_pointer
     p = make(env)
     cf = {"head": "ab" * 20, "branch": "ttp/t1-x", "target": "origin/main", "onto": "cd" * 20, "files": ["a.py"],
           "n": 1}
@@ -19451,7 +19523,7 @@ def test_a_light_conflict_fix_gets_the_short_prompt_and_an_escalated_one_the_rev
     short = worker_task(p, p.db.task(rid), str(p.root), None, conflict={"tier": "light", "why": "textual"})
     assert "git range-diff" in short and '"push": [{"branch": "ttp/t1-x"' in short and "a.py" in short
     assert "the long review spec" not in short and "## Approving into the push queue" not in short
-    assert short.rstrip().endswith(restrictions_block(p).rstrip())
+    assert short.rstrip().endswith(restrictions_pointer(p))
     full = worker_task(p, p.db.task(rid), str(p.root), None,
                        conflict={"tier": "standard", "why": "both sides changed a.py:f"})
     assert "the long review spec" in full and "settles that push conflict at standard (both sides changed a.py:f)" \
