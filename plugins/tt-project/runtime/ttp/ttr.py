@@ -25,12 +25,25 @@ so a daemon restart or host reboot mid-incident neither loses nor duplicates one
 the open row and keeps it, or ends it once the machine is healthy. While the daemon is stopped nothing
 is observed: a recovery in that time is recorded at its first tick after. While the project is paused
 heal checks do not run, so their reports freeze: a heal report whose last check is older than the
-check's period plus HEAL_STALE_MARGIN_S is ignored then, and an incident only it kept open ends there;
+check's period plus HEAL_STALE_MARGIN_S is ignored then, and an incident only it kept open ends at that
+tick, at the latest its last unhealthy sample plus the check's period (below);
 co-tenant conditions and known outages still count.
+
+A heal check samples only every period, so a short fault would last until the next healthy sample: while a
+heal check keeps an incident open, its row records the check's last unhealthy sample (`last_bad`, the
+check's last run) and period (`period_s`), and the incident ends no later than that sample plus the
+period (no earlier than it started), even when the recovering sample or the tick that sees it is later.
+Another source keeping it open clears both, and rows from before they were recorded keep their end.
 
 `ttp ttr [<project>] [<alias>] [--days N] [--json]` reports per machine the incidents in the window
 (those still open, or that ended within it), the median, p90 and max TTR of the ended ones, the open
 ones and the last one; the daily review carries one line per machine with an incident in REVIEW_DAYS.
+An incident that starts inside the window of a test change (`ttp machines change add --test`) by the same
+project on the same machine (from the entry's `added` until it was closed, or now while it is open) is a
+test: it is labelled at report time, so rows recorded before are too, has kind 'test', stays out of the
+counts and median, p90 and max, and is listed apart (count, then up to TEST_LISTED of them). Another
+project's entry or another machine's never relabels one. Closed entries are kept
+machine_ledger.CLOSED_KEPT_S, as long as the `ttp ttr` default window.
 """
 from __future__ import annotations
 
@@ -47,6 +60,7 @@ REVIEW_DAYS = 7         # the daily review's window
 CAUSE_CHARS = 200
 HEAL_STALE_MARGIN_S = 300   # while paused, a heal report older than its check's period plus this is ignored
 KINDS = ("down", "held", "outage")
+TEST_LISTED = 3         # test incidents listed per machine line (all in --json)
 
 
 def watched(p) -> set[str]:
@@ -77,7 +91,9 @@ def down_now(p, now: float, aliases: set[str] | None = None) -> dict[str, dict]:
             continue
         if isinstance(rep, list) and len(rep) == 2 and rep[0] in aliases:
             seen.setdefault(rep[0], []).append({"since": float(st.get("since") or st.get("unknown_since") or now),
-                                                "kind": rep[1], "cause": f"heal check {row['name']}"})
+                                                "kind": rep[1], "cause": f"heal check {row['name']}",
+                                                "last_bad": float(st["last_check"]) if st.get("last_check") else None,
+                                                "period_s": float(row["every_s"]) if row["every_s"] else None})
     for c in machine_ledger.conditions().values():
         alias = c.get("alias")
         if alias in aliases and now - float(c.get("last") or 0) < machine_ledger.CONDITION_GONE_S:
@@ -94,6 +110,16 @@ def down_now(p, now: float, aliases: set[str] | None = None) -> dict[str, dict]:
         out[alias] = {**first, "since": min(first["since"], now),
                       "cause": " ".join(str(first["cause"]).split())[:CAUSE_CHARS]}
     return out
+
+
+def _capped(r, end: float) -> float:
+    """`end` of open row `r`, no later than its last unhealthy heal sample plus the check's period (module doc)."""
+    keys = r.keys()
+    bad = r["last_bad"] if "last_bad" in keys else None
+    period = r["period_s"] if "period_s" in keys else None
+    if bad is None or not period:
+        return end
+    return min(end, max(float(bad) + float(period), float(r["started"])))
 
 
 def observe(p, now: float | None = None) -> tuple[list[str], list[str]]:
@@ -114,9 +140,13 @@ def observe(p, now: float | None = None) -> tuple[list[str], list[str]]:
             elif d["kind"] != r["kind"] and d["cause"] != r["cause"]:
                 end = min(max(d["since"], float(r["started"])), now)   # handover to another source
             else:
+                sample = (d.get("last_bad"), d.get("period_s"))
+                if sample != (r["last_bad"], r["period_s"]):
+                    db.x("UPDATE ttr_incidents SET last_bad=?, period_s=? WHERE id=? AND ended IS NULL",
+                         (*sample, r["id"]))
                 continue
             if db.conn.execute("UPDATE ttr_incidents SET ended=? WHERE id=? AND ended IS NULL",
-                               (end, r["id"])).rowcount:
+                               (_capped(r, end), r["id"])).rowcount:
                 ended.append(alias)
                 if d is not None:
                     del open_rows[alias]
@@ -125,8 +155,9 @@ def observe(p, now: float | None = None) -> tuple[list[str], list[str]]:
                 continue
             last = db.one("SELECT MAX(ended) AS e FROM ttr_incidents WHERE alias=?", (alias,))
             start = max(d["since"], float(last["e"] or 0) if last else 0.0)
-            if db.conn.execute("INSERT OR IGNORE INTO ttr_incidents(alias, kind, cause, started) VALUES(?,?,?,?)",
-                               (alias, d["kind"], d["cause"], start)).rowcount:
+            if db.conn.execute("INSERT OR IGNORE INTO ttr_incidents(alias, kind, cause, started, last_bad, period_s) "
+                               "VALUES(?,?,?,?,?,?)", (alias, d["kind"], d["cause"], start, d.get("last_bad"),
+                                                       d.get("period_s"))).rowcount:
                 opened.append(alias)
     return opened, ended
 
@@ -139,17 +170,36 @@ def _p90(xs: list[float]) -> float:
     return s[max(0, math.ceil(0.9 * len(s)) - 1)]
 
 
-def report(db: DB, alias: str | None = None, days: float = DAYS, now: float | None = None) -> dict[str, dict]:
-    """{alias: stats} of the incidents open now or ended within `days` (module doc). TTRs in seconds."""
+def test_windows(project: str | None, now: float) -> dict[str, list[tuple[float, float, int]]]:
+    """{alias: [(from, to, change id)]} of project `project`'s test changes (`ttp machines change add --test`):
+    from when each was added until it was closed, or `now` while it is open."""
+    if not project:
+        return {}
+    from . import machine_ledger
+    out: dict[str, list[tuple[float, float, int]]] = {}
+    for c in machine_ledger.changes(open_only=False):
+        if c.get("test") and c.get("by") == project and c.get("alias") and c.get("added") is not None:
+            out.setdefault(c["alias"], []).append((float(c["added"]), float(c.get("closed") or now), c.get("id")))
+    return out
+
+
+def report(db: DB, alias: str | None = None, days: float = DAYS, now: float | None = None,
+           project: str | None = None) -> dict[str, dict]:
+    """{alias: stats} of the incidents open now or ended within `days` (module doc). TTRs in seconds.
+    `project`: the project whose test changes label incidents as tests (none without it)."""
     now = time.time() if now is None else now
     since = now - days * 86400
     rows = db.q("SELECT * FROM ttr_incidents WHERE (ended IS NULL OR ended>=?)" + (" AND alias=?" if alias else "")
                 + " ORDER BY started, id", (since, alias) if alias else (since,))
-    out: dict[str, dict] = {}
+    windows = test_windows(project, now)
+    out: dict[str, list] = {}
     for r in rows:
         out.setdefault(r["alias"], []).append(r)
     stats = {}
-    for a, rs in sorted(out.items()):
+    for a, all_rs in sorted(out.items()):
+        change = {r["id"]: next((cid for lo, hi, cid in windows.get(a, ()) if lo <= float(r["started"]) <= hi), None)
+                  for r in all_rs}
+        rs = [r for r in all_rs if change[r["id"]] is None]
         ttrs = [float(r["ended"]) - float(r["started"]) for r in rs if r["ended"] is not None]
         stats[a] = {
             "incidents": len(rs),
@@ -159,7 +209,11 @@ def report(db: DB, alias: str | None = None, days: float = DAYS, now: float | No
             "max_s": max(ttrs) if ttrs else None,
             "open": [{"id": r["id"], "kind": r["kind"], "cause": r["cause"], "started": r["started"],
                       "open_s": now - float(r["started"])} for r in rs if r["ended"] is None],
-            "last": {k: rs[-1][k] for k in ("id", "kind", "cause", "started", "ended")},
+            "last": {k: rs[-1][k] for k in ("id", "kind", "cause", "started", "ended")} if rs else None,
+            "tests": [{"id": r["id"], "kind": "test", "source_kind": r["kind"], "cause": r["cause"],
+                       "started": r["started"], "ended": r["ended"], "change": change[r["id"]],
+                       "ttr_s": None if r["ended"] is None else float(r["ended"]) - float(r["started"])}
+                      for r in all_rs if change[r["id"]] is not None],
         }
     return stats
 
@@ -179,16 +233,26 @@ def line(alias: str, s: dict, where, days: float) -> str:
         text += "; open: " + ", ".join(f"{o['kind']} since {timefmt.long(o['started'], where)} "
                                        f"({_dur(o['open_s'])})" for o in s["open"])
     last = s["last"]
-    if last["ended"] is not None:
+    if last and last["ended"] is not None:
         text += (f"; last: {last['kind']} {timefmt.long(last['started'], where)}, recovered in "
                  f"{_dur(float(last['ended']) - float(last['started']))}")
-    return text + (f" ({last['cause']})" if last.get("cause") else "")
+    text += f" ({last['cause']})" if last and last.get("cause") else ""
+    tests = s.get("tests") or []
+    if tests:
+        shown = [f"{t['source_kind']} {timefmt.long(t['started'], where)}, "
+                 + (f"{_dur(t['ttr_s'])}" if t["ttr_s"] is not None else "open")
+                 + f", change #{t['change']}" for t in tests[-TEST_LISTED:]]
+        more = len(tests) - len(shown)
+        text += (f"; tests (not in TTR): {len(tests)}: " + "; ".join(shown)
+                 + (f"; {more} earlier" if more else ""))
+    return text
 
 
-def lines(db: DB, where, alias: str | None = None, days: float = DAYS, now: float | None = None) -> list[str]:
-    return [line(a, s, where, days) for a, s in report(db, alias, days, now).items()]
+def lines(db: DB, where, alias: str | None = None, days: float = DAYS, now: float | None = None,
+          project: str | None = None) -> list[str]:
+    return [line(a, s, where, days) for a, s in report(db, alias, days, now, project).items()]
 
 
 def review_lines(p, now: float | None = None) -> list[str]:
-    """For the daily review: one line per machine with an incident in the last REVIEW_DAYS."""
-    return lines(p.db, timefmt.home(p), days=REVIEW_DAYS, now=now)
+    """For the daily review: one line per machine with an incident in the last REVIEW_DAYS, test ones apart."""
+    return lines(p.db, timefmt.home(p), days=REVIEW_DAYS, now=now, project=p.name)

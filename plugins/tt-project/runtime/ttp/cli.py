@@ -1597,9 +1597,9 @@ def cmd_ttr(a) -> None:
         die("no tt-project project here; name one: `ttp ttr <name>`")
     if a.json:
         print(json.dumps({"zone": timefmt.home(p), "days": a.days,
-                          "machines": ttr.report(p.db, a.alias, a.days)}, indent=1))
+                          "machines": ttr.report(p.db, a.alias, a.days, project=p.name)}, indent=1))
         return
-    got = ttr.lines(p.db, timefmt.home(p), a.alias, a.days)
+    got = ttr.lines(p.db, timefmt.home(p), a.alias, a.days, project=p.name)
     print("\n".join(got) if got else f"no machine incidents in {a.days:g} d"
           + (f" on {a.alias}" if a.alias else ""))
 
@@ -5291,9 +5291,10 @@ def _machine_change(a) -> None:
     try:
         if a.until_task:
             _until_task_ok(p, by, a.until_task)
-        c = ml.add_power_cycle(a.alias, a.power_cycle_at, by, a.what, tid, queue=queue) if a.power_cycle_at else \
+        c = ml.add_power_cycle(a.alias, a.power_cycle_at, by, a.what, tid, queue=queue,
+                                extra={"test": True} if a.test else None) if a.power_cycle_at else \
             ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect,
-                          until_task=a.until_task, queue=queue)
+                          until_task=a.until_task, queue=queue, test=a.test)
     except ValueError as e:
         die(str(e))
     print(_queued_line(c) if c.get("queued") else f"recorded {ml.change_line(c)}")
@@ -7785,6 +7786,9 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("--expect", action="append", metavar="FINGERPRINT|CONDITION",
                    help="an alert the change is known to cause (an event fingerprint, or down/held on this "
                         "machine): it keeps the coordinator's turn routine while the change is open; repeatable")
+    c.add_argument("--test", action="store_true",
+                   help="the change is made for a test: `ttp ttr` labels this project's incidents on the machine "
+                        "that start while it is open as tests, outside its TTR stats")
     c = cs.add_parser("list", help="the open changes")
     c.add_argument("alias", nargs="?", help="only this machine")
     c.add_argument("--all", action="store_true", help="closed ones too")

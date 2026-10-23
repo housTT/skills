@@ -2656,7 +2656,8 @@ def test_ttr_ignores_a_frozen_heal_report_while_the_project_is_paused(env):
     # Past that the frozen report is ignored, so the pause does not stretch the incident.
     late = t0 + 600 + ttr.HEAL_STALE_MARGIN_S + 1
     assert ttr.observe(p, late) == ([], ["box-b"])
-    assert p.db.one("SELECT ended FROM ttr_incidents WHERE alias='box-b'")["ended"] == late
+    # (It ends at its last unhealthy sample plus the check's period, no later than that tick.)
+    assert p.db.one("SELECT ended FROM ttr_incidents WHERE alias='box-b'")["ended"] == t0 + 600
     # Not paused: the same stale report counts again (the check runs and keeps it current).
     p.db.set_kv("paused", False)
     assert ttr.observe(p, late + 60) == (["box-b"], [])
@@ -2696,6 +2697,140 @@ def test_ttr_incident_hands_over_to_the_source_that_keeps_the_machine_down(env):
     ml.clear_outage("box-b")
     assert ttr.observe(p, t0 + 780) == ([], ["box-b"])
     assert p.db.one("SELECT ended FROM ttr_incidents WHERE kind='outage'")["ended"] == t0 + 780
+
+
+def test_ttr_labels_incidents_in_this_projects_test_changes_and_keeps_them_out_of_the_stats(env, monkeypatch, capsys):
+    """An incident starting inside an open or closed `--test` change of the same project on the same machine
+    is a test, labelled at report time (rows recorded before too): out of the counts and median, p90 and
+    max, and listed apart. A non-test entry, another project's or another machine's does not relabel one."""
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import ttr
+    p = make(env, "alpha")
+    for a in ("box-a", "box-c"):
+        mm.add(a)
+    t0 = time.time() - 86400
+    closed = ml.add_change("box-a", "restarts the idle broker for a test", "systemctl start svc", "alpha",
+                           expires="1d", now=t0, test=True)
+    ml.close_change(closed["id"], "done", "alpha", now=t0 + 1000)
+    plain = ml.add_change("box-a", "a drop-in", "rm drop-in", "alpha", expires="1d", now=t0 + 2000)
+    other = ml.add_change("box-a", "a test of theirs", "true", "beta", expires="1d", now=t0 + 3000, test=True)
+    ml.close_change(other["id"], "done", "beta", now=t0 + 3800)
+    elsewhere = ml.add_change("box-c", "a test elsewhere", "true", "alpha", expires="1d", now=t0 + 4000, test=True)
+    opened = ml.add_change("box-a", "another test", "true", "alpha", expires="1d", now=t0 + 5000, test=True)
+    got = {c["id"]: c for c in ml.changes(open_only=False)}
+    assert got[closed["id"]]["test"] and got[closed["id"]]["closed"] == t0 + 1000, "the flag survives the close"
+    assert "test" not in got[plain["id"]] and "a test" not in ml.change_line(got[plain["id"]], t0)
+    assert ml.change_line(got[opened["id"]], t0).count("; a test") == 1
+    # Rows recorded before any of this (no sample columns filled): labelled at report time.
+    rows = [(t0 + 100, t0 + 1060), (t0 + 1500, t0 + 1600), (t0 + 2100, t0 + 2400), (t0 + 3100, t0 + 3700),
+            (t0 + 4100, t0 + 4200), (t0 + 5100, None)]
+    ids = [p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-a','held',?,?,?)",
+                  (f"heal check up{i}", s, e)) for i, (s, e) in enumerate(rows)]
+    now = t0 + 6000
+    s = ttr.report(p.db, now=now, project="alpha")["box-a"]
+    assert (s["incidents"], s["recovered"]) == (4, 4)
+    assert (s["median_s"], s["p90_s"], s["max_s"]) == (200, 600, 600)
+    assert s["open"] == [] and s["last"]["id"] == ids[4]
+    assert [(t["id"], t["kind"], t["source_kind"], t["change"], t["ttr_s"]) for t in s["tests"]] == [
+        (ids[0], "test", "held", closed["id"], 960), (ids[5], "test", "held", opened["id"], None)]
+    # Without a project nothing is relabelled; another project sees only its own test changes.
+    assert ttr.report(p.db, now=now)["box-a"]["incidents"] == 6
+    beta = ttr.report(p.db, now=now, project="beta")["box-a"]
+    assert [t["id"] for t in beta["tests"]] == [ids[3]] and beta["incidents"] == 5
+    text = ttr.lines(p.db, "UTC", now=now, project="alpha")[0]
+    assert text.startswith("box-a: 4 incidents in 30 d; TTR median 3 min, p90 10 min, max 10 min")
+    assert "tests (not in TTR): 2: held " in text and f"16 min, change #{closed['id']}" in text
+    assert f"open, change #{opened['id']}" in text
+    assert ttr.review_lines(p, now=now) == [ttr.line("box-a", ttr.report(p.db, days=ttr.REVIEW_DAYS, now=now,
+                                                                        project="alpha")["box-a"], p, ttr.REVIEW_DAYS)]
+    assert "tests (not in TTR): 2" in ttr.review_lines(p, now=now)[0]
+    # A machine with only test incidents: no TTR and no last one, the tests still listed.
+    p.db.x("DELETE FROM ttr_incidents WHERE id NOT IN (?, ?)", (ids[0], ids[5]))
+    only = ttr.report(p.db, now=now, project="alpha")["box-a"]
+    assert (only["incidents"], only["last"], len(only["tests"])) == (0, None, 2)
+    assert ttr.line("box-a", only, "UTC", 30).startswith("box-a: 0 incidents in 30 d; tests (not in TTR): 2: ")
+    # More tests than TEST_LISTED: the latest are listed, the rest counted.
+    for i in range(ttr.TEST_LISTED + 1):
+        p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-a','down','x',?,?)",
+               (t0 + 200 + i, t0 + 300 + i))
+    many = ttr.line("box-a", ttr.report(p.db, now=now, project="alpha")["box-a"], "UTC", 30)
+    assert f"tests (not in TTR): {ttr.TEST_LISTED + 3}: " in many and "; 3 earlier" in many
+    # The CLI: --test records the flag, the listing shows it, and ttp ttr labels by the project it runs in.
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    cli.main(["machines", "change", "add", "box-c", "restarts a service for a test", "--undo", "true",
+              "--expires", "1h", "--test"])
+    assert "; a test" in capsys.readouterr().out and ml.changes()[-1]["test"] is True
+    cli.main(["machines", "change", "list", "box-c"])
+    assert capsys.readouterr().out.count("; a test") == 2
+    cli.main(["ttr", "--json"])
+    listed = [t["id"] for t in json.loads(capsys.readouterr().out)["machines"]["box-a"]["tests"]]
+    assert len(listed) == ttr.TEST_LISTED + 3 and {ids[0], ids[5]} <= set(listed), "--json lists every test"
+    del elsewhere, other
+
+
+def test_ttr_caps_a_heal_incident_at_its_last_unhealthy_sample_plus_the_check_period(env, tmp_path):
+    """A sparse check no longer stretches a short fault: a heal-sourced incident ends no later than the
+    check's last unhealthy sample plus its period; another source keeping it open clears the cap, and rows
+    from before the samples were recorded (and databases from before the columns) keep the old end."""
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    from ttp import ttr
+    from ttp.db import DB
+    p = make(env, "alpha")
+    mm.add("box-b")
+    t0 = 1_800_000_000.0
+    sched.upsert(p.db, "box-b-up", "command", "10m", payload={"heal": {"check": "true", "machine": "box-b"}})
+    key = heal.STATE_KEY + "box-b-up"
+    p.db.set_kv(key, {"status": "unhealthy", "since": t0, "last_check": t0, "machine_reported": ["box-b", "held"]})
+    assert ttr.observe(p, t0 + 60) == (["box-b"], [])
+    r = p.db.one("SELECT * FROM ttr_incidents")
+    assert (r["last_bad"], r["period_s"]) == (t0, 600)
+    p.db.set_kv(key, {"status": "unhealthy", "since": t0, "last_check": t0 + 600, "machine_reported": ["box-b", "held"]})
+    assert ttr.observe(p, t0 + 660) == ([], [])
+    assert p.db.one("SELECT last_bad FROM ttr_incidents")["last_bad"] == t0 + 600
+    # The recovering sample comes late (t0 + 1500), and the tick later still: the end is capped.
+    p.db.set_kv(key, {"status": "healthy", "last_check": t0 + 1500})
+    assert ttr.observe(p, t0 + 1560) == ([], ["box-b"])
+    assert p.db.one("SELECT ended FROM ttr_incidents")["ended"] == t0 + 1200
+    # Another source of the same kind keeps it open after the check recovers: no cap, it ends at its tick.
+    p.db.set_kv(key, {"status": "unhealthy", "since": t0 + 2000, "last_check": t0 + 2000,
+                      "machine_reported": ["box-b", "held"]})
+    assert ttr.observe(p, t0 + 2060) == (["box-b"], [])
+    ml.report("other", "box-b", "held", "slow", now=t0 + 2100)
+    p.db.set_kv(key, {"status": "healthy", "last_check": t0 + 2600})
+    assert ttr.observe(p, t0 + 2660) == ([], [])
+    r = p.db.one("SELECT * FROM ttr_incidents WHERE ended IS NULL")
+    assert (r["last_bad"], r["period_s"]) == (None, None)
+    ml.report("other", "box-b", "held", cleared=True, now=t0 + 4000)
+    assert ttr.observe(p, t0 + 4060) == ([], ["box-b"])
+    assert p.db.one("SELECT ended FROM ttr_incidents WHERE id=?", (r["id"],))["ended"] == t0 + 4060
+    # The cap never ends one before it started.
+    p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, last_bad, period_s) "
+           "VALUES('box-b','down','heal check box-b-up',?,?,?)", (t0 + 5000, t0 + 4000, 600))
+    assert ttr.observe(p, t0 + 5100) == ([], ["box-b"])
+    assert p.db.one("SELECT ended FROM ttr_incidents WHERE started=?", (t0 + 5000,))["ended"] == t0 + 5000
+    # An old open row without samples ends at the tick that sees the machine healthy.
+    p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started) VALUES('box-b','down','heal check box-b-up',?)",
+           (t0 + 6000,))
+    assert ttr.observe(p, t0 + 9000) == ([], ["box-b"])
+    assert p.db.one("SELECT ended FROM ttr_incidents WHERE started=?", (t0 + 6000,))["ended"] == t0 + 9000
+    # A database from before the columns gains them and keeps its rows.
+    old = tmp_path / "old.db"
+    con = sqlite3.connect(old)
+    con.execute("CREATE TABLE ttr_incidents (id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL, "
+                "kind TEXT NOT NULL, cause TEXT, started REAL NOT NULL, ended REAL)")
+    con.execute("INSERT INTO ttr_incidents(alias, kind, started, ended) VALUES('box-b','down',1,61)")
+    con.commit()
+    con.close()
+    db = DB(old)
+    [row] = db.q("SELECT * FROM ttr_incidents")
+    assert (row["ended"], row["last_bad"], row["period_s"]) == (61, None, None)
+    assert ttr.report(db, now=100, days=1)["box-b"]["max_s"] == 60
 
 
 def test_goal_service_up_passes_fails_and_reports_could_not_run(env, tmp_path, monkeypatch):

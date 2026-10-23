@@ -170,14 +170,15 @@ def _one_line(text: Any, chars: int = TEXT_CHARS) -> str:
 
 def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, until_probe: str | None = None,
                task: int | None = None, now: float | None = None, expects=None, extra: dict | None = None,
-               until_task: int | None = None, queue: Path | None = None) -> dict:
+               until_task: int | None = None, queue: Path | None = None, test: bool = False) -> dict:
     """Record a live change to machine `alias` made by project `by`; returns the entry. `queue`: the project's
     state dir, where the change is queued for its daemon when the shared ledger is read-only here (returns
     the request then, with `queued`: its id; see Queued requests). `expects`: the
     event fingerprints or machine conditions (down, held) the change is known to cause, which then
     keep the coordinator's turn routine (coordinator._known_case). `extra`: more fields (a kind).
     `until_task`: a task of project `by` whose end (done, failed, cancelled, gone) makes it overdue
-    (check_task validates it)."""
+    (check_task validates it). `test`: the change is made for a test, so `ttp ttr` labels this project's
+    incidents on `alias` that start while it is open as tests (ttr.test_windows)."""
     now = time.time() if now is None else now
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
@@ -193,7 +194,8 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
     end = float(expires) if isinstance(expires, (int, float)) else \
         ends.parse_expires(expires, now) if expires else now + PROBE_END_S   # a number: an epoch time
     fields = {"alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now, "expires": end,
-              "probe": probe or None, **({"until_task": int(until_task)} if until_task else {}), **(extra or {})}
+              "probe": probe or None, **({"until_task": int(until_task)} if until_task else {}),
+              **({"test": True} if test else {}), **(extra or {})}
     if expects:
         fields["expects"] = [_one_line(x, 200) for x in expects if _one_line(x, 200)]
     try:
@@ -556,6 +558,7 @@ def change_line(c: dict, now: float | None = None, where=None, clip: int | None 
         if c.get("until_task") else f"ends {ends.shown(c['expires'], where)}"
     by = c.get("by", "?") + (f" #{c['task']}" if c.get("task") else "")
     end += f"; expects {', '.join(c['expects'])}" if c.get("expects") else ""
+    end += "; a test" if c.get("test") else ""
     head, tail = f"#{c['id']} {c['alias']}: ", (f" (by {by}; undo: `{part(c['undo'])}`; {end})"
                                                 + (f" OVERDUE: {part(late)}" if late else ""))
     what = _clip(c["what"], max(clip - len(head) - len(tail), CLIP_WHAT_MIN)) if clip else c["what"]

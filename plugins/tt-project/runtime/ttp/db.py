@@ -153,9 +153,10 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS alerts_key ON alerts(key, cleared);
 
 -- Time to recover (ttr.py): one row per machine incident; rows are only added, each end written once.
+-- last_bad/period_s: while a heal check keeps it open, the check's last unhealthy sample and its period.
 CREATE TABLE IF NOT EXISTS ttr_incidents (
   id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL, kind TEXT NOT NULL, cause TEXT,
-  started REAL NOT NULL, ended REAL);
+  started REAL NOT NULL, ended REAL, last_bad REAL, period_s REAL);
 CREATE UNIQUE INDEX IF NOT EXISTS ttr_open ON ttr_incidents(alias) WHERE ended IS NULL;
 CREATE INDEX IF NOT EXISTS ttr_alias ON ttr_incidents(alias, started);
 
@@ -340,6 +341,18 @@ class DB:
         self._migrate_issue_watch_key()
         self._migrate_stuck_since()
         self._migrate_message_broadcast()
+        self._migrate_ttr_sample()
+
+    def _migrate_ttr_sample(self) -> None:
+        # A heal-sourced incident's last unhealthy sample and check period (ttr.observe caps its end by
+        # them). Rows from before have neither and keep their recorded end.
+        if "last_bad" in {r["name"] for r in self.q("PRAGMA table_info(ttr_incidents)")}:
+            return
+        with self.tx():
+            cols = {r["name"] for r in self.q("PRAGMA table_info(ttr_incidents)")}
+            for col in ("last_bad", "period_s"):
+                if col not in cols:
+                    self.x(f"ALTER TABLE ttr_incidents ADD COLUMN {col} REAL")
 
     def _migrate_message_context(self) -> None:
         # A relayer's context, kept apart from the user's verbatim words. Older messages have none.
