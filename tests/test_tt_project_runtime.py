@@ -26217,6 +26217,8 @@ DURABLE_EXEMPT = {
     ("locks.py", 'open(path, "a")'): "the lock file itself: its content only describes the holder",
     ("locks.py", '.lock", "a")'): "a flock guard file, never written",
     ("locks.py", "tmp.write_text(str(n))"): "the priority-turn streak: only a count, a lost write shifts the bound by a turn",
+    ("progress.py", 'open(state / LOCK, "a")'): "a flock guard file, never written",
+    ("progress.py", "os.replace(log, state / OLD)"): "rotates the driver report log aside: a rename; a crash before it only leaves the log a line over its bound",
     ("locks.py", "os.replace(tmp, path)"): "the priority-turn streak: only a count, a lost write shifts the bound by a turn",
     ("activity.py", 'open(state / LOCK, "a")'): "a flock guard file, never written",
     ("activity.py", "os.replace(log, state / OLD)"): "rotates the bounded activity log; a rename lost to a crash leaves the log one generation longer",
@@ -28037,8 +28039,9 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     code, question = {"kind": "code", "title": "t"}, {"kind": "question", "title": "t"}
     # The rules a code or a question task reads on every call stay under their budgets (they had
     # grown to 20.5k chars for every task, shared clusters, device runners and remote drivers included).
+    # 13.6k: +1 rule, the one line a looping driver reports its refusals with (`ttp progress report`).
     rules = {k: feature_blocks(src, worker_features(p, t)) for k, t in (("code", code), ("question", question))}
-    assert len(rules["code"]) <= 13_500, len(rules["code"])
+    assert len(rules["code"]) <= 13_600, len(rules["code"])
     assert len(rules["question"]) <= 10_000, len(rules["question"])
     # A question task cannot detach, so it skips the pointer to the long-running script rules.
     assert "references/long-running-scripts.md" in rules["code"]
