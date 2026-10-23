@@ -668,8 +668,9 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                        f"branch's head when there is one, and the push publishes its head onto {onto}.\n"))
     elif (old_branch := rebased_branch(task)) and branch:
         history += (f"\nThis task rebases branch {old_branch}: it starts from that branch's head on its own branch "
-                    f"{branch} and delivers there (`ttp push --own --detach`), never onto {old_branch}: a rebase "
-                    f"cannot fast-forward it.\n")
+                    f"{branch}, and `ttp push --own --detach` publishes its head back onto {old_branch}. A rebase "
+                    f"cannot fast-forward it, so that push replaces it only under a lease on the tip it reads "
+                    f"(never a plain force push, never `git push`), and never creates it.\n")
     delivery = cfg.get("delivery", {})
     venv = project_venv(p, cwd)
     venv_line = (f"python venv: {venv} (the project's, already active: VIRTUAL_ENV and PATH; shared with other "

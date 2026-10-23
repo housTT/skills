@@ -170,9 +170,9 @@ Each field's rules are in the section named; the table only lists them.
   "NOT queued by the daemon" is yours to add. `continue_cap` refuses more hops: re-plan or give
   a `reason` naming what changed. `stale_duplicate`: cancel its task unless it has work of its own.
 - A task that delivers onto another task's branch (a fix on its PR) has a line `pr_branch: <branch>`
-  in its spec (branch alone, in backticks, starting its line), or a later `task_update` sets it
+  in its spec (starting its line), or a later `task_update` sets it
   (latest wins); else `ttp push --own` refuses it. A rebase cannot fast-forward a branch: put
-  "rebase" in its title.
+  "rebase" in its title; --own then replaces it under a lease.
   A follow-up carries a branch only via its own `pr_branch:` line; a task that `continues` a
   failed or cancelled one carries its branch, unless its spec names only the push branch, that
   branch was never published, it is a third task's branch no `pr_branch:` line names, or

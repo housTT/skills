@@ -456,7 +456,7 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
     if not exists:
         _git(p.root, "fetch", "--quiet", "origin", check=False, timeout=timeout)
     # A rebase starts from the branch it rebases, even when it also continues a review.
-    start = carried_head(p, task) if carried or rebased_branch(task) else None
+    start = carried_head(p, task) if carried or (delivery_branch(task) or ("", False))[1] else None
     start = start or (None if carried else continued_head(p, task)) or carried_head(p, task)
     try:
         start = start or resolve_base(p)
@@ -489,8 +489,9 @@ def valid_branch(name: str) -> bool:
 
 # A spec line naming the branch a task delivers onto (coordinator: task_add labels it; push: --own
 # publishes onto another task's branch only for a task whose spec has one).
-SPEC_PR_BRANCH = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?pr_branch:[ \t]*(?P<q>[`'\"]?)"
-                            r"(?P<branch>[A-Za-z0-9][\w./-]*[\w-])(?P=q)(?=[.,;:]?(?:[ \t]|$))", re.M)
+# The branch may be quoted, or the whole `pr_branch: <branch>` in backticks: all read the same.
+SPEC_PR_BRANCH = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?(?P<w>`?)pr_branch:[ \t]*(?P<q>[`'\"]?)"
+                            r"(?P<branch>[A-Za-z0-9][\w./-]*[\w-])(?P=q)(?P=w)(?=[.,;:]?(?:[ \t]|$))", re.M)
 
 
 def spec_names_pr_branch(spec: str, branch: str) -> bool:
@@ -506,7 +507,8 @@ NO_PR_BRANCH = "no_pr_branch"
 # A task_update appends its spec text after a line `## Update`; a `pr_branch:` line there, or
 # `pr_branch: ""` (no own branch), sets the task's branch from then on (recorded_pr_branch).
 UPDATE_SECTION = re.compile(r"^## Update\b.*$", re.M)
-SPEC_CLEARED_PR_BRANCH = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?pr_branch:[ \t]*(?:\"\"|''|``)[ \t]*$", re.M)
+SPEC_CLEARED_PR_BRANCH = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?(?P<w>`?)pr_branch:[ \t]*(?:\"\"|''|``)"
+                                    r"(?P=w)[ \t]*$", re.M)
 
 
 def spec_line_branch(text: str) -> str | None:
@@ -552,13 +554,45 @@ def carried_branch(task: dict) -> str:
 
 def rebased_branch(task: dict) -> str:
     """The branch a task's `rebases:<branch>` label names: it starts from that branch's head on its own
-    branch and delivers there (a rebase cannot fast-forward the old one), or ""."""
+    branch and delivers back onto it with a lease (a rebase cannot fast-forward it), or ""."""
     try:
         labels = json.loads(task.get("labels") or "[]")
     except (ValueError, TypeError):
         return ""
     found = next((lb[8:] for lb in labels if isinstance(lb, str) and lb.startswith("rebases:")), "")
     return found if valid_branch(found) else ""
+
+
+def named_branch(task: dict) -> str:
+    """The branch `task`'s latest pr_branch record, else its `rebases:` label, names as written, even
+    one valid_branch drops (main, master): `ttp push --own` refuses such a task rather than publish its
+    own branch in its place."""
+    named = recorded_pr_branch(task)
+    if named is not None:
+        return named
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return ""
+    return next((lb[8:] for lb in labels if isinstance(lb, str) and lb.startswith("rebases:")), "")
+
+
+def delivery_branch(task: dict) -> tuple[str, bool] | None:
+    """The one reading of the branch `task` itself builds on and delivers onto, for the dispatcher
+    (carried_head, ensure) and `ttp push --own` (push.delivery_source) alike: (branch, rebase). The
+    latest record wins: a `pr_branch:` line a task_update appended, else its pr_branch label
+    (recorded_pr_branch; ("", False) when cleared: it lands on the push branch), else its
+    `rebases:<branch>` label (rebase True: the branch is rewritten, so --own replaces it only under a
+    lease). None when nothing names one (push.delivery_source then looks at the task it continues).
+    A name that is no valid branch counts as none."""
+    named = recorded_pr_branch(task)
+    if named == "":
+        return "", False
+    if named is not None and valid_branch(named):
+        return named, False
+    if old := rebased_branch(task):
+        return old, True
+    return None
 
 
 def on_carried(p: Project, task: dict) -> str:
@@ -841,7 +875,7 @@ def restore_root(repo: Path, branch: str, run_id: int, timeout_s: float = 60, ta
 def carried_head(p: Project, task: dict) -> str | None:
     """The head of the task's carried branch (carried_branch), so it builds on what it delivers onto,
     or of the branch it rebases (rebased_branch)."""
-    branch = carried_branch(task) or rebased_branch(task)
+    branch = (delivery_branch(task) or ("", False))[0]
     for cand in (branch, f"origin/{branch}") if branch else ():
         head = _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
         if head:

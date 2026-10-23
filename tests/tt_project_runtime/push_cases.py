@@ -6287,10 +6287,11 @@ def test_push_own_with_a_git_remote_still_pushes_to_it_and_never_falls_back_to_t
     assert _git_out(repo, "rev-parse", "feature/x") == before
 
 
-def test_a_rebase_task_delivers_on_its_own_branch_and_its_review_publishes_that_one(env, monkeypatch):
+def test_a_rebase_task_builds_on_its_own_branch_and_its_review_publishes_back_onto_the_old_one(env, monkeypatch):
     """A task whose title says it rebases the branch its spec names is labelled rebases:<branch>, not
-    pr_branch: it starts from that branch's head on its own branch, its prompt says it delivers there,
-    and its review publishes that new branch with --own (never the old one, never the queue)."""
+    pr_branch: it starts from that branch's head on its own branch, its prompt says --own publishes
+    back onto the old branch under a lease, and its review publishes it there with --own (never a
+    plain force push, never the queue)."""
     from ttp import coordinator as coord, push, pushq, worktree
     from ttp.prompts import worker_task
     p = make(env)
@@ -6308,17 +6309,18 @@ def test_a_rebase_task_delivers_on_its_own_branch_and_its_review_publishes_that_
     path, branch = worktree.ensure(p, t)
     assert branch.startswith(f"ttp/t{t['id']}-")
     assert _git_out(path, "rev-parse", "HEAD") == _git_out(p.root, "rev-parse", "feature/x")
-    assert "rebases branch feature/x" in worker_task(p, t, str(path), branch)
+    prompt = worker_task(p, t, str(path), branch)
+    assert "rebases branch feature/x" in prompt and "under a lease" in prompt
     # A title without "rebase" keeps pr_branch.
     assert coord.apply(p, [{"type": "task_add", "title": "Fix feature/x CI", "kind": "code",
                             "spec": "pr_branch: `feature/x`\nFix it."}]) == []
     assert json.loads(p.db.one("SELECT labels FROM tasks WHERE title='Fix feature/x CI'")["labels"]) \
         == ["pr_branch:feature/x"]
-    # Its review: retargeted to the task's own branch, published with --own, review only for the queue.
+    # Its review: published back onto feature/x with --own under a lease, review only for the queue.
     code, _, _, (rev,) = _finish_code(env, p, "rebase it", {"r.py": 3}, labels=["rebases:feature/x"])
-    own = p.db.task(code)["branch"]
-    assert own.startswith(f"ttp/t{code}-") and push.pr_elsewhere(p, p.db.task(code), {"push_branch": "origin/work"}) == own
-    assert f"It rebases feature/x and delivers onto its own branch {own}" in rev["spec"], rev["spec"]
+    assert push.pr_elsewhere(p, p.db.task(code), {"push_branch": "origin/work"}) == "feature/x"
+    assert "It rebases feature/x and delivers back onto feature/x" in rev["spec"], rev["spec"]
+    assert "under a lease" in rev["spec"], rev["spec"]
     assert "`ttp push --own --detach`" in rev["spec"] and "do not approve it for the push queue" in rev["spec"]
 
 
@@ -10813,3 +10815,145 @@ def test_own_push_publishes_another_tasks_branch_checked_out_when_only_an_update
         assert coord.apply(p, [{"type": "task_update", "id": tid, **how}]) == []
         p.db.update_task(tid, status="running", branch=theirs)
         assert push.own_target(p, repo) == ("origin", theirs), how
+
+
+def _rebase_setup(env, monkeypatch, checks=("true",), spec_line="pr_branch: {old}"):
+    """An earlier task's branch `old` on origin (the tip `theirs`, not on the push branch) and a
+    running task labelled rebases:<old> whose spec names it, on its own branch with a rebased head
+    that does not fast-forward `old`."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, list(checks))
+    owner = p.db.add_task("First example", "s", kind="code")
+    old = f"ttp/t{owner}-example"
+    _commit(other, "old.txt", "old\n")
+    _git_out(other, "push", "-q", "origin", f"HEAD:refs/heads/{old}")
+    theirs = _git_out(origin, "rev-parse", old)
+    _git_out(repo, "fetch", "-q", "origin")
+    tid = p.db.add_task("Rebase the example", spec_line.format(old=old) + "\nRebase it onto proj.",
+                        kind="code", labels=[f"rebases:{old}"])
+    own = f"ttp/t{tid}-rebase-the-example"
+    p.db.update_task(tid, status="running", branch=own)
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    _git_out(repo, "checkout", "-q", "-B", own)
+    _commit(repo, "old.txt", "old, rebased\n")
+    return p, repo, origin, other, tid, old, theirs
+
+
+@pytest.mark.parametrize("spec_line", ["pr_branch: {old}", "`pr_branch: {old}`", "pr_branch: `{old}`"])
+def test_own_push_publishes_a_rebase_onto_the_branch_it_rebases_under_a_lease(env, monkeypatch, capsys, spec_line):
+    """A task labelled rebases:<branch> whose spec names that branch in a `pr_branch:` line (plain, in
+    backticks, or the whole line in backticks) publishes with --own onto that branch, as the dispatcher
+    built it on it: from its own branch or with that branch itself checked out. The non-fast-forward
+    update goes only with a lease on the tip it read."""
+    from ttp import push, worktree
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch, spec_line=spec_line)
+    t = p.db.task(tid)
+    assert worktree.delivery_branch(t) == (old, True) and push.delivery_source(p, t)[1:] == (old, True)
+    assert worktree.carried_head(p, t) == theirs   # what the dispatcher builds it on
+    assert push.own_target(p, repo) == ("origin", old) and push.own_lease(p, old)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", old) == head
+    assert "under a lease" in capsys.readouterr().err
+    # The reported case: the rebased branch itself checked out.
+    _git_out(repo, "checkout", "-q", "-B", old)
+    _commit(repo, "more.txt", "more\n")
+    assert push.own_target(p, repo) == ("origin", old)
+    assert _ttp("push", "--own") == 0 and _git_out(origin, "rev-parse", old) == _git_out(repo, "rev-parse", "HEAD")
+    # A pr_branch task (no rebase) still only fast-forwards.
+    p.db.update_task(tid, labels=json.dumps([f"pr_branch:{old}"]))
+    assert not push.own_lease(p, old)
+
+
+def test_own_push_lease_keeps_a_branch_that_moved_during_the_checks(env, monkeypatch, tmp_path):
+    """The lease is on the tip read before the checks: someone pushing to the rebased branch while
+    they run makes the push fail, and their commit stays. Never a plain force push."""
+    mover = tmp_path / "move.sh"
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch, checks=(f"sh {mover}",))
+    mover.write_text(f"git -C {other} commit -q --allow-empty -m moved && "
+                     f"git -C {other} push -q origin HEAD:refs/heads/{old}\n")
+    assert _ttp("push", "--own") == push_rejected()
+    moved = _git_out(origin, "rev-parse", old)
+    assert moved != theirs and moved == _git_out(other, "rev-parse", "HEAD")
+
+
+def push_rejected():
+    from ttp import push
+    return push.REJECTED
+
+
+def test_a_continuation_of_a_rebase_task_publishes_onto_the_same_branch(env, monkeypatch, capsys):
+    """A task continuing a rebase task (no branch record of its own) resolves the same branch, with
+    the lease, in the dispatcher's routing and in --own alike."""
+    from ttp import push
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch)
+    p.db.update_task(tid, status="failed")
+    nxt = p.db.add_task("Rebase the example, again", "Finish the rebase.", kind="code",
+                        labels=[f"continues:{tid}"])
+    own = f"ttp/t{nxt}-again"
+    p.db.update_task(nxt, status="running", branch=own)
+    monkeypatch.setenv("TTP_TASK", str(nxt))
+    _git_out(repo, "checkout", "-q", "-B", own)
+    assert push.delivery_source(p, p.db.task(nxt))[1:] == (old, True)
+    assert push.own_target(p, repo) == ("origin", old) and push.own_lease(p, old)
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", old) == _git_out(repo, "rev-parse", "HEAD")
+    # A cleared record (pr_branch "") stops the chain: it lands on the push branch, --own has no target.
+    p.db.update_task(nxt, labels=json.dumps([f"continues:{tid}", "no_pr_branch"]))
+    assert push.delivery_source(p, p.db.task(nxt)) == (None, "", False) and not push.own_lease(p, old)
+    _git_out(repo, "checkout", "-q", "-B", old)
+    with pytest.raises(ValueError, match="publishes only this task's own branch"):
+        push.own_target(p, repo)
+
+
+def test_own_push_refuses_a_rebase_branch_no_record_names_or_a_shared_one(env, monkeypatch, capsys):
+    """A task with no rebases:/pr_branch record of a branch may not publish onto it; a record naming
+    the push branch, main or master is refused, never forced."""
+    from ttp import push
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch)
+    stray = p.db.add_task("Unrelated", "s", kind="code")
+    p.db.update_task(stray, status="running", branch=f"ttp/t{stray}-unrelated")
+    monkeypatch.setenv("TTP_TASK", str(stray))
+    _git_out(repo, "checkout", "-q", "-B", old)
+    with pytest.raises(ValueError, match="publishes only this task's own branch"):
+        push.own_target(p, repo)
+    assert not push.own_lease(p, old)
+    assert _ttp("push", "--own") != 0 and _git_out(origin, "rev-parse", old) == theirs
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    _git_out(repo, "checkout", "-q", f"ttp/t{tid}-rebase-the-example")
+    for shared in ("proj", "main", "master"):
+        p.db.update_task(tid, spec=f"pr_branch: {shared}\nRebase it.", labels=json.dumps([f"rebases:{shared}"]))
+        with pytest.raises(ValueError, match="shared branch"):
+            push.own_target(p, repo)
+    assert _git_out(origin, "rev-parse", "proj") != _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_own_push_rebase_obeys_own_push_off_and_existing_only(env, monkeypatch, capsys):
+    """own_push off refuses a rebase's --own; existing_only (and on) never creates the branch a rebase
+    names when the remote lacks it."""
+    from ttp import push
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch)
+    p.set_config("delivery.own_push", "off")
+    assert _ttp("push", "--own") != 0 and "own pushes are off" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", old) == theirs
+    _git_out(origin, "branch", "-D", old)
+    for mode in ("existing_only", "on"):
+        p.set_config("delivery.own_push", mode)
+        assert _ttp("push", "--own") != 0, mode
+        assert "never creates" in capsys.readouterr().err or mode == "existing_only"
+        assert old not in _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+
+
+def test_backticked_and_plain_pr_branch_lines_label_a_task_the_same(env):
+    """task_add reads `pr_branch: <b>`, `pr_branch: \\`<b>\\`` and the whole line in backticks alike:
+    a rebase title labels rebases:<b>, another title pr_branch:<b>."""
+    from ttp import coordinator as coord, worktree
+    p = make(env)
+    for i, line in enumerate(("pr_branch: ttp/t1-example", "pr_branch: `ttp/t1-example`",
+                              "`pr_branch: ttp/t1-example`", "- `pr_branch: ttp/t1-example`.")):
+        assert worktree.spec_line_branch(line) == "ttp/t1-example", line
+        for title, label in ((f"Rebase the example {i}", "rebases"), (f"Fix the example {i}", "pr_branch")):
+            assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "force": True,
+                                    "spec": f"{line}\nDo it."}]) == []
+            labels = json.loads(p.db.one("SELECT labels FROM tasks WHERE title=?", (title,))["labels"])
+            assert f"{label}:ttp/t1-example" in labels, (line, labels)
+    assert worktree.spec_line_branch('`pr_branch: ""`') == ""

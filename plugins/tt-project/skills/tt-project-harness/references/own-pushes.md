@@ -6,6 +6,12 @@ Unset, a code task may still create its own `ttp/t<id>-...` branch (draft PRs on
 A code task refused creating another task's branch it carries is told its route: commit on its own branch and run `ttp push --own-branch --detach`.
 Never `git push` around a refusal.
 
+## Which branch `--own` publishes onto
+
+The branch the task was built on: its latest `pr_branch:` record (a task_update's, else its label from the spec's `pr_branch: <branch>` line, plain or in backticks; `pr_branch: ""` means the push branch), else its `rebases:<branch>` label, else the branch of the task it continues.
+A `pr_branch:` branch only fast-forwards. A `rebases:` branch is replaced under a lease on the tip `--own` read (`--force-with-lease`), never with a plain force push, and never created.
+A branch no record of the task names is refused, as are the push branch, main, master and the remote's default branch.
+
 ## Where own branches go
 
 `delivery.own_push_remote` names where `ttp push --own` (and every push that publishes as with `--own`) sends a branch: a git remote's name, a URL, or a map from a repo (its path, or its main checkout's folder name; `"*"` for any other) to one.

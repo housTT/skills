@@ -9559,10 +9559,11 @@ class Daemon:
                          f"only: if it passes, hand off `done`; do not run `ttp push` or approve it for the push "
                          f"queue. Leave the branch" + (" and the PR" if pr else "") + " as they are.")
         elif elsewhere and (old := worktree.rebased_branch(task)) and d.get("push_allowed", True):
-            lines.append(f"It rebases {old} and delivers onto its own branch {elsewhere}, not {old} (a rebase "
-                         f"cannot fast-forward it) and not {d['push_branch']}. If it passes, publish it with "
-                         f"`ttp push --own --detach` from the change's worktree; never run plain `ttp push` and "
-                         f"do not approve it for the push queue.")
+            lines.append(f"It rebases {old} and delivers back onto {elsewhere}, not {d['push_branch']}. If it "
+                         f"passes, publish it with `ttp push --own --detach` from the change's worktree: a rebase "
+                         f"cannot fast-forward {old}, so that push replaces it under a lease on the tip it reads. "
+                         f"Never force-push it another way, never run plain `ttp push` and do not approve it for "
+                         f"the push queue.")
         elif elsewhere and d.get("push_allowed", True):
             lines.append(f"It delivers onto its pr_branch {elsewhere}, not {d['push_branch']}. If it passes, "
                          f"publish it there with `ttp push --own --detach` from the change's worktree; never run "

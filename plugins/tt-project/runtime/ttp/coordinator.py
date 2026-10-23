@@ -1622,7 +1622,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         old = None
                 taken = bool(carried and old and old["id"] == carried[0]["id"])
                 onto = given.group("branch") if given else ""
-                # A rebase of that branch cannot fast-forward it: it delivers on its own branch.
+                # A rebase of that branch cannot fast-forward it: it works on its own branch and
+                # `ttp push --own` replaces that branch under a lease (push.own_lease).
                 rebase = bool(onto and REBASE_TITLE.search(title))
                 if onto:
                     labels.append(f"{'rebases' if rebase else 'pr_branch'}:{onto}")
@@ -1696,8 +1697,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                  f"change ({push.own_landing(cfg)}); never write `--own` into its spec")
                 elif rebase:
                     notes.append(f"task_add: #{new_id} rebases {onto}: it starts from that branch on its own "
-                                 f"branch and delivers there with `ttp push --own` (a rebase cannot fast-forward "
-                                 f"{onto}); its review publishes that new branch")
+                                 f"branch, and `ttp push --own` (its review's) publishes it back onto {onto} under "
+                                 f"a lease (a rebase cannot fast-forward it)")
                 elif carried and taken:
                     notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]}: continues "
                                  f"#{old['id']}, so `ttp push --own` publishes onto it")

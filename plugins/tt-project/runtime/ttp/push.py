@@ -1559,11 +1559,17 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     task = os.environ.get("TTP_TASK")
     fresh = bool(m and task and m.group(1) == task and _fresh(p, task, branch))
     as_is = bool(m and task and m.group(1) == task and (fresh or os.environ.get(OWN_BRANCH_ENV)))
-    onto = _pr_branch(p, task) if task and not as_is else ""
+    # The branch the dispatcher built it on (delivery_source: its pr_branch or rebases: record, or the
+    # one of a task it continues), as its own branch or with that branch itself checked out. Its own
+    # record as written first, so an invalid one is refused below rather than skipped.
+    onto = (_pr_branch(p, task) or pr_branch_of(p, _task_row(p, task))) if task and not as_is else ""
     notes = is_notes_branch(p, branch)   # publishes itself, never onto a pr_branch
+    if task and not as_is and not notes and (named := worktree.named_branch(_task_row(p, task) or {})) in PROTECTED:
+        raise ValueError(f"--own never pushes to a shared branch ({named}): this task's pr_branch or "
+                         f"rebases: record names it")
     if m and task and m.group(1) == task and not notes and not as_is and (why := _switched(p, task, branch)):
         raise ValueError(why)
-    carried = bool(m and onto and m.group(1) == task and not notes)
+    carried = bool(onto and not notes and (m and m.group(1) == task or branch == onto))
     if m and task and m.group(1) != task and not carried and not notes:
         # A review publishes the code task it covers onto that task's pr_branch, as the task would:
         # from that task's own branch, or from the pr_branch itself checked out (a task's ttp/t<id>-...
@@ -2434,29 +2440,44 @@ def _no_push_of(task: dict, whose: str) -> str | None:
 
 
 def pr_branch_of(p: Project, task: dict | None) -> str:
-    """The branch a task is recorded as delivering onto (worktree.carried_branch), its own branch
-    when it rebases one (`rebases:<branch>`: a rebase cannot fast-forward the old branch), or that of
-    the task it continues (a fix of a failed review's findings builds on that task's work), or "".
+    """The branch a task delivers onto (delivery_source): the one its own records name (its pr_branch,
+    or the branch it rebases: `rebases:<branch>`, replaced under a lease), or that of the task it
+    continues (a fix of a failed review's findings builds on that task's work), or "".
     A task labelled worktree.NO_PR_BRANCH carries none, whatever the tasks it continues carry."""
     return pr_branch_source(p, task)[1]
 
 
 def pr_branch_source(p: Project, task: dict | None) -> tuple[dict | None, str]:
-    """(the task whose label gives `task` its branch, that branch) as pr_branch_of finds them: `task`
-    itself or one it continues; (None, "") when it carries none."""
+    """(the task whose record gives `task` its branch, that branch) as delivery_source finds them."""
+    return delivery_source(p, task)[:2]
+
+
+def delivery_source(p: Project, task: dict | None) -> tuple[dict | None, str, bool]:
+    """(the task whose record gives `task` its branch, that branch, whether it is a rebase of it): the
+    one resolver of the branch a task delivers onto, for the dispatcher's routing and `ttp push --own`
+    alike. `task` itself (worktree.delivery_branch: the latest of an appended `pr_branch:` line, its
+    pr_branch label and its `rebases:` label), else the task it continues, and so on; (None, "", False)
+    when it carries none (also a cleared record: NO_PR_BRANCH or `pr_branch: ""`)."""
     seen: set[int] = set()
     while task and task["id"] not in seen:
         seen.add(task["id"])
-        named = worktree.recorded_pr_branch(task)
-        if named == "":   # NO_PR_BRANCH or a cleared `pr_branch: ""` update line
-            return None, ""
-        if onto := worktree.carried_branch(task):
-            return task, onto
-        if worktree.rebased_branch(task) and (onto := str(task.get("branch") or "")):
-            return task, onto
+        if (found := worktree.delivery_branch(task)) is not None:
+            return (task, *found) if found[0] else (None, "", False)
         c = continues_id(task)
         task = p.db.task(c) if c is not None else None
-    return None, ""
+    return None, "", False
+
+
+def own_lease(p: Project, branch: str) -> bool:
+    """Whether `ttp push --own` publishes onto `branch` as a rebase: the running task, or a code task
+    the running review covers, delivers onto it by a `rebases:` record (delivery_source). Such a push
+    replaces the branch under a lease on the tip it read (publish), never as a plain force push, and
+    never creates it. Never outside a run, never for `--own-branch`."""
+    task = os.environ.get("TTP_TASK")
+    if not task or os.environ.get(OWN_BRANCH_ENV):
+        return False
+    rows = [r for r in [_task_row(p, task)] + _reviewed(p, task) if r]
+    return any((found := delivery_source(p, r))[2] and found[1] == branch for r in rows)
 
 
 def never_published(repo: Path, d: dict, branch: str, timeout: float = 30) -> bool:
@@ -3058,7 +3079,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None,
             base: str | None = None, ff_only: bool = False, recorded: dict | None = None,
             check_run_dir: str | None = None, reuse: Callable[[str, list, list], str] | None = None,
-            host: str = "") -> int:
+            host: str = "", lease: bool = False) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
@@ -3070,7 +3091,10 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     unless every check was skipped by its `if_changed` scope (`outside_scope`, compared with `base`).
     `reuse(tree, commands, envs)` names a pass `ttp checks` recorded of exactly those commands on HEAD's
     tree under the same environment (pushpass.check_envs), or gives "": with one, nothing runs again.
-    `host` (delivery.checks_host) is where those recorded commands run, as the project's checks do."""
+    `host` (delivery.checks_host) is where those recorded commands run, as the project's checks do.
+    `lease` (own_lease: a rebase of `branch`) replaces the remote branch instead of fast-forwarding it,
+    only with `--force-with-lease` on the tip read before the checks: a branch that moved since is
+    not overwritten, and one the remote lacks is refused (a rebase never creates its branch)."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -3082,10 +3106,15 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         say(why)
         return REFUSED
     head = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    if not local and head and _existing_tip(repo, remote, branch) == head:
+    read = _existing_tip(repo, remote, branch) if not local else ""
+    if not local and head and read == head:
         # Already published (e.g. by the change a review covers): nothing to check or push again.
         say(f"{head[:10]} is already {remote}/{branch}'s tip; nothing to push")
         return 0
+    if lease and not local and not read:
+        say(f"{remote} has no branch {branch} (or it cannot be read): a rebase replaces an existing branch "
+            f"under a lease and never creates one; not pushing")
+        return REFUSED
     if not checks and (code := code_paths(repo, base) if base else ["(no push target to compare with)"]):
         more = f" and {len(code) - 3} more" if len(code) > 3 else ""
         say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "
@@ -3142,6 +3171,15 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             return REFUSED
         if local:
             return _move_local(repo, branch, head, say)
+        if lease and not local:
+            # Never a plain force push: only while the remote still has the tip read before the checks.
+            if _git(repo, "push", f"--force-with-lease=refs/heads/{branch}:{read}", remote,
+                    f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
+                say(f"pushed {head[:10]} to {remote}/{branch}, replacing {read[:10]} (a rebase, under a lease)")
+                return 0
+            say(f"push to {remote}/{branch} was rejected: it no longer has {read[:10]}, the tip the lease was "
+                f"taken on (someone pushed to it since); not overwritten")
+            return REJECTED
         if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
             say(f"pushed {head[:10]} to {remote}/{branch}")
             return 0
@@ -3459,9 +3497,10 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
         # shared branch this work leaves from: always fetch it (cheap), so none sees a stale base.
         base = own_base(p, repo, remote)
+        lease = own_lease(p, branch)   # a rebase replaces the branch it rebases, under a lease
         rc = publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
                      timed=lambda s: record_check_s(p, s), base=base,
-                     ff_only=own_ff_only(branch),
+                     ff_only=own_ff_only(branch) and not lease, lease=lease,
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
                      reuse=lambda tree, cmds, envs: _own_pass(p, tree, cmds, envs), host=d.get("checks_host") or "")
     else:
