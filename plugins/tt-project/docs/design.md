@@ -77,6 +77,18 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    after `waiting.on_pass_timeout_s`; its exit 0
    with a `done` or `needs_review` hand-off at `$TTP_RESULT` ends the task; a failed or overrun
    command wakes it at its own tier, anything else wakes it as usual.
+   Before a due wait starts a model turn, the wait-wake gate (`waitgate.py`) decides whether one
+   is needed. Must-wake events always wake: an escalation, any wake reason but a timer or "probe
+   passed", a changed spec, a probe answer that changed since the last skip, and the cap
+   (`waiting.wake_gate.max_skips`, 4, or `max_skip_h`, 4 h, since the last turn). Model-free rules
+   then skip what is still pending (a detached job with no exit code, a lock still held, checks or
+   a push still running or queued, a probe pass the last turn already saw); Jev, where its
+   `wake_gate` use is on, judges the rest; anything else wakes as before. A skip re-defers the
+   task with a doubling backoff (`backoff_s` to `max_backoff_s`) and keeps the probe answer it
+   saw; the probe loop wakes it at once when that answer changes. The next real turn settles each
+   decision (a wake that only handed the wait back, or a skip whose next turn found work, is a
+   miss), and the daily review reports skips, Jev spend and the estimated saving.
+   `waiting.wake_gate.enabled` false turns it off.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.
