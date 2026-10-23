@@ -1131,7 +1131,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_progress, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -4588,6 +4588,10 @@ class Daemon:
             self._schedule_skip(row, status)
         except Exception as e:   # the run is recorded; its skip history and alert are extras
             log(self.p, f"schedule {row['name']}: skip record failed: {type(e).__name__}: {e}")
+        try:
+            progress.note_schedule(db, row["name"], status)
+        except Exception as e:   # counting must never keep the run from being recorded
+            log(self.p, f"progress check: could not count schedule {row['name']}: {type(e).__name__}: {e}")
         if again is not None:   # a heal check's grace end or settle recheck comes before its period
             db.x("UPDATE schedules SET next_run=MIN(next_run, ?) WHERE name=?", (again, row["name"]))
         elif row["kind"] == "command" and (spec := heal.of(payload)):   # backing off while healthy
@@ -5027,6 +5031,17 @@ class Daemon:
         if v.wake:
             self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                         (time.time(), source, "observation", v.fingerprint, v.severity, text[:4000], "queued"))
+
+    def check_progress(self, every_s: float = 60) -> None:
+        """Model-free progress and stall check (progress.py): work queued or running with no result past
+        its threshold raises `no_progress`; the same not-yet, refusal or failure repeating raises
+        `stall`. Each key wakes the coordinator once, again on escalation or after a long interval."""
+        now = time.time()
+        if now - getattr(self, "_progress_checked", 0.0) < every_s:
+            return
+        self._progress_checked = now
+        for e in progress.check(self.p.db, self.cfg, self.p.state, now, where=self.p, current_probe=_current_probe):
+            log(self.p, f"progress check: {e['kind']} for {', '.join(e['keys'])}")
 
     def check_stall(self, every_s: float = 60) -> None:
         """Model-free stall check: dispatch would start a queued task, yet nothing starts. Once no
@@ -7304,6 +7319,7 @@ class Daemon:
             self._probe_rc.pop(task["id"], None)
             self._start_rc.pop(task["id"], None)
             startgate.forget(self.p.db, tid=task["id"])
+            progress.forget_probe(self.p.db, task["id"])
             self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
                                   not_before=None)
             log(self.p, f"task {task['id']} start_when passed; ready to start")
@@ -7315,6 +7331,9 @@ class Daemon:
             out = got[0] if got and got[2] == d.get("when") else ""
             startgate.record(self.p.db, task["id"], d.get("when") or "", rc,
                              startgate.reason(self.p.db, d.get("when") or "", rc, out), now)
+            if rc in NOT_YET_RCS:
+                progress.note_probe(self.p.db, task["id"], d.get("when") or "", rc,
+                                    startgate.reason(self.p.db, d.get("when") or "", rc, out), now)
         if rc in NOT_YET_RCS:
             self._start_resource_stale(task, d, now)
         elif detach.failed_check(d.get("when") or "", rc):
@@ -8000,6 +8019,12 @@ class Daemon:
             db.update_task(tid, not_before=nb, blocked_reason=(
                 f"waiting for {what}; its probe says {says}; next try "
                 f"{timefmt.short(nb, self.p)}")[:500])
+            try:
+                probe = str(prev.get("retry_when") or "")
+                progress.note_probe(db, tid, probe, rc, startgate.reason(
+                    db, probe, rc, (self._probe_out.get(tid) or ("",))[0]), at)
+            except Exception as e:   # counting must never keep a wait from sleeping
+                log(self.p, f"progress check: could not count task {tid}'s probe: {type(e).__name__}: {e}")
             log(self.p, f"task {tid} retry_when probe still failing"
                         f"{' (host unreachable)' if rc == 255 else ''}; asleep until "
                         f"{timefmt.short(nb, self.p)}")

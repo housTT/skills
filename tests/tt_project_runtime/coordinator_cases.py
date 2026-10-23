@@ -997,6 +997,8 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     ask = db.post("out", "Which board should the soak use?", kind="ask")
     ev = db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
               (time.time(), "daemon", "observation", "normal", "a new thing happened", "queued"))
+    db.set_kv("progress_state", {"raised": {"stall:probe:#1": {"kind": "stall", "what": "task #1", "since": time.time(),
+                                                               "reason": "not yet", "first": time.time()}}})
     gates = {"claude": {"level": "green", "reasons": [], "numbers": {}, "max_tier": "deep", "max_parallel": 6,
                         "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
     full, seen = coord.digest_parts(p, gates, [ev], [])
@@ -8816,9 +8818,9 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     p = make(env)
     role = coordinator_role(p)
     # A default project's role prompt stays under its size budget (it had grown to 52.7k chars).
-    # 31_148: room for the relay-label and stale_duplicate rules, the machine-wide hold, schedule precheck
-    # and facts-at-send-time rules, the Course check rule, the overlaps rule and the likely-correction rule
-    assert len(role) <= 31_148, len(role)
+    # 31_210: room for the relay-label and stale_duplicate rules, the machine-wide hold, schedule precheck
+    # and facts-at-send-time rules, the Course check and Progress rule, the overlaps rule and the likely-correction rule
+    assert len(role) <= 31_210, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.

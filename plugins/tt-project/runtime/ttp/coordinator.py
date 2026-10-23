@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -249,6 +249,7 @@ EFFORT_EVENT_TRIGGERS = {
     "dead_dependency": "stuck", sweep.SWEEP_KIND: "stuck",
     "time_only_hold": "stuck", "blocked_dependency": "stuck", "dependency_cycle": "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "deferral_job_failed": "stuck",
+    "no_progress": "stuck", "stall": "stuck",
     "missing_task_ref": "stuck", obligations.PROMISE_KIND: "stuck", mitigate.OVERDUE: "stuck",
     "review_stall": "stuck", "review_failed_unhandled": "stuck", "review_nofix": "stuck", "landed_wait_dead": "stuck", askrethink.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
@@ -307,7 +308,8 @@ MUTE_CHARS = 200
 # resources and memory changes are always shown whole; the machine ledger collapses per line
 # (LEDGER_SEEN_KEY).
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
-COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried", "settled_areas", "course_check")
+COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried", "settled_areas", "course_check",
+               "progress")
 # The shared machine ledger collapses per line: co-tenants reword its lines often ('seen by', 'page
 # held', outage ends), so a turn with no machine_* event shows only the new or reworded ones, and the
 # whole ledger again after a machine event (ledger_section). The seen lines are keyed on the ledger
@@ -843,6 +845,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         course_id += "\ncorrection:" + missed[0].split(" pointed out")[0]
     section("course_check", course_lines, course_id,
             f"## Course check: {len(course_lines) - 1} lines (as last turn; correct course or say why it is fine)")
+    prog_lines, prog_id = progress.digest_lines(db, now)
+    section("progress", prog_lines, prog_id,
+            f"## Progress: {len(prog_lines) - 1} stuck (as last turn; act on each or say why it is fine)")
     mem = memory_budget_line(p)
     if mem:
         section("memory_budget", [mem], mem, mem.split(";")[0] + " (as last turn)")

@@ -377,6 +377,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     low = schedule.below_suggestion(db)
     if low:
         out.append(f"schedule caps under their suggestion: {len(low)}: " + "; ".join(low[:TOP]) + _more(low))
+    from . import progress
+    if stuck := progress.audit_line(db, since, now):
+        out.append(stuck)
     held = overrides(p, db, now, blocked_h)
     if held:
         out.append(f"overrides held long: {len(held)}: " + "; ".join(held[:TOP]) + _more(held))

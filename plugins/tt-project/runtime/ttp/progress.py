@@ -16,6 +16,44 @@ last result. N refusals, stalls or failures in a row with no result (waiting.pro
 default 5) are a stalled key. The daemon raises one keyed observation per streak
 (Daemon.watch_progress); `ttp status` and the web app list a driver whose process still runs as
 stalled, not running (`stalled`).
+
+Progress and stall check (`check`, the daemon's check_progress): model-free, each minute, so the
+coordinator hears about work that stopped producing results before the user does. It reads the
+reports above through `entries` (both generations, so a rotation loses no line) and leaves report
+streaks to `streaks`/Daemon.watch_progress: one detector, one wake per stalled driver key.
+
+Progress clock: the time since the last counted result (a task done, a worker hand-off, a driver's
+`result` report for its key, or made inside a task's run), kept per open task, per resource open
+tasks name and for the project. Past its threshold while work is queued or running, one keyed
+`no_progress` event names what is stuck, since when and the last reason seen:
+
+- task: a queued task dispatch could start (dependencies met, no timer or start_when, no paused
+  resource) that has had no result for `task_h` (2) hours while a worker slot is free;
+- resource: a resource named by queued or running tasks with no result on any task naming it for
+  `resource_h` (2) hours;
+- project: no result anywhere for `project_h` (2) hours while tasks are queued or running.
+
+Repeat detectors, each one keyed `stall` event with the count, first and last seen and the reason:
+
+- probe: a waiting task's retry_when or a deferred task's start_when still says not yet after
+  `probe_n` (10) verdicts and `probe_h` (1) hours (waits on the task's own job, a push, CI, another
+  task landing or a time are expected to be long and left out). It is flagged "waits on what it
+  fixes" when the probe waits on a resource that is down or paused and the task is that resource's
+  fix, or a task holding the resource waits on this one;
+- runs: a task's (or one schedule's) worker runs failing `fail_n` (3) times in a row the same way;
+- schedule: a schedule failing `repeat_n` (5) times in a row with the same status. A skip on its own
+  daily cap is not counted here: the daemon's schedule-budget observation (Daemon._schedule_skip)
+  reports it, once a day.
+
+Each key wakes once per condition. It wakes again only when its count (or stuck time) reaches
+`escalate_x` (2) times what it was at the last wake, or after `rewake_h` (12) hours. Hysteresis: a
+raised key that drops out of a check is not cleared at once (a stuck task drops out whenever every
+worker slot is briefly full). It stays raised, quiet, and clears only once it has stayed healthy for
+`clear_n` (3) checks in a row spanning at least `clear_min` (30) minutes; coming back before that
+continues the same raise and never wakes as new. Schedule repeats also lapse after `quiet_h` (6)
+hours with no repeat. Each cleared key is kept for the daily review with how long it took. A mute
+(source `daemon:progress`, match the key) keeps a key quiet. Thresholds live under
+`coordinator.progress_check` in project.json (0 turns one off).
 """
 from __future__ import annotations
 
@@ -25,7 +63,9 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Any, Callable
 
+from .db import DB, TERMINAL_TASK_STATES, deferral, load_result
 from .project import durable_append
 
 LOG, OLD, LOCK = "progress.jsonl", "progress.1.jsonl", "progress.lock"
@@ -163,3 +203,479 @@ def stalled(state: Path, cfg: dict | None, now: float | None = None) -> list[dic
         out.append({"key": k["key"], "source": k["last"].get("source") or "", "bad": k["bad"],
                     "since": float(k["first"].get("ts") or 0), "line": describe(k)})
     return sorted(out, key=lambda x: -x["bad"])
+
+
+# ---- progress and stall check (the daemon's check_progress) ----
+
+KEY = "progress_check"          # coordinator.progress_check: thresholds
+STATE_KEY = "progress_state"    # kv: results seen, counters, raised keys, cleared history
+SOURCE = "daemon:progress"      # the events' source, for observation mutes
+EVENT_KINDS = ("no_progress", "stall")
+# clear_n/clear_min: hysteresis. A raised key clears only after clear_n healthy checks in a row that
+# span clear_min minutes: at the daemon's 60 s check that is 3 checks and half an hour, long enough
+# for slots that fill and free, short enough that a fixed key leaves the digest within the hour.
+CHECK_DEFAULTS = {"task_h": 2, "resource_h": 2, "project_h": 2, "probe_n": 10, "probe_h": 1, "repeat_n": 5,
+                  "fail_n": 3, "escalate_x": 2, "rewake_h": 12, "quiet_h": 6, "clear_n": 3, "clear_min": 30}
+HEADER = "## Progress (stuck work: re-plan, re-tier, re-point the probe, route around, cancel or fix the cause)"
+BAD_RUNS = ("failed", "timeout", "stalled")
+# Waits expected to be long, whose producer has its own clock: the task's own detached job or checks,
+# a push, CI, another task landing, another project's reply, an upstream fix, a time.
+OWN_WAIT_RE = re.compile(r"detach --check|checks --result|push --result|\bttp ci\b|ack-wait|landed:|ttp landed|"
+                         r"upstream --fixed|^\s*test \"\$\(date")
+FIX_RE = re.compile(r"\b(fix\w*|repair\w*|recover\w*|restor\w*|reboot\w*|reset\w*|heal\w*|unstick\w*|revive\w*)\b", re.I)
+REASON_CHARS = 200
+HISTORY_KEEP = 200
+RESULTS_KEEP = 500
+DAY = 86400
+
+
+def check_settings(cfg: dict | None) -> dict:
+    got = ((cfg or {}).get("coordinator") or {}).get(KEY) or {}
+    out = dict(CHECK_DEFAULTS)
+    if isinstance(got, dict):
+        for k in CHECK_DEFAULTS:
+            try:
+                out[k] = max(0.0, float(got.get(k, CHECK_DEFAULTS[k]) or 0))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _norm(text: str) -> str:
+    """A reason with its numbers and hex ids masked, so 'busy for 61 s' repeats 'busy for 600 s'."""
+    return re.sub(r"\d+", "#", re.sub(r"\b[0-9a-f]{7,40}\b", "#", " ".join(str(text or "").split()).lower()))
+
+
+def _clip(text: Any, n: int = REASON_CHARS) -> str:
+    s = " ".join(str(text or "").split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _dur(s: float) -> str:
+    s = max(0.0, s)
+    return f"{s / 3600:.1f} h" if s >= 5400 else f"{int(s // 60)} min"
+
+
+def _ts(rec: dict, default: float) -> float:
+    try:
+        return float(rec.get("ts"))
+    except (TypeError, ValueError):
+        return default
+
+
+def load(db: DB) -> dict:
+    st = db.kv(STATE_KEY) or {}
+    if not isinstance(st, dict):
+        st = {}
+    for k in ("results", "probes", "scheds", "raised"):
+        st.setdefault(k, {})
+    st.setdefault("history", [])
+    return st
+
+
+def _save(db: DB, st: dict) -> None:
+    if len(st["results"]) > RESULTS_KEEP:
+        st["results"] = dict(sorted(st["results"].items(), key=lambda kv: kv[1])[-RESULTS_KEEP:])
+    st["history"] = st["history"][-HISTORY_KEEP:]
+    db.set_kv(STATE_KEY, st)
+
+
+def _take_results(st: dict, recs: list[dict], now: float) -> None:
+    """Drivers' `result` reports as counted results: per report key, and per task for one made inside
+    a task's run (`task:<id>`). Kept in the state, so a result rotated out of the file still counts."""
+    for rec in recs:
+        if rec["kind"] != "result":
+            continue
+        ts = _ts(rec, now)
+        for k in {str(rec["key"]).strip()[:200], f"task:{rec['task']}" if rec.get("task") else ""} - {""}:
+            st["results"][k] = max(ts, float(st["results"].get(k) or 0))
+
+
+# ---- inputs the daemon feeds ----
+
+def note_probe(db: DB, tid: int, probe: str, rc: Any, reason: str, now: float | None = None) -> None:
+    """A probe (retry_when or start_when) said not yet: count it for its task."""
+    now = time.time() if now is None else now
+    st = load(db)
+    rec = st["probes"].get(str(tid))
+    if rec and rec.get("probe") == probe and now <= float(rec["last"]):
+        return   # this verdict is counted already
+    if rec and rec.get("probe") == probe:
+        rec.update(n=int(rec["n"]) + 1, last=now, rc=rc, reason=_clip(reason) or rec.get("reason"))
+    else:
+        st["probes"][str(tid)] = {"probe": probe, "n": 1, "first": now, "last": now, "rc": rc, "reason": _clip(reason)}
+    _save(db, st)
+
+
+def forget_probe(db: DB, tid: int) -> None:
+    """The task's probe passed: progress for its wait."""
+    st = load(db)
+    if st["probes"].pop(str(tid), None) is not None:
+        _save(db, st)
+
+
+def _schedule_failed(status: str) -> bool:
+    s = str(status or "")
+    return s == "no command" or s.startswith("error")
+
+
+def note_schedule(db: DB, name: str, status: str, now: float | None = None) -> None:
+    """A schedule's trigger ended with `status`. Failures count when they repeat; a run that did
+    something ends the stint. Skips change nothing: the expected ones (the budget gate, an open run, a
+    debounce, the idle guard, a precheck), and one on its own daily cap, which the daemon's
+    schedule-budget observation reports (Daemon._schedule_skip), so it is never reported twice."""
+    from . import schedule as sched
+    now = time.time() if now is None else now
+    if sched.skip(status):
+        return
+    st = load(db)
+    rec = st["scheds"].get(name)
+    if _schedule_failed(status):
+        if rec and rec.get("norm") == _norm(status):
+            rec.update(n=int(rec["n"]) + 1, last=now, reason=_clip(status))
+        else:
+            st["scheds"][name] = {"n": 1, "first": now, "last": now, "reason": _clip(status), "norm": _norm(status)}
+    elif rec is None:
+        return
+    else:
+        st["scheds"].pop(name, None)
+    _save(db, st)
+
+
+# ---- conditions ----
+
+def _resources(task: dict) -> set[str]:
+    from .coordinator import task_resources
+    return task_resources(task)
+
+
+def _active(db: DB, cfg: dict, now: float) -> tuple[list[dict], list[dict], int, dict]:
+    """(queued tasks dispatch could start, running worker runs with their task, free slots, paused)."""
+    paused = db.paused_resources()
+    ready = []
+    for t in db.ready_tasks():
+        if deferral(t).get("when") or float(t.get("not_before") or 0) > now or _resources(t) & paused.keys():
+            continue
+        ready.append(t)
+    running = db.q("SELECT r.started, r.task, t.labels, t.id tid FROM runs r LEFT JOIN tasks t ON t.id=r.task "
+                   "WHERE r.role!='coordinator' AND r.status='running'")
+    slots = int(((cfg or {}).get("budget") or {}).get("max_parallel_workers", 6) or 0)
+    return ready, running, slots - len(running), paused
+
+
+def _last_results(db: DB, st: dict, now: float) -> dict[int, float]:
+    """Task id -> its last counted result (a worker hand-off, done, a driver's result for `task:<id>`)."""
+    out: dict[int, float] = {}
+    for r in db.q("SELECT task, MAX(ended) t FROM runs WHERE role!='coordinator' AND status='ok' "
+                  "AND task IS NOT NULL AND ended>? GROUP BY task", (now - 30 * DAY,)):
+        out[int(r["task"])] = float(r["t"] or 0)
+    for r in db.q("SELECT id, updated FROM tasks WHERE status='done' AND updated>?", (now - 30 * DAY,)):
+        out[int(r["id"])] = max(out.get(int(r["id"]), 0.0), float(r["updated"] or 0))
+    for k, ts in st["results"].items():
+        m = re.fullmatch(r"task:#?(\d+)", k)
+        if m:
+            out[int(m.group(1))] = max(out.get(int(m.group(1)), 0.0), float(ts))
+    return out
+
+
+def _task_reason(db: DB, t: dict) -> str:
+    if t.get("blocked_reason"):
+        return _clip(t["blocked_reason"])
+    r = db.one("SELECT status, exit_code FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
+               (t["id"],))
+    return f"last run {r['status']}" + (f" (exit {r['exit_code']})" if r and r["exit_code"] not in (None, 0) else "") \
+        if r else "queued, never started"
+
+
+def no_progress(db: DB, cfg: dict, s: dict, st: dict, now: float, open_streaks: dict | None = None) -> list[dict]:
+    """Queued or running work with no counted result past its threshold. `open_streaks`: drivers'
+    report streaks (`streaks`), whose last refusal or failure names why a resource is stuck."""
+    ready, running, free, paused = _active(db, cfg, now)
+    if not ready and not running:
+        return []
+    last = _last_results(db, st, now)
+    out = []
+    if s["task_h"] and free > 0:
+        for t in ready:
+            since = max(float(t["created"] or now), last.get(t["id"], 0.0))
+            if now - since >= s["task_h"] * 3600:
+                out.append({"kind": "no_progress", "key": f"task:#{t['id']}", "task": t["id"],
+                            "what": f"task #{t['id']} {_clip(t['title'], 60)}", "since": since, "n": now - since,
+                            "reason": _task_reason(db, t)})
+    trouble = db.kv("resource_trouble") or {}
+    if s["resource_h"]:
+        named: dict[str, list[tuple[float, dict | None]]] = {}
+        for t in ready:
+            for r in _resources(t):
+                named.setdefault(r, []).append((float(t["created"] or now), t))
+        for run in running:
+            for r in _resources({"labels": run.get("labels")}):
+                named.setdefault(r, []).append((float(run["started"] or now), None))
+        for r, starts in sorted(named.items()):
+            ids = [int(x["id"]) for x in db.q("SELECT id, labels FROM tasks WHERE labels LIKE ?", (f'%:{r}"%',))
+                   if r in _resources(x)]
+            done = max([last.get(i, 0.0) for i in ids] + [float(st["results"].get(f"resource:{r}") or 0),
+                                                          float(st["results"].get(r) or 0)])
+            since = max(done, min(a for a, _ in starts))
+            if now - since < s["resource_h"] * 3600:
+                continue
+            why = (f"paused: {paused[r].get('reason') or '?'}" if r in paused else
+                   "resource trouble: its tasks keep failing" if r in trouble else
+                   next((f"{x['last']['kind']}: {x['last'].get('reason') or '?'}"
+                         for k, x in (open_streaks or {}).items() if x["bad"] and r in k), "")
+                   or next((_task_reason(db, t) for _, t in starts if t), "work on it is running, no result"))
+            out.append({"kind": "no_progress", "key": f"resource:{r}", "what": f"resource {r}", "since": since,
+                        "n": now - since, "reason": _clip(why)})
+    if s["project_h"]:
+        done = max([0.0, *last.values(), *(float(v) for v in st["results"].values())])
+        starts = [float(t["created"] or now) for t in ready] + [float(r["started"] or now) for r in running]
+        since = max(done, min(starts))
+        if now - since >= s["project_h"] * 3600:
+            out.append({"kind": "no_progress", "key": "project", "what": "the project", "since": since,
+                        "n": now - since,
+                        "reason": f"{len(ready)} task(s) queued, {len(running)} worker run(s) running, no result"})
+    return out
+
+
+def _self_ref(db: DB, t: dict, probe: str, rc: Any, paused: dict, trouble: dict) -> str:
+    """'waits on what it fixes: <resource> ...' when the probe waits on a resource that is down or
+    paused and the task is its fix (or a task holding it waits on this one); else ''."""
+    from . import locks, netwait
+    named = set(locks.probe_resources(probe))
+    hosts = set(netwait.hosts(probe)) if rc == 255 else set()
+    down = {r: f"paused ({paused[r].get('reason') or 'no reason'})" for r in named | hosts if r in paused}
+    down.update({r: "in resource trouble" for r in named | hosts if r in trouble and r not in down})
+    down.update({h: "unreachable" for h in hosts if h not in down})
+    try:
+        labels = json.loads(t.get("labels") or "[]")
+    except ValueError:
+        labels = []
+    title, mine = str(t.get("title") or ""), _resources(t)
+    for r, how in sorted(down.items()):
+        fix = any(isinstance(lb, str) and lb.startswith(f"outage:{r}:") for lb in labels) or \
+            ((r in mine or r.lower() in title.lower()) and FIX_RE.search(title))
+        if fix:
+            return f"waits on what it fixes: {r} is {how} and this task is its fix"
+        for h in db.q("SELECT id, depends_on, labels, result, status FROM tasks WHERE id!=? AND status NOT IN "
+                      f"({','.join('?' * len(TERMINAL_TASK_STATES))}) AND labels LIKE ?",
+                      (t["id"], *TERMINAL_TASK_STATES, f'%:{r}"%')):
+            if r not in _resources(h):
+                continue
+            hp = str(load_result(h["result"]).get("retry_when") or "") + " " + str(deferral(h).get("when") or "")
+            try:
+                deps = [int(x) for x in json.loads(h["depends_on"] or "[]")]
+            except (ValueError, TypeError):
+                deps = []
+            if t["id"] in deps or re.search(rf"(#|--task\s+){t['id']}\b", hp):
+                return f"waits on what it fixes: {r} is {how} and its holder #{h['id']} waits on this task"
+    return ""
+
+
+def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None]) -> list[dict]:
+    out = []
+    paused, trouble = db.paused_resources(), db.kv("resource_trouble") or {}
+    for k, rec in list(st["probes"].items()):
+        t = db.task(int(k))
+        if not t or t["status"] in TERMINAL_TASK_STATES or t["status"] == "running" or current_probe(t) != rec["probe"]:
+            st["probes"].pop(k)   # the wait ended, or its probe was re-pointed
+            continue
+        if t["status"] == "waiting" and load_result(t["result"]).get("wait_kind") == "self":
+            continue   # its own job or window: the wait checks cover a job that hangs
+        if not s["probe_n"] or OWN_WAIT_RE.search(rec["probe"]) or int(rec["n"]) < s["probe_n"] \
+                or now - float(rec["first"]) < s["probe_h"] * 3600:
+            continue
+        out.append({"kind": "stall", "key": f"probe:#{t['id']}", "task": t["id"],
+                    "what": f"task #{t['id']} {_clip(t['title'], 60)}: its probe said not yet {rec['n']} times",
+                    "since": float(rec["first"]), "last": float(rec["last"]), "n": int(rec["n"]),
+                    "reason": f"{rec.get('reason') or 'not yet'}; probe: {_clip(rec['probe'], 120)}",
+                    "selfref": _self_ref(db, t, rec["probe"], rec.get("rc"), paused, trouble)})
+    return out
+
+
+def run_stalls(db: DB, s: dict, now: float) -> list[dict]:
+    """A task's, or one schedule's, latest worker runs that failed `fail_n` times in a row the same way."""
+    if not s["fail_n"]:
+        return []
+    groups: dict[str, list[dict]] = {}
+    for r in db.q("SELECT r.task, r.status, r.exit_code, r.note, r.ended, t.origin, t.labels, t.status tstatus, "
+                  "t.title FROM runs r JOIN tasks t ON t.id=r.task WHERE r.role!='coordinator' AND r.ended>? "
+                  "AND r.status NOT IN ('running','lost') ORDER BY r.ended DESC, r.id DESC", (now - DAY,)):
+        if r["origin"] == "schedule":
+            labels = json.loads(r["labels"] or "[]")
+            key = f"schedule-runs:{labels[0]}" if labels else f"runs:#{r['task']}"
+        else:
+            key = f"runs:#{r['task']}"
+        groups.setdefault(key, []).append(r)
+    out = []
+    for key, rows in groups.items():
+        if key.startswith("runs:") and rows[0]["tstatus"] in TERMINAL_TASK_STATES:
+            continue
+        sig, n = None, 0
+        for r in rows:
+            try:
+                note = json.loads(r["note"] or "{}")
+            except ValueError:
+                note = {}
+            why = _clip((note.get("error") if isinstance(note, dict) else "") or
+                        f"{r['status']}" + (f", exit {r['exit_code']}" if r["exit_code"] is not None else ""))
+            if r["status"] not in BAD_RUNS or (isinstance(note, dict) and note.get("lost_to_reboot")):
+                break
+            mine = (r["status"], r["exit_code"], _norm(why))
+            if sig is not None and mine != sig:
+                break
+            sig, n, reason, first = mine, n + 1, why, float(r["ended"] or now)
+        if n >= s["fail_n"]:
+            what = (f"schedule {key.split(':', 1)[1]}" if key.startswith("schedule-runs:")
+                    else f"task #{rows[0]['task']} {_clip(rows[0]['title'], 60)}")
+            out.append({"kind": "stall", "key": key, "what": f"{what}: {n} runs in a row failed the same way",
+                        "since": first, "last": float(rows[0]["ended"] or now), "n": n, "reason": reason,
+                        **({"task": rows[0]["task"]} if key.startswith("runs:") else {})})
+    return out
+
+
+def schedule_stalls(db: DB, s: dict, st: dict, now: float) -> list[dict]:
+    out = []
+    names = {r["name"] for r in db.q("SELECT name FROM schedules WHERE enabled=1")}
+    for name, rec in list(st["scheds"].items()):
+        if name not in names or (s["quiet_h"] and now - float(rec["last"]) >= s["quiet_h"] * 3600):
+            st["scheds"].pop(name)
+            continue
+        if s["repeat_n"] and int(rec["n"]) >= s["repeat_n"]:
+            out.append({"kind": "stall", "key": f"schedule:{name}",
+                        "what": f"schedule {name}: the same status {rec['n']} times in a row",
+                        "since": float(rec["first"]), "last": float(rec["last"]), "n": int(rec["n"]),
+                        "reason": rec["reason"]})
+    return out
+
+
+# ---- waking ----
+
+def _line(c: dict, now: float, where: Any = None) -> str:
+    when = _since(c["since"], now, where)
+    text = f"{c['what']}, no progress since {when} ({_dur(now - c['since'])})"
+    if c.get("last") and c["kind"] == "stall":
+        text += f", last {_since(c['last'], now, where)}"
+    text += f"; why: {c['reason'] or '?'}"
+    if c.get("selfref"):
+        text += f"; {c['selfref']}"
+    return f"[{c['key']}] {text}"
+
+
+def _since(ts: float, now: float, where: Any) -> str:
+    if where is not None:
+        from . import timefmt
+        try:
+            return timefmt.short(ts, where, now)
+        except Exception:
+            pass
+    return f"{_dur(now - ts)} ago"
+
+
+def _decide(st: dict, conds: list[dict], s: dict, now: float) -> list[tuple[dict, str]]:
+    """(condition, why it wakes: new, escalated or still) for each key due a wake; updates `raised`.
+    A raised key missing from this check counts one healthy check (ok_n, since ok_since) and moves to
+    `history` only after clear_n of them spanning clear_min minutes (hysteresis); seen again before
+    that, it continues its raise: no new wake, and escalation still measured from its last wake."""
+    due, seen = [], set()
+    for c in conds:
+        key = f"{c['kind']}:{c['key']}"
+        seen.add(key)
+        r = st["raised"].get(key)
+        why = ("new" if r is None else
+               "escalated" if s["escalate_x"] and float(c["n"]) >= float(r["n"]) * s["escalate_x"] else
+               "still" if s["rewake_h"] and now - float(r["at"]) >= s["rewake_h"] * 3600 else "")
+        keep = {"kind": c["kind"], "what": c["what"], "since": c["since"], "reason": c["reason"],
+                "cur": c["n"], "selfref": c.get("selfref") or "", "first": (r or {}).get("first", now),
+                "ok_n": 0, "ok_since": None}
+        st["raised"][key] = {**(r or {}), **keep, **({"n": c["n"], "at": now, "wakes": int((r or {}).get("wakes", 0)) + 1}
+                                                     if why else {})}
+        if why:
+            due.append((c, why))
+    for key in [k for k in st["raised"] if k not in seen]:
+        r = st["raised"][key]
+        r["ok_n"] = int(r.get("ok_n") or 0) + 1
+        r["ok_since"] = r.get("ok_since") or now
+        if r["ok_n"] < s["clear_n"] or now - float(r["ok_since"]) < s["clear_min"] * 60:
+            continue
+        st["raised"].pop(key)
+        st["history"].append({"key": key, "kind": r.get("kind"), "what": r.get("what"), "raised": r.get("first"),
+                              "cleared": r["ok_since"], "wakes": r.get("wakes", 0)})
+    return due
+
+
+def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | None = None, where: Any = None,
+          current_probe: Callable[[dict], str | None] | None = None, wake: bool = True) -> list[dict]:
+    """One pass: read drivers' results, find every stuck condition, raise one event per kind for the
+    keys due a wake (muted keys only counted) and clear the keys healthy long enough. Returns the
+    events raised."""
+    from . import screen as scr
+    now = time.time() if now is None else now
+    cfg = cfg or {}
+    s = check_settings(cfg)
+    if current_probe is None:
+        from .daemon import _current_probe as current_probe
+    st = load(db)
+    recs = entries(Path(state_dir)) if state_dir else []
+    _take_results(st, recs, now)
+    conds = (no_progress(db, cfg, s, st, now, streaks(recs)) + probe_stalls(db, s, st, now, current_probe)
+             + run_stalls(db, s, now) + schedule_stalls(db, s, st, now))
+    due = _decide(st, conds, s, now)
+    events = []
+    with db.tx():
+        _save(db, st)
+        for kind in EVENT_KINDS:
+            items = []
+            for c, why in due:
+                if c["kind"] != kind:
+                    continue
+                text = _line(c, now, where) + ("" if why == "new" else f" ({why})")
+                if scr.count_muted(db, SOURCE, text, "normal", now, whole=True, key=c["key"]):
+                    continue
+                items.append((c, text))
+            if not items or not wake:
+                continue
+            head = ("No progress: work is queued or running but produced no result past its threshold."
+                    if kind == "no_progress" else
+                    "Stall: the same not-yet or failure keeps repeating.")
+            text = (head + " Re-plan, re-tier, re-point the probe, route around, cancel, or add a harness task "
+                    "for the cause:\n" + "\n".join(f"- {t}" for _, t in items))
+            fp = f"{kind}:" + ",".join(c["key"] for c, _ in items)
+            task = items[0][0].get("task") if len(items) == 1 else None
+            data = json.dumps([{k: c.get(k) for k in ("key", "what", "since", "last", "n", "reason", "selfref")}
+                               for c, _ in items])
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
+                 "VALUES(?,?,?,?,?,?,?,?,?)", (now, SOURCE, kind, fp[:300], "normal", text[:4000], data, "queued", task))
+            events.append({"kind": kind, "keys": [c["key"] for c, _ in items], "text": text})
+    return events
+
+
+# ---- digest and daily review ----
+
+def digest_lines(db: DB, now: float | None = None) -> tuple[list[str], str]:
+    """The coordinator's Progress block ([] when nothing is stuck) and its identity (keys only)."""
+    now = time.time() if now is None else now
+    raised = load(db)["raised"]
+    if not raised:
+        return [], ""
+    lines = [HEADER]
+    for key, r in sorted(raised.items(), key=lambda kv: float(kv[1].get("since") or now)):
+        lines.append(f"- {r.get('kind')} [{key.split(':', 1)[1]}] {_clip(r.get('what'), 100)}: stuck "
+                     f"{_dur(now - float(r.get('since') or now))}; why: {_clip(r.get('reason'), 140)}"
+                     + (f"; {r['selfref']}" if r.get("selfref") else "")
+                     + (f"; healthy for {_dur(now - float(r['ok_since']))}, not cleared yet" if r.get("ok_since") else ""))
+    return lines, "\n".join(sorted(raised))
+
+
+def audit_line(db: DB, since: float, now: float | None = None) -> str:
+    """The daily review's line: no_progress and stall keys raised or cleared in the window, how long
+    each took to clear, and those still open."""
+    now = time.time() if now is None else now
+    st = load(db)
+    cleared = [h for h in st["history"] if float(h.get("cleared") or 0) >= since]
+    open_ = [(k, r) for k, r in st["raised"].items()]
+    if not cleared and not open_:
+        return ""
+    parts = [f"{h['key']} cleared after {_dur(float(h['cleared']) - float(h.get('raised') or h['cleared']))}"
+             f" ({h.get('wakes', 0)} wake{'s' if h.get('wakes', 0) != 1 else ''})" for h in cleared[-8:]]
+    parts += [f"{k} still open after {_dur(now - float(r.get('first') or now))}" for k, r in open_[:8]]
+    return (f"no-progress and stall events: {len(cleared)} cleared, {len(open_)} open: " + "; ".join(parts))

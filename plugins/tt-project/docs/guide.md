@@ -319,6 +319,28 @@ prolonged whole-box outage.
   that added neither that nor an `upstream:` task, and gave no `correction #<id>: <why>` in its
   summary, gets one Course check line in the next digest. The daily review's efficiency audit lists
   each correction of the last 24 h with its class fix task, or none.
+- Progress and stall check: each minute the daemon checks, without a model, that work keeps yielding
+  results (a task done, a worker hand-off, a driver's `result` report). A `no_progress` event names a
+  queued task dispatch could start (with a worker slot free), a resource queued or running tasks
+  name, or the whole project, once it has gone `task_h`, `resource_h` or `project_h` (2 each) hours
+  with work queued or running and no result. A `stall` event names a repeat: a retry_when or
+  start_when probe still saying not yet after `probe_n` (10) verdicts and `probe_h` (1) hour (waits
+  on the task's own job, a push, CI, another task or a time are left out), a task's or schedule's
+  worker runs failing `fail_n` (3) times in a row the same way, or a schedule failing `repeat_n` (5)
+  times in a row the same way (a skip on its own daily cap is the schedule-budget observation's, not
+  counted again). A driver's refusals and failures are counted once, by the `ttp progress report`
+  streak check (`waiting.progress.stall_after`). A probe that waits on a down or paused resource the
+  task itself is meant to fix (or whose holder waits on the task) is flagged "waits on what it fixes".
+  Each key wakes the coordinator once, again when its count or stuck time reaches `escalate_x` (2)
+  times what it was at the last wake or after `rewake_h` (12) hours. A key that drops out of one
+  check (all worker slots briefly full) is not cleared and never wakes again as new: it clears only
+  after `clear_n` (3) healthy checks in a row spanning `clear_min` (30) minutes (schedule repeats
+  also lapse after `quiet_h`, 6, quiet hours). The digest's `Progress` section lists the open keys
+  and the daily review lists each with how long it took to clear. Thresholds live under
+  `coordinator.progress_check` (0 turns one off); a mute on source `daemon:progress` matching a key
+  keeps it quiet. A driver's `result` report (`ttp progress report result --key <key> ...`) resets the
+  clock of its key, of `task:<id>` or `resource:<name>` when that is its key, and of the task whose
+  run made it.
 - Promises: a coordinator reply or notify that commits to a deliverable or a time ("I'll report the
   sha by 15:00", "ETA 18:30") is always recorded as a promise. It holds the chat, the promised
   words, the due time (the time it names, in the home zone, else `coordinator.promise_default_h`, 6,
