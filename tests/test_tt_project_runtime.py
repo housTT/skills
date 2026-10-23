@@ -11793,6 +11793,57 @@ def test_a_kept_worktree_is_logged_once_and_tracked_changes_raise_one_event(env,
     assert not path.exists() and not p.db.kv("worktrees_dirty") and "uncommitted" not in status_text(p)
 
 
+def test_a_kept_reason_is_logged_once_per_holder_and_only_real_clean_ups_are_logged(env, monkeypatch):
+    """The keep line comes again only when the holder task changes, not when it goes queued, running or
+    pushing, nor after a restart; status still shows its current state. A cache clean-up is logged only
+    when it removed something from a worktree that stays."""
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp.daemon import Daemon
+    tid, path, _ = _code_task(p, "change")
+    (path / ".gitignore").write_text("build/\n")
+    _commit_file(path, "change")
+    review = p.db.add_task("review change", "Review it, then ttp push.", kind="review", tier="light",
+                           origin="user", depends_on=[tid])
+
+    def kept_lines():
+        return [ln for ln in (p.logs / "daemon.log").read_text().splitlines() if f"task {tid} kept:" in ln]
+    d = Daemon(p.base)
+    d.prune_worktrees()
+    for status in ("running", "pushing", "queued", "pushing"):
+        p.db.update_task(review, status=status)
+        d.prune_worktrees(every_s=0)
+        Daemon(p.base).prune_worktrees(every_s=0)   # a restart does not log it again
+    d.prune_worktrees(every_s=0)
+    assert path.exists() and len(kept_lines()) == 1 and f"task #{review} (queued)" in kept_lines()[0]
+    assert f"task #{review} (pushing)" in p.db.kv("worktrees_kept")[str(tid)]
+    p.db.update_task(review, status="done")
+    other = p.db.add_task("follow-up", f"Continue from #{tid}.", kind="code", tier="light", origin="user")
+    d.prune_worktrees(every_s=0)
+    assert path.exists() and len(kept_lines()) == 2 and f"task #{other} (queued)" in kept_lines()[1]
+    # A worktree kept for its own uncommitted edit: an empty clean-up logs nothing, a real one logs once.
+    p.db.update_task(other, status="done")
+    (path / "change.txt").write_text("edited\n")
+    d.prune_worktrees(every_s=0)
+    log = (p.logs / "daemon.log").read_text()
+    assert path.exists() and f"task {tid}: removed" not in log and "kept: uncommitted" in kept_lines()[-1]
+    (path / "build").mkdir()
+    (path / "build" / "a.o").write_text("x")
+    p.db.update_task(tid, status="failed")
+    d.prune_worktrees(every_s=0)
+    log = (p.logs / "daemon.log").read_text()
+    assert not (path / "build").exists() and log.count(f"task {tid}: removed build") == 1, log
+    # The worktree goes: its caches go with it, under the one removal line.
+    _git_out(path, "checkout", "--", "change.txt")
+    (path / "build").mkdir()
+    (path / "build" / "a.o").write_text("x")
+    p.db.update_task(tid, status="done")
+    d.prune_worktrees(every_s=0)
+    log = (p.logs / "daemon.log").read_text()
+    assert not path.exists() and f"task {tid} (done) removed" in log
+    assert log.count(f"task {tid}: removed") == 1, log
+
+
 def test_untracked_leftovers_move_to_the_last_run_and_the_worktree_goes(env, monkeypatch):
     """A finished worktree whose only dirty entries are untracked files under the size limit: they move
     to <last run dir>/worktree-leftovers/ with their relative paths, the worktree goes, the branch

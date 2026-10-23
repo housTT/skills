@@ -1466,6 +1466,15 @@ def missing_cd_worktree(probe: str | None, p: Project) -> str | None:
 FINISH_GRACE_S = 3600
 
 
+_HOLDER_STATUS = re.compile(r"\b(task #\d+) \([\w-]+\)")
+
+
+def keep_key(why: str | None) -> str | None:
+    """A keep reason without its holder task's status, so the daemon logs a worktree's reason again
+    when the holder changes, not each time that task goes queued, running or pushing."""
+    return _HOLDER_STATUS.sub(r"\1", why) if why else why
+
+
 def held_by(p: Project, task: dict, open_tasks: list[dict], now: float, path: Path | None = None) -> str | None:
     """Why a finished task's worktree (or another worktree of the task, at `path`) must stay
     untouched for now, or None."""

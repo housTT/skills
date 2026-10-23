@@ -247,7 +247,7 @@ DISK_FLOOR_GB = 2        # below this even questions and plans wait
 DISK_SWEEP_EVERY_S = 900  # under the disk guard, finished tasks' worktrees are swept at most this often
 DISK_DU_TIMEOUT_S = 30   # the guard alert's du breakdown stops after this, keeping what it measured
 DISK_DU_TOP = 6          # the biggest top-level directories it names
-KV_WORKTREES_LOGGED = "worktrees_logged"   # task -> the keep reason the daemon log last gave
+KV_WORKTREES_LOGGED = "worktrees_logged"   # task -> the keep reason the daemon log last gave (compared by worktree.keep_key)
 KV_WORKTREES_DIRTY = "worktrees_dirty"     # task -> modified tracked files a kept finished worktree holds
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
 CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last good copy both unreadable
@@ -6483,7 +6483,7 @@ class Daemon:
                             f"({ar['bytes'] / 1e6:.1f} MB) to {ar['dir']}"
                             + (f"; dropped {ar['dropped']} over the cap ({ar['dropped_bytes'] / 1e6:.1f} MB), "
                                f"listed in its manifest" if ar["dropped"] else ""))
-            if r["cleared"]:
+            if r["cleared"] and r["why"] is not None:   # a removed worktree's caches go with it: its line says enough
                 log(self.p, f"worktree {r['path']} of task {r['task']}: removed {', '.join(r['cleared'][:10])}")
             if r.get("moved"):
                 mv = r["moved"]
@@ -6502,7 +6502,7 @@ class Daemon:
                 log(self.p, f"worktree {r['path']} of task {r['task']} ({r['status']}) removed; "
                             f"branch {r['branch'] or '?'} kept")
             else:
-                if logged.get(key) != r["why"]:   # once per reason, across restarts too
+                if worktree.keep_key(logged.get(key)) != worktree.keep_key(r["why"]):   # once per reason and holder, across restarts too
                     logged[key] = r["why"]
                     log(self.p, f"worktree {r['path']} of task {r['task']} kept: {r['why']}")
                 # Held (see worktree.held_by): checked again every sweep (no git work), so it goes soon after the hold ends.
@@ -6537,7 +6537,7 @@ class Daemon:
             logged.pop(key, None)
             log(self.p, f"{what} removed; branch {r['branch'] or '?'} kept")
         else:
-            if logged.get(key) != r["why"]:
+            if worktree.keep_key(logged.get(key)) != worktree.keep_key(r["why"]):
                 logged[key] = r["why"]
                 log(self.p, f"{what} kept: {r['why']}")
             self._run_kept[key] = (0 if r.get("held") else now, r["why"])
