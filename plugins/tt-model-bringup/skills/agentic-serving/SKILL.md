@@ -84,8 +84,7 @@ reader can tell a thin result from a small grant.
 Work from cheap to expensive:
 
 1. Prove the harness end to end on every runner, with a few tasks per eval. On a CI grant this is
-   also what proves the published refs: a run that fetches the pushed branches and serves the model
-   is the only evidence the publish was complete.
+   also the only evidence the publish was complete.
 2. Run small seeded samples at the stage-11 configuration with caching on. Measure the workload and
    noise, and check the invariants on the real traffic. Send failures back to the stage that owns
    them.

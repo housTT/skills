@@ -30,8 +30,8 @@ and fast checks can stay on the local device; CI is for what needs the grant.
 }
 ```
 
-`dispatch_inputs` must match the workflow's declared `workflow_dispatch` names. Prove the harness
-on each distinct `runner_label` before scoring on it.
+`dispatch_inputs` must match the workflow's declared `workflow_dispatch` names. Each distinct
+`runner_label` is a machine class to prove separately, not a duplicate.
 
 ## Publish
 
@@ -77,8 +77,3 @@ summing under the cap.
 
 Infrastructure failures (runner offline, image pull, unrelated timeout) are re-dispatched, not
 scored. Crashes, loops and malformed output are measurements.
-
-## Evidence
-
-Scores are reported, not gated. `compute.json` ties each score to a run id, runner label and
-implementation SHA; without those three, two numbers cannot be known to be comparable.
