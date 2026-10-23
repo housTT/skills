@@ -66,10 +66,10 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 - the eval harness: default the tt-inference-server agentic runner;
 - `compute`.
 
-`compute` is the hardware the operator grants. Without it, use the local device only. With it,
-`max_parallel` sets how many runs may be in flight. Keep every granted slot busy, and treat
-`max_parallel` as a ceiling, not a quota: use the slots the plan needs and leave the rest idle.
-Re-plan when the grant changes.
+`compute` is the hardware the operator grants, on top of the local device, which stays available
+for the quick checks the earlier stages ran there. Without a grant, local is all there is. With
+one, `max_parallel` is how many runs may be in flight: a ceiling to fill when the plan needs it,
+not a quota to spend. Re-plan when the grant changes.
 
 A grant dispatches runs one of two ways. `commands` takes operator-supplied `submit`, `status` and
 `collect` shell commands and is the general form. `kind: "github_actions"` dispatches a workflow in

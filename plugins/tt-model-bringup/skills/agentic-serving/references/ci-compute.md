@@ -1,7 +1,8 @@
 # CI compute for goal 12
 
 Read when `compute.kind` is `github_actions`. Runners do not share your filesystem — they fetch the
-implementation from Git refs — so a grant needs a publish step as well as a dispatch step.
+implementation from Git refs — so a grant needs a publish step as well as a dispatch step. Small
+and fast checks can stay on the local device; CI is for what needs the grant.
 
 ## Input
 
@@ -69,9 +70,10 @@ is shared state when several explorers dispatch — register at launch, not at c
 `queued` + `in_progress` against `max_parallel`. Collect into `doc/agentic_evals/runs/<arm>/` with
 the prediction, dispatched inputs, published SHAs and run id.
 
-`run_timeout_hours` is a hard cap — a run that reaches it is killed and returns nothing. Plan
-against the top of an estimate's range, split suites on task boundaries so partial results stay
-scorable, and give a multi-eval run per-eval timeouts summing under the cap.
+`run_timeout_hours` is enforced by CI, not by you: a run that reaches it is killed and returns
+nothing. Use it as a planning bound — do not dispatch what the top of its estimate exceeds. Split
+suites on task boundaries so parts stay scorable, and give a multi-eval run per-eval timeouts
+summing under the cap.
 
 Infrastructure failures (runner offline, image pull, unrelated timeout) are re-dispatched, not
 scored. Crashes, loops and malformed output are measurements.
