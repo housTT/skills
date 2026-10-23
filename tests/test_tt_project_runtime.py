@@ -31109,6 +31109,50 @@ def test_a_dead_landed_wait_survives_a_daemon_restart_and_broken_probe_verdicts(
     assert p.db.kv(deadwait.KEY) == {}
 
 
+def test_a_landed_wait_on_a_push_queue_landing_is_not_dead_and_agrees_with_ttp_landed(env):
+    """A done producer the push queue landed (a pushed or landed push_queue row of it, a carrier
+    such as its review, or its branch; no task_landings row) has a path: no landed_wait_dead. One
+    with no landing of any kind still raises it. deadwait and `ttp landed --task` (task_shas) read
+    the same saved landings, so they agree on every fixture."""
+    p = make(env)
+    from ttp import deadwait, landed
+    from ttp.daemon import Daemon
+    dead = lambda x: p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (deadwait.DEAD_EVENT, x))
+    t0 = time.time()
+
+    def producer(name, row=None):
+        code, branch, _, (rev,) = _finish_code(env, p, name, {f"{name}.py": 5})
+        p.db.update_task(rev["id"], status="failed")
+        if row:
+            task, status = row(code, rev["id"])
+            p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha, "
+                   "pushed_sha) VALUES(?,?,?,?,?,?,?,?,?)",
+                   (task, branch, "c" * 40, "origin/work", status, t0, t0, "a" * 40, "a" * 40))
+        w = p.db.add_task(f"after {name}", "s", origin="coordinator", labels=[f"start_when:landed:#{code}"])
+        d = Daemon(p.base)
+        rows = p.db.q("SELECT * FROM tasks WHERE id=?", (w,))
+        d._dead_landed_waits(rows, t0)
+        d._dead_landed_waits(rows, t0 + 2 * deadwait.GRACE_S)
+        return code
+
+    cases = {"own": lambda c, r: (c, "landed"),        # its own row
+             "review": lambda c, r: (r, "pushed"),     # the review that approved it
+             "branch": lambda c, r: (999999, "landed")}   # a row matched by its branch only
+    for name, row in cases.items():
+        code = producer(name, row)
+        assert not dead(code), name
+        assert deadwait.path(p.db, code, set()) == "a landing is recorded", name
+        assert landed.task_shas(p, code) == (["a" * 40], landed.task_shas(p, code)[1]), name
+        assert landed.task_shas(p, code)[1].startswith("its push queue landing"), name
+    # A queue row still on its way back (conflict) is no landing; nor is nothing at all.
+    for name, row in {"conflict": lambda c, r: (c, "conflict"), "none": None}.items():
+        code = producer(name, row)
+        assert len(dead(code)) == 1, name
+        assert deadwait.path(p.db, code, set()) == "", name
+        assert landed.recorded(p.db, code) == ([], ""), name
+        assert landed.task_shas(p, code)[1].startswith("its branch "), name   # not landed: its own head
+
+
 def test_a_check_only_review_failure_gets_no_fix_pair_and_keeps_its_dependents(env):
     """A review that failed only because a check or gate is missing or does not apply
     (review_failure: check_only) gets no empty fix and re-review: it stays failed, the reviewed code

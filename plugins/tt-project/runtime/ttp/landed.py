@@ -248,18 +248,11 @@ def carriers(db, tid: int) -> dict[int, tuple[str, int | None, str]]:
     return out
 
 
-def task_shas(p, tid: int) -> tuple[list[str], str]:
-    """The commits that carry task `tid` to the branch, and where they come from: the landed commits
-    the push queue recorded for it or a task that carries it on (carriers: a review of it, a fix, a
-    re-review, a rebase or re-done task, or any of their branches), then their successful detached
-    pushes or recorded supersessions, else, once it is done with commits of its own, its branch's
-    head. ([], why) when there is none yet."""
-    db = p.db
-    task = db.task(tid)
-    if not task:
-        return [], f"no task #{tid}"
-    branch = task.get("branch") or ""
-    carry = carriers(db, tid)
+def recorded(db, tid: int, carry: dict | None = None) -> tuple[list[str], str]:
+    """The landed commits saved for task `tid` or a task that carries it on (`carry`, else
+    carriers): a push queue row it or its branch landed in, a successful detached push, a recorded
+    supersession; ([], "") when none. `ttp landed --task` and deadwait both judge from this."""
+    carry = carriers(db, tid) if carry is None else carry
     branches = {v[0] for v in carry.values() if v[0]}
 
     def via(src: str, i) -> str:
@@ -282,6 +275,23 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
                 list(carry))
     if rows:
         return [r["sha"] for r in rows], via("the commit recorded as superseding it", rows[-1]["task"])
+    return [], ""
+
+
+def task_shas(p, tid: int) -> tuple[list[str], str]:
+    """The commits that carry task `tid` to the branch, and where they come from: the landed commits
+    the push queue recorded for it or a task that carries it on (carriers: a review of it, a fix, a
+    re-review, a rebase or re-done task, or any of their branches), then their successful detached
+    pushes or recorded supersessions (recorded), else, once it is done with commits of its own, its
+    branch's head. ([], why) when there is none yet."""
+    db = p.db
+    task = db.task(tid)
+    if not task:
+        return [], f"no task #{tid}"
+    branch = task.get("branch") or ""
+    shas, why = recorded(db, tid)
+    if shas:
+        return shas, why
     head = _commit(p.root, f"refs/heads/{branch}") if branch else ""
     if not head:
         return [], f"#{tid} has no landing recorded and no branch"

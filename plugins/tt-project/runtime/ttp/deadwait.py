@@ -65,22 +65,15 @@ def raise_nofix(db, review: dict, why: str, branch: str) -> int | None:
                  review["id"]))
 
 
-def _landed(db, ids: set[int]) -> bool:
-    """A landing or superseding commit is recorded for one of `ids` (the probe passes soon)."""
-    marks = ",".join("?" * len(ids))
-    return bool(db.one(f"SELECT 1 FROM task_landings WHERE task IN ({marks})", tuple(ids))
-                or db.one(f"SELECT 1 FROM task_superseded WHERE task IN ({marks})", tuple(ids)))
-
-
 def path(db, x: int, held: set[int]) -> str:
     """What can still land producer `x`'s work, '' when nothing: x itself not done, a landing
-    recorded, an open task carrying its change or on its branch (a held task, or one that depends on
+    recorded (landed.recorded), an open task carrying its change or on its branch (a held task, or one that depends on
     a held task, is no path: it waits on x too), or a push queue row."""
     t = db.task(x)
     if not t or t["status"] != "done":
         return f"#{x} is {t['status'] if t else 'missing'}"
     carried = landed.carriers(db, x)
-    if _landed(db, set(carried)):
+    if landed.recorded(db, x, carried)[0]:   # the same saved landings `ttp landed --task` counts
         return "a landing is recorded"
     branches = {b for b, _, _ in carried.values() if b}
     for o in db.q("SELECT * FROM tasks WHERE status NOT IN (?,?,?) ORDER BY id", TERMINAL_TASK_STATES):
