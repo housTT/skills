@@ -11,7 +11,13 @@ Use upstream EleutherAI lm-evaluation-harness for accuracy and `vllm bench serve
 
 ## Select and run benchmarks
 
-Read [the run contract](references/run-contract.md) for setup, profiles, commands and report inputs. Aim for one or two applicable generative benchmarks: MMLU-Pro, GPQA Diamond, IFEval or GSM8K-CoT. Prefer tasks with published figures for the exact model; a missing reference does not prevent running or completing the stage. Another upstream generative task is suitable when the client can execute and score it correctly. Accuracy here is a regression signal, not the verdict — goal 12 measures it again on the tuned configuration, so spend the stage's hour on performance and keep this pass small.
+Read [the run contract](references/run-contract.md) for setup, profiles, commands and report inputs.
+
+Take the eval selection from `bringup/agentic_evals/inputs.json` when it is set, otherwise the goal-12 defaults, so this stage and goal 12 report the same suites and their numbers compare. Do not pick a different set here.
+
+This harness is lm-evaluation-harness, so part of that selection may not be runnable: agentic suites needing tool use or a terminal belong to goal 12's runner, and a suite that fits neither the harness nor the hour is recorded as not covered rather than swapped for another benchmark. Prefer tasks with published figures for the exact model; a missing reference does not prevent completing the stage.
+
+Keep this pass light. It is a regression signal against the stage-10 configuration — goal 12 re-measures the same suites on the tuned configuration, at larger samples, and reports the scores that describe the shipped model. Spend the hour on performance and roofline, which nothing else in the pipeline produces.
 
 Select the upstream prompt/scorer variant and the model's generation settings before running. A benchmark name alone does not identify a recipe. Use the model's native HF chat template exactly once, with structured chat messages, and record its tokenizer revision, thinking mode, generation parameters and answer parsing. Preserve normal benchmark prompt lengths, few-shot examples and EOS behavior. Allow sufficient output budget for the intended reasoning mode.
 
