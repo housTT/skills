@@ -260,3 +260,82 @@ def test_one_resource_lock_output_is_unchanged(env, tmp_path):
     r = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", "true"], env={**run_env, "TTP_LOCKS_HELD": "board"},
                        capture_output=True, text=True, timeout=60)
     assert r.stderr == "ttp lock: board is held already by an enclosing ttp lock (exclusive); running the command under it\n"
+
+
+def _reserve_for(p, res, task, stale=False):
+    """The daemon's reservation of res for task (_resources_free(reserve=True)); its path."""
+    from ttp import hold, locks, shared
+    mark = locks.reserve_path(shared.locks_dir(p, res, p.config()), res)
+    locks.reserve(mark, shared.holder(p, res, hold.who(task), p.config()))
+    if stale:
+        r = json.loads(mark.read_text())
+        mark.write_text(json.dumps({**r, "ts": time.time() - locks.RESERVE_STALE_S - 5}))
+    return mark
+
+
+def test_a_tasks_own_driver_takes_the_slot_its_task_reserved_and_other_tasks_still_wait(env, tmp_path):
+    """A queued exclusive task's reservation holds off other tasks' commands, but its own detached driver
+    (same TTP_TASK) takes the slot ahead of them, as the task's run would, and clears the reservation."""
+    from ttp import locks
+    p = make(env)
+    marks, go_h, go_d = tmp_path / "marks", tmp_path / "go-h", tmp_path / "go-d"
+    h = _lock(_lock_env(env, p, TTP_TASK="1"), "rig-a", cmd=_mark(marks, "H", go_h))
+    procs = [h]
+    try:
+        assert _until_true(lambda: marks.exists() and "start H" in marks.read_text())
+        mark = _reserve_for(p, "rig-a", 7)
+        o = _lock(_lock_env(env, p, TTP_TASK="8"), "rig-a", cmd=_mark(marks, "O"))
+        procs.append(o)
+        assert _until_true(lambda: _queue_len(p, "rig-a") == 1)
+        d = _lock(_lock_env(env, p, TTP_TASK="7"), "rig-a", cmd=_mark(marks, "D", go_d))
+        procs.append(d)
+        assert _until_true(lambda: _queue_len(p, "rig-a") == 2)
+        go_h.touch()
+        assert _until_true(lambda: "start D" in marks.read_text()), (marks.read_text(), d.stderr)
+        assert locks.reserved_by(mark) is None, "the driver left its task's reservation behind"
+        time.sleep(0.3)
+        assert "start O" not in marks.read_text() and o.poll() is None, marks.read_text()
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "rig-b", "--", "true"],
+                           env=_lock_env(env, p, TTP_TASK="9"), capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        _reserve_for(p, "rig-b", 7)
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "rig-b", "--", "true"],
+                           env=_lock_env(env, p, TTP_TASK="9"), capture_output=True, text=True, timeout=60)
+        assert r.returncode == 75 and "reserved for task #7" in r.stderr, (r.returncode, r.stderr)
+    finally:
+        go_h.touch()
+        go_d.touch()
+    assert _ended(procs) == [0, 0, 0], [x.stderr.read() for x in procs]
+    starts = [ln.split()[1] for ln in marks.read_text().splitlines() if ln.startswith("start")]
+    assert starts == ["H", "D", "O"], starts
+
+
+def test_a_stale_reservation_for_the_drivers_own_task_behaves_as_before(env, tmp_path):
+    from ttp import locks
+    p = make(env)
+    mark = _reserve_for(p, "rig-a", 7, stale=True)
+    before = mark.read_text()
+    for task in ("7", "8"):
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "2", "rig-a", "--", "true"],
+                           env=_lock_env(env, p, TTP_TASK=task), capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, (task, r.stderr)
+    assert mark.read_text() == before and locks.reserved_by(mark) is None, "a stale reservation was touched"
+
+
+def test_a_multi_lock_passes_only_its_own_tasks_reservations_all_or_nothing(env, tmp_path):
+    from ttp import locks, shared
+    p = make(env)
+    mark = _reserve_for(p, "rig-a", 7)
+    r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "rig-a,rig-b", "--", "true"],
+                       env=_lock_env(env, p, TTP_TASK="8"), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 75 and "reserved for task #7" in r.stderr, (r.returncode, r.stderr)
+    other = _reserve_for(p, "rig-b", 9)
+    r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "rig-a,rig-b", "--", "true"],
+                       env=_lock_env(env, p, TTP_TASK="7"), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 75 and "rig-b (reserved for task #9)" in r.stderr, (r.returncode, r.stderr)
+    assert "rig-a (reserved" not in r.stderr and locks.reserved_by(mark) == "task #7", r.stderr
+    assert not shared.held(p) or all("reserved for" in x for x in shared.held(p)), "a subset was held"
+    other.unlink()
+    r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "rig-a,rig-b", "--", "true"],
+                       env=_lock_env(env, p, TTP_TASK="7"), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and locks.reserved_by(mark) is None, (r.returncode, r.stderr)

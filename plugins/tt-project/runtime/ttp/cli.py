@@ -3602,7 +3602,8 @@ def cmd_lock(a) -> None:
     the commands that touch it, and the rest of the task runs alongside other work. Slots come from
     the project's `resources` config (default 1); a running `exclusive:<resource>` task holds one for
     its whole run, and one waiting for a slot reserves the resource: new commands wait until it has
-    started. The lock is held until the command has ended, however it ends. Every name in config
+    started, except that task's own commands (its detached driver, same TTP_TASK), which take the slot
+    and clear the reservation as its run would. The lock is held until the command has ended, however it ends. Every name in config
     `device.locks` is the one device lock. Waiters are served in arrival order. Each take and release
     goes to the project's activity log (activity.py, `ttp machines activity`); `--disruptive` marks a
     command that may reset, power-cycle or reboot what it holds.
@@ -3709,8 +3710,11 @@ def cmd_lock(a) -> None:
             sys.exit(rc)
         return _lock_answers(a, [(L["name"], *lockprobe.answer(p, cfg, L["name"], a.shared, a.json)) for L in todo])
     label = hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID"))
+    own = os.environ.get("TTP_TASK") or ""
     for L in todo:
         L["who"] = shared.holder(p, L["res"], label, cfg)
+        # What the daemon's reservation for this task names (_resources_free): its own driver may pass it.
+        L["own"] = shared.holder(p, L["res"], hold.who(own), cfg) if own.strip() else None
     held_locks = [x for x in os.environ.get("TTP_LOCKS_HELD", "").split(",") if x]
     shared_locks = [x for x in os.environ.get("TTP_LOCKS_SHARED", "").split(",") if x]
     inner = [L for L in todo if L["res"] in held_locks or (L["res"] in shared_locks and a.shared)]
@@ -3812,18 +3816,26 @@ def cmd_lock(a) -> None:
         # (the held slots of every lock, []) once all are this waiter's, else (None, [(lock, reserved for)]
         # of the ones it waits for). Several are taken only when the turn has come on each, and a slot
         # lost in the instant between is let go with the others: no subset is ever kept.
+        # A lock reserved for this task (TTP_TASK) is its own driver's to take now, ahead of the queue the
+        # reservation holds off, as the task's run would take it (runner._take_exclusive).
         out = []
         for L in todo:
             by = lk.reserved_by(L["mark"])
-            if by or (len(todo) > 1 and not lk.turn(L["where"], L["res"], L["ticket"], L["paths"], past_multi=past_multi)):
+            L["mine"] = bool(by) and by == L["own"]
+            by = None if L["mine"] else by
+            if by or (len(todo) > 1 and not L["mine"]
+                      and not lk.turn(L["where"], L["res"], L["ticket"], L["paths"], past_multi=past_multi)):
                 out.append((L, by))
         if out:
             return None, out
         fs = []
         for L in todo:
             try:
-                f = lk.take_in_turn(L["where"], L["res"], L["ticket"], L["paths"], L["who"], " ".join(cmd),
-                                    past_multi=past_multi)
+                if L["mine"]:
+                    f = (lk.try_take_shared if a.shared else lk.try_take)(L["paths"], L["who"], " ".join(cmd))
+                else:
+                    f = lk.take_in_turn(L["where"], L["res"], L["ticket"], L["paths"], L["who"], " ".join(cmd),
+                                        past_multi=past_multi)
             except OSError as e:
                 for g in fs:
                     g.close()
@@ -3844,6 +3856,9 @@ def cmd_lock(a) -> None:
             for t in tickets:
                 lk.dequeue(t)
             tickets.clear()
+            for L in todo:   # as the task's run does once it has its slot (runner._take_exclusive)
+                if L["mine"]:
+                    lk.unreserve(L["mark"], L["own"])
             waited = time.time() - started
             if waited > 5:
                 print(f"ttp lock: got {what}{' (shared)' if a.shared else ''} after {waited / 60:.1f} min",
