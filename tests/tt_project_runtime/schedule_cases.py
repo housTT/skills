@@ -525,6 +525,117 @@ def test_an_own_daily_budget_skip_is_kept_and_raises_one_keyed_observation_until
     assert len(sched.skips(p.db, "filler")) == 3, "a run never overwrites the skip history"
 
 
+def _finished_runs(p, name, costs):
+    for usd in costs:
+        tid = p.db.add_task(f"[{name}] run", "x", origin="schedule")
+        p.db.x("UPDATE tasks SET labels=?, status='done', spent_usd=? WHERE id=?", (json.dumps([name]), usd, tid))
+
+
+def test_a_suggested_daily_cap_is_runs_a_day_times_the_median_run_cost_and_needs_three_runs(env):
+    from ttp import audit, schedule as sched
+    p = make(env)
+    _filler(p, budget_day=1)
+    row = lambda: p.db.one("SELECT * FROM schedules WHERE name='filler'")
+    _finished_runs(p, "filler", [0.20, 0.0, 0.90])   # a run that cost nothing never counts
+    assert sched.suggest_cap(p.db, row()) is None, "under 3 runs: no suggestion"
+    _finished_runs(p, "other", [5.0, 5.0, 5.0])      # another schedule's runs are not its own
+    _finished_runs(p, "filler", [0.10, 0.20])
+    assert sched.suggest_cap(p.db, row()) == {"runs_day": 24, "median_usd": 0.2, "runs": 4, "usd": 6.0}
+    _finished_runs(p, "filler", [0.20] * 10)          # only the last 10
+    hint = sched.suggest_cap(p.db, row())
+    assert hint == {"runs_day": 24, "median_usd": 0.2, "runs": 10, "usd": 6.0}, hint
+    assert sched.cap_text(hint) == "suggested cap $6.00 = 24 runs/day x $0.20 median (10 runs) x 1.25"
+    assert sched.below_suggestion(p.db) == ["filler cap $1.00/day, " + sched.cap_text(hint)]
+    assert any(x.startswith("schedule caps under their suggestion: 1: filler cap $1.00/day")
+               for x in audit.lines(p.db, p=p))
+    sched.upsert(p.db, "filler", "llm", "1h", budget_usd_day=6, payload={"spec": "x"})
+    assert sched.below_suggestion(p.db) == [] and not any("under their suggestion" in x for x in audit.lines(p.db, p=p))
+    sched.upsert(p.db, "watch", "command", "1h", payload={"command": "true"})
+    _finished_runs(p, "watch", [1.0] * 3)
+    assert sched.suggest_cap(p.db, p.db.one("SELECT * FROM schedules WHERE name='watch'")) is None, "llm only"
+
+
+def test_ttp_schedules_shows_the_suggested_cap_next_to_the_daily_cap(env, capsys):
+    from ttp import cli
+    p = make(env)
+    _filler(p, budget_day=1)
+    _finished_runs(p, "filler", [0.20] * 5)
+    capsys.readouterr()
+    cli.main(["schedules", p.name])
+    listed = capsys.readouterr().out
+    cli.main(["schedules", p.name, "show", "filler"])
+    shown = json.loads(capsys.readouterr().out)
+    assert "cap $1.00/day (suggested cap $6.00 = 24 runs/day x $0.20 median (5 runs) x 1.25)" in listed, listed
+    assert shown["budget_usd_day"] == 1 and shown["state"]["suggested_budget_usd_day"]["usd"] == 6.0, shown
+
+
+def _cap_issues(p, status="open"):
+    return p.db.q("SELECT watch_key FROM issues WHERE source='daemon:schedule-cap' AND status=?", (status,))
+
+
+def _cap_wakes(p):
+    return p.db.q("SELECT text FROM events WHERE source='daemon:schedule-cap' AND kind='observation'")
+
+
+def test_a_schedule_past_80_percent_of_its_own_cap_is_observed_once_a_budget_day_only_on_a_green_gate(env):
+    from types import SimpleNamespace
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    gate = lambda level, optional=True: {d.cfg.get("core_provider", "claude"):
+                                         SimpleNamespace(allow_optional=optional, level=level)}
+    sched.upsert(p.db, "filler", "llm", "1h", budget_usd_day=1, payload={"spec": "x"})
+    spend = lambda usd: p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)",
+                               (time.time() - 60, "schedule:filler", usd))
+    spend(0.70)
+    d.gates = gate("green")
+    d._schedule_cap_warn()
+    assert not _cap_wakes(p), "under 80%"
+    spend(0.15)
+    for level, optional in (("yellow", True), ("yellow", False), ("orange", False), ("red", False)):
+        d.gates = gate(level, optional)
+        d._schedule_cap_warn()
+    assert not _cap_wakes(p), "only while the gate is green"
+    d.gates = gate("green")
+    d._schedule_cap_warn()
+    wakes = _cap_wakes(p)
+    assert len(wakes) == 1 and "$0.85 of its own $1.00" in wakes[0]["text"], wakes
+    assert _cap_issues(p) == [{"watch_key": "schedule-cap-80:filler"}]
+    spend(0.10)
+    d._schedule_cap_warn()
+    p.db.x("UPDATE issues SET status='fixed' WHERE source='daemon:schedule-cap'")
+    d._schedule_cap_warn()
+    assert len(_cap_wakes(p)) == 1, "once a budget day, even once the first is closed by hand"
+    # A new budget day: the open warning closes, and it may fire again.
+    p.db.x("UPDATE issues SET status='open' WHERE source='daemon:schedule-cap'")
+    warned = p.db.kv("schedule_cap_warned")
+    p.db.set_kv("schedule_cap_warned", {"filler": {**warned["filler"], "at": time.time() - 86401}})
+    d.gates = gate("yellow")
+    d._schedule_cap_warn()
+    assert not _cap_issues(p) and len(_cap_issues(p, "fixed")) == 1 and len(_cap_wakes(p)) == 1
+    d.gates = gate("green")
+    d._schedule_cap_warn()
+    assert len(_cap_wakes(p)) == 2
+
+
+def test_the_80_percent_warning_follows_a_fixed_budget_day(env):
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.gates = {}
+    d.cfg.setdefault("budget", {})["day_start"] = "00:00"
+    sched.upsert(p.db, "filler", "llm", "1h", budget_usd_day=1, payload={"spec": "x"})
+    p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)", (time.time() - 60, "schedule:filler", 0.9))
+    d._schedule_cap_warn()
+    d._schedule_cap_warn()
+    assert len(_cap_wakes(p)) == 1
+    p.db.set_kv("schedule_cap_warned", {"filler": {"day": 0.0, "at": time.time()}})   # raised on an earlier day
+    d._schedule_cap_warn()
+    assert len(_cap_wakes(p)) == 2
+
+
 def test_expected_schedule_skips_are_kept_but_never_raised(env, tmp_path):
     """A gate held by the budget, a debounce, an open run and a precheck exit 0 are planned skips."""
     from types import SimpleNamespace

@@ -135,6 +135,10 @@ prolonged whole-box outage.
   in `budget.timezone` (an IANA name such as `Europe/Berlin`; unset, the project's home zone, below;
   the host's own zone plays no part), 23 or 25 hours long across a daylight-saving change. The daily cap and the global
   cap count that day. Empty (the default) keeps the rolling 24 hours. Weekly caps stay rolling.
+- Schedule caps: `ttp schedules` shows an llm schedule's suggested daily cap next to its own (runs a day x
+  the median cost of its last 10 runs x 1.25; none under 3 runs), and the daily review lists caps under it.
+  Past 80% of its own cap with a green gate, a schedule raises one `schedule-cap-80:<name>` observation per
+  budget day, closed at the day's reset. Caps never change by themselves.
 - Home time zone: each project keeps the IANA zone of the user's workstation as `home_timezone` in
   its `project.json`. `ttp new` records the zone of the machine it runs on (with `--host`, the
   workstation's, never the box's). `ttp connect` from a workstation (not from an ssh login), and a workstation's spend push

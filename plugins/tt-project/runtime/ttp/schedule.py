@@ -279,6 +279,49 @@ def spent_today(db: DB, name: str) -> float:
     return float(row["s"]) if row else 0.0
 
 
+CAP_RUNS = 10        # finished runs the suggested daily cap takes its median cost from
+CAP_MIN_RUNS = 3     # fewer finished runs than this: no suggestion
+CAP_MARGIN = 1.25    # suggested cap = runs a day x median run cost x this
+CAP_WARN = 0.8       # share of its own daily cap a schedule's spend passes before it is observed
+
+
+def suggest_cap(db: DB, row: dict, n: int = CAP_RUNS) -> dict | None:
+    """An llm schedule's suggested daily cap: its runs a day (from `every`) x the median cost of its
+    last `n` finished runs (one scheduled task each) x CAP_MARGIN. None for another kind, or with
+    fewer than CAP_MIN_RUNS runs. Only shown: a cap is never changed by itself."""
+    if row.get("kind") != "llm" or not int(row.get("every_s") or 0):
+        return None
+    costs = [float(r["spent_usd"]) for r in db.q(
+        "SELECT spent_usd FROM tasks WHERE origin='schedule' AND labels=? AND status IN ('done','failed','cancelled') "
+        "AND spent_usd > 0 ORDER BY id DESC LIMIT ?", (json.dumps([row["name"]]), n))]
+    if len(costs) < CAP_MIN_RUNS:
+        return None
+    costs.sort()
+    mid = len(costs) // 2
+    median = costs[mid] if len(costs) % 2 else (costs[mid - 1] + costs[mid]) / 2
+    per_day = 86400 / int(row["every_s"])
+    return {"runs_day": round(per_day, 2), "median_usd": round(median, 2), "runs": len(costs),
+            "usd": round(per_day * median * CAP_MARGIN, 2)}
+
+
+def cap_text(s: dict | None) -> str:
+    """'suggested cap $6.00 = 24 runs/day x $0.20 median (10 runs) x 1.25', or ''."""
+    if not s:
+        return ""
+    return (f"suggested cap ${s['usd']:.2f} = {s['runs_day']:g} runs/day x ${s['median_usd']:.2f} median "
+            f"({s['runs']} runs) x {CAP_MARGIN:g}")
+
+
+def below_suggestion(db: DB) -> list[str]:
+    """Enabled llm schedules whose daily cap is under its suggestion, one line each, for the daily audit."""
+    out = []
+    for r in db.q("SELECT * FROM schedules WHERE enabled=1 AND kind='llm' AND budget_usd_day IS NOT NULL ORDER BY name"):
+        s = suggest_cap(db, r)
+        if s and float(r["budget_usd_day"]) < s["usd"] - 0.005:
+            out.append(f"{r['name']} cap ${float(r['budget_usd_day']):.2f}/day, {cap_text(s)}")
+    return out
+
+
 def with_costs(db: DB, home: str | None = None) -> list[dict]:
     """Schedules annotated with their last-7-day cost and `at` time, for the web app's recurring pane."""
     rows = db.q("SELECT * FROM schedules ORDER BY name")

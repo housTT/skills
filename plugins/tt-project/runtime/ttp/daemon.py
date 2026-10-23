@@ -141,6 +141,9 @@ CLEAN_STOP_KEY = "clean_stop"   # kv: {boot, ts} of the daemon's last clean stop
 SCHEDULE_BUDGET_KEY = "schedule_budget_raised"   # kv: schedule -> when its own-budget skip last raised (_schedule_skip)
 SCHEDULE_BUDGET_SOURCE = "daemon:schedule-budget"
 SCHEDULE_BUDGET_CLEARED = "the schedule ran again or its spend is back under its daily cap"
+SCHEDULE_CAP_KEY = "schedule_cap_warned"   # kv: schedule -> {"day", "at"} of its last 80%-of-own-cap observation
+SCHEDULE_CAP_SOURCE = "daemon:schedule-cap"
+SCHEDULE_CAP_CLEARED = "a new budget day started"
 SCHEDULE_GAP_KEY = "schedule_gap_names"   # kv: schedule-gap issue key -> the schedules it names (sweep_schedule_gaps)
 SCHEDULE_GAP_CLEARED = "every schedule named ran again"
 LEASE_STALE_S = 180
@@ -4262,6 +4265,10 @@ class Daemon:
             self._schedule_gaps(due)
         except Exception:
             log(self.p, "schedule gaps: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        try:
+            self._schedule_cap_warn()
+        except Exception:
+            log(self.p, "schedule cap warning: " + traceback.format_exc().replace("\n", " | ")[:1000])
         for s in due:
             payload = json.loads(s["payload"] or "{}")
             if s["kind"] in ("command", "watcher") or (s["kind"] == "llm" and _precheck_cmd(payload)):
@@ -4303,6 +4310,42 @@ class Daemon:
                              f"stopped ({killed} process group(s) killed) and counts as failed", "normal",
                              lifecycle=scr.ERROR)
                 self._schedule_ran(run.s, why, None)
+
+    def _schedule_cap_warn(self) -> None:
+        """An llm schedule whose last-24-h spend passes sched.CAP_WARN of its own daily cap while the
+        budget gate is green raises one normal keyed observation (SCHEDULE_CAP_SOURCE, key
+        schedule-cap-80:<name>) per budget day (budget.day_start; without one, per 24 h), before the
+        cap starts skipping runs. A new budget day closes it. Nothing changes a cap by itself."""
+        db, now = self.p.db, time.time()
+        gate = self.gates.get(self.cfg.get("core_provider", "claude"))
+        green = gate is None or (gate.allow_optional and gate.level == "green")
+        day = gcap.day_bounds(self.cfg.get("budget") or {}, now)
+        raised = db.kv(SCHEDULE_CAP_KEY) or {}
+        kept = {n: v for n, v in raised.items()
+                if (v.get("day") == day[0] if day else v.get("day") is None and now - float(v["at"]) < 86400)}
+        for name in set(raised) - set(kept):   # its budget day is over: the warning resets
+            for r in db.q("SELECT id, history FROM issues WHERE source=? AND watch_key=? AND status='open'",
+                          (SCHEDULE_CAP_SOURCE, f"schedule-cap-80:{name}")):
+                history = json.loads(r["history"] or "[]") + [{"ts": now, "action": "closed", "by": "daemon",
+                                                               "why": SCHEDULE_CAP_CLEARED}]
+                db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=?, history=? WHERE id=?",
+                     (now, SCHEDULE_CAP_CLEARED, json.dumps(history), r["id"]))
+        if green:
+            for r in db.q("SELECT * FROM schedules WHERE enabled=1 AND kind='llm' AND budget_usd_day > 0"):
+                name, cap = r["name"], float(r["budget_usd_day"])
+                if name in kept or (spent := sched.spent_today(db, name)) < sched.CAP_WARN * cap:
+                    continue
+                hint = sched.cap_text(sched.suggest_cap(db, r))
+                text = (f"Schedule {name} has spent ${spent:.2f} of its own ${cap:.2f} daily cap in the last 24 h "
+                        f"({spent / cap:.0%}) while the budget gate is green: past the cap it skips runs the "
+                        f"project could afford. {hint + '. ' if hint else ''}If its runs matter, raise its daily "
+                        f"cap (`budget_usd`), lower its per-run `budget_usd_run`, or run it less often; caps "
+                        f"never change by themselves.")
+                kept[name] = {"day": day[0] if day else None, "at": now}
+                log(self.p, f"schedule {name}: ${spent:.2f} of ${cap:.2f} daily cap; observation raised")
+                self.observe(SCHEDULE_CAP_SOURCE, text, "normal", whole=True, key=f"schedule-cap-80:{name}")
+        if kept != raised:
+            db.set_kv(SCHEDULE_CAP_KEY, kept)
 
     def _schedule_gaps(self, due: list[dict]) -> None:
         """Due schedules that start whole periods late (sched.missed) left a hole in what they record:

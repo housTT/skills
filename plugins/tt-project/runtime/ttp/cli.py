@@ -4784,6 +4784,8 @@ def cmd_schedules(a) -> None:
                                                   "description", "payload")}
         state["recent_skips"] = [{"at": timefmt.short(float(x["ts"]), p), "reason": x["reason"]}
                                  for x in sched.skips(p.db, a.schedule)]
+        if hint := sched.suggest_cap(p.db, r):
+            state["suggested_budget_usd_day"] = {**hint, "text": sched.cap_text(hint)}
         print(json.dumps({**e, "state": state}, indent=2, default=str))
         return
     from . import heal
@@ -4799,7 +4801,11 @@ def cmd_schedules(a) -> None:
         slow = heal.interval(p.db, r, spec) if spec else 0
         if slow > int(r["every_s"]):   # a heal check backing off while healthy
             at = (at + " " if at else "") + f"(now {heal._secs(slow)}: healthy)"
-        print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' ' + at if at else ''}"
+        cap = "" if r["kind"] != "llm" else \
+            f" cap ${float(r['budget_usd_day']):.2f}/day" if r["budget_usd_day"] is not None else " no daily cap"
+        if cap and (hint := sched.cap_text(sched.suggest_cap(p.db, r))):
+            cap += f" ({hint})"
+        print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' ' + at if at else ''}{cap}"
               f"{f' timeout {t}s' if t else ''}{f' precheck: {pre[:60]}' if pre else ''}"
               f"{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}"
               f"{f' ({n} skip(s) in 24 h)' if (n := len(sched.skips(p.db, r['name'], sched.SKIP_KEEP, time.time() - 86400))) else ''}")

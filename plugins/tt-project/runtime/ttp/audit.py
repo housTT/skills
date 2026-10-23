@@ -35,7 +35,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, ends, quietgate, reviewstats, sharedchecks, suitecost, turngate, unblock, upstream
+from . import budget, chaincap, ends, quietgate, reviewstats, schedule, sharedchecks, suitecost, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -367,6 +367,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
                        f"${x['review_usd']:.2f} + fixes ${x['fix_usd']:.2f}" for x in loops[:3]))
     if routed := reviewstats.audit_line(db, since):
         out.append(routed)
+    low = schedule.below_suggestion(db)
+    if low:
+        out.append(f"schedule caps under their suggestion: {len(low)}: " + "; ".join(low[:TOP]) + _more(low))
     held = overrides(p, db, now, blocked_h)
     if held:
         out.append(f"overrides held long: {len(held)}: " + "; ".join(held[:TOP]) + _more(held))
