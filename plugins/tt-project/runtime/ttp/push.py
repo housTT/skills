@@ -1559,7 +1559,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     task = os.environ.get("TTP_TASK")
     fresh = bool(m and task and m.group(1) == task and _fresh(p, task, branch))
     as_is = bool(m and task and m.group(1) == task and (fresh or os.environ.get(OWN_BRANCH_ENV)))
-    onto = _labelled(p, task, "pr_branch") if task and not as_is else ""
+    onto = _pr_branch(p, task) if task and not as_is else ""
     notes = is_notes_branch(p, branch)   # publishes itself, never onto a pr_branch
     if m and task and m.group(1) == task and not notes and not as_is and (why := _switched(p, task, branch)):
         raise ValueError(why)
@@ -1953,9 +1953,11 @@ def _labels(t: dict | None) -> list[str]:
         return []
 
 
-def _labelled(p: Project, task: str | None, name: str) -> str:
-    """The value of task `task`'s first `<name>:<value>` label, or ""."""
-    return next((x.partition(":")[2] for x in _labels(_task_row(p, task)) if x.startswith(f"{name}:")), "")
+def _pr_branch(p: Project, task: str | None) -> str:
+    """The branch task `task` is recorded as delivering onto (worktree.recorded_pr_branch: its label or
+    the latest `pr_branch:` line an update appended to its spec), as written, or ""."""
+    t = _task_row(p, task)
+    return (worktree.recorded_pr_branch(t) if t else None) or ""
 
 
 def is_notes_branch(p: Project, branch: str) -> bool:
@@ -1980,7 +1982,7 @@ def _switched(p: Project, task: str, branch: str) -> str:
     given = str((t or {}).get("branch") or "")
     if not given or given == branch:
         return ""
-    onto = _labelled(p, task, "pr_branch")
+    onto = _pr_branch(p, task)
     to = f", which it publishes onto {onto}" if onto and onto != given else ""
     return (f"this worktree has {branch} checked out, but task #{task} delivers from {given}{to}: "
             f"--own publishes neither. Switch back to {given} (bring the commits over, e.g. "
@@ -1999,7 +2001,7 @@ def _fresh(p: Project, task: str, branch: str) -> bool:
     mg = OWN_BRANCH.fullmatch(given)
     if not given or given == branch or (mg and mg.group(1) == task):
         return False
-    onto = _labelled(p, task, "pr_branch")
+    onto = _pr_branch(p, task)
     spec = str(t.get("spec") or "")
     return not any(b and worktree.spec_names_pr_branch(spec, b) for b in (given, onto)) \
         and not any(x.startswith("pr_fix:") for x in _labels(t))
@@ -2012,7 +2014,8 @@ def _carries(p: Project, task: str, owner: str, branch: str) -> bool:
     if not t:
         return False
     labels = _labels(t)
-    return str(t.get("branch") or "") == branch or f"pr_branch:{branch}" in labels or f"continues:{owner}" in labels
+    return str(t.get("branch") or "") == branch or worktree.recorded_pr_branch(t) == branch \
+        or f"continues:{owner}" in labels
 
 
 def _may_land(p: Project, task: str, owner: str, branch: str) -> bool:
@@ -2431,7 +2434,7 @@ def _no_push_of(task: dict, whose: str) -> str | None:
 
 
 def pr_branch_of(p: Project, task: dict | None) -> str:
-    """The branch a task's `pr_branch:` label delivers onto (worktree.carried_branch), its own branch
+    """The branch a task is recorded as delivering onto (worktree.carried_branch), its own branch
     when it rebases one (`rebases:<branch>`: a rebase cannot fast-forward the old branch), or that of
     the task it continues (a fix of a failed review's findings builds on that task's work), or "".
     A task labelled worktree.NO_PR_BRANCH carries none, whatever the tasks it continues carry."""
@@ -2444,7 +2447,8 @@ def pr_branch_source(p: Project, task: dict | None) -> tuple[dict | None, str]:
     seen: set[int] = set()
     while task and task["id"] not in seen:
         seen.add(task["id"])
-        if worktree.NO_PR_BRANCH in _labels(task):
+        named = worktree.recorded_pr_branch(task)
+        if named == "":   # NO_PR_BRANCH or a cleared `pr_branch: ""` update line
             return None, ""
         if onto := worktree.carried_branch(task):
             return task, onto

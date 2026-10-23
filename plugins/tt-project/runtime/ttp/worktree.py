@@ -503,14 +503,44 @@ def spec_names_pr_branch(spec: str, branch: str) -> bool:
 NO_PR_BRANCH = "no_pr_branch"
 
 
-def carried_branch(task: dict) -> str:
-    """The branch a task's `pr_branch:<branch>` label names (it delivers onto it), or "" (also when
-    the label's value is not a valid branch name: valid_branch)."""
+# A task_update appends its spec text after a line `## Update`; a `pr_branch:` line there, or
+# `pr_branch: ""` (no own branch), sets the task's branch from then on (recorded_pr_branch).
+UPDATE_SECTION = re.compile(r"^## Update\b.*$", re.M)
+SPEC_CLEARED_PR_BRANCH = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?pr_branch:[ \t]*(?:\"\"|''|``)[ \t]*$", re.M)
+
+
+def recorded_pr_branch(task: dict) -> str | None:
+    """The branch `task` is recorded as delivering onto, as written (callers check valid_branch): the
+    latest `pr_branch:` line a task_update appended to its spec (UPDATE_SECTION; `pr_branch: ""`
+    clears it), else its `pr_branch:<branch>` label (task_add's, from its original spec's line, or a
+    task_update's `pr_branch`). "" when it carries none (a cleared line, NO_PR_BRANCH); None when
+    nothing names one, so push.pr_branch_of looks at the task it continues. Reviews and harness tasks
+    (NEVER_OWN_KINDS) go by their labels only: their specs quote other tasks'."""
     try:
-        labels = json.loads(task.get("labels") or "[]")
+        labels = [lb for lb in json.loads(task.get("labels") or "[]") if isinstance(lb, str)]
     except (ValueError, TypeError):
+        labels = []
+    if task.get("kind") not in NEVER_OWN_KINDS:
+        spec = str(task.get("spec") or "")
+        latest = None
+        for start in (m.end() for m in UPDATE_SECTION.finditer(spec)):
+            nxt = UPDATE_SECTION.search(spec, start)
+            part = spec[start:nxt.start() if nxt else len(spec)]
+            hits = [(m.start(), m.group("branch")) for m in SPEC_PR_BRANCH.finditer(part)]
+            hits += [(m.start(), "") for m in SPEC_CLEARED_PR_BRANCH.finditer(part)]
+            if hits:
+                latest = max(hits)[1]
+        if latest is not None:
+            return latest
+    if NO_PR_BRANCH in labels:
         return ""
-    found = next((lb[10:] for lb in labels if isinstance(lb, str) and lb.startswith("pr_branch:")), "")
+    return next((lb[10:] for lb in labels if lb.startswith("pr_branch:")), None)
+
+
+def carried_branch(task: dict) -> str:
+    """The branch a task delivers onto (recorded_pr_branch), or "" (also when it is not a valid
+    branch name: valid_branch)."""
+    found = recorded_pr_branch(task) or ""
     return found if valid_branch(found) else ""
 
 

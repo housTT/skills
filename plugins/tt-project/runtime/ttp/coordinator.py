@@ -1754,16 +1754,23 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             prev.setdefault("retry_when_orig", probe)
                             prev["retry_when"] = rest
                             upd["result"] = dump_result(prev)
-                if a.get("pr_branch") == "":
-                    # Carries no branch (its own label or one inherited through `continues`): it delivers
-                    # to the push branch.
+                branch_line = ""
+                if a.get("pr_branch") is not None:
+                    # "" carries no branch (its own label or one inherited through `continues`): it delivers
+                    # to the push branch. A branch name: it delivers onto that branch. The spec gets the
+                    # line too, so a later update's `pr_branch:` line or field wins (worktree.recorded_pr_branch).
+                    want = str(a["pr_branch"]).strip()
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
                         raise ValueError(f"task #{task['id']} is {task['status']}: its branch changes only before "
                                          f"it starts; add a new one with continues and pr_branch \"\"")
+                    if want and not worktree.valid_branch(want):
+                        raise ValueError(f"task #{task['id']} rejected: pr_branch {want!r} is not one valid branch name")
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
                     upd["labels"] = [lb for lb in labels if not (isinstance(lb, str) and lb.startswith(
-                        ("pr_branch:", "rebases:")) or lb == worktree.NO_PR_BRANCH)] + [worktree.NO_PR_BRANCH]
+                        ("pr_branch:", "rebases:")) or lb == worktree.NO_PR_BRANCH)] + \
+                        [f"pr_branch:{want}" if want else worktree.NO_PR_BRANCH]
+                    branch_line = f"pr_branch: `{want}`" if want else 'pr_branch: ""'
                 if a.get("start_after") is not None or a.get("start_when") is not None \
                         or (a.get("why") is not None and deferral(task).get("when")):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
@@ -1793,7 +1800,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"#{task['id']} rejected: depends on #{dep} which "
                                          f"{'does not exist' if why == 'does not exist' else 'is ' + why}; "
                                          f"drop or replace depends_on")
-                spec = a.get("spec") or ""
+                spec = "\n\n".join(x for x in (a.get("spec") or "", branch_line) if x)
                 if a.get("text") and upd.get("status", task["status"]) in ("blocked", "cancelled"):
                     upd["blocked_reason"] = a["text"][:500]
                 elif a.get("text"):

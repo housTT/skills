@@ -10634,3 +10634,106 @@ def test_push_checks_by_repo_rejects_malformed_values(env, tmp_path, monkeypatch
     problems = project.config_problems({"delivery": {"push_checks_by_repo": json.loads(value)}})
     assert any(x.startswith("delivery.push_checks_by_repo: ") for x in problems)
     assert not project.config_problems({"delivery": {"push_checks_by_repo": {"harness": ["true"]}}})
+
+
+def test_recorded_pr_branch_reads_the_label_then_the_latest_update_line(env):
+    """worktree.recorded_pr_branch, the one reader of a task's pr_branch: its label (task_add's, from the
+    original spec's line, or task_update's field), unless a `pr_branch:` line a task_update appended to
+    its spec (after `## Update`) says otherwise; the latest such line wins, `pr_branch: ""` clears it,
+    and a line in the original spec or in running prose is not an update. Reviews go by labels only."""
+    from ttp import push, worktree
+    p = make(env)
+
+    def row(spec, labels=(), kind="code"):
+        return p.db.task(p.db.add_task("T", spec, kind=kind, labels=list(labels)))
+
+    upd = "\n\n## Update\n"
+    assert worktree.recorded_pr_branch(row("s")) is None
+    assert worktree.recorded_pr_branch(row("pr_branch: `feature/a`\nDo it.", ["pr_branch:feature/a"])) == "feature/a"
+    assert worktree.recorded_pr_branch(row("s", ["no_pr_branch"])) == ""
+    assert worktree.recorded_pr_branch(row(f"s{upd}pr_branch: `feature/b`\nPush there.")) == "feature/b"
+    assert worktree.recorded_pr_branch(row(f"s{upd}pr_branch: `feature/b`", ["pr_branch:feature/a"])) == "feature/b"
+    assert worktree.recorded_pr_branch(row(f"s{upd}pr_branch: `feature/b`", ["no_pr_branch"])) == "feature/b"
+    assert worktree.recorded_pr_branch(
+        row(f"s{upd}pr_branch: `feature/b`{upd}Also:\n- pr_branch: feature/c", ["pr_branch:feature/a"])) == "feature/c"
+    cleared = row(f"s{upd}pr_branch: `feature/b`{upd}pr_branch: \"\"", ["pr_branch:feature/a"])
+    assert worktree.recorded_pr_branch(cleared) == "" and worktree.carried_branch(cleared) == ""
+    assert push.pr_branch_of(p, cleared) == ""
+    assert worktree.recorded_pr_branch(row(f"s{upd}Read the spec's pr_branch: line first.")) is None
+    assert worktree.recorded_pr_branch(row(f"s{upd}pr_branch: `feature/b`", kind="review")) is None
+    assert worktree.carried_branch(row(f"s{upd}pr_branch: `feature/b`", ["pr_branch:feature/a"])) == "feature/b"
+
+
+def test_own_push_honors_the_pr_branch_an_update_records(env, monkeypatch, capsys):
+    """`ttp push --own` publishes onto the branch a task is recorded as delivering onto, however that was
+    set: a `pr_branch:` line of its original spec, task_update's `pr_branch` field, or a `pr_branch:` line
+    a task_update appended to its spec (a reported case: a branch named only in later spec updates was
+    refused). The later update wins; `pr_branch` "" means no own branch. A branch nothing names, the
+    push branch, main and what delivery.own_push forbids are still refused."""
+    from ttp import coordinator as coord, push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    for b in ("feature/a", "feature/b", "feature/c"):
+        _git_out(other, "push", "-q", "origin", f"HEAD:refs/heads/{b}")
+    owner = p.db.add_task("Speed up the loader", "s", kind="code")
+    theirs = f"ttp/t{owner}-speed-up-the-loader"
+    p.db.update_task(owner, status="done", branch=theirs)
+    _git_out(other, "push", "-q", "origin", f"HEAD:refs/heads/{theirs}")
+
+    def add(title, spec):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
+        return p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]
+
+    def update(tid, **a):
+        assert coord.apply(p, [{"type": "task_update", "id": tid, **a}]) == []
+
+    def target(tid):
+        own = f"ttp/t{tid}-own"
+        p.db.update_task(tid, branch=own)
+        _git_out(repo, "checkout", "-q", "-B", own)
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        return push.own_target(p, repo)
+
+    # The original spec's line, as before.
+    orig = add("Fix the CI", "pr_branch: `feature/a`\nFix CI there.")
+    assert target(orig) == ("origin", "feature/a")
+    # task_update's field, on a task not yet running: recorded, and it wins over the original line.
+    update(orig, pr_branch="feature/b")
+    assert target(orig) == ("origin", "feature/b")
+    # A `pr_branch:` line a task_update appended to the spec (it may run already): the latest wins.
+    plain = add("Tidy the docs", "Tidy them.")
+    assert target(plain) == ("origin", f"ttp/t{plain}-own")
+    update(plain, spec="Deliver it onto the PR branch.\npr_branch: `feature/a`")
+    assert target(plain) == ("origin", "feature/a")
+    p.db.update_task(plain, status="running")
+    update(plain, spec="pr_branch: `feature/c`")
+    assert target(plain) == ("origin", "feature/c")
+    # Another task's ttp/t<id>-... branch named by an update is the task's to publish, not inherited.
+    update(orig, spec=f"pr_branch: `{theirs}`")
+    assert target(orig) == ("origin", theirs)
+    # The field after an update line wins; "" means no own branch: its own branch, under its own name.
+    update(orig, pr_branch="feature/c")
+    assert target(orig) == ("origin", "feature/c")
+    update(orig, pr_branch="")
+    assert target(orig) == ("origin", f"ttp/t{orig}-own") and push.pr_branch_of(p, p.db.task(orig)) == ""
+    problems = coord.apply(p, [{"type": "task_update", "id": orig, "pr_branch": "feat..ure"}])
+    assert problems and "not one valid branch name" in problems[0]
+    # Still refused: a branch nothing names, the push branch, main, and what own_push forbids.
+    _git_out(repo, "checkout", "-q", "-B", theirs)
+    with pytest.raises(ValueError, match="only this task's own branch"):
+        push.own_target(p, repo)
+    for shared in ("proj", "main"):
+        update(plain, spec=f"pr_branch: `{shared}`")
+        with pytest.raises(ValueError):
+            target(plain)
+    update(plain, spec="pr_branch: `feature/gone`")
+    with pytest.raises(ValueError, match="exists neither here nor on origin"):
+        target(plain)
+    update(plain, spec="pr_branch: `feature/a`")
+    remote, branch = target(plain)
+    p.set_config("delivery.own_push", "off")
+    with pytest.raises(ValueError, match="own pushes are off"):
+        push.own_gate(p, repo, remote, branch)
+    p.set_config("delivery.own_push", "existing_only")
+    push.own_gate(p, repo, remote, branch)
+    with pytest.raises(ValueError, match="has no branch"):
+        push.own_gate(p, repo, remote, "feature/new")
