@@ -2771,6 +2771,128 @@ def test_ttr_labels_incidents_in_this_projects_test_changes_and_keeps_them_out_o
     del elsewhere, other
 
 
+def test_ttr_relabels_incidents_once_a_change_is_flagged_a_test_after_the_fact(env, monkeypatch, capsys):
+    """`ttp machines change edit <id> --test` flags a change, open or closed, after the fact: incidents already
+    recorded inside its window become tests at the next report, with an edit trail; `--no-test` restores them.
+    Only the project that recorded it or the machine's recovery owner may flip it; outside the window nothing moves."""
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import ttr
+    p = make(env, "alpha")
+    mm.add("box-a")
+    t0 = time.time() - 86400
+    c = ml.add_change("box-a", "a repro driver", "true", "alpha", expires="1d", now=t0)
+    ml.close_change(c["id"], "done", "alpha", now=t0 + 1000)
+    inside = p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-a','down','x',?,?)",
+                    (t0 + 100, t0 + 400))
+    outside = p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-a','held','y',?,?)",
+                     (t0 + 2000, t0 + 2300))
+    now = t0 + 3000
+    before = ttr.report(p.db, now=now, project="alpha")["box-a"]
+    assert (before["incidents"], before["tests"]) == (2, [])
+    # Another project, not the machine's recovery owner, is refused; nothing is written.
+    with pytest.raises(ValueError, match="recorded by alpha: only that project may flip its test flag, not beta"):
+        ml.set_test(c["id"], "beta", True, now=now)
+    assert "edits" not in ml.changes(open_only=False)[0]
+    got = ml.set_test(c["id"], "alpha", True, now=now)
+    assert got["test"] is True and got["closed"] == t0 + 1000 and got["what"] == "a repro driver"
+    assert got["edits"] == [{"at": now, "by": "alpha", "was": {"test": False}, "test": True}]
+    s = ttr.report(p.db, now=now, project="alpha")["box-a"]
+    assert s["incidents"] == 1 and s["last"]["id"] == outside
+    assert [(t["id"], t["source_kind"], t["change"]) for t in s["tests"]] == [(inside, "down", c["id"])]
+    with pytest.raises(ValueError, match="already flagged"):
+        ml.set_test(c["id"], "alpha", True, now=now)
+    # The machine's recovery owner may clear it; the trail keeps both edits.
+    mm.set_recovery("box-a", owner="gamma")
+    with pytest.raises(ValueError, match=r"or box-a's recovery owner \(gamma\)"):
+        ml.set_test(c["id"], "beta", False, now=now)
+    got = ml.set_test(c["id"], "gamma", False, now=now + 10)
+    assert "test" not in got and got["edits"][-1] == {"at": now + 10, "by": "gamma", "was": {"test": True},
+                                                       "test": False}
+    restored = ttr.report(p.db, now=now, project="alpha")["box-a"]
+    assert (restored["incidents"], restored["tests"]) == (2, [])
+    # The CLI: inside the project, --test flips it; another project's --by is refused with a clear message.
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    cli.main(["machines", "change", "edit", str(c["id"]), "--test"])
+    assert "now flagged as a test" in capsys.readouterr().out
+    assert ml.changes(open_only=False)[0]["edits"][-1]["by"] == "alpha"
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "change", "edit", str(c["id"]), "--no-test", "--by", "beta"])
+    assert "only that project or box-a's recovery owner (gamma) may flip" in capsys.readouterr().err
+    cli.main(["machines", "change", "edit", str(c["id"]), "--no-test"])
+    assert "no longer flagged" in capsys.readouterr().out and "test" not in ml.changes(open_only=False)[0]
+
+
+def test_machine_change_add_since_backdates_its_start_into_ttr_windows(env, monkeypatch, capsys):
+    """`ttp machines change add --since` backdates a new change's start (a delay back or an ISO time in the home
+    zone): an incident since then is a test of a --test change. A future time or one past SINCE_MAX_S is refused."""
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import ttr
+    p = make(env, "alpha")
+    mm.add("box-a")
+    now = 1_800_000_000.0
+    assert ml.parse_since("2h", now) == now - 7200
+    assert ml.parse_since("2027-01-14 22:00", now, "America/Los_Angeles") == now - 7200   # 06:00 UTC
+    assert ml.parse_since("2027-01-15T06:00Z", now, "America/Los_Angeles") == now - 7200
+    for bad, why in (("2027-01-15 09:00", "in the future"), ("8d", "more than 7 days back"), ("soon", "delay back")):
+        with pytest.raises(ValueError, match=why):
+            ml.parse_since(bad, now, "UTC")
+    with pytest.raises(ValueError, match="within the last 7 days"):
+        ml.add_change("box-a", "x", "true", "alpha", expires="1d", now=now, since=now + 60)
+    t = time.time()
+    early = p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-a','down','x',?,?)",
+                   (t - 3 * 3600, t - 2.5 * 3600))
+    inside = p.db.x("INSERT INTO ttr_incidents(alias, kind, cause, started, ended) VALUES('box-a','held','y',?,?)",
+                    (t - 1800, t - 1200))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    cli.main(["machines", "change", "add", "box-a", "a repro driver", "--undo", "true", "--expires", "1h",
+              "--test", "--since", "2h"])
+    out = capsys.readouterr().out
+    c = ml.changes()[-1]
+    assert "; backdated to " in out and abs(c["since"] - (t - 7200)) < 60 and c["added"] >= t
+    s = ttr.report(p.db, project="alpha")["box-a"]
+    assert [x["id"] for x in s["tests"]] == [inside] and s["last"]["id"] == early
+    for bad, why in (("1h", "future"), ("8d", "more than 7 days back")):
+        with pytest.raises(SystemExit):
+            cli.main(["machines", "change", "add", "box-a", "x", "--undo", "true", "--expires", "1h",
+                      "--since", bad if bad != "1h" else "2099-01-01T00:00"])
+        assert why in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "change", "add", "box-a", "x", "--power-cycle-at", "1h", "--since", "1h"])
+    assert "cannot be backdated" in capsys.readouterr().err
+    assert len(ml.changes()) == 1
+
+
+def test_machine_change_test_flag_is_queued_from_a_read_only_ledger(env, monkeypatch):
+    """From a sandbox that keeps the shared ledger read-only, a flag edit is queued for the project's daemon,
+    which sets it (once, with its trail) on its next tick, keeping the ownership rule."""
+    import errno
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env, "alpha")
+    mm.add("box-a")
+    c = ml.add_change("box-a", "a repro driver", "true", "alpha", expires="1d")
+    real = ml._write
+
+    def ro(*a, **k):
+        raise OSError(errno.EROFS, "Read-only file system")
+    monkeypatch.setattr(ml, "_write", ro)
+    req = ml.set_test(c["id"], "alpha", True, now=100.0, queue=p.state)
+    assert req["op"] == "test" and req["queued"] and ml.set_test(c["id"], "alpha", True, queue=p.state)["queued"] == req["queued"]
+    with pytest.raises(ValueError, match="only that project"):
+        ml.set_test(c["id"], "beta", True, queue=p.state)
+    monkeypatch.setattr(ml, "_write", real)
+    done = ml.apply_requests(p.state, log=lambda _m: None)
+    assert [d["id"] for d in done] == [c["id"]] and ml.pending(p.state) == []
+    got = ml.changes()[0]
+    assert got["test"] is True and got["edits"] == [{"at": 100.0, "by": "alpha", "was": {"test": False}, "test": True}]
+
+
 def test_ttr_caps_a_heal_incident_at_its_last_unhealthy_sample_plus_the_check_period(env, tmp_path):
     """A sparse check no longer stretches a short fault: a heal-sourced incident ends no later than the
     check's last unhealthy sample plus its period; another source keeping it open clears the cap, and rows

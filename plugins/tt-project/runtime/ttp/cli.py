@@ -5350,7 +5350,18 @@ def _machine_change(a) -> None:
         print(_queued_line(c) if c.get("queued") else f"closed machine change #{c['id']} on {c['alias']}")
         return
     if a.change == "edit":
+        flag_only = a.test is not None and not any((a.what, a.undo, a.expires, a.until_probe, a.until_task))
         try:
+            if a.test is not None:
+                c = ml.set_test(a.id, by, a.test, queue=queue)
+                if c.get("queued"):
+                    print(f"queued the test flag of machine change #{a.id} (request {c['queued']}): the shared "
+                          f"machine ledger is read-only here, so this project's daemon sets it on its next tick")
+                else:
+                    print(f"machine change #{a.id} is {'now' if a.test else 'no longer'} flagged as a test: "
+                          f"`ttp ttr` labels the incidents inside its window afresh")
+            if flag_only:
+                return
             if a.until_task:
                 c = next((c for c in ml.changes() if c.get("id") == a.id), None)
                 _until_task_ok(p, c.get("by") if c else by, a.until_task)
@@ -5360,7 +5371,8 @@ def _machine_change(a) -> None:
         except OSError as e:
             if e.errno not in ml.UNWRITABLE:
                 raise
-            die(f"the shared machine ledger is read-only here ({e.strerror}), and an edit is not queued: "
+            die(f"the shared machine ledger is read-only here ({e.strerror}), and an edit (except --test or "
+                f"--no-test) is not queued: "
                 f"`ttp machines change close {a.id}` and `ttp machines change add` a new entry (both are queued "
                 f"for this project's daemon)")
         print(f"edited {ml.change_line(c)}")
@@ -5377,13 +5389,16 @@ def _machine_change(a) -> None:
         die("give the --undo command (or --power-cycle-at <t> for a planned power cycle)")
     if not a.power_cycle_at and not (a.expires or a.until_probe or a.until_task):
         die(ml.END_HINT)
+    if a.since and a.power_cycle_at:
+        die("a power cycle cannot be backdated: --since is for a change already made")
     try:
+        since = ml.parse_since(a.since, where=p) if a.since else None
         if a.until_task:
             _until_task_ok(p, by, a.until_task)
         c = ml.add_power_cycle(a.alias, a.power_cycle_at, by, a.what, tid, queue=queue,
                                 extra={"test": True} if a.test else None) if a.power_cycle_at else \
             ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect,
-                          until_task=a.until_task, queue=queue, test=a.test)
+                          until_task=a.until_task, queue=queue, test=a.test, since=since)
     except ValueError as e:
         die(str(e))
     print(_queued_line(c) if c.get("queued") else f"recorded {ml.change_line(c)}")
@@ -7882,6 +7897,9 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("--test", action="store_true",
                    help="the change is made for a test: `ttp ttr` labels this project's incidents on the machine "
                         "that start while it is open as tests, outside its TTR stats")
+    c.add_argument("--since", metavar="T",
+                   help="backdate the change's start, for one already made: a delay back (2h) or an ISO time "
+                        "(home zone unless it names one); not in the future, at most 7 days back")
     c = cs.add_parser("list", help="the open changes")
     c.add_argument("alias", nargs="?", help="only this machine")
     c.add_argument("--all", action="store_true", help="closed ones too")
@@ -7890,7 +7908,8 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("id", type=int, help="the change's id, as `ttp machines change list` shows it")
     c.add_argument("--why", help="how it ended")
     c.add_argument("--by", help="who closes it (default: the project you are in)")
-    c = cs.add_parser("edit", help="correct an open change in place (same id): its text, undo command or end")
+    c = cs.add_parser("edit", help="correct an open change in place (same id): its text, undo command or end; "
+                                   "or flag one, open or closed, as a test")
     c.add_argument("id", type=int, help="the change's id, as `ttp machines change list` shows it")
     c.add_argument("--what", help="the new text: what changed and why, one line")
     c.add_argument("--undo", help="the new command that undoes it")
@@ -7902,6 +7921,13 @@ def main(argv: list[str] | None = None) -> None:
     end.add_argument("--until-task", dest="until_task", type=int, metavar="ID",
                      help="a new end: once this open task ends; a continuation task gives its own id "
                           "to re-extend the entry (again 7 days at the latest)")
+    flag = c.add_mutually_exclusive_group()
+    flag.add_argument("--test", dest="test", action="store_true", default=None,
+                      help="flag the change, open or closed, as made for a test after the fact: `ttp ttr` labels "
+                           "the incidents inside its window as tests; only the project that recorded it or the "
+                           "machine's recovery owner may")
+    flag.add_argument("--no-test", dest="test", action="store_false",
+                      help="clear its test flag: its incidents count in TTR again")
     c.add_argument("--by", help="who edits it (default: the project you are in)")
     s.set_defaults(fn=cmd_machines)
 

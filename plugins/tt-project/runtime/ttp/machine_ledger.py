@@ -54,6 +54,15 @@ states. `ttp machines change edit <id> [--what] [--undo] [--expires] [--until-pr
 corrects an open entry in place (same id), with an edit trail in the entry; giving its until-probe again, even
 the same one, drops its result and passes so far: it is judged afresh after PROBE_GRACE_S.
 
+Test changes. `ttp machines change add ... --test` marks a change made for a test: `ttp ttr` labels the
+recording project's incidents on that machine that start inside its window as tests (ttr.test_windows).
+`--since <t>` backdates a new entry's start (`since`; its `added` stays when it was recorded): a delay back
+(`2h`) or an ISO time, in the project's home zone unless it names one, not in the future and at most
+SINCE_MAX_S back. `ttp machines change edit <id> --test` (`--no-test` undoes it) flags an entry, open or
+closed, after the fact (set_test), so incidents already recorded inside its window are relabelled at the next
+report; only the project that recorded it or the machine's recovery owner may, and the edit trail keeps when,
+who and the old and new value. Unlike other edits, a flag edit is queued from a read-only sandbox.
+
 Planned power cycles. `ttp machines change add <alias> "<why>" --power-cycle-at <t>` records a power-cycle
 intent: an entry of kind `power_cycle` that needs no undo and closes itself POWER_CYCLE_AFTER_S after T
 (never overdue; any co-tenant daemon closes it once past). It expects the machine `down` only from
@@ -74,8 +83,8 @@ content (request_id), and the project's own daemon records it on its next routin
 model-free. A retry of the same command finds the request already queued, or its open entry (which keeps
 the request's id as `request`), and adds nothing; a daemon killed between the ledger write and the request's
 removal finds that entry and only removes the request. A request the ledger refuses by then (its machine
-gone) is kept as `<id>.failed.json` with the reason, and logged. `ttp machines change edit` is not queued:
-close the entry and add a new one.
+gone) is kept as `<id>.failed.json` with the reason, and logged. `ttp machines change edit` is not queued
+(close the entry and add a new one), except its --test or --no-test (op `test`).
 
 A page is never lost nor sent twice: `route` records each due page as pending, with a text fixed for its
 step, and hands it to one daemon at a time (a claim that lapses after CLAIM_S); that daemon marks it
@@ -93,6 +102,7 @@ import os
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -113,6 +123,7 @@ PROBE_END_S = 7 * 86400      # an entry with only an until-probe or until-task i
 PROBE_GRACE_S = 300          # an until-probe first runs this long after its entry (or its new probe) was made
 PROBE_PASSES = 2             # passes in a row before an until-probe counts as passed
 CLOSED_KEPT_S = 30 * 86400   # closed entries kept this long
+SINCE_MAX_S = 7 * 86400      # `change add --since` backdates a start at most this far
 TEXT_CHARS = 300
 CONDITIONS = ("down", "held")
 # what a known outage explains (`ttp machines outage --covers`), besides a service's name; none given:
@@ -170,7 +181,8 @@ def _one_line(text: Any, chars: int = TEXT_CHARS) -> str:
 
 def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, until_probe: str | None = None,
                task: int | None = None, now: float | None = None, expects=None, extra: dict | None = None,
-               until_task: int | None = None, queue: Path | None = None, test: bool = False) -> dict:
+               until_task: int | None = None, queue: Path | None = None, test: bool = False,
+               since: float | None = None) -> dict:
     """Record a live change to machine `alias` made by project `by`; returns the entry. `queue`: the project's
     state dir, where the change is queued for its daemon when the shared ledger is read-only here (returns
     the request then, with `queued`: its id; see Queued requests). `expects`: the
@@ -178,8 +190,11 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
     keep the coordinator's turn routine (coordinator._known_case). `extra`: more fields (a kind).
     `until_task`: a task of project `by` whose end (done, failed, cancelled, gone) makes it overdue
     (check_task validates it). `test`: the change is made for a test, so `ttp ttr` labels this project's
-    incidents on `alias` that start while it is open as tests (ttr.test_windows)."""
+    incidents on `alias` that start while it is open as tests (ttr.test_windows). `since`: an epoch time the
+    change started before it was recorded (parse_since): its window starts there."""
     now = time.time() if now is None else now
+    if since is not None and not now - SINCE_MAX_S <= float(since) <= now:
+        raise ValueError(f"--since must lie within the last {SINCE_MAX_S / 86400:g} days, not in the future")
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
     what, undo, probe = _one_line(what), _one_line(undo, 1000), _one_line(until_probe, ends.PROBE_CHARS)
@@ -195,7 +210,8 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         ends.parse_expires(expires, now) if expires else now + PROBE_END_S   # a number: an epoch time
     fields = {"alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now, "expires": end,
               "probe": probe or None, **({"until_task": int(until_task)} if until_task else {}),
-              **({"test": True} if test else {}), **(extra or {})}
+              **({"test": True} if test else {}), **({"since": float(since)} if since is not None else {}),
+              **(extra or {})}
     if expects:
         fields["expects"] = [_one_line(x, 200) for x in expects if _one_line(x, 200)]
     try:
@@ -204,6 +220,32 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         if queue is None or e.errno not in UNWRITABLE:
             raise
         return _queue(queue, "add", fields)
+
+
+def parse_since(raw: str, now: float | None = None, where=None) -> float:
+    """`change add --since`: a delay back (`2h`, `3d`) or an ISO date or time, in the zone of `where` (a
+    Project, settings or zone name; None: timefmt.ambient()) unless it names one. Refuses a time ahead of now or more than
+    SINCE_MAX_S back."""
+    now = time.time() if now is None else now
+    s = str(raw or "").strip()
+    m = re.fullmatch(r"([0-9]+) ?([smhdw])", s)
+    if m:
+        at = now - int(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}[m[2]]
+    else:
+        iso = re.sub(r"([+-][0-9]{2})([0-9]{2})$", r"\1:\2", s.replace(" ", "T", 1).replace("Z", "+00:00"))
+        try:
+            d = datetime.fromisoformat(iso)
+        except ValueError:
+            raise ValueError(f"--since {raw!r}: use a delay back such as 2h, or an ISO time such as "
+                             f"2026-10-05T09:00") from None
+        from . import timefmt
+        zone = timefmt.tzinfo(where if where is not None else timefmt.ambient())
+        at = (d if d.tzinfo else d.replace(tzinfo=zone)).timestamp()
+    if at > now:
+        raise ValueError(f"--since {raw!r} is in the future: a change's start can only be backdated")
+    if at < now - SINCE_MAX_S:
+        raise ValueError(f"--since {raw!r} is more than {SINCE_MAX_S / 86400:g} days back")
+    return at
 
 
 def _store_change(fields: dict, request: str | None = None) -> dict:
@@ -313,7 +355,7 @@ def restore_power_cycle(cid: int, was: dict, by: str, mark: str, now: float | No
 # queued requests (see Queued requests) ------------------------------------------------------------
 
 # fields a retry of the same command may change (it runs later): left out of its request id
-UNHASHED = ("added", "at", "expires")
+UNHASHED = ("added", "at", "expires", "since")
 
 
 def request_id(op: str, fields: dict) -> str:
@@ -376,6 +418,9 @@ def apply_requests(state: Path, log: Callable[[str], None] = print) -> list[dict
                     raise ValueError(f"no machine {f.get('alias')!r} in `ttp machines list`")
                 c = _store_change(f, request=rid)
                 log(f"machine change #{c['id']} on {c['alias']} recorded from queued request {rid}")
+            elif req.get("op") == "test":
+                c = _set_test(int(f["id"]), f.get("by") or "", bool(f.get("test")), float(f.get("at") or time.time()))
+                log(f"machine change #{c['id']} test flag set to {bool(f.get('test'))} from queued request {rid}")
             elif req.get("op") == "close":
                 try:
                     c = _close(int(f["id"]), f.get("why") or "", f.get("by") or "", float(f.get("at") or time.time()))
@@ -445,6 +490,52 @@ def _close(cid: int, why: str, by: str, now: float) -> dict:
                 _write(LEDGER, doc)
                 return c
     raise ValueError(f"no open machine change #{cid}")
+
+
+def set_test(cid: int, by: str, test: bool, now: float | None = None, queue: Path | None = None) -> dict:
+    """Flag entry #cid, open or closed, as made for a test (`test`) or not, after the fact: `ttp ttr` then labels
+    the incidents inside its window afresh. Only its author or its machine's recovery owner (`by`) may. Keeps
+    the entry; appends {at, by, was: {test}, test} to its `edits`. `queue`: as add_change's."""
+    now = time.time() if now is None else now
+    c = next((c for c in changes(open_only=False) if c.get("id") == cid), None)
+    if c is None:
+        raise ValueError(f"no machine change #{cid}")
+    _test_owner_ok(c, by)
+    if bool(c.get("test")) == bool(test):
+        raise ValueError(f"machine change #{cid} is {'already' if test else 'not'} flagged as a test: nothing to change")
+    try:
+        return _set_test(cid, by, bool(test), now)
+    except OSError as e:
+        if queue is None or e.errno not in UNWRITABLE:
+            raise
+        return _queue(queue, "test", {"id": cid, "test": bool(test), "by": by, "at": now})
+
+
+def _test_owner_ok(c: dict, by: str) -> None:
+    owner = (machines.load().get(c.get("alias")) or {}).get("recovery_owner")
+    if not by or by not in (c.get("by"), owner):
+        raise ValueError(f"machine change #{c.get('id')} was recorded by {c.get('by') or '?'}: only that project"
+                         + (f" or {c.get('alias')}'s recovery owner ({owner})" if owner else "")
+                         + f" may flip its test flag, not {by or 'an unnamed caller'}; run it inside that project")
+
+
+def _set_test(cid: int, by: str, test: bool, now: float) -> dict:
+    with _locked():
+        doc = _read(LEDGER, {"next": 1, "changes": []})
+        c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
+        if c is None:
+            raise ValueError(f"no machine change #{cid}")
+        _test_owner_ok(c, by)
+        was = bool(c.get("test"))
+        if was == test:
+            return c   # flipped already (a queued request run again, or by someone else)
+        if test:
+            c["test"] = True
+        else:
+            c.pop("test", None)
+        c.setdefault("edits", []).append({"at": now, "by": by, "was": {"test": was}, "test": test})
+        _write(LEDGER, doc)
+        return c
 
 
 def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = None, expires: Any = None,
@@ -559,6 +650,7 @@ def change_line(c: dict, now: float | None = None, where=None, clip: int | None 
     by = c.get("by", "?") + (f" #{c['task']}" if c.get("task") else "")
     end += f"; expects {', '.join(c['expects'])}" if c.get("expects") else ""
     end += "; a test" if c.get("test") else ""
+    end += f"; backdated to {ends.shown(c['since'], where)}" if isinstance(c.get("since"), (int, float)) else ""
     head, tail = f"#{c['id']} {c['alias']}: ", (f" (by {by}; undo: `{part(c['undo'])}`; {end})"
                                                 + (f" OVERDUE: {part(late)}" if late else ""))
     what = _clip(c["what"], max(clip - len(head) - len(tail), CLIP_WHAT_MIN)) if clip else c["what"]

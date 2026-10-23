@@ -39,8 +39,10 @@ Another source keeping it open clears both, and rows from before they were recor
 (those still open, or that ended within it), the median, p90 and max TTR of the ended ones, the open
 ones and the last one; the daily review carries one line per machine with an incident in REVIEW_DAYS.
 An incident that starts inside the window of a test change (`ttp machines change add --test`) by the same
-project on the same machine (from the entry's `added` until it was closed, or now while it is open) is a
-test: it is labelled at report time, so rows recorded before are too, has kind 'test', stays out of the
+project on the same machine (from the entry's `since`, a backdated start, else its `added`, until it was
+closed, or now while it is open) is a test: it is labelled at report time from the entry's flag as it is
+then, so rows recorded before the entry or before `ttp machines change edit <id> --test` flagged it are too,
+and `--no-test` gives them their own kind back. A test incident has kind 'test', stays out of the
 counts and median, p90 and max, and is listed apart (count, then up to TEST_LISTED of them). Another
 project's entry or another machine's never relabels one. Closed entries are kept
 machine_ledger.CLOSED_KEPT_S, as long as the `ttp ttr` default window.
@@ -171,15 +173,17 @@ def _p90(xs: list[float]) -> float:
 
 
 def test_windows(project: str | None, now: float) -> dict[str, list[tuple[float, float, int]]]:
-    """{alias: [(from, to, change id)]} of project `project`'s test changes (`ttp machines change add --test`):
-    from when each was added until it was closed, or `now` while it is open."""
+    """{alias: [(from, to, change id)]} of project `project`'s changes flagged as tests now (`ttp machines change
+    add --test`, or `edit <id> --test` later): from each one's start (its backdated `since`, else when it was
+    added) until it was closed, or `now` while it is open."""
     if not project:
         return {}
     from . import machine_ledger
     out: dict[str, list[tuple[float, float, int]]] = {}
     for c in machine_ledger.changes(open_only=False):
         if c.get("test") and c.get("by") == project and c.get("alias") and c.get("added") is not None:
-            out.setdefault(c["alias"], []).append((float(c["added"]), float(c.get("closed") or now), c.get("id")))
+            start = c["since"] if isinstance(c.get("since"), (int, float)) else c["added"]
+            out.setdefault(c["alias"], []).append((float(start), float(c.get("closed") or now), c.get("id")))
     return out
 
 
