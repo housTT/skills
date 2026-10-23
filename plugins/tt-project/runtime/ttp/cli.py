@@ -3552,28 +3552,47 @@ def cmd_goal(a) -> None:
 LOCK_NA = 3   # `ttp lock --probe` outside a project, of a lock only a project keeps: no answer here
 
 
+def _machine_lock_answer(resource: str, shared_mode: bool, as_json: bool = False) -> tuple[int, str | dict]:
+    """(exit code, line) of `ttp lock --probe` outside any project (see _probe_machine_lock); the line
+    is lockprobe.report's dict when `as_json`."""
+    from . import fleethold, lockprobe, locks as lk, shared
+    if resource not in shared.names({}):
+        said = f"{resource}: n/a (no tt-project project here, and `ttp machines` does not share it)"
+        return LOCK_NA, {"resource": resource, "na": True, "line": said} if as_json else said
+    hold = fleethold.covering(resource)
+    held = shared.read_pause(resource) or (fleethold.entry(hold) if hold else None)
+    if held is not None:
+        said = f"{resource}: paused" + (f" ({held['reason']})" if held.get("reason") else "")
+        return 75, lockprobe.report(resource, said, False, paused=held) if as_json else said
+    where = shared.root() / resource
+    paths = lk.slot_paths(where, resource, shared.machine_slots(resource))
+    free = lk.probe(where, resource, paths, shared=shared_mode and not resource.endswith("-device"))
+    said = lockprobe.line(resource, free, where, resource, paths)
+    return (0 if free else 75), lockprobe.report(resource, said, free, where, resource, paths) if as_json else said
+
+
 def _probe_machine_lock(resource: str, shared_mode: bool, as_json: bool = False) -> None:
     """`ttp lock --probe` outside any project. A resource shared through `ttp machines` keeps its lock
     under ~/.tt-project/locks, where every project takes it: that lock answers, as the plain probe does
     (0 free, 75 busy, paused or reserved). Any other lock lives in some project's state, so there is
     nothing here to read: it says n/a and exits LOCK_NA. --json prints lockprobe.report instead."""
-    from . import fleethold, lockprobe, locks as lk, shared
-    if resource not in shared.names({}):
-        said = f"{resource}: n/a (no tt-project project here, and `ttp machines` does not share it)"
-        print(json.dumps({"resource": resource, "na": True, "line": said}) if as_json else said)
-        sys.exit(LOCK_NA)
-    hold = fleethold.covering(resource)
-    held = shared.read_pause(resource) or (fleethold.entry(hold) if hold else None)
-    if held is not None:
-        said = f"{resource}: paused" + (f" ({held['reason']})" if held.get("reason") else "")
-        print(json.dumps(lockprobe.report(resource, said, False, paused=held)) if as_json else said)
-        sys.exit(75)
-    where = shared.root() / resource
-    paths = lk.slot_paths(where, resource, shared.machine_slots(resource))
-    free = lk.probe(where, resource, paths, shared=shared_mode and not resource.endswith("-device"))
-    said = lockprobe.line(resource, free, where, resource, paths)
-    print(json.dumps(lockprobe.report(resource, said, free, where, resource, paths)) if as_json else said)
-    sys.exit(0 if free else 75)
+    rc, said = _machine_lock_answer(resource, shared_mode, as_json)
+    print(json.dumps(said) if as_json else said)
+    sys.exit(rc)
+
+
+def _lock_answers(a, answers: list[tuple[str, int, str | dict]]) -> None:
+    """Print `ttp lock --probe` answers of several resources ((name, exit code, line) each), as lines or
+    with --json as a list of their lockprobe.report rows, each with a state (free, busy, paused or n/a),
+    and exit: 75 when any is busy or paused, else LOCK_NA when any has no answer here, else 0."""
+    if a.json:
+        print(json.dumps([{**said, "state": {0: "free", LOCK_NA: "n/a"}.get(rc) or (
+            "paused" if said.get("paused") else "busy")} for _, rc, said in answers], indent=1))
+    else:
+        for _, _, said in answers:
+            print(said)
+    rcs = {rc for _, rc, _ in answers}
+    sys.exit(75 if 75 in rcs else LOCK_NA if LOCK_NA in rcs else 0)
 
 
 def cmd_lock(a) -> None:
@@ -3587,6 +3606,14 @@ def cmd_lock(a) -> None:
     `device.locks` is the one device lock. Waiters are served in arrival order. Each take and release
     goes to the project's activity log (activity.py, `ttp machines activity`); `--disruptive` marks a
     command that may reset, power-cycle or reboot what it holds.
+
+    `ttp lock A,B,C -- <cmd...>` (the names in one word) holds several at once, all or nothing: it queues on each at the same
+    arrival time, so later waiters on any of them never pass it, and takes them, in name order, only
+    once it is in turn on all of them; one that is not ready means it takes none and keeps waiting, so
+    it never holds a subset while it waits. Every one shows as held by the same holder until the
+    command ends. Each lock keeps its own rules (shared, device, nested, paused, reserved). A `ttp lock` run
+    under a hold already (an enclosing one, or an exclusive task's run) does not wait behind such a
+    waiter: it may be waiting for that very hold.
 
     `ttp lock --shared <resource> -- <cmd...>` is for read-only work: shared holders run together,
     while an exclusive holder (a plain `ttp lock`, or an exclusive task's whole-run hold) and shared
@@ -3611,7 +3638,8 @@ def cmd_lock(a) -> None:
     shares (its lock is machine-wide) and says n/a, exit 3, for any other. `--json` (a probe) prints the
     answer as JSON: free, paused, waiting, reserved_for and each live holder with its pid and whether it
     lives; a slot an exclusive run handed to the keeper of its detached jobs names the keeper (pid, via
-    "keeper") and the run supervisor that took it (taker_pid).
+    "keeper") and the run supervisor that took it (taker_pid). `--probe A,B` answers for each and exits
+    75 when any is busy or paused; with `--json` it prints a list of those answers, each with a state.
     """
     from . import hold, lockprobe, locks as lk
     cmd = list(a.command or [])
@@ -3619,72 +3647,88 @@ def cmd_lock(a) -> None:
         a.disruptive, cmd = True, cmd[1:]
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
-    if a.json:
-        a.probe = True
+    if a.json and cmd:
+        die("ttp lock --json lists the locks and runs nothing: drop the command or --json", 2)
+    a.probe = a.probe or a.json
     if not cmd and not a.probe:
         die("usage: ttp lock [--disruptive] <resource> -- <command...>  |  ttp lock --probe <resource>")
+    names = list(dict.fromkeys(n for n in a.resource.split(",") if n))
+    if not names:
+        die("usage: ttp lock [--disruptive] <resource>[,<resource>...] -- <command...>", 2)
     base = os.environ.get("TTP_PROJECT")
     if not base and a.probe:
         base = next((str(d) for d in [Path.cwd(), *Path.cwd().parents] if Project(d).exists()), None)
     if not base and a.probe:
-        return _probe_machine_lock(a.resource, a.shared, a.json)
+        if len(names) == 1:
+            return _probe_machine_lock(names[0], a.shared, a.json)
+        return _lock_answers(a, [(n, *_machine_lock_answer(n, a.shared, a.json)) for n in names])
     if not base:
         die("ttp lock only works inside a tt-project run (or with TTP_PROJECT set)")
     p = Project(base)
 
-    def _pause() -> dict | None:
-        # A pause of any of the device's names holds them all; a fleet hold, every name on its machine.
-        return lockprobe.pause(p, cfg, a.resource)
-
     def _refuse_paused() -> None:
-        # Checked before each try, so a pause set while this waits holds too.
-        held = _pause()
-        if held is not None:
-            if waiting:
-                _end_wait()
-            why = f" ({held['reason']})" if held.get("reason") else ""
-            die(f"{a.resource} is paused{why}; hand the task back as waiting until it is resumed", 75)
+        # Checked before each try, so a pause set while this waits holds too. A pause of any of the
+        # device's names holds them all; a fleet hold, every name on its machine.
+        for L in todo:
+            held = lockprobe.pause(p, cfg, L["name"])
+            if held is not None:
+                if waiting:
+                    _end_wait()
+                why = f" ({held['reason']})" if held.get("reason") else ""
+                die(f"{L['name']} is paused{why}; hand the task back as waiting until it is resumed", 75)
 
     from . import shared
     cfg = p.config()
-    res = lk.canonical(cfg, a.resource)
-    where = shared.locks_dir(p, res, cfg)
-    is_device = res in lk.device_locks(cfg) or res.endswith("-device") or a.resource.endswith("-device")
-    if a.shared and is_device:
-        if not a.probe:
-            die(f"{a.resource} is a device lock: one command at a time may use the device, so it cannot be "
-                f"held shared. Use a plain `ttp lock {a.resource} -- <command>`", 2)
-        a.shared = False   # a probe in a retry_when keeps working: it answers for the plain lock
+    todo: list[dict] = []   # the locks to take, one per canonical lock, in name order (see the docstring)
+    for n in names:
+        res = lk.canonical(cfg, n)
+        if all(L["res"] != res for L in todo):
+            todo.append({"name": n, "res": res, "where": shared.locks_dir(p, res, cfg),
+                         "device": res in lk.device_locks(cfg) or res.endswith("-device") or n.endswith("-device")})
+    todo.sort(key=lambda L: L["res"])
+    dev = next((L for L in todo if L["device"]), None)
+    if a.shared and dev and not a.probe:   # a probe answers for the plain lock: a retry_when keeps working
+        die(f"{dev['name']} is a device lock: one command at a time may use the device, so it cannot be "
+            f"held shared. Use a plain `ttp lock {dev['name']} -- <command>`", 2)
 
-    def _unwritable(e: OSError) -> None:
+    def _unwritable(e: OSError, L: dict) -> None:
         # Never a private lock instead: other holders would not see it. Say what is wrong.
-        die(f"cannot take the lock of {a.resource}: {where} is not writable here ({e.strerror or e}). "
+        die(f"cannot take the lock of {L['name']}: {L['where']} is not writable here ({e.strerror or e}). "
             f"The run's sandbox or file permissions must allow writing it; hand the task back as blocked "
             f"and name this directory")
 
-    try:
-        paths = lk.slot_paths(where, res, shared.slots(p, res, cfg))
-    except OSError as e:
-        _unwritable(e)
+    for L in todo:
+        try:
+            L["paths"] = lk.slot_paths(L["where"], L["res"], shared.slots(p, L["res"], cfg))
+        except OSError as e:
+            _unwritable(e, L)
     if a.probe:   # a paused `ttp lock` exits 75, so its probe must too
-        rc, said = lockprobe.answer(p, cfg, a.resource, a.shared, a.json)
-        print(json.dumps(said) if a.json else said)
-        sys.exit(rc)
-    who = shared.holder(p, res, hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID")), cfg)
+        if len(names) == 1:
+            rc, said = lockprobe.answer(p, cfg, names[0], a.shared, a.json)
+            print(json.dumps(said) if a.json else said)
+            sys.exit(rc)
+        return _lock_answers(a, [(L["name"], *lockprobe.answer(p, cfg, L["name"], a.shared, a.json)) for L in todo])
+    label = hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID"))
+    for L in todo:
+        L["who"] = shared.holder(p, L["res"], label, cfg)
     held_locks = [x for x in os.environ.get("TTP_LOCKS_HELD", "").split(",") if x]
     shared_locks = [x for x in os.environ.get("TTP_LOCKS_SHARED", "").split(",") if x]
-    if res in held_locks or (res in shared_locks and a.shared):
+    inner = [L for L in todo if L["res"] in held_locks or (L["res"] in shared_locks and a.shared)]
+    todo = [L for L in todo if L not in inner]
+    for L in inner:
         # An enclosing `ttp lock` of this command holds it already, in this mode or a stronger one.
-        print(f"ttp lock: {a.resource} is held already by an enclosing ttp lock "
-              f"({'exclusive' if res in held_locks else 'shared'}); running the command under it",
-              file=sys.stderr, flush=True)
+        print(f"ttp lock: {L['name']} is held already by an enclosing ttp lock "
+              f"({'exclusive' if L['res'] in held_locks else 'shared'}); "
+              f"{'taking the rest' if todo else 'running the command under it'}", file=sys.stderr, flush=True)
+    if not todo:
         sys.exit(subprocess.call(cmd))
-    if res in shared_locks:
-        die(f"cannot lock {a.resource} exclusively inside a shared `ttp lock` of it: it would wait for itself. "
+    if bad := next((L for L in todo if L["res"] in shared_locks), None):
+        die(f"cannot lock {bad['name']} exclusively inside a shared `ttp lock` of it: it would wait for itself. "
             f"Take the exclusive lock around the whole command instead", 2)
-    child_env = {**os.environ, **({"TTP_LOCKS_SHARED": ",".join(shared_locks + [res])} if a.shared
-                                  else {"TTP_LOCKS_HELD": ",".join(held_locks + [res])})}
-    if is_device:
+    mine = [L["res"] for L in todo]
+    child_env = {**os.environ, **({"TTP_LOCKS_SHARED": ",".join(shared_locks + mine)} if a.shared
+                                  else {"TTP_LOCKS_HELD": ",".join(held_locks + mine)})}
+    if any(L["device"] for L in todo):
         child_env["TTP_NO_DEVICE"] = "0"   # a device lock is the sanctioned way to a device
         child_env = unmask_devices(child_env)   # and sees the devices a run's own commands do not
     detached = bool(os.environ.get("TTP_DETACHED"))
@@ -3697,39 +3741,51 @@ def cmd_lock(a) -> None:
     from . import activity
     from .runner import boot_id
 
-    def _logged(mode: str, run) -> int:
-        # The take and the release go to the project's activity log (`ttp machines activity`).
-        aid = activity.new_id()
-        activity.append(p.state, activity.base(p.name, ev="take", id=aid, resource=res, mode=mode, cmd=activity.head(cmd),
-                                               start=time.time(), pid=os.getpid(), boot=boot_id(),
-                                               **({"disruptive": True} if a.disruptive else {})))
+    def _logged(mode: str, ls: list[dict], run) -> int:
+        # Each take and release goes to the project's activity log (`ttp machines activity`).
+        ids = [activity.new_id() for _ in ls]
+        for aid, L in zip(ids, ls):
+            activity.append(p.state, activity.base(p.name, ev="take", id=aid, resource=L["res"], mode=mode,
+                                                   cmd=activity.head(cmd), start=time.time(), pid=os.getpid(),
+                                                   boot=boot_id(), **({"disruptive": True} if a.disruptive else {})))
         rc = 1
         try:
             rc = run()
             return rc
         finally:
-            activity.append(p.state, {"ev": "release", "id": aid, "end": time.time(), "rc": rc})
+            for aid in ids:
+                activity.append(p.state, {"ev": "release", "id": aid, "end": time.time(), "rc": rc})
 
-    if res in {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}:
+    whole = {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}
+    if run_held := [L for L in todo if L["res"] in whole]:
         # This run's task holds the resource for its whole run already, exclusively even for a --shared
         # command: a nested plain `ttp lock` of it inside the command just runs too.
         _refuse_paused()
+        todo = [L for L in todo if L not in run_held]
         if a.shared:
-            child_env.update(TTP_LOCKS_SHARED=",".join(shared_locks), TTP_LOCKS_HELD=",".join(held_locks + [res]))
-        print(f"ttp lock: {a.resource} is held already by this task's whole run; running the command under it",
-              file=sys.stderr, flush=True)
-        sys.exit(_logged("exclusive", lambda: subprocess.call(cmd, env=child_env)))
+            child_env.update(TTP_LOCKS_SHARED=",".join(shared_locks + [L["res"] for L in todo]),
+                             TTP_LOCKS_HELD=",".join(held_locks + [L["res"] for L in run_held]))
+        for L in run_held:
+            print(f"ttp lock: {L['name']} is held already by this task's whole run; "
+                  f"{'taking the rest' if todo else 'running the command under it'}", file=sys.stderr, flush=True)
+        if not todo:
+            sys.exit(_logged("exclusive", run_held, lambda: subprocess.call(cmd, env=child_env)))
+    what = ",".join(L["name"] for L in todo)   # what the messages and the retry_when name
+    # A waiter that holds locks already never waits behind one for several resources at once: that one
+    # may wait for a lock this waiter's holder has, and neither would ever go on.
+    past_multi = bool(held_locks or shared_locks or whole)
     timeout = a.timeout
     cap = float(spec.get("stall_s") or 0) / 2
     capped = False
     if cap and not detached:
         if timeout is not None and (timeout == 0 or timeout > cap):
             print(f"ttp lock: --timeout {timeout:.0f} capped to {cap:.0f} s inside a run; if it runs out, "
-                  f"hand off `waiting` with retry_when `ttp lock --probe{' --shared' if a.shared else ''} {a.resource}`",
+                  f"hand off `waiting` with retry_when `ttp lock --probe{' --shared' if a.shared else ''} {what}`",
                   file=sys.stderr, flush=True)
         capped = not timeout or timeout > cap
         timeout = cap if timeout is None or timeout == 0 else min(timeout, cap)
-    mark = lk.reserve_path(where, res)
+    for L in todo:
+        L["mark"] = lk.reserve_path(L["where"], L["res"])
     wait_dir = None if detached else run_dir
     started, told = time.time(), 0.0
     wait_key = f"{os.getpid()}:{started}"
@@ -3742,26 +3798,55 @@ def cmd_lock(a) -> None:
             waiting = False
             lk.record_wait(wait_dir, wait_key, started, time.time())
 
-    try:
-        ticket = lk.enqueue(where, res, who, shared=a.shared)
-    except OSError as e:
-        _unwritable(e)
-    atexit.register(lambda: lk.dequeue(ticket))   # however this ends; a dead process's ticket is dropped too
+    tickets: list = []
+    atexit.register(lambda: [lk.dequeue(t) for t in tickets])   # however this ends; a dead process's ticket is dropped too
+    for L in todo:
+        try:   # one arrival time on every lock: no two waiters can be ahead of each other on different ones
+            L["ticket"] = lk.enqueue(L["where"], L["res"], L["who"], since=started, shared=a.shared,
+                                     multi=len(todo) > 1)
+        except OSError as e:
+            _unwritable(e, L)
+        tickets.append(L["ticket"])
+
+    def _take() -> tuple[list | None, list]:
+        # (the held slots of every lock, []) once all are this waiter's, else (None, [(lock, reserved for)]
+        # of the ones it waits for). Several are taken only when the turn has come on each, and a slot
+        # lost in the instant between is let go with the others: no subset is ever kept.
+        out = []
+        for L in todo:
+            by = lk.reserved_by(L["mark"])
+            if by or (len(todo) > 1 and not lk.turn(L["where"], L["res"], L["ticket"], L["paths"], past_multi=past_multi)):
+                out.append((L, by))
+        if out:
+            return None, out
+        fs = []
+        for L in todo:
+            try:
+                f = lk.take_in_turn(L["where"], L["res"], L["ticket"], L["paths"], L["who"], " ".join(cmd),
+                                    past_multi=past_multi)
+            except OSError as e:
+                for g in fs:
+                    g.close()
+                _end_wait()
+                _unwritable(e, L)
+            if not f:
+                for g in fs:
+                    g.close()
+                return None, [(L, None)]
+            fs.append(f)
+        return fs, []
+
     while True:
         _refuse_paused()
-        reserved = lk.reserved_by(mark)
-        try:
-            f = None if reserved else lk.take_in_turn(where, res, ticket, paths, who, " ".join(cmd))
-        except OSError as e:
+        fs, blocked = _take()
+        if fs:
             _end_wait()
-            _unwritable(e)
-        if f:
-            _end_wait()
-            lk.dequeue(ticket)
-            ticket = None
+            for t in tickets:
+                lk.dequeue(t)
+            tickets.clear()
             waited = time.time() - started
             if waited > 5:
-                print(f"ttp lock: got {a.resource}{' (shared)' if a.shared else ''} after {waited / 60:.1f} min",
+                print(f"ttp lock: got {what}{' (shared)' if a.shared else ''} after {waited / 60:.1f} min",
                       file=sys.stderr, flush=True)
             # The lock is held until the command itself has ended. A signal to this process (a
             # timeout, a cancel) is passed on to the command, and the lock is released only once
@@ -3781,9 +3866,10 @@ def cmd_lock(a) -> None:
                 try:
                     return proc.wait()
                 finally:
-                    f.close()
+                    for f in fs:
+                        f.close()
 
-            sys.exit(_logged("shared" if a.shared else "lock", _wait))
+            sys.exit(_logged("shared" if a.shared else "lock", todo, _wait))
         if wait_dir and not waiting:
             # The run's wall clock stops while it waits here; the supervisor reads this record.
             # A signal ends the wait through _end_wait, so the record never stays open.
@@ -3797,15 +3883,18 @@ def cmd_lock(a) -> None:
             capped, timeout = False, a.timeout
             _end_wait()
             wait_dir = None
-            print(f"ttp lock: not under the run's agent; waiting for {a.resource} without the run's cap",
+            print(f"ttp lock: not under the run's agent; waiting for {what} without the run's cap",
                   file=sys.stderr, flush=True)
         # Noted before any give-up: a wait that ends at once under load still shows as a wait, not a stall.
         if time.time() - told >= 120:
-            ahead = len(lk.queued(where, res)) - 1
-            line = (f"waiting for {a.resource} (reserved for {reserved})" if reserved else
-                    f"waiting for {a.resource}{' (shared)' if a.shared else ''} (held by "
-                    f"{', '.join(lk.holders_now(paths, p)) or 'another task'}"
-                    f"{f'; {ahead} ahead in queue' if ahead > 0 else ''})")
+            def _why(L: dict, by) -> str:
+                if by:
+                    return f"{L['name']} (reserved for {by})"
+                ahead = len(lk.queued(L["where"], L["res"])) - 1
+                return (f"{L['name']}{' (shared)' if a.shared else ''} (held by "
+                        f"{', '.join(lk.holders_now(L['paths'], p)) or 'another task'}"
+                        f"{f'; {ahead} ahead in queue' if ahead > 0 else ''})")
+            line = "waiting for " + "; ".join(_why(L, by) for L, by in blocked)
             print(f"ttp lock: {line}", file=sys.stderr, flush=True)
             if run_dir:
                 try:
@@ -3816,9 +3905,9 @@ def cmd_lock(a) -> None:
             told = time.time()
         if timeout and time.time() - started > timeout:
             _end_wait()
-            die(f"{a.resource} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
-                f"`waiting`, waiting_for `{a.resource}`, retry_when "
-                f"`ttp lock --probe{' --shared' if a.shared else ''} {a.resource}`", 75)
+            die(f"{what} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
+                f"`waiting`, waiting_for `{what}`, retry_when "
+                f"`ttp lock --probe{' --shared' if a.shared else ''} {what}`", 75)
         time.sleep(poll_s(3))
 
 def cmd_land(a) -> None:
@@ -7425,7 +7514,9 @@ def main(argv: list[str] | None = None) -> None:
         "`-device`): --shared on one exits 2 and runs nothing, and `--probe --shared` on one answers as the "
         "plain probe does. Nested: a `ttp lock` inside one that holds the same lock in the same or a "
         "stronger mode (or inside an exclusive task's run) just runs; an exclusive one inside a shared hold "
-        "of the same lock exits 2 at once, as it could only wait for itself."))
+        "of the same lock exits 2 at once, as it could only wait for itself. Several resources, named in one word (`ttp lock "
+        "A,B -- <cmd>`, `--probe A,B`), are taken all or nothing: it keeps its place in every queue and holds none "
+        "of them until it can take them all."))
     s.add_argument("--probe", action="store_true",
                    help="exit 0 if the resource is free, not paused and nobody queues for it, else 75 (for retry_when)")
     s.add_argument("--shared", action="store_true",
@@ -7433,8 +7524,10 @@ def main(argv: list[str] | None = None) -> None:
                         "(not for device locks)")
     s.add_argument("--json", action="store_true",
                    help="probe, printing JSON: free, paused, waiting and each live holder with its pid and whether "
-                        "it lives (a keeper of detached jobs: via \"keeper\", the taker's pid in taker_pid)")
-    s.add_argument("resource", help="the resource's name (a device, machine or build folder)")
+                        "it lives (a keeper of detached jobs: via \"keeper\", the taker's pid in taker_pid); "
+                        "several resources: a list of these (runs nothing)")
+    s.add_argument("resource", help="the resource's name (a device, machine or build folder); several "
+                                    "in one word (`ttp lock A,B -- <cmd>`) are held all or nothing")
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after this many seconds (exit 75); 0 waits as long as it takes; "
                         "inside a run: at most half its stall limit")

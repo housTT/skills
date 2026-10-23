@@ -358,7 +358,7 @@ _REDIRECT = re.compile(r"^\d*(?:>>?|<|>&|&>)")
 
 
 def lock_probe_parts(cmd: str) -> tuple[list[tuple[str, bool]], list[str]]:
-    """A wait probe's `ttp lock --probe [--shared] <resource>` commands (joined by &&, || or ;, output
+    """A wait probe's `ttp lock --probe [--shared] <resource>...` commands (joined by &&, || or ;, output
     redirections allowed) as (resource, shared), and its other commands as their text."""
     found, rest = [], []
     for part in re.split(r"&&|\|\||;", str(cmd or "")):
@@ -376,7 +376,7 @@ def lock_probe_parts(cmd: str) -> tuple[list[tuple[str, bool]], list[str]]:
                 words.append(x)
         names = [x for x in words[2:] if not x.startswith("-")]
         if words[:2] == ["ttp", "lock"] and "--probe" in words and "--timeout" not in words and len(names) == 1:
-            found.append((names[0], "--shared" in words))
+            found += [(n, "--shared" in words) for n in names[0].split(",") if n]   # `--probe A,B`: each of them
         elif part.strip():
             rest.append(part.strip())
     return found, rest
@@ -547,6 +547,7 @@ _TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that
 
 SHARED_TICKET = "-shared"   # ends a shared waiter's ticket name
 GROUP_TICKET = ".g"         # then a fair queue's group id: <arrival>-<pid>[.p<priority>].g<id>
+MULTI_TICKET = ".m"         # after the pid, a waiter for several resources at once (`ttp lock A,B`)
 PRIORITY_TICKET = ".p"      # before it, the waiter's task priority (lowest first; checkcap uses 0 for obligation owners)
 SERVED_KEEP_S = 86400.0     # a group's last-served time older than this no longer changes its turn
 
@@ -557,7 +558,8 @@ def group_id(group: str | None) -> str:
 
 
 def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = None,
-            shared: bool = False, group: str | None = None, priority: int | None = None) -> Path:
+            shared: bool = False, group: str | None = None, priority: int | None = None,
+            multi: bool = False) -> Path:
     """A ticket for this process in the resource's arrival queue. Like a slot, it is an OS file lock
     held by this process, so it ends with it (a crash, a kill, a reboot) whatever its pid becomes.
     Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`. `since`
@@ -565,12 +567,13 @@ def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = N
     A shared waiter's ticket name ends in SHARED_TICKET. `group` (a project) is what a fair queue
     (fair_order) takes turns between; waiters without one form their own group. `priority` (the task's;
     lower first) orders the waiters within a group; it goes before the group id, so older runtimes
-    still read the group."""
+    still read the group. `multi`: one of the tickets of a waiter for several resources at once
+    (MULTI_TICKET after the pid), which a waiter that holds locks already does not wait behind (my_turn)."""
     d = queue_dir(locks_dir, resource)
     d.mkdir(parents=True, exist_ok=True)
     gid = group_id(group)
     prio = f"{PRIORITY_TICKET}{int(priority)}" if priority is not None else ""
-    name = (f"{time.time() if since is None else since:017.6f}-{os.getpid()}{prio}"
+    name = (f"{time.time() if since is None else since:017.6f}-{os.getpid()}{MULTI_TICKET if multi else ''}{prio}"
             f"{GROUP_TICKET + gid if gid else ''}{SHARED_TICKET if shared else ''}")
     # Locked under a hidden name first, then renamed in: `queued` never sees it unlocked.
     tmp = d / f".{name}.tmp"
@@ -626,6 +629,10 @@ def queued(locks_dir: Path, resource: str) -> list[Path]:
             except OSError:
                 pass
     return out
+
+
+def is_multi(ticket: Path) -> bool:
+    return MULTI_TICKET in ticket.name.partition(PRIORITY_TICKET)[0].partition(GROUP_TICKET)[0]
 
 
 def is_shared(ticket: Path) -> bool:
@@ -769,31 +776,39 @@ def mark_turn(locks_dir: Path, resource: str, ticket: Path | None) -> None:
 
 
 def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False,
-            urgent_max: int = 0) -> bool:
+            urgent_max: int = 0, past_multi: bool = False) -> bool:
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
     waiters, one per free slot, with no shared waiter ahead. A shared one: no exclusive waiter
     ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
-    arrival order."""
+    arrival order. `past_multi` (a waiter that holds locks already): waiters for several resources at
+    once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
+    behind it would never end."""
     q = queued(locks_dir, resource)
     if ticket not in q:
         return True
     if fair:
         q = fair_order(locks_dir, resource, q, urgent_max)
-    ahead = q[:q.index(ticket)]
+    ahead = [t for t in q[:q.index(ticket)] if not (past_multi and is_multi(t))]
     if is_shared(ticket):
         return all(is_shared(t) for t in ahead)
     return not any(is_shared(t) for t in ahead) and len(ahead) < max(int(slots or 0), 0)
 
 
 def take_in_turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], holder: str, what: str = "",
-                 fair: bool = False):
+                 fair: bool = False, past_multi: bool = False):
     """try_take (try_take_shared for a shared ticket), but only when this ticket's turn has come
     (my_turn), so a later waiter never takes the one slot an earlier one is about to."""
-    if is_shared(ticket):
-        return try_take_shared(paths, holder, what) if my_turn(locks_dir, resource, ticket, 0) else None
-    if not my_turn(locks_dir, resource, ticket, len(paths) - len(held_labels(paths)), fair):
+    if not turn(locks_dir, resource, ticket, paths, fair, past_multi):
         return None
-    return try_take(paths, holder, what)
+    return try_take_shared(paths, holder, what) if is_shared(ticket) else try_take(paths, holder, what)
+
+
+def turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], fair: bool = False,
+         past_multi: bool = False) -> bool:
+    """my_turn with the resource's free slots counted now: what take_in_turn checks before it takes."""
+    if is_shared(ticket):
+        return my_turn(locks_dir, resource, ticket, 0, past_multi=past_multi)
+    return my_turn(locks_dir, resource, ticket, len(paths) - len(held_labels(paths)), fair, past_multi=past_multi)
 
 
 def probe(locks_dir: Path, resource: str, paths: list[Path], shared: bool = False) -> bool:
