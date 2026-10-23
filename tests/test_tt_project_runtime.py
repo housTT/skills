@@ -33196,7 +33196,7 @@ def test_a_net_hold_says_why_and_clears_when_it_ends(env, net, monkeypatch):
     d._net_holds["claude"] = {"host": "api.anthropic.com", "since": time.monotonic(), "checked": time.monotonic(),
                               "checking": False, "up": False, "probe": None}
     monkeypatch.setattr(d, "start_run", lambda *a, **k: 1)
-    monkeypatch.setattr(d, "_resources_free", lambda *a, **k: False)   # nothing starts after the hold
+    monkeypatch.setattr(d, "_resource_hold", lambda *a, **k: {"kind": "busy", "resource": "bench", "tasks": []})   # nothing starts after the hold
     d.update_gates()
     d.dispatch()
     t = p.db.task(held)

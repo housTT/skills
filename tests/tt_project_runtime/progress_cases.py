@@ -663,7 +663,7 @@ def _held_slot(d, res, pid=None):
     return f
 
 
-def _dead_pid():
+def _exited_holder_pid():
     proc = subprocess.Popen(["true"])
     proc.wait()
     return proc.pid
@@ -691,7 +691,7 @@ def test_overdue_names_a_live_lock_holder_and_its_pid_from_the_recorded_hold(env
 def test_overdue_never_names_a_dead_lock_holder_as_live(env, monkeypatch):
     p, d, now, check = _start_setup(env, monkeypatch)
     tid = _ready_task(p, "Needs the bench", ["exclusive:bench"])
-    dead = _dead_pid()
+    dead = _exited_holder_pid()
     held = _held_slot(d, "bench", pid=dead)
     try:
         for m in range(16):
