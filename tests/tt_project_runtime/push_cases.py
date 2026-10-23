@@ -10313,7 +10313,7 @@ def test_own_push_refuses_a_local_working_copy_or_another_projects_folder_as_ori
     is a non-bare local path (also as file://), or any path inside another registered project's
     folder, is refused naming the setting, and no ref is created there. Set to that same path, it
     goes. A local bare repo of no other project, and network URLs, are as before."""
-    from ttp import project, push
+    from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     tmp = env["tmp"]
     heads = lambda r: _git_out(r, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
@@ -10332,7 +10332,7 @@ def test_own_push_refuses_a_local_working_copy_or_another_projects_folder_as_ori
     theirs.mkdir(parents=True)
     their_bare = theirs / "mirror.git"
     _bare_init(env, their_bare)
-    monkeypatch.setattr(project, "load_registry",
+    monkeypatch.setattr(push, "load_registry",
                         lambda: {"projects": {"neighbour": {"dir": str(theirs)}, p.name: {"dir": str(p.root)}}})
     _git_out(repo, "remote", "set-url", "origin", str(their_bare))
     assert _ttp("push", "--own") == 2

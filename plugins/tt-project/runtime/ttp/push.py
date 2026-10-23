@@ -37,8 +37,8 @@ from . import (checkcap, checkdirs, envfault, landed, locks, machines, prguard, 
                timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
-from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, nice_level,
-                      own_creates_pr_branch, own_push, push_queue_on, renice, write_json)
+from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
+                      load_registry, nice_level, own_creates_pr_branch, own_push, push_queue_on, renice, write_json)
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -1655,7 +1655,6 @@ def _local_path(url: str, repo: Path) -> Path | None:
 def _owning_project(path: Path) -> tuple[str, Path] | None:
     """(name, folder) of the registered project on this machine (`ttp list`) whose folder holds
     `path` most closely, or None."""
-    from .project import hostname, load_registry
     best = None
     for name, e in (load_registry().get("projects") or {}).items():
         if not (isinstance(e, dict) and e.get("dir")) or e.get("host") not in (None, hostname()):
