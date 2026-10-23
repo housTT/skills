@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: a failed review whose spec also names another change's branch (a coordinator note) gets its fix task and re-review on the branch it depends on, instead of none; a failed review the daemon cannot fix (no fix follow-ups, a capped round, branches that are not one stack, a task cap) raises one `review_nofix` event naming the review, its branch and what waits on it; and a `landed:#<id>` start_when whose producer is done, not landed, with no open review, fix, rebase or push row that can land it, raises one `landed_wait_dead` event naming the held tasks (after `waiting.landed_wait_dead_s`), cleared once a path appears or the work lands.

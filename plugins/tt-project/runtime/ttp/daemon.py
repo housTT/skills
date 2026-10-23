@@ -42,6 +42,7 @@ from . import replymsg
 from . import awake
 from . import budget as bud
 from . import budgetkind
+from . import deadwait
 from . import cachettl
 from . import chaincap
 from . import checkcap
@@ -3908,6 +3909,13 @@ class Daemon:
         fix = self._fix_failed_review(dict(task, **upd), fixes, summary) \
             if new == "failed" and task["kind"] == "review" and fixes and len(fups) <= MAX_FOLLOWUPS \
             and not area and not check_only else None
+        # A failed review left with no fix (a capped round, no fix follow-ups, findings on branches
+        # that are not one stack) wakes the coordinator with its own event, never silently.
+        nofix = "" if fix or area or check_only or new != "failed" or task["kind"] != "review" else \
+            getattr(self, "_nofix", "") if fixes and len(fups) <= MAX_FOLLOWUPS else \
+            f"it proposed more than {MAX_FOLLOWUPS} follow-ups" if fixes else "it proposed no fix follow-ups"
+        if nofix:
+            text += f"\nNo automatic fix: {nofix} ({deadwait.NOFIX_EVENT} raised)."
         folded = {id(f) for f in fixes} if fix else set()
         if fix:
             moved = ", ".join(f"#{i}" for i in fix[2])
@@ -3950,6 +3958,11 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", f"task_{outcome}", sev, text, data,
                   "handled" if quiet or routine else "queued", task["id"]))
+        if nofix:
+            reviewed = next((c["branch"] for i in dependency_ids(task) if isinstance(i, int)
+                             and (c := db.task(i)) and c.get("branch")), "")
+            if deadwait.raise_nofix(db, db.task(task["id"]) or dict(task, **upd), nofix, reviewed):
+                log(self.p, f"review {task['id']}: no fix queued ({nofix}); raised to the coordinator")
         if area:
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", reviewcap.REVIEW_AREA_EVENT, "normal",
@@ -7199,7 +7212,24 @@ class Daemon:
             self._start_probe(t["id"], d["when"], now, "start_when")
             if t["id"] not in self._probes:
                 self._start_verdict(t, self._probe_rc.pop(t["id"])[0], now)
+        self._dead_landed_waits(deferred, now)
         self.release_review_holds(now)
+
+    def _dead_landed_waits(self, deferred: list[dict], now: float) -> None:
+        """deadwait.check over the deferred tasks whose start_when's last verdict on a `landed:#<id>`
+        (or `ttp landed --task <id>`) was not yet: one event per producer nothing can land."""
+        not_yet: dict[int, list[dict]] = {}
+        for t in deferred:
+            when = deferral(t).get("when") or ""
+            rc = self._start_rc.get(t["id"])
+            if rc and rc[0] in NOT_YET_RCS and rc[2] == when:
+                for ref in landed.task_refs(when):
+                    if ref.isdigit():
+                        not_yet.setdefault(int(ref), []).append(t)
+        try:
+            deadwait.check(self.p.db, self.cfg, not_yet, now)
+        except Exception:
+            log(self.p, "dead landed waits: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def release_review_holds(self, now: float) -> None:
         """Model-free: a review held for a carried change's open fix chain (reviewhold) is released
@@ -9807,9 +9837,14 @@ class Daemon:
         failed review's dependents: (fix id, re-review id, the dependents moved). None when auto
         reviews are off, the review covers no single code branch, AUTO_FIX_ROUNDS reviews of this
         stack already failed, a task cap is reached or a task already continues it: the coordinator
-        then decides, and the dependents are blocked as before."""
+        then decides, and the dependents are blocked as before. Why no fix was queued is left in
+        self._nofix ('' when nothing needs raising: auto reviews off, a task already continues it,
+        or its change already landed, which has its own notice), for deadwait.raise_nofix.
+        The covered code tasks are those it depends on and those its spec names; when they are not
+        one stack (a coordinator note naming another change's branch), those it depends on decide."""
         cfg, db = self.cfg, self.p.db
         d = cfg.get("delivery") or {}
+        self._nofix = ""
         if not (cfg.get("review") or {}).get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
             return None
         # A re-review repeats the stack's first review's spec, not the nested specs of the rounds since.
@@ -9819,25 +9854,42 @@ class Daemon:
             if t["kind"] == "review":
                 rounds, first = rounds + 1, t
             c = continues_id(t)
-        if rounds > AUTO_FIX_ROUNDS or db.one("SELECT id FROM tasks WHERE labels LIKE ?",
-                                              (f'%"continues:{review["id"]}"%',)):
+        if db.one("SELECT id FROM tasks WHERE labels LIKE ?", (f'%"continues:{review["id"]}"%',)):
+            return None
+        if rounds > AUTO_FIX_ROUNDS:
+            self._nofix = f"{rounds} reviews of this stack failed (the daemon fixes at most {AUTO_FIX_ROUNDS} rounds)"
             return None
         if coord.next_task_slot(db, coord.task_cap(cfg)) is not None \
                 or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
+            self._nofix = "a 24 h task cap is reached"
             return None
         spec = review.get("spec") or ""
-        cands = [t for i in sorted(coord._covered(db, dependency_ids(review), spec))
+        deps = dependency_ids(review)
+        cands = [t for i in sorted(coord._covered(db, deps, spec))
                  for t in [db.task(i)] if t and t["kind"] == "code" and t["branch"]]
+        code = None
         try:
-            # A review of a stack (a fix on top of its change) is fixed on the stack's tip.
-            tips = [t for t in cands if all(o is t or worktree._closest_ancestor(self.p, [o["branch"]], t["branch"])
-                                            for o in cands)]
-            code = tips[0] if tips else None
+            # A review of a stack (a fix on top of its change) is fixed on the stack's tip. A branch
+            # its spec only mentions (another change it must fit with) is no part of the stack.
+            for group in (cands, [t for t in cands if t["id"] in deps]):
+                tips = [t for t in group if all(o is t or worktree._closest_ancestor(self.p, [o["branch"]], t["branch"])
+                                                for o in group)]
+                if tips:
+                    code = tips[0]
+                    break
             head = worktree._git(self.p.root, "rev-parse", "--short=12", code["branch"]) if code else ""
         except Exception as e:
             log(self.p, f"review {review['id']}: no fix queued, its branch was not read: {e}")
+            self._nofix = f"its branch was not read ({coord.clip(str(e), 200)})"
             return None
-        if not code or not head or self._landed_elsewhere(code):
+        if not code:
+            self._nofix = ("its findings span branches that are not one stack: "
+                           + ", ".join(t["branch"] for t in cands)) if cands else "it covers no code task with a branch"
+            return None
+        if not head:
+            self._nofix = f"branch {code['branch']} has no commit"
+            return None
+        if self._landed_elsewhere(code):
             return None
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
         # A stack kept off the push branch stays review only through its fix and re-review.

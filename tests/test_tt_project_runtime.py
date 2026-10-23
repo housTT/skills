@@ -30938,6 +30938,101 @@ def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env)
     assert w["status"] == "blocked" and w["blocked_reason"] == f"dependency #{re_rev2['id']} failed"
 
 
+def test_a_failed_review_whose_spec_names_another_branch_still_gets_one_fix_pair(env):
+    """A coordinator note in a review's spec that names another change's branch (one it must fit
+    with) left the daemon with two covered branches that are not one stack: it queued no fix and
+    said nothing. The branch the review depends on decides; a repeat queues no second pair."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.db import continues_id, dependency_ids
+    code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    other, obranch, _, _ = _finish_code(env, p, "driver reports", {"report.py": 10})
+    p.db.update_task(rev["id"], spec=rev["spec"] + f"\nCoordinator note: check how it fits with #{other} "
+                                                  f"(branch {obranch}).")
+    waiter = p.db.add_task("build on it", "s", origin="coordinator", labels=[f"start_when:landed:#{code}"])
+    failed = _fail_review(env, p, rev["id"], [{"title": "wake storm", "spec": "add hysteresis"}])
+    fixes = p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rev['id']}:%",))
+    assert len(fixes) == 1 and continues_id(fixes[0]) == code, "no fix was queued for the reviewed branch"
+    (re_rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([fixes[0]["id"]]),))
+    assert f"Fix #{fixes[0]['id']} and re-review #{re_rev['id']}" in failed["text"]
+    assert not p.db.q("SELECT id FROM events WHERE kind='review_nofix'")
+    # A second pass over the same failed review (a repeat tick, a re-read hand-off) adds nothing.
+    d = Daemon(p.base)
+    assert d._fix_failed_review(p.db.task(rev["id"]), [{"title": "wake storm", "spec": "x"}], "x") is None
+    assert d._nofix == "", "a review a fix already continues was raised as having none"
+    assert len(p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix review #%'")) == 1
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review' AND depends_on=?",
+                      (json.dumps([fixes[0]["id"]]),))) == 1
+    assert dependency_ids(p.db.task(waiter)) == [] and branch != obranch
+
+
+def test_a_failed_review_the_daemon_cannot_fix_wakes_the_coordinator_once(env):
+    """No fix follow-ups, or findings over branches that are not one stack: one review_nofix event
+    (queued: it wakes the coordinator) names the review, the branch and what waits; never two."""
+    p = make(env)
+    from ttp import deadwait
+    code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    held = p.db.add_task("build on it", "s", origin="coordinator", labels=[f"start_when:landed:#{code}"])
+    failed = _fail_review(env, p, rev["id"])
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind='review_nofix'")
+    assert ev["status"] == "queued" and ev["task"] == rev["id"]
+    assert "it proposed no fix follow-ups" in ev["text"] and branch in ev["text"] and f"#{held} (queued)" in ev["text"]
+    assert f"Review #{rev['id']}" in ev["text"] and "No automatic fix: it proposed no fix follow-ups" in failed["text"]
+    assert deadwait.raise_nofix(p.db, p.db.task(rev["id"]), "again", branch) is None
+    assert len(p.db.q("SELECT id FROM events WHERE kind='review_nofix'")) == 1
+    # A review that depends on two changes that are not one stack: the coordinator decides which.
+    a, abranch, _, _ = _finish_code(env, p, "one", {"one.py": 5})
+    b, bbranch, _, _ = _finish_code(env, p, "two", {"two.py": 5})
+    both = p.db.add_task(f"Review #{a} and #{b}", f"review {abranch} and {bbranch}", kind="review",
+                         origin="coordinator", depends_on=[a, b])
+    _fail_review(env, p, both, [{"title": "bug", "spec": "fix it"}])
+    ev = p.db.one("SELECT * FROM events WHERE kind='review_nofix' AND task=?", (both,))
+    assert ev and "span branches" in ev["text"] and abranch in ev["text"] and bbranch in ev["text"]
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE ?", (f"Fix review #{both}:%",))
+
+
+def test_a_landed_wait_with_no_path_to_landing_wakes_the_coordinator_once_and_clears(env):
+    """X done, its review failed, nothing open carries its change: the tasks held on landed:#X get
+    one landed_wait_dead event after the grace; a fix that appears clears it, a new dead end raises
+    it again."""
+    p = make(env)
+    from ttp import deadwait
+    from ttp.daemon import Daemon
+    code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    a = p.db.add_task("next a", "s", origin="coordinator", labels=[f"start_when:landed:#{code}"])
+    b = p.db.add_task("next b", "s", origin="coordinator", labels=[f"start_when:landed:#{code}"])
+    d = Daemon(p.base)
+    rows = lambda: p.db.q("SELECT * FROM tasks WHERE id IN (?,?)", (a, b))
+    dead = lambda: p.db.q("SELECT * FROM events WHERE kind=?", (deadwait.DEAD_EVENT,))
+    t0 = time.time()
+    for tid in (a, b):
+        d._start_rc[tid] = (1, t0, f"landed:#{code}")
+    d._dead_landed_waits(rows(), t0 + 10 * deadwait.GRACE_S)
+    assert not dead(), "an open review is a path to landing"
+    p.db.update_task(rev["id"], status="failed")
+    d._dead_landed_waits(rows(), t0)
+    assert not dead(), "raised before the grace"
+    d._dead_landed_waits(rows(), t0 + deadwait.GRACE_S)
+    d._dead_landed_waits(rows(), t0 + 2 * deadwait.GRACE_S)
+    (ev,) = dead()
+    assert ev["status"] == "queued" and f"#{a} (queued), #{b} (queued)" in ev["text"]
+    assert branch in ev["text"] and f"review #{rev['id']} failed" in ev["text"]
+    # A fix of the review appears: a path, so the event clears; a later dead end raises a new one.
+    fix = p.db.add_task(f"Fix review #{rev['id']}: feature", "s", kind="code",
+                        labels=[f"continues:{code}", f"review_fix:{rev['id']}"])
+    d._dead_landed_waits(rows(), t0 + 3 * deadwait.GRACE_S)
+    assert p.db.one("SELECT status FROM events WHERE id=?", (ev["id"],))["status"] == "handled"
+    assert p.db.kv(deadwait.KEY) == {}
+    p.db.update_task(fix, status="cancelled")
+    d._dead_landed_waits(rows(), t0 + 4 * deadwait.GRACE_S)
+    d._dead_landed_waits(rows(), t0 + 6 * deadwait.GRACE_S)
+    assert len(dead()) == 2
+    # A task that waits on X too is no path, and nor is one that waits on a held task.
+    p.db.add_task("rebase it", "s", kind="code", labels=[f"rebases:{branch}"], depends_on=[a])
+    d._dead_landed_waits(rows(), t0 + 7 * deadwait.GRACE_S)
+    assert [e["status"] for e in dead()] == ["handled", "queued"]
+
+
 def test_a_check_only_review_failure_gets_no_fix_pair_and_keeps_its_dependents(env):
     """A review that failed only because a check or gate is missing or does not apply
     (review_failure: check_only) gets no empty fix and re-review: it stays failed, the reviewed code

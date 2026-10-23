@@ -112,6 +112,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "start_resource_stale_s": 10800,
                 # a start_when still false this long shows as a warning in status and the feed (0: never)
                 "start_gate_warn_s": 1800,
+                # a landed:#<id> start_when whose producer is done, not landed, with nothing open that
+                # can land it, this long, is raised once per producer (deadwait.py; 0: at once)
+                "landed_wait_dead_s": 900,
                 "max_stale_wakes": 3,           # max_stale_wakes: 0 = off
                 # the wait-wake gate (waitgate.py): a due wake of a waiting task first checks model-free
                 # rules (job, lock, checks or push still pending; same probe answer) then Jev, and re-defers
