@@ -16232,12 +16232,23 @@ def test_a_run_far_past_its_own_limits_is_ended_unless_the_host_slept(env, tmp_p
             proc.wait()
 
 
+def _environ_has(pid, var):
+    try:
+        return var.encode() in pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return False
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the leaderless group is found through /proc")
 @pytest.mark.parametrize("ours", [True, False], ids=["this-run", "another-run"])
-def test_the_reaper_ends_the_tools_of_an_agent_that_already_exited(env, tmp_path, ours):
+@pytest.mark.parametrize("mid_exec", [False, True], ids=["started", "mid-exec"])
+def test_the_reaper_ends_the_tools_of_an_agent_that_already_exited(env, tmp_path, monkeypatch, ours, mid_exec):
     # Runner and agent both gone (a watchdog that could not run): the agent's tools still run in its
-    # process group. The reaper ends that group, but only when a member carries this run's dir.
+    # process group. The reaper ends that group, but only when a member carries this run's dir. A tool
+    # caught in the middle of an exec shows an empty environment for a moment (under load, for
+    # milliseconds): the reaper must look again, not take it for another run's.
     p = make(env)
+    from ttp import daemon as dmod
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     tid = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
@@ -16253,6 +16264,13 @@ def test_the_reaper_ends_the_tools_of_an_agent_that_already_exited(env, tmp_path
         assert _wait(lambda: tool_file.exists() and tool_file.read_text().strip())
         tool = int(tool_file.read_text())
         assert os.getpgid(tool) == leader.pid
+        # The tool runs `sleep` with its environment set up before the reaper looks.
+        mine = f"TTP_RUN_DIR={run_dir if ours else tmp_path / 'other'}"
+        assert _wait(lambda: _environ_has(tool, mine), 15), "the tool never started"
+        if mid_exec:   # its first looks find the tool mid-exec
+            real, empty = dmod._read_environ, iter(range(5))
+            monkeypatch.setattr(dmod, "_read_environ",
+                                lambda pid: b"" if int(pid) == tool and next(empty, None) is not None else real(pid))
         (run_dir / "child.pid").write_text(f"{leader.pid}\n1\n")
         (run_dir / "lease").touch()
         old = time.time() - 600
@@ -16263,7 +16281,8 @@ def test_the_reaper_ends_the_tools_of_an_agent_that_already_exited(env, tmp_path
         if ours:
             assert _wait(lambda: _gone(tool), 15), "the agent's tool kept running after its agent and runner"
         else:
-            assert not _gone(tool, 0.5), "the reaper ended a group that is not this run's"
+            assert not _gone_within(tool, 0.5), "the reaper ended a group that is not this run's"
+        assert not mid_exec or next(empty, None) is None, "the reaper never met the tool mid-exec"
     finally:
         with contextlib.suppress(OSError, TypeError):
             os.kill(tool, signal.SIGKILL)
@@ -34920,7 +34939,8 @@ def test_devq_health_gate_refusal_skips_the_job_after_health_wait(devq_dir, tmp_
     assert m["attempts"] == 0 and not (tmp_path / "ran").exists()
 
 
-def _gone(pid, timeout=10):
+def _gone_within(pid, timeout=10):
+    """pid ends within timeout s. Its own name: the zombie-aware _gone above must not be replaced."""
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -34943,7 +34963,7 @@ def test_devq_stops_a_job_whose_output_matches_a_wedge_pattern_and_frees_the_dev
     assert m["wedge"]["pattern"] == "potential hang detected" and "the device is unrecoverable" in m["wedge"]["line"]
     assert "wedged: output matched" in m["reason"]
     assert time.time() - t0 < 60, "stopped early, not at its 300 s limit"
-    assert _gone(int(pidf.read_text())), "the wedged job's process group was stopped"
+    assert _gone_within(int(pidf.read_text())), "the wedged job's process group was stopped"
     assert _devq_marker(d, "next-1")["status"] == "done", "the device went to the next job"
     assert not list((d / "running").iterdir()), "no job lock left behind"
     assert "kind=wedged" in (d / "drops.log").read_text()

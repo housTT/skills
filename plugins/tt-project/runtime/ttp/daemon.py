@@ -230,6 +230,9 @@ ON_PASS_NOTES_EVERY_S, ON_PASS_NOTES_DAYS = 600, 14   # sweep for notes an unset
 AUTH_PROBE_S = 900      # while a provider without a login check is logged out, one run on it checks this often
 AUTH_CHECK_S = (60, 120, 300, 600, 1200, 1800)   # backoff of the model-free login checks of an open breaker
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
+# How long the reaper waits for a group member caught mid-exec (its environment reads empty until the
+# new program's is set up) to show the environment it carries.
+EXEC_SETTLE_S = 2.0
 # A supervisor whose pid lives but whose lease went stale for this long in awake time is hung (its
 # watch thread died or it is stuck): the daemon ends it and its agent. Also, as a backstop, any run
 # this far past its own wall clock, stall limit and waits.
@@ -10295,11 +10298,27 @@ def _run_group_left(pgid: int, run_dir: Path) -> bool:
             fields = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[1].split()
             if int(fields[2]) != pgid or int(fields[3]) != pgid:
                 continue
-            if want in Path(f"/proc/{d}/environ").read_bytes().split(b"\0"):
+            if want in _settled_environ(d).split(b"\0"):
                 return True
         except (OSError, IndexError, ValueError):
             continue
     return False
+
+
+def _settled_environ(pid: str) -> bytes:
+    """/proc/<pid>/environ, read again for up to EXEC_SETTLE_S while it reads empty: a process in the
+    middle of an exec has no environment to show until the new program's is set up, so one look
+    could miss the tool a run left behind."""
+    deadline = time.monotonic() + EXEC_SETTLE_S
+    while True:
+        env = _read_environ(pid)
+        if env or time.monotonic() >= deadline:
+            return env
+        time.sleep(0.02)
+
+
+def _read_environ(pid: str) -> bytes:
+    return Path(f"/proc/{pid}/environ").read_bytes()
 
 
 def _end_group(pgid: int, grace_s: float) -> None:
