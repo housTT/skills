@@ -5324,9 +5324,15 @@ def test_runs_but_the_coordinator_take_budget_worker_cache_ttl(env, monkeypatch)
         _wait_gone(p.db.one("SELECT pid FROM runs WHERE id=?", (rid,))["pid"], time.time() + 20)
 
 
+def _no_schedule_due(db, now):
+    """Moves the template's llm schedules (daily-review at a fixed time of day) a day past `now`, so
+    cache_ttl auto never sees one due within the hour whatever the wall clock reads."""
+    db.x("UPDATE schedules SET next_run=? WHERE kind='llm'", (now + 86400,))
+
+
 def _auto_ttl_daemon(env, monkeypatch, tmp_path):
     """A daemon whose coordinator turns go out with cache_ttl auto, and a turn starter returning
-    (env TTL, mark TTLs, turn note) of each turn."""
+    (env TTL, mark TTLs, turn note) of each turn. No schedule is due within the hour."""
     from ttp.providers import claude
     from ttp.daemon import Daemon
     from ttp import coordinator as coord
@@ -5336,6 +5342,7 @@ def _auto_ttl_daemon(env, monkeypatch, tmp_path):
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
     monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # room for the runtime's own mark
     p = make(env)
+    _no_schedule_due(p.db, time.time())
     head, context = coord.prompt_parts(p)
     box = {"d": Daemon(p.base)}
 

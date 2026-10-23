@@ -1383,6 +1383,7 @@ def test_cache_signals_read_running_due_tasks_llm_schedules_chat_and_turns(env):
     from ttp import cachettl
     p = make(env)
     db, now = p.db, time.time()
+    _no_schedule_due(db, now)
     db.x("UPDATE messages SET ts=?", (now - 86400,))
     sig = cachettl.signals(db, now)
     assert sig["running"] == [] and sig["due"] == [] and sig["chat"] == now - 86400, sig
