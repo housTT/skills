@@ -13,6 +13,9 @@ records, kept here as plain functions of a probe, its output and the project.
   is raised once: a probe waiting on a dead resource hides the outage (watched_resources).
 - A probe that waits over ssh only for an end marker file, with no check that the job's driver still
   lives, is flagged (end_marker_only): a driver killed by a reboot or power cycle never writes it.
+- A wait on any probe other than `ttp lock --probe` shows the probe's own latest line, with when it was
+  read, before the worker's hand-off words, labelled with their time (live_note): a holder the
+  worker named may have ended long ago.
 - A probe that greps a section header a status command always prints (`tt-device-mcp status | grep -q
   RUNNING`) is flagged (header_grep): it matches whether or not a job is listed under it."""
 from __future__ import annotations
@@ -31,6 +34,36 @@ OUTPUT_CHARS = 400
 START_STALE_S = 3 * 3600      # default of waiting.start_resource_stale_s
 WATCHED_RESOURCE_RE = re.compile(r"device|serv", re.I)
 TASK_REF_RE = re.compile(r"(?:#|\blanded:#?|--task[ =])([0-9]+)\b")
+
+
+LIVE_CHARS = 160              # a probe's line in a wait note
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]")
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def last_line(text: str, n: int = LIVE_CHARS) -> str:
+    """A probe output's last non-empty line, trimmed, without control characters, at most n characters."""
+    for ln in reversed(_ANSI_RE.sub("", str(text or "")).splitlines()):
+        ln = " ".join(_CTRL_RE.sub(" ", ln).split())
+        if ln:
+            return ln if len(ln) <= n else ln[:n - 1] + "…"
+    return ""
+
+
+def live_note(said: str, said_at, out: str, read_at, where) -> str:
+    """A wait note for a probe that is not `ttp lock --probe`: the probe's latest line and when it was
+    read, then the worker's hand-off words (`said`) labelled with their time; with no line, those words
+    marked as possibly stale."""
+    from . import timefmt
+
+    def at(ts) -> str:
+        return timefmt.short(float(ts), where) if isinstance(ts, (int, float)) and ts > 0 else ""
+    line, since = last_line(out), at(said_at)
+    note = f"worker's note{f' from {since}' if since else ''}"
+    if line:
+        read = at(read_at)
+        return f"{line}{f' (read {read})' if read else ''}" + (f"; {note}: {said}" if said else "")
+    return f"{said} ({note}, may be stale)" if said else f"its probe's condition ({note}, may be stale)"
 
 
 def _words(probe: str) -> list[str]:

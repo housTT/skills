@@ -37092,6 +37092,60 @@ def test_status_and_web_read_a_hold_anchor_by_its_kind(env, anchor, kind, text):
         assert f"  #{tid} waiting 0.0h: cache layout — {text}" in out and f"needs you (#{tid}" not in out, out
 
 
+def _not_yet_note(p, d, tid):
+    """The note a due waiting task gets once its probe said not yet (run, reaped, then due again)."""
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    return p.db.task(tid)["blocked_reason"]
+
+
+def test_a_wait_on_another_probe_shows_its_latest_line_and_labels_the_workers_note(env):
+    """A wait whose probe is not `ttp lock --probe` (a project's own wrapper, a driver check): its note
+    leads with the probe's last non-empty line, trimmed and without control characters, and when it was
+    read; the hand-off's waiting_for follows as the worker's note from its time, never as the live state."""
+    from ttp import daemon as dmod, timefmt, waits, waitheal
+    p = make(env)
+    probe = "printf 'checking\\n  \\033[31mheld by job 42\\033[0m\\a  \\n\\n'; exit 1"
+    tid = _due_waiting_task(p, probe, waiting_for="held by task #5")
+    since = json.loads(p.db.task(tid)["result"])["waiting_since"]
+    d = dmod.Daemon(p.base)
+    note = _not_yet_note(p, d, tid)
+    read = timefmt.short(d._probe_live[tid][1], p)
+    assert note.startswith(f"waiting for held by job 42 (read {read}); worker's note from "
+                           f"{timefmt.short(since, p)}: held by task #5; its probe says not yet; next try "), note
+    assert not any(c in note for c in "\x1b\x07"), repr(note)
+    assert "probe" not in waits.wait_kind({**p.db.task(tid), "labels": "[]"}, [], time.time())["text"]
+    assert waitheal.last_line("x" * 500 + "\n") == "x" * (waitheal.LIVE_CHARS - 1) + "…"
+    assert waitheal.last_line("a\x00b\tc\r\n \n") == "a b c"
+
+
+def test_a_wait_on_another_probe_that_prints_nothing_marks_the_workers_note_as_maybe_stale(env):
+    from ttp import daemon as dmod, timefmt
+    p = make(env)
+    tid = _due_waiting_task(p, "exit 1", waiting_for="held by task #5")
+    since = json.loads(p.db.task(tid)["result"])["waiting_since"]
+    d = dmod.Daemon(p.base)
+    note = _not_yet_note(p, d, tid)
+    assert note.startswith(f"waiting for held by task #5 (worker's note from {timefmt.short(since, p)}, may be "
+                           f"stale); its probe says not yet; next try "), note
+
+
+def test_a_wait_on_ttp_lock_probes_keeps_its_live_lock_note(env):
+    from ttp import daemon as dmod, lockprobe
+    p = make(env)
+    tid = _due_waiting_task(p, "ttp lock --probe build-a >/dev/null", waiting_for="build-a held by task #5")
+    held = _held_build_lock(p, "build-a", "x")
+    try:
+        d = dmod.Daemon(p.base)
+        note = _not_yet_note(p, d, tid)
+        said = lockprobe.answer(p, p.config(), "build-a")[1]
+    finally:
+        held.close()
+    assert note.startswith(f"waiting for {said}; its probe says not yet; next try "), (note, said)
+    assert "worker's note" not in note and "task #5" not in note, note
+
+
 def test_wait_kind_label_wins_and_queued_holds_read_plainly():
     from ttp import waits
     from ttp.daemon import LOGGED_OUT_NOTE, NET_HELD_NOTE, PAUSED_NOTE

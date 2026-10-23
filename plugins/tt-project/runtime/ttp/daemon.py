@@ -698,6 +698,7 @@ class Daemon:
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
+        self._probe_live: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last line, when read, probe
         self._woke_on: dict[int, tuple[int | str, float, str]] = {}   # task -> the verdict its last wake came on (wake gate)
         self._wait_what_errs: set[str] = set()   # causes of lock-probe errors already logged (_wait_what)
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
@@ -7094,6 +7095,7 @@ class Daemon:
         self._poll_on_pass(now)
         self._sweep_on_pass_notes(now)
         outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
+        lines: dict[int, str] = {}   # and its last line (waitheal.last_line)
         done = []
         for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
@@ -7103,7 +7105,7 @@ class Daemon:
             if rc is None:
                 _kill_group(proc)
             if id(proc) not in outs:
-                outs[id(proc)] = self._probe_text(proc)
+                outs[id(proc)], lines[id(proc)] = self._probe_texts(proc)
             done.append((tid, proc, probe, rc))
         # Every 255's hosts at once: in an outage the tick waits out one ssh timeout, not one per probe.
         self._check_hosts([h for _, proc, probe, rc in done if rc == netwait.UNREACHABLE_RC
@@ -7112,7 +7114,7 @@ class Daemon:
             task = db.task(tid)
             if task and _current_probe(task) != probe:
                 continue   # re-pointed (`set-when`) while it ran: its verdict is not the new probe's
-            self._note_probe_out(tid, probe, outs[id(proc)], now)
+            self._note_probe_out(tid, probe, outs[id(proc)], now, lines[id(proc)])
             runner = waitheal.devq_runner(probe) if rc == waitheal.DEVQ_RUNNER_DOWN_RC else None
             if runner:
                 # Its device runner is down: the daemon brings it back, and the task sleeps on.
@@ -7784,15 +7786,20 @@ class Daemon:
 
     def _probe_text(self, proc) -> str:
         """The end of a finished probe run's output, once (its file is closed after)."""
+        return self._probe_texts(proc)[0]
+
+    def _probe_texts(self, proc) -> tuple[str, str]:
+        """_probe_text, and the output's last non-empty line (waitheal.last_line) for a wait note."""
         f = self._probe_files.pop(id(proc), None)
         if f is None:
-            return ""
+            return "", ""
         try:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - 4000))
-            return waitheal.clip(f.read().decode(errors="replace"))
+            raw = f.read().decode(errors="replace")
+            return waitheal.clip(raw), waitheal.last_line(raw)
         except (OSError, ValueError):
-            return ""
+            return "", ""
         finally:
             f.close()
 
@@ -7809,8 +7816,9 @@ class Daemon:
             return None
         return held
 
-    def _note_probe_out(self, tid: int, probe: str, text: str, now: float) -> None:
+    def _note_probe_out(self, tid: int, probe: str, text: str, now: float, line: str = "") -> None:
         got = self._probe_out.get(tid)
+        self._probe_live[tid] = (line, now, probe)
         if not got or got[0] != text or got[2] != probe:
             self._probe_out[tid] = (text, now, probe)
 
@@ -8079,8 +8087,10 @@ class Daemon:
         """What a waiting task waits for, as its note says it. A wait on `ttp lock --probe` commands names
         each lock as that probe answers now (lockprobe.answer: live holders with pid and liveness, a done
         task's hold marked stale), never the holders its hand-off named, which may have finished since; any
-        other commands of its probe follow as they are. Any other wait, its hand-off's words and the facts
-        found about the tasks and asks they name (refwaits)."""
+        other commands of its probe follow as they are. A wait on any other probe, that probe's latest line
+        and when it was read, then the hand-off's words labelled as the worker's note from its time
+        (waitheal.live_note; with no line, those words marked as possibly stale). A wait with no probe, its
+        hand-off's words. Either way with the facts found about the tasks and asks they name (refwaits)."""
         found, rest = locks.lock_probe_parts(str(prev.get("retry_when") or ""))
         if found:
             try:   # an unwritable or corrupt shared lock dir must not break a hand-off or a tick
@@ -8094,7 +8104,12 @@ class Daemon:
                 said = str(prev.get("waiting_for") or prev.get("summary") or "")
                 names = ", ".join(r for r, _ in found)
                 return (said + ("; " if said else "") + f"locks: {names}")[:300]
-        return refwaits.with_facts(str(prev.get("waiting_for") or prev.get("summary") or "")[:300], prev)
+        said = refwaits.with_facts(str(prev.get("waiting_for") or prev.get("summary") or "")[:300], prev)
+        probe = str(prev.get("retry_when") or "")
+        if not probe.strip():
+            return said
+        line, read, by = self._probe_live.get(tid) or ("", None, "")
+        return waitheal.live_note(said, prev.get("waiting_since"), line if by == probe else "", read, self.p)[:400]
 
     def _stale_wait_event(self, task: dict, prev: dict, since: float, max_hold: float) -> None:
         """Once per wait: its probe has said "not yet" for `max_hold_s`. The task keeps sleeping."""

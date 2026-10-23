@@ -162,8 +162,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - `waiting` when a resource is busy (a reservation, a queue, a review). It returns after
   `retry_after_s`, not counted as an attempt. Save what you learned first. Always give a
   `retry_when`: the harness runs it model-free every few minutes in the project root. Keep it
-  read-only and under a minute. It must exit 0 once the wait is over whatever the outcome (the job
-  finished or failed), and 1 while it is not (75, a busy `ttp lock`, or 255, ssh not reaching the
+  read-only, under a minute, printing a line naming its wait. It must exit 0 once the wait
+  is over whatever the outcome, 1 while it is not (75, a busy `ttp lock`, or 255, ssh not reaching the
   host, also keep it asleep); any other exit wakes it as broken. A failing remote command exits
   1, never `|| exit 255`; quote it as one string. A wait only time ends:
   `test "$(date +%s)" -ge <epoch>`.
