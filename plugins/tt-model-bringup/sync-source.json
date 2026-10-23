@@ -99,7 +99,7 @@
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.txt",
       "blob": "7c661791b3c29bbad8de5ce8d50176d13633657f",
       "source_sha256": "6817dc59aa6d8cdc9c50404aa4e919240f1a07e3ce772dab04ae21d4561bec24",
-      "packaged_sha256": "aba54d306325b5fb472e5a163f5ef379a8c9584b11fd4bb2f5e6d041f4f26b02"
+      "packaged_sha256": "af6faed6bbb4c3fb89d474258c785b6902081b3e792ce8104f2f5f7ba9d83920"
     },
     {
       "source": ".agents/requirements.txt",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "abb24610f7b17e159d3e05738a32bc7aa993b869af7eb8a8c968b6fd0c083d4d"
+      "packaged_sha256": "c507cdf3b8acc1099658b30ae2c51e1a5e39fa80b3a0866ec121a3b004009615"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",

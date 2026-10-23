@@ -61,6 +61,9 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 
 - evals: default `r1_gpqa_diamond`, `swe_bench_verified`, `terminal_bench_2`, the release-spec
   names; the default subset is 10 tasks each;
+- `batch_sizes`, default 1, 8, 16, 32, shared with stages 10 and 11: stage 10 validates a tuned
+  configuration for each, stage 11 measures performance across all of them, and evals run once on
+  the largest the device holds — 16 rather than 32 is an acceptable recorded outcome;
 - `stage_budget_hours` (default 24) and `suite_budget_hours` (default 8);
 - reference scores;
 - the eval harness: default the tt-inference-server agentic runner;

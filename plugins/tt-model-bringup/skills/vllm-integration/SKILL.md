@@ -292,3 +292,15 @@ The README should lead with vLLM sampling status, qualitative verdict, primary s
 | tt_transformers generator | `models/tt_transformers/tt/generator.py` |
 | Thin vLLM adapter | `models/tt_transformers/tt/generator_vllm.py` |
 | vLLM model registration | Standalone plugin registration; see [stack setup](references/serving-stack.md) |
+
+## Per-batch serving configurations
+
+Validate and record one serving configuration for each configured batch size, taken from
+`bringup/agentic_evals/inputs.json` when set and otherwise 1, 8, 16 and 32. Each is tuned for its
+own batch; the single-user configuration with a larger `--max-num-seqs` is not a tuned batch-16
+configuration and should not be recorded as one.
+
+Record any batch the device cannot hold, with the reason. Stage 11 measures performance across
+every validated batch and goal 12 runs evals once on the largest of them, so a batch dropped for
+memory moves where the eval numbers come from — 16 instead of 32 is an acceptable outcome, an
+unrecorded drop is not.
