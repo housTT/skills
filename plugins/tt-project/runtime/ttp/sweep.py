@@ -33,14 +33,23 @@ named it since (`#<id>` or the resource's name). A turn re-judges it at least ev
 signal, while every item is such a hold or one no turn can lift (`ends`): nothing a turn could see has
 changed. Any change, a broken or stale probe, or a hold with no probe is swept as before.
 
+Ask-held holds: a blocked task or a resource pause the coordinator set whose hold (the task's
+`waits:ask:<id>` anchor or blocked reason, the pause's reason) and sweep outcome together name exactly
+one open ask (`ask <id>`), with a `human_indispensable` or a `still_blocked` with no probe, is shown as
+HELD BY OPEN ASK <id> and carried without a turn (ask_held) while the ask stays open, no user message
+(nor the user's words relayed) came since the outcome, its status, spec and reason and its pause row
+are unchanged, the ask has not passed coordinator.ask_rethink_h since (askrethink.py), and a turn
+judged it within RECHECK_H (the daily re-check). Anything else brings it back for judgment.
+
 Signals that bring a sweep forward (never closer than coordinator.blocker_sweep_min_gap_h to the last
 one): a paused resource is no longer paused, an ask was resolved, a stuck task's dependency finished,
 a provider's limit or logout pause ended, a provider's account or budget kind changed (budgetkind),
 a `still_blocked` next check came due, or another module
 called signal() (the hook for later checks, such as a broker's health lifting a pause). While every
-item ends without a turn (`ends`), only a pause ending or one of the built-in signals above brings a
-sweep forward; other signal() requests (a budget kind change, resolved upstream notes) wait for the
-interval, so a sweep still runs at least every coordinator.blocker_sweep_h hours.
+item ends without a turn (`ends`), is a probe-watched hold or names one open ask (`ask`), only a
+pause ending or one of the built-in signals above brings a sweep forward; other signal() requests (a
+budget kind or account change, resolved upstream notes) wait for the interval, so a sweep still runs
+at least every coordinator.blocker_sweep_h hours unless every item is carried.
 
 Loops: a task handed off stuck twice in a row with the same normalized reason, or whose spec changed
 while it stayed in the same stuck state since the last sweep, is shown as LOOP: resolve it, do not
@@ -327,7 +336,57 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
         else:
             out.append(item)
     _watch(db, out, paused, now)
+    _ask_holds(db, out, paused, cfg, now)
     return out
+
+
+_ASK_RX = re.compile(r"\bask\s*#?(\d+)(?!\d)", re.I)   # as askrethink._cites
+
+
+def _named_asks(db: DB, key: str, o: dict | None, paused: dict[str, dict]) -> tuple[set[int], dict | None]:
+    """The asks a blocked task's or coordinator-set pause's hold and its outcome `o` cite, and the
+    pause row (None for a task). Empty for anything else."""
+    from .waits import _held_ask
+    kind, _, ident = key.partition(":")
+    texts, ids, row = [(o or {}).get("until"), (o or {}).get("why")], set(), None
+    if kind == "task" and ident.isdigit():
+        t = db.task(int(ident)) or {}
+        if t.get("status") != "blocked":
+            return set(), None
+        texts.append(t.get("blocked_reason"))
+        if (anchored := _held_ask(t)) is not None:
+            ids.add(anchored)
+    elif kind == "resource" and isinstance(row := paused.get(ident), dict) and row.get("by") != "user":
+        texts.append(row.get("reason"))
+    else:
+        return set(), None
+    return ids | {int(m) for x in texts for m in _ASK_RX.findall(str(x or ""))}, row
+
+
+def _open_asks(db: DB) -> dict[int, dict]:
+    return {int(r["id"]): r for r in db.q("SELECT id, ts, ref FROM messages WHERE direction='out' "
+                                          "AND kind='ask' AND handled=0")}
+
+
+def _ask_holds(db: DB, live: list[dict], paused: dict[str, dict], cfg: dict, now: float) -> None:
+    """Give each blocked task and coordinator-set pause naming exactly one open ask its `ask` ({id,
+    said, rethink, pause, held}): see the module doc."""
+    cand = [i for i in live if not i.get("ends") and i["status"] in ("blocked", "paused")]
+    asks = _open_asks(db) if cand else {}
+    if not asks:
+        return
+    outs, h = outcomes(db), askrethink.hours(cfg)
+    said = max(_num((db.one("SELECT MAX(ts) ts FROM messages WHERE direction='in' AND kind='user'") or {}).get("ts")),
+               _num(db.kv(RELAYED_KEY, 0)))
+    for i in cand:
+        ids, row = _named_asks(db, i["key"], outs.get(i["key"]), paused)
+        if len(ids) != 1 or (aid := next(iter(ids))) not in asks:
+            continue
+        a = asks[aid]
+        rethinks = h > 0 and (a["ref"] or "").removeprefix("blocking:") in askrethink.REASONS
+        i["ask"] = {"id": aid, "said": said, "rethink": float(a["ts"]) + h * 3600 if rethinks else None,
+                    "pause": _pause_fp(row) if row else None}
+        i["ask"]["held"] = ask_held(outs.get(i["key"]), i, now)
 
 
 def _watch(db: DB, live: list[dict], paused: dict[str, dict], now: float) -> None:
@@ -399,7 +458,7 @@ def remember(db: DB, live: list[dict]) -> None:
 def loop(db: DB, item: dict, prev: dict | None) -> str | None:
     """Why this item looks like a re-block loop, or None: the same normalized stuck reason handed off
     twice in a row, or its spec changed since the last sweep while it stayed in the same stuck state."""
-    if item["task"] is None or item["kind"] == "deferred" or item.get("ends"):
+    if item["task"] is None or item["kind"] == "deferred" or item.get("ends") or (item.get("ask") or {}).get("held"):
         return None
     last = _last_stuck_events(db, item["task"], 2)
     if len(last) == 2 and last[0]["kind"] == last[1]["kind"]:
@@ -482,9 +541,10 @@ def _signals(db: DB, state: dict, live: list[dict], now: float, rearm_only: bool
     outs = outcomes(db)
     for i in live:
         o = outs.get(i["key"]) or {}
-        if i.get("ends") or o.get("outcome") != "still_blocked":
+        if i.get("ends") or o.get("outcome") not in ("still_blocked", "human_indispensable") or \
+                (o["outcome"] == "human_indispensable" and not o.get("ask")):
             continue
-        if watched(o, i, now):   # its own probe watches it, unchanged: its next check is no news
+        if watched(o, i, now) or ask_held(o, i, now):   # unchanged, as the turn judged it: no news
             continue
         if _recheck_due(o, i, now) and last < _num(o.get("ts")) + RECHECK_H * 3600 <= now:
             out.append(f"daily re-check due: {i['key']}")
@@ -494,12 +554,13 @@ def _signals(db: DB, state: dict, live: list[dict], now: float, rearm_only: bool
 
 
 def _quiet(db: DB, cfg: dict, state: dict, live: list[dict], now: float) -> bool:
-    """Every item is a watched hold carried unchanged or a hold no turn can lift, at least one the
-    former: a sweep turn would only re-read them, so none starts, not even on a signal."""
+    """Every item is a watched or ask-held hold carried unchanged or a hold no turn can lift, at
+    least one of the former: a sweep turn would only re-read them, so none starts, not even on a signal."""
     if holdloops.flagged(db) or all(i.get("ends") for i in live):
         return False
     outs, prev, rethought = outcomes(db), state.get("items") or {}, rethink(db, cfg, live, now)
-    return all(_carries(i, state, outs, now) and (i.get("ends") or watched(outs.get(i["key"]), i, now))
+    return all(_carries(i, state, outs, now)
+               and (i.get("ends") or watched(outs.get(i["key"]), i, now) or ask_held(outs.get(i["key"]), i, now))
                and not loop(db, i, prev.get(i["key"])) and i["key"] not in rethought for i in live)
 
 
@@ -528,8 +589,10 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
         return f"every {every / 3600:g}h"
     if since < min(every, _cfg(cfg, "blocker_sweep_min_gap_h", MIN_GAP_H) * 3600):
         return None
-    # Every item ends without a turn: only what may end one brings the sweep forward.
-    sigs = _signals(db, state, live, now, rearm_only=all(i.get("ends") for i in live))
+    # Every item ends without a turn, is probe-watched or waits on an open ask: only what may end one
+    # brings the sweep forward, never a budget kind or account change.
+    sigs = _signals(db, state, live, now, rearm_only=all(
+        i.get("ends") or (i.get("watch") or {}).get("failing") or i.get("ask") for i in live))
     return "; ".join(sigs)[:300] if sigs and not _quiet(db, cfg, state, live, now) else None
 
 
@@ -541,8 +604,8 @@ def _snap(i: dict) -> dict:
 def carried(o: dict | None, i: dict, now: float) -> bool:
     """A still_blocked outcome that still holds for item `i`: re-checkable, its next check ahead, and
     recorded against the item as it is now. Such an item needs no new outcome at this sweep. Nor does
-    a hold that ends without a turn (`ends`): a user pause or a time-only deferral."""
-    if i.get("ends"):
+    a hold that ends without a turn (`ends`): a user pause or a time-only deferral, nor an ask-held one."""
+    if i.get("ends") or ask_held(o, i, now):
         return True
     if not (o and o.get("outcome") == "still_blocked" and recheckable(o) and o.get("item") == _snap(i)):
         return False
@@ -563,7 +626,24 @@ def _recheck_due(o: dict | None, i: dict, now: float) -> bool:
     """A watched hold whose only change is that its daily re-check came due: an item, not a FLAG."""
     w = i.get("watch") or {}
     return bool(o and w.get("failing") and o.get("fp") and o["fp"] == i.get("fp") and o.get("item") == _snap(i)
-                and _num(i.get("touched")) <= _num(o.get("ts")) and now > _num(o.get("ts")) + RECHECK_H * 3600)
+                and _num(i.get("touched")) <= _num(o.get("ts")) and now > _num(o.get("ts")) + RECHECK_H * 3600) \
+        or (_ask_ok(o, i, now) and now > _num(o["ts"]) + RECHECK_H * 3600)
+
+
+def _ask_ok(o: dict | None, i: dict, now: float) -> bool:
+    """Outcome `o` names the one open ask item `i` waits on as its only lift, and nothing it rests on
+    changed: no user message since, the same status, spec, reason and pause row, and the ask has not
+    passed coordinator.ask_rethink_h since."""
+    a = i.get("ask") or {}
+    return bool(o and a and o.get("ask") == a["id"] and o.get("outcome") in ("still_blocked", "human_indispensable")
+                and not o.get("probe") and o.get("item") == _snap(i) and o.get("ask_pause") == a.get("pause")
+                and _num(a.get("said")) <= _num(o.get("ts"))
+                and not (a.get("rethink") and _num(o.get("ts")) < a["rethink"] <= now))
+
+
+def ask_held(o: dict | None, i: dict, now: float) -> bool:
+    """An ask-held hold carried without a turn: _ask_ok, and a turn judged it within RECHECK_H."""
+    return _ask_ok(o, i, now) and _num(o["ts"]) <= now <= _num(o["ts"]) + RECHECK_H * 3600
 
 
 def flags(db: DB, state: dict, live: list[dict], now: float) -> dict[str, str]:
@@ -723,6 +803,12 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None, whe
                  _task_resources(db.task(int(key[5:])) or {}) if key.startswith("task:") else set()) & paused.keys()
         if names:   # held by the user's own pause: carries the items naming it until the row changes
             o["pause"] = {n: _pause_fp(paused[n]) for n in sorted(names)}
+    if outcome == "human_indispensable" or (outcome == "still_blocked" and not o.get("probe")):
+        o["why"] = _clip(a.get("why") or a.get("reason") or a.get("text") or "", 300)
+        ids, row = _named_asks(db, key, o, db.paused_resources())
+        snap = ((db.kv(STATE_KEY, {}) or {}).get("items") or {}).get(key)
+        if len(ids) == 1 and next(iter(ids)) in _open_asks(db) and snap:   # held only by that ask (ask_held)
+            o.update(ask=next(iter(ids)), item=snap, **({"ask_pause": _pause_fp(row)} if row else {}))
     o["why"] = _clip(a.get("why") or a.get("reason") or a.get("text") or "", 300)
     outs = outcomes(db)
     outs[key] = o
@@ -758,8 +844,11 @@ def _carries(i: dict, state: dict, outs: dict, now: float) -> bool:
     # An item a user pause's outcome covers ignores flags raised before it was covered: no sweep flags
     # a covered item, and a loop counts only once a sweep after the outcome found it again.
     marks = ("flags", "loops", "reviews")
+    o = outs.get(i["key"])
     if i.get("cover") is not None:
         marks = ("reviews",) if float(i["cover"]) >= float(state.get("last") or 0) else ("loops", "reviews")
+    elif ask_held(o, i, now) and _num(o["ts"]) >= _num(state.get("last")):   # it answers that sweep's marks
+        marks = ("reviews",)
     return not any(i["key"] in (state.get(f) or {}) for f in marks) and carried(outs.get(i["key"]), i, now)
 
 
@@ -778,6 +867,8 @@ def _line(i: dict, state: dict, outs: dict, now: float) -> str:
                 else "OUTAGE TASK, NOT DUE YET" if i["kind"] == "outage"
                 else "PROMISED, NOT DUE YET"}.get(i["ends"], "DEFERRED")
         return f"- {who} | {what} (no action): {_clip(i['reason'], 160)}"
+    if _carries(i, state, outs, now) and ask_held(outs.get(i["key"]), i, now):
+        return f"- {who} | HELD BY OPEN ASK {i['ask']['id']} (no action): {_last_check(outs.get(i['key']), now)}"
     if _carries(i, state, outs, now):
         o = outs.get(i["key"])
         tail = "; its probe still says not yet, unchanged" if o and float(o.get("next") or 0) <= now else ""

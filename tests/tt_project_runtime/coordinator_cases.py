@@ -12031,6 +12031,142 @@ def test_blocker_sweep_keeps_its_6h_floor_while_every_item_ends_with_the_user(en
     assert sweep.due(db, cfg, now + 6 * 3600) == "upstream notes resolved: 0123abcd"
 
 
+def _ask_held(p, now, ref="blocking:review"):
+    """A blocked task whose only lift is an open ask, judged human_indispensable by a sweep at `now`."""
+    from ttp import coordinator as coord, sweep
+    db, cfg = p.db, p.config()
+    aid = db.post("out", "Sign the vendor contract?", kind="ask", ref=ref)
+    db.x("UPDATE messages SET ts=? WHERE id=?", (now - 600, aid))
+    tid = db.add_task("sign the vendor contract")
+    db.update_task(tid, status="blocked", blocked_reason=f"waiting on the answer to ask {aid}")
+    assert sweep.due(db, cfg, now) == "every 6h"
+    sweep.start(db, cfg, "every 6h", now)
+    db.x("UPDATE events SET status='handled'")
+    assert coord.apply(p, [{"type": "sweep", "id": tid, "outcome": "human_indispensable",
+                            "why": "only the user can sign it"}]) == []
+    assert db.kv(sweep.OUTCOMES_KEY)[f"task:{tid}"]["ask"] == aid
+    return aid, tid
+
+
+def _live(db, cfg, key, at):
+    from ttp import sweep
+    return next(i for i in sweep.items(db, at, cfg) if i["key"] == key)
+
+
+def test_blocker_sweep_carries_a_hold_only_an_open_ask_can_lift_and_starts_no_sweep(env):
+    """A blocked task whose outcome names one open ask as its only lift is carried without a turn: no
+    interval sweep, no budget kind change brings one forward, and a sweep lists it HELD BY OPEN ASK."""
+    from ttp import coordinator as coord, sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    aid, tid = _ask_held(p, now)
+    key = f"task:{tid}"
+    i = _live(db, cfg, key, now + 7 * 3600)
+    assert i["ask"]["id"] == aid and i["ask"]["held"] and sweep.carried(db.kv(sweep.OUTCOMES_KEY)[key], i, now + 7 * 3600)
+    assert sweep.due(db, cfg, now + 7 * 3600) is None, "every item ask-held: no interval sweep"
+    sweep.signal(db, "claude budget changed: plan -> api")
+    sweep.signal(db, "claude account changed")
+    for h in (2, 7, 20):
+        assert sweep.due(db, cfg, now + h * 3600) is None, h
+    # A sweep that runs anyway (another item) carries it with no action and no flag.
+    eid = sweep.start(db, cfg, "every 6h", now + 7 * 3600)
+    state = db.kv(sweep.STATE_KEY)
+    assert key in state["carried"] and not state["flags"] and not state["loops"]
+    line = next(ln for ln in coord.digest(p, {}, [eid], []).splitlines() if ln.startswith(f"- #{tid} "))
+    assert f"| HELD BY OPEN ASK {aid} (no action): last re-check" in line, line
+    db.x("UPDATE events SET status='handled'")
+    assert sweep.due(db, cfg, now + 9 * 3600) is None
+    # A coordinator-set resource pause waiting on the same ask is carried the same way, until its row changes.
+    coord.pause_resource(p, "board-a", True, reason=f"until ask {aid} is answered", by="coordinator")
+    eid = sweep.start(db, cfg, "every 6h", now + 9 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    assert sweep.record(db, {"resource": "board-a", "outcome": "human_indispensable", "why": "the user decides"},
+                        None, now + 9 * 3600 + 60) == "resource:board-a"
+    assert sweep.due(db, cfg, now + 16 * 3600) is None
+    _set_pause_row(db, "board-a", {**db.paused_resources()["board-a"], "until": now + 30 * 3600})
+    assert not _live(db, cfg, "resource:board-a", now + 16 * 3600)["ask"]["held"]
+    assert sweep.due(db, cfg, now + 16 * 3600) == "every 6h"
+
+
+def test_blocker_sweep_mixed_items_with_one_not_carried_still_sweep_on_a_budget_kind_change(env):
+    from ttp import sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    _ask_held(p, now)
+    other = db.add_task("needs a key")
+    db.update_task(other, status="blocked", blocked_reason="needs the vendor's key")
+    sweep.signal(db, "claude budget changed: plan -> api")
+    assert sweep.due(db, cfg, now + 2 * 3600) == "claude budget changed: plan -> api"
+    assert sweep.due(db, cfg, now + 7 * 3600) == "every 6h"
+
+
+@pytest.mark.parametrize("change", ["answered", "withdrawn", "user message", "relayed words", "reason", "spec",
+                                    "second ask"])
+def test_blocker_sweep_ask_held_hold_comes_back_once_anything_it_rests_on_changes(env, change):
+    from ttp import sweep, unblock
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    aid, tid = _ask_held(p, now)
+    key = f"task:{tid}"
+    assert sweep.due(db, cfg, now + 7 * 3600) is None
+    if change in ("answered", "withdrawn"):
+        db.x("UPDATE messages SET handled=1 WHERE id=?", (aid,))
+        if change == "answered":
+            db.set_kv(unblock.RESOLVED_KEY, {str(aid): {"ts": now + 3600}})
+            assert sweep.due(db, cfg, now + 2 * 3600) == f"ask #{aid} resolved"
+    elif change == "user message":
+        db.post("in", "signed it", chat="c1", kind="user")
+    elif change == "relayed words":
+        sweep.user_words_relayed(db, time.time() + 1)
+    elif change == "reason":
+        db.update_task(tid, blocked_reason=f"waiting on the answer to ask {aid}; legal also asked")
+    elif change == "spec":
+        db.x("UPDATE tasks SET spec=? WHERE id=?", ("sign it in blue ink", tid))
+    else:
+        other = db.post("out", "Which entity signs?", kind="ask", ref="blocking:review")
+        db.update_task(tid, blocked_reason=f"waiting on ask {aid} and ask {other}")
+    i = _live(db, cfg, key, now + 7 * 3600)
+    assert not (i.get("ask") or {}).get("held")
+    assert not sweep.carried(db.kv(sweep.OUTCOMES_KEY)[key], i, now + 7 * 3600)
+    assert sweep.due(db, cfg, now + 7 * 3600) == "every 6h"
+
+
+def test_blocker_sweep_ask_held_hold_comes_back_past_ask_rethink_h_and_at_the_daily_re_check(env):
+    from ttp import sweep
+    p = make(env)
+    db, cfg, now = p.db, p.config(), time.time()
+    # An ask askrethink may raise (blocking: human): carried until ask_rethink_h (2h) passes since it opened.
+    aid, tid = _ask_held(p, now, ref="blocking:human")
+    key = f"task:{tid}"
+    assert _live(db, cfg, key, now + 3600)["ask"]["held"]
+    assert not _live(db, cfg, key, now + 3 * 3600)["ask"]["held"]
+    assert sweep.due(db, cfg, now + 7 * 3600) == "every 6h"
+    # The turn that rethinks it records human_indispensable again: carried again.
+    sweep.start(db, cfg, "every 6h", now + 7 * 3600)
+    db.x("UPDATE events SET status='handled'")
+    sweep.record(db, {"id": tid, "outcome": "human_indispensable", "why": "only the user signs"}, None, now + 7 * 3600 + 60)
+    assert sweep.due(db, cfg, now + 14 * 3600) is None
+    # The daily re-check: a turn judges it again RECHECK_H after the outcome, brought forward by its signal.
+    sweep.start(db, cfg, "every 6h", now + 28 * 3600)   # another item's sweep, say
+    db.x("UPDATE events SET status='handled'")
+    assert key in db.kv(sweep.STATE_KEY)["carried"]
+    later = now + 7 * 3600 + 60 + sweep.RECHECK_H * 3600 + 60
+    assert not _live(db, cfg, key, later)["ask"]["held"]
+    assert sweep.due(db, cfg, later) == f"daily re-check due: {key}"
+    assert not sweep.flags(db, db.kv(sweep.STATE_KEY), sweep.items(db, later, cfg), later)
+    # A still_blocked naming the ask is carried past its next check the same way.
+    sweep.start(db, cfg, "daily", later)
+    db.x("UPDATE events SET status='handled'")
+    sweep.record(db, {"id": tid, "outcome": "still_blocked", "until": f"ask {aid} is answered"}, later + 3600, later + 60)
+    assert db.kv(sweep.OUTCOMES_KEY)[key]["ask"] == aid
+    assert sweep.due(db, cfg, later + 3 * 3600) is None
+    # ... but not one with a probe: something else may lift it.
+    sweep.record(db, {"id": tid, "outcome": "still_blocked", "until_probe": "test -e out/signed"}, later + 3600,
+                 later + 120)
+    assert "ask" not in db.kv(sweep.OUTCOMES_KEY)[key]
+    assert sweep.due(db, cfg, later + 3 * 3600) == f"next check due: {key}"
+
+
 def test_blocker_sweep_item_newly_covered_by_a_user_pause_ignores_flags_raised_before_it(env):
     """A task flagged at the last sweep (no outcome) that a user pause's human_indispensable then covers
     carries without that old flag, so an interval sweep is skipped while nothing else is stuck."""

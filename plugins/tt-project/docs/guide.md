@@ -266,7 +266,11 @@ prolonged whole-box outage.
   pattern), a resource pause the user set, or a deferral only until a time. A `human_indispensable`
   outcome on a task a user-set resource pause holds covers every task naming that resource until
   the pause row changes, a user message arrives, or another project's note relays the user's words
-  (a non-empty `user's words (verbatim)` part); then the sweep judges them again. An outcome stored
+  (a non-empty `user's words (verbatim)` part); then the sweep judges them again. A blocked task or
+  coordinator-set pause whose hold and `human_indispensable` (or probe-less `still_blocked`) outcome
+  name one open ask is listed as `HELD BY OPEN ASK <id>` and starts no sweep, not even on a budget
+  kind change, until the ask is answered or withdrawn, a user message arrives, the item changes, the
+  ask passes `coordinator.ask_rethink_h`, or a day passes since that outcome. An outcome stored
   in an older format is no cover. A waiting task on a user-pause probe is never reported
   as a stale wait. The daily review lists everything stuck over 6 h with its sweep outcome.
 - Course check: a digest section, shown only when something trips, with model-free signs the project
