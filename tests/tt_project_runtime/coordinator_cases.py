@@ -1386,6 +1386,9 @@ def test_cache_signals_read_running_due_tasks_llm_schedules_chat_and_turns(env):
     _no_schedule_due(db, now)
     db.x("UPDATE messages SET ts=?", (now - 86400,))
     db.x("UPDATE schedules SET next_run=? WHERE kind='llm'", (now + 86400,))   # the default schedules (daily-review, ...) are not due within the hour, whatever the clock
+    # The seeded llm schedules (daily-review) run at a set time of day: pushed past the hour, or the
+    # test fails whenever it runs within the hour before them.
+    db.x("UPDATE schedules SET next_run=? WHERE kind='llm'", (now + 86400,))
     sig = cachettl.signals(db, now)
     assert sig["running"] == [] and sig["due"] == [] and sig["chat"] == now - 86400, sig
     run = db.add_task("running")
@@ -1413,6 +1416,7 @@ def test_auto_cache_ttl_sends_a_quiet_projects_cold_turn_at_5m_and_status_still_
     now = time.time()
     p.db.x("UPDATE messages SET ts=?", (now - 86400,))
     p.db.x("UPDATE schedules SET next_run=? WHERE kind='llm'", (now + 86400,))   # the default schedules (daily-review, ...) are not due within the hour, whatever the clock
+    p.db.x("UPDATE schedules SET next_run=? WHERE kind='llm'", (now + 86400,))   # daily-review: not due by time of day
     for k in range(1, 6):   # a turn every 2 h, the last one 2 h ago
         p.db.x("INSERT INTO runs(role, started, ended, status) VALUES ('coordinator', ?, ?, 'ok')",
                (now - k * 7200, now - k * 7200 + 60))
