@@ -649,7 +649,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   asleep instead of woken at its tier. Its checks run again on the same head, model-free, once the
   push branch's tip moves past a commit changing a failing test's file, or after
   `checks.shared_backoff_h` (default 2); after 3 such reruns it wakes as before. Each shared failure
-  is one incident with one fix task and one low feed line; the daily audit lists the tasks held and
+  is one incident with one fix task and one low feed line. While that fix is open, in review or
+  waiting in the push queue, a new failure of the same ids joins its incident and adds no task. A
+  failure no fix owns first reruns only its failing ids on the push-branch tip, model-free and bounded
+  by `checks.shared_tip_timeout_s` (default 900): when they pass there, no fix task is added and the
+  held tasks wake to rebase onto the tip; when they fail there too, or the rerun proves nothing, the
+  incident opens as above. The daily audit lists the tasks held and
   the wakes avoided with their estimated $. A failing id whose earlier incident's fix task ended done
   and landed through the push queue within `checks.shared_repeat_h` (default 72) makes a repeat: its fix task runs at standard and must give
   the root cause, use a fake clock or event in place of wall-time assertions, and pass 20 runs of

@@ -17,13 +17,21 @@ its own checks pass: nothing here skips or weakens them.
 A new incident with an id whose earlier incident's fix task ended done and landed on the push branch
 within `checks.shared_repeat_h` is a repeat: the last fix did not hold. Its fix task runs at standard and its spec asks for the root cause, a fake
 clock or event in place of wall-time assertions, and REPEAT_RUNS passing runs of each repeated test
-under parallel load before done."""
+under parallel load before done.
+
+One owner per failure (in_flight): an incident whose fix task ended done stays open while that fix is
+on its way to the push branch (a review of it open, a push queue row of it not settled), so a second
+failure of the same ids links to it instead of adding a fix task. A failure no open incident owns is
+first rerun model-free on the push-branch tip, only its failing ids (tip_verdict, Daemon._tip_check):
+when they pass there, no fix task is added and the held task is woken to rebase onto the tip; when they
+fail there too (or the tip cannot be checked), one incident opens as before."""
 from __future__ import annotations
 
 import hashlib
 import json
 import re
 import sqlite3
+import time
 
 from .db import TERMINAL_TASK_STATES, DB, review_subject
 
@@ -43,6 +51,10 @@ BACKOFF_H = 2.0        # checks.shared_backoff_h: a held task's checks run again
 REPEAT_H = 72.0        # checks.shared_repeat_h: an id whose incident closed this recently is a repeat
 REPEAT_RUNS = 20       # passing runs under parallel load a repeat's fix task proves
 RERUNS_MAX = 3         # reruns on one head before the task wakes as before
+FLIGHT_S = 3600.0      # a fix done this recently with no review yet is still on its way (its review is queued)
+TIP_TIMEOUT_S = 900.0  # checks.shared_tip_timeout_s: the bound on rerunning the failing ids on the tip
+TIP_KEY = "shared_tip_checks"   # kv: {key: {tip, ids, at}} of the tip reruns started (Daemon._tip_check)
+PUSH_PENDING = ("approved", "batched", "held")   # push queue rows not settled yet
 KEEP_S = 7 * 86400     # failure rows kept this long
 # A review the push queue failed on its batch checks (review_failure check_only, pushq._settle):
 # the failing ids, and whether they are all of them (failing_ids).
@@ -58,7 +70,8 @@ def settings(cfg: dict) -> dict:
     return {"min_tasks": int(c.get("shared_min_tasks", MIN_TASKS)),
             "window_s": float(c.get("shared_window_h", WINDOW_H)) * 3600,
             "backoff_s": float(c.get("shared_backoff_h", BACKOFF_H)) * 3600,
-            "repeat_s": float(c.get("shared_repeat_h", REPEAT_H)) * 3600}
+            "repeat_s": float(c.get("shared_repeat_h", REPEAT_H)) * 3600,
+            "tip_timeout_s": float(c.get("shared_tip_timeout_s", TIP_TIMEOUT_S))}
 
 
 def failing_ids(output: str) -> tuple[list[str], bool]:
@@ -198,7 +211,7 @@ def incident(db: DB, task: dict, ids: list[str], excerpt: str, now: float, cfg: 
     ensure(db)
     for r in db.q("SELECT * FROM checks_incidents WHERE closed IS NULL ORDER BY id"):
         fix = db.task(r["fix_task"]) if r["fix_task"] else None
-        if fix is None or fix["status"] in TERMINAL_TASK_STATES:
+        if fix is None or (fix["status"] in TERMINAL_TASK_STATES and not in_flight(db, fix, now)):
             db.x("UPDATE checks_incidents SET closed=? WHERE id=?", (now, r["id"]))
             continue
         have = _rows(r["ids"])
@@ -226,6 +239,67 @@ def incident(db: DB, task: dict, ids: list[str], excerpt: str, now: float, cfg: 
           f"in several tasks' checks. Their tasks sleep without a model run until the push-branch tip changes "
           f"those tests or a backoff passes; fix task #{fid}.", "handled", fid))
     return iid, True
+
+
+def in_flight(db: DB, fix: dict, now: float) -> bool:
+    """A fix task that ended done whose change is on its way to the push branch and not on it yet: a
+    review of it still open, a push queue row of it, its branch or a review of it not settled
+    (PUSH_PENDING), or no review yet within FLIGHT_S of its hand-off. A failed, cancelled or landed fix
+    is not; nor is a done one whose reviews all ended with nothing queued to push."""
+    if fix["status"] != "done":
+        return False
+    from .tried import landed_tasks
+    if fix["id"] in landed_tasks(db):
+        return False
+    revs = [t for t in db.q("SELECT id, status, labels, title FROM tasks WHERE kind='review' AND id>?", (fix["id"],))
+            if review_subject(t) == fix["id"]]
+    if any(t["status"] not in TERMINAL_TASK_STATES for t in revs):
+        return True
+    mine = {fix["id"]} | {t["id"] for t in revs}
+    for r in db.q(f"SELECT task, branch FROM push_queue WHERE status IN ({','.join('?' * len(PUSH_PENDING))})",
+                  PUSH_PENDING):
+        if r["task"] in mine or (fix.get("branch") and r["branch"] == fix["branch"]):
+            return True
+    return not revs and now - float(fix.get("updated") or 0) < FLIGHT_S
+
+
+def owner(db: DB, ids: list[str], now: float) -> int | None:
+    """The open incident sharing an id with `ids` whose fix task is live or in flight, else None."""
+    ensure(db)
+    for r in db.q("SELECT * FROM checks_incidents WHERE closed IS NULL ORDER BY id"):
+        fix = db.task(r["fix_task"]) if r["fix_task"] else None
+        if fix and set(_rows(r["ids"])) & set(ids) and (
+                fix["status"] not in TERMINAL_TASK_STATES or in_flight(db, fix, now)):
+            return int(r["id"])
+    return None
+
+
+def tip_key(tip: str, ids: list[str]) -> str:
+    return hashlib.sha256(json.dumps([tip, sorted(ids)]).encode()).hexdigest()[:16]
+
+
+def tip_verdict(db: DB, key: str, rc_text: str | None, now: float, cfg: dict) -> str | None:
+    """The rerun of failing ids on the tip that `key` names: "pass" (pytest exit 0), "fail" (exit 1:
+    a test failed there too), "pending" while it runs within its bound, None when none was started or
+    it ended any other way (timed out, killed, nothing collected): the tip proves nothing."""
+    e = (db.kv(TIP_KEY) or {}).get(key)
+    if not isinstance(e, dict):
+        return None
+    if rc_text is None:
+        return "pending" if now < float(e.get("at") or 0) + settings(cfg)["tip_timeout_s"] + 120 else None
+    rc = rc_text.strip()
+    return "pass" if rc == "0" else "fail" if rc == "1" else None
+
+
+def tip_started(db: DB, key: str, tip: str, ids: list[str], now: float) -> list[str]:
+    """Record a tip rerun as started; the keys of entries older than a day, dropped (their directories
+    are the caller's to remove)."""
+    st = db.kv(TIP_KEY) or {}
+    old = [k for k, e in st.items() if not isinstance(e, dict) or now - float(e.get("at") or 0) > 86400]
+    st = {k: e for k, e in st.items() if k not in old}
+    st[key] = {"tip": tip, "ids": sorted(ids), "at": now}
+    db.set_kv(TIP_KEY, st)
+    return old
 
 
 def repeats(db: DB, ids: list[str], now: float, cfg: dict) -> list[str]:
@@ -293,7 +367,7 @@ def _repeat_text(again: list[str]) -> str:
 
 def covered(db: DB, ids: list[str], skip: set[int] | frozenset = frozenset()) -> str:
     """What already owns every id ("" when one is not owned): an open incident whose fix task is
-    live, or a live code task (not in `skip`) whose title or spec names the id."""
+    live or in flight, or a live code task (not in `skip`) whose title or spec names the id."""
     if not ids:
         return ""
     ensure(db)
@@ -301,7 +375,8 @@ def covered(db: DB, ids: list[str], skip: set[int] | frozenset = frozenset()) ->
     left = set(ids)
     for r in db.q("SELECT * FROM checks_incidents WHERE closed IS NULL ORDER BY id"):
         fix = db.task(r["fix_task"]) if r["fix_task"] else None
-        if fix and fix["status"] not in TERMINAL_TASK_STATES and left & set(_rows(r["ids"])):
+        if fix and (fix["status"] not in TERMINAL_TASK_STATES or in_flight(db, fix, time.time())) \
+                and left & set(_rows(r["ids"])):
             owners.append(f"incident {r['id']} (fix #{fix['id']})")
             left -= set(_rows(r["ids"]))
     if left:

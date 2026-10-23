@@ -232,6 +232,28 @@ PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
+# The detached rerun of a shared failure's ids on the push-branch tip (Daemon._start_tip_check):
+# argv dir worktree repo timeout_s cmd...; writes rc (124 once timed out) and removes the worktree.
+TIP_RUNNER = r'''
+import os, signal, subprocess, sys
+d, wt, repo, limit, argv = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), sys.argv[5:]
+with open(os.path.join(d, "out"), "wb") as out:
+    try:
+        child = subprocess.Popen(argv, cwd=wt, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+        try:
+            rc = child.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+            rc = 124
+    except OSError:
+        rc = 127
+with open(os.path.join(d, "rc.tmp"), "w") as f:
+    f.write(f"{rc}\n")
+os.replace(os.path.join(d, "rc.tmp"), os.path.join(d, "rc"))
+subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", wt], capture_output=True)
+'''
 ON_PASS_TIMEOUT_S, ON_PASS_DIR, ON_PASS_LOG = 600, "on_pass", "on_pass.log"   # a hand-off's on_pass_cmd
 ON_PASS_NOTES_EVERY_S, ON_PASS_NOTES_DAYS = 600, 14   # sweep for notes an unsettled on_pass_cmd queued
 AUTH_PROBE_S = 900      # while a provider without a login check is logged out, one run on it checks this often
@@ -8053,7 +8075,10 @@ class Daemon:
         queue's known-bad tip (sharedchecks): keep the task asleep without a model run, counted in one
         incident with one fix task. While held, its checks run again on the same head once the push
         branch's tip moves past a commit touching a failing test's file, or after the backoff; after
-        RERUNS_MAX reruns it wakes. False: wake it as before (another runner, an id not shared...)."""
+        RERUNS_MAX reruns it wakes. False: wake it as before (another runner, an id not shared...).
+        No new incident while one owns the ids with a fix live or on its way to the push branch
+        (sharedchecks.owner); with none, the failing ids are first rerun on the push-branch tip
+        (_tip_gate): passing there, no fix task is added and the task wakes to rebase."""
         from .cli import _read_checks_pid
         db, tid = self.p.db, task["id"]
         if rc == "killed":
@@ -8074,7 +8099,17 @@ class Daemon:
         if hold.get("run_dir") != str(run_dir) or hold.get("head") != head:
             hold = {}
         tip = self._push_tip()
-        if hold and hold.get("started") == started:   # the failure it was held on: release or sleep on
+        tipped = False   # its ids' rerun on the tip ended without passing: open the incident
+        if hold and hold.get("started") == started and hold.get("tip_check"):   # waiting on the tip's rerun
+            v = self._tip_result(hold["tip_check"], now)
+            if v == "pending":
+                if (task["not_before"] or 0) <= now + PROBE_EVERY_S:
+                    db.update_task(tid, not_before=now + 2 * PROBE_EVERY_S)
+                return True
+            if v == "pass":
+                return self._tip_passed(task, ids, str(hold.get("tip") or ""), now)
+            tipped, hold = True, {k: v for k, v in hold.items() if k != "tip_check"}
+        elif hold and hold.get("started") == started:   # the failure it was held on: release or sleep on
             moved = bool(tip and hold.get("tip") and tip != hold["tip"]
                           and pushq.touches(self.p, hold["tip"], tip, sharedchecks.files(hold.get("ids") or ids)))
             if not moved and now < float(hold.get("until") or 0):
@@ -8098,6 +8133,11 @@ class Daemon:
             return False
         if not sharedchecks.shared(db, tid, head, ids, now, self.cfg, pushq.bad_tip_ids(db), sigs):
             return False
+        if not tipped and sharedchecks.owner(db, ids, now) is None:
+            gate = self._tip_gate(task, prev, {"run_dir": str(run_dir), "head": head, "ids": ids, "started": started,
+                                               "tip": tip, "since": now, "reruns": int(hold.get("reruns") or 0)}, now)
+            if gate is not None:
+                return gate
         tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
         with db.tx():
             iid, opened = sharedchecks.incident(db, task, ids, out, now, self.cfg)
@@ -8108,6 +8148,90 @@ class Daemon:
                 "tip": tip, "since": now, "until": until, "reruns": int(hold.get("reruns") or 0)}}))
         log(self.p, f"task {tid}: its checks failed on {len(ids)} test(s) failing in other tasks too "
                     f"(incident {iid}{', opened' if opened else ''}); held without a model run")
+        return True
+
+    def _tip_gate(self, task: dict, prev: dict, hold: dict, now: float) -> bool | None:
+        """A shared failure no incident owns: rerun only its failing ids on the push-branch tip before a
+        fix task is added (sharedchecks.tip_verdict). True: held while that rerun runs, or woken to rebase
+        since they pass there. None: open the incident as before (no tip, the task's head already holds
+        it, the rerun could not start, failed there or proved nothing)."""
+        tid, tip, head, ids = task["id"], hold["tip"], hold["head"], hold["ids"]
+        try:
+            if not tip or worktree.is_ancestor(self.p, tip, head):
+                return None   # its own failure on a head holding the tip is the tip's
+        except (OSError, subprocess.SubprocessError):
+            return None
+        key = sharedchecks.tip_key(tip, ids)
+        v = self._tip_result(key, now)
+        if v is None and not (self.p.db.kv(sharedchecks.TIP_KEY) or {}).get(key):
+            if not self._start_tip_check(tip, ids, key):
+                return None
+            for old in sharedchecks.tip_started(self.p.db, key, tip, ids, now):
+                shutil.rmtree(self._tip_dir(old), ignore_errors=True)
+            v = "pending"
+        if v == "pass":
+            return self._tip_passed(task, ids, tip, now)
+        if v != "pending":
+            return None
+        until = now + sharedchecks.settings(self.cfg)["tip_timeout_s"]
+        self.p.db.update_task(tid, not_before=now + 2 * PROBE_EVERY_S, result=dump_result(
+            {**prev, "shared_hold": {**hold, "tip_check": key, "until": until}}))
+        log(self.p, f"task {tid}: its checks failed on {len(ids)} test(s) failing in other tasks too and no fix "
+                    f"owns them; held while they rerun on the push-branch tip {tip[:12]}")
+        return True
+
+    def _tip_passed(self, task: dict, ids: list[str], tip: str, now: float) -> bool:
+        """Its failing ids pass on the push-branch tip: no fix task; wake it to rebase and rerun its checks."""
+        log(self.p, f"task {task['id']}: its {len(ids)} failing test(s) pass on the push-branch tip {tip[:12]}; "
+                    f"no fix task, woken to rebase onto it and rerun its checks")
+        self._wake_waiting(task, f"its checks failed on {len(ids)} test(s) ({', '.join(ids[:3])}"
+                                 f"{', ...' if len(ids) > 3 else ''}) that pass on the push-branch tip {tip[:12]}: "
+                                 "rebase onto the tip and run your checks again; no fix task was added", now,
+                           extra={"wake_tier": task["tier"] if task["tier"] in bud.TIER_ORDER else "standard",
+                                  "shared_hold": {}})
+        return True
+
+    def _tip_dir(self, key: str) -> Path:
+        return self.p.state / "shared-tip" / key
+
+    def _tip_result(self, key: str, now: float) -> str | None:
+        try:
+            rc = (self._tip_dir(key) / "rc").read_text()
+        except OSError:
+            rc = None
+        return sharedchecks.tip_verdict(self.p.db, key, rc, now, self.cfg)
+
+    def _start_tip_check(self, tip: str, ids: list[str], key: str) -> bool:
+        """Rerun only `ids` on the push-branch tip `tip`, model-free and detached: in a worktree of its own
+        under state/shared-tip/<key>, `python3 -m pytest -q <ids>` with the project's venv, niced like
+        workers, devices masked, killed past checks.shared_tip_timeout_s. Its exit code goes to rc there
+        and the worktree is removed once it ends. False when it could not start."""
+        d = self._tip_dir(key)
+        wt = d / "wt"
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+            d.mkdir(parents=True)
+            worktree._git(self.p.root, "worktree", "add", "--detach", str(wt), tip,
+                          timeout=worktree.git_timeout(self.p), env=worktree.checkout_env(self.p))
+        except Exception as e:
+            log(self.p, f"shared checks: the tip {tip[:12]} could not be checked out to rerun {len(ids)} test(s): {e}")
+            return False
+        path = os.environ.get("PATH", "")
+        venv = worktree.project_venv(self.p, wt)
+        env = machines.mask_devices({**os.environ, **(worktree.venv_env(venv, path) if venv else {}),
+                                     "TTP_NO_DEVICE": "1"})
+        level = nice_level(self.cfg.get("runner"))[0]
+        argv = [sys.executable, "-c", TIP_RUNNER, str(d), str(wt), str(self.p.root),
+                str(sharedchecks.settings(self.cfg)["tip_timeout_s"]),
+                *(["nice", "-n", str(level)] if level else []), "python3", "-m", "pytest", "-q", *ids]
+        try:
+            subprocess.Popen(argv, cwd=str(wt), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            log(self.p, f"shared checks: the rerun of {len(ids)} test(s) on the tip {tip[:12]} did not start: {e}")
+            worktree._git(self.p.root, "worktree", "remove", "--force", str(wt), check=False)
+            return False
+        log(self.p, f"shared checks: rerunning {len(ids)} failing test(s) on the push-branch tip {tip[:12]}")
         return True
 
     def _push_tip(self) -> str:
