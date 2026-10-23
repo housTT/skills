@@ -5276,6 +5276,54 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
         assert spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL") == (None if ttl == "off" else ttl)
 
 
+def test_runs_but_the_coordinator_take_budget_worker_cache_ttl(env, monkeypatch):
+    from ttp.providers import claude, codex
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord, project
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.setattr(codex.Codex, "binary", lambda self: "/usr/bin/true")
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # room for the runtime's own mark
+    p = make(env)
+    head, context = coord.prompt_parts(p)
+    rids = []
+
+    def start(role, provider="claude", **kw):
+        rid = Daemon(p.base).start_run(role, "GO", provider, "standard", str(p.root), **kw)
+        rids.append(rid)
+        run = p.runs / str(rid)
+        (run / "STOP").touch()
+        spec = json.loads((run / "run.json").read_text())
+        marks = [b["cache_control"]["ttl"] for b in json.loads((run / "input.jsonl").read_text())
+                 ["message"]["content"] if "cache_control" in b] if (run / "input.jsonl").exists() else []
+        return spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL"), marks
+
+    assert project.DEFAULT_CONFIG["budget"]["worker_cache_ttl"] == "5m"
+    assert start("worker")[0] == "5m" and start("reviewer")[0] == "5m", "the default is 5m"
+    assert start("worker", system=head, context=context) == ("5m", ["5m"]), \
+        "the mark must take the env's lifetime (a mismatch is an API 400)"
+    coord_before = start("coordinator", read_only=True, cache_ttl="1h", system=head, context=context)
+    assert coord_before == ("1h", ["1h"]), "the coordinator keeps its own setting"
+    p.set_config("budget.worker_cache_ttl", "1h")
+    assert start("worker")[0] == "1h" and start("reviewer")[0] == "1h"
+    assert start("worker", system=head, context=context) == ("1h", ["1h"])
+    p.set_config("budget.worker_cache_ttl", "off")
+    assert start("worker") == (None, []) and start("reviewer") == (None, []), "off leaves the agent's default"
+    assert start("worker", system=head, context=context) == (None, [])
+    assert start("coordinator", read_only=True, cache_ttl="1h", system=head, context=context) == coord_before
+    p.set_config("budget.worker_cache_ttl", "")
+    codex_env = start("worker", provider="codex")
+    assert codex_env == (None, []), "a provider without the switch gets no env"
+    p.set_config("budget.worker_cache_ttl", "10m")
+    assert start("worker")[0] == "5m", "an unknown value runs at the default"
+    assert any("budget.worker_cache_ttl: '10m' is not one of 5m, 1h, off" in m
+               for m in project.config_problems(json.loads(p.config_path.read_text()))), "it is reported"
+    for ok in ("5m", "1h", "off", "OFF", ""):
+        assert not [m for m in project.config_problems({"budget": {"worker_cache_ttl": ok}}) if "worker_cache_ttl" in m]
+    for rid in rids:   # each run was told to STOP: let its runner end before the test does
+        _wait_gone(p.db.one("SELECT pid FROM runs WHERE id=?", (rid,))["pid"], time.time() + 20)
+
+
 def _auto_ttl_daemon(env, monkeypatch, tmp_path):
     """A daemon whose coordinator turns go out with cache_ttl auto, and a turn starter returning
     (env TTL, mark TTLs, turn note) of each turn."""

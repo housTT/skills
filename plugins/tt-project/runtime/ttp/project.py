@@ -81,6 +81,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 4000-128000; its own default is 30000); longer output goes to a file, and the worker gets a
         # short preview and the path. 0 leaves the agent's default.
         "bash_output_max_chars": 12000,
+        # Prompt cache lifetime of worker, reviewer and every other run but the coordinator's
+        # (coordinator.cache_ttl): "5m" (a cache write at 1.25x input; calls within a run are rarely
+        # 5 min apart), "1h" (2x input), or "off" (the agent's own default).
+        "worker_cache_ttl": "5m",
         "exclusive_wait_s": 600,        # an exclusive run waiting for its resource gives up after this
         # A hold kept for the detached jobs of a done, failed or cancelled task raises a low alert
         # once it has held its resource this long (0 = never). Nothing is released automatically.
@@ -727,6 +731,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     if isinstance(raw.get("budget"), dict):
         from .globalcap import setting_problems
         out += setting_problems(raw["budget"])
+        from .cachettl import worker_problems
+        out += worker_problems(raw["budget"])
     if isinstance(raw.get("runner"), dict) and "nice" in raw["runner"]:
         out += [why for why in [nice_level(raw["runner"])[1]] if why]
     v = (raw.get("runner") or {}).get("prevent_idle_sleep") if isinstance(raw.get("runner"), dict) else None

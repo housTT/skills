@@ -1168,6 +1168,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   read-only mode either.
 - Cursor has no reasoning-effort flag; tiers map to model names.
 - Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code and Codex.
+- On Claude Code, worker, reviewer and every other run but the coordinator's write the prompt cache
+  at `budget.worker_cache_ttl`: `5m` by default (a write at 1.25x input instead of 2x; calls within a
+  run are rarely 5 minutes apart), `1h`, or `off` (the agent's own default). The coordinator keeps
+  `coordinator.cache_ttl`. Codex and Cursor have no such switch.
 - Long command output stays out of a worker's context: `ttp clip -- <cmd>` and `ttp checks` keep
   it in a file and show a test run's failures (else head and tail). On Claude Code, Bash output
   past `budget.bash_output_max_chars` also goes to a file. A worker whose run re-reads more than

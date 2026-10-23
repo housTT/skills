@@ -31,6 +31,25 @@ GAPS = 5                 # the recent turn gaps whose median is weighed
 QUIET_GAP_MIN = 90       # a median gap over this, with nothing running or due, is a quiet project
 
 
+WORKER_TTLS = ("5m", "1h", "off")
+WORKER_DEFAULT = "5m"
+
+
+def worker_setting(budget: dict) -> str:
+    """budget.worker_cache_ttl, the prompt cache lifetime of every run but the coordinator's: "5m" (the
+    default: a write at 1.25x input instead of 2x, and worker calls rarely sit 5 min apart), "1h", or
+    "off" (no setting: the agent's own default). Unset, "" or an unknown value is the default."""
+    v = str((budget or {}).get("worker_cache_ttl") or "").strip().lower()
+    return v if v in WORKER_TTLS else WORKER_DEFAULT
+
+
+def worker_problems(budget: dict) -> list[str]:
+    v = (budget or {}).get("worker_cache_ttl")
+    if v is None or str(v).strip().lower() in WORKER_TTLS + ("",):
+        return []
+    return [f"budget.worker_cache_ttl: {v!r} is not one of {', '.join(WORKER_TTLS)}; {WORKER_DEFAULT} is used"]
+
+
 def setting(c: dict) -> str:
     """coordinator.cache_ttl as set, lower-cased; unset, null or "" (left by an older template) is "auto"."""
     return str(c.get("cache_ttl") or "").strip().lower() or AUTO

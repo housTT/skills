@@ -1825,7 +1825,8 @@ class Daemon:
         """`context` (with `system`): stable text that follows the system prompt, sent as a block of
         its own with a cache breakpoint after it where the provider can mark one (else it ends the
         system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime; `auto`
-        picks it per coordinator turn (cachettl.py)."""
+        picks it per coordinator turn (cachettl.py). Unset, every run but the coordinator's takes
+        budget.worker_cache_ttl ("off": none set)."""
         if system is not None and append_system is not None:   # both would be run_dir/system.md
             raise ValueError("start_run takes `system` or `append_system`, not both")
         if self.cfg_status == "unavailable":
@@ -1866,6 +1867,8 @@ class Daemon:
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=[str(token_path(self.p).resolve())])
         cache_fp = None
+        if role != "coordinator" and not cache_ttl:
+            cache_ttl = cachettl.worker_setting(self.cfg.get("budget") or {})
         if cache_ttl == cachettl.AUTO:
             if prov.cache_env("1h"):
                 cache_fp = cachettl.fingerprint(system, context, schema, model, effort,
