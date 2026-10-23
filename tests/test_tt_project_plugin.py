@@ -438,8 +438,18 @@ def test_coordinator_rewrites_a_changed_restriction_in_place():
     rule = coordinator[start:coordinator.index(" - ", start)]
     for phrase in ("in that same turn", "`quote` set to the old item", "`replaces`", "no `over`",
                    "Never leave the old item standing next to a new section",
-                   "A temporary loosening of a permanent item also `quote`s that item"):
+                   "A loosening they make temporary also `quote`s the item",
+                   # A loosening goes in as written (in any wording, as broad as the user's words, no invented
+                   # narrowing or end), only on the user's verbatim words, with a priority-1 tools task.
+                   "Any wording counts", "no exact phrase", "add no narrowing or end they did not give",
+                   "A second message on the same rule", "classify `restriction_change`",
+                   "Only the user's verbatim words loosen one", "never past what another item bans",
+                   "`task_add` priority 1 updating every project tool that enforces the old wording"):
         assert phrase in rule, phrase
+    # "Stricter reading wins" governs how tasks obey a restriction, never the reading of the user's change.
+    assert "never how you read the user's own words changing one" in coordinator
+    # An evidence-based ask to drop or loosen a restriction that blocks work and prevents no harm.
+    assert "recommending to drop or loosen it, never silent re-applying" in coordinator
     # Next to the other charter_update guidance, under User instructions.
     assert coordinator.index("# User instructions") < start < coordinator.index("# Keep moving")
     assert "merges the permanent Restrictions sections into one block" in rule

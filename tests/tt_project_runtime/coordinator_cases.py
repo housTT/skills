@@ -1711,6 +1711,70 @@ def test_a_users_change_to_a_restriction_rewrites_the_item_in_place(env):
 
 
 
+def test_a_users_loosening_of_a_restriction_names_the_tools_still_enforcing_the_old_item(env):
+    """After the user's word loosens or removes a Restrictions item, the project's own tools (bin/,
+    hooks/, schedule commands and heal checks) that still carry its terms are named in a queued
+    event, unless a task of the same batch names them; the check edits nothing."""
+    p = make(env)
+    from ttp import coordinator as coord
+    item = "Never run a chip reset that can reach a host serving live traffic."
+    base = f"# demo\n\n## Restrictions\n- {item}\n- Never merge.\n"
+    (p.root / "bin").mkdir(exist_ok=True)
+    gate = p.root / "bin" / "reset-gate.sh"
+    gate.write_text("#!/bin/sh\n# skip the reset while a neighbour is serving\nexit 0\n")
+    (p.harness / "hooks").mkdir(exist_ok=True)
+    (p.harness / "hooks" / "pre.sh").write_text("#!/bin/sh\necho unrelated\n")
+    assert coord.apply(p, [{"type": "schedule_set", "name": "gate-watch", "kind": "command", "every": "1h",
+                            "command": "bin/check-peers --serving --before-reset"}]) == []
+
+    def tools():
+        return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
+    loosen = {"type": "charter_update", "section": "Restrictions", "quote": item,
+              "text": "A chip reset may run even when it can reach a host serving live traffic."}
+    for k, act in enumerate((loosen, {**loosen, "text": ""})):   # a loosening and a removal alike
+        p.db.x("DELETE FROM events")
+        p.charter_path.write_text(base)
+        assert coord.apply(p, [act], turn=20 + k, user_turn=True) == []
+        out = tools()
+        assert len(out) == 1 and "bin/reset-gate.sh:2" in out[0] and "schedule gate-watch" in out[0], out
+        assert "pre.sh" not in out[0] and "priority-1 task" in out[0]
+        assert gate.read_text().startswith("#!/bin/sh\n# skip the reset"), "the check never edits a tool"
+    assert "restriction_tools" in coord.UNBLOCK_KINDS
+    # A task of the same batch that names a tool covers it; the rest are still named.
+    p.db.x("DELETE FROM events")
+    p.charter_path.write_text(base)
+    assert coord.apply(p, [{"type": "task_add", "kind": "code", "priority": 1, "title": "update reset-gate.sh",
+                            "spec": "drop the serving check from bin/reset-gate.sh"}, loosen],
+                       turn=30, user_turn=True) == []
+    out = tools()
+    assert len(out) == 1 and "reset-gate.sh" not in out[0] and "schedule gate-watch" in out[0], out
+    # A narrowing (only adds a limit) and an edit outside the user's word name nothing.
+    p.db.x("DELETE FROM events")
+    p.charter_path.write_text(base)
+    assert coord.apply(p, [{**loosen, "text": item.rstrip(".") + ", and never on a weekend."}],
+                       turn=31, user_turn=True) == []
+    assert tools() == []
+    p.charter_path.write_text(base)
+    coord.apply(p, [{**loosen, "over": "the serving fleet was retired on 2026-10-01, so the rule's case is gone"}],
+                turn=32, user_turn=False)
+    assert tools() == []
+
+
+def test_the_charter_guard_tells_a_users_loosening_to_go_in_as_written(env):
+    """A user's loosening the guard refuses is sent back as a quoted resend on their word: no `over`, no
+    end they did not give; the temporary-exception route only when their words make it temporary."""
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never push to the main branch.\n- Never merge.\n")
+    mid = p.db.post("in", "workers may push hotfixes to the main branch")
+    err = coord.apply(p, [{"type": "charter_update", "section": "Policies",
+                           "text": "Workers may push to the main branch for hotfixes."}], turn=5, user_turn=True,
+                      messages=[mid])
+    assert len(err) == 1 and "`quote` \"Never push to the main branch.\"" in err[0], err
+    assert "their words in any wording are enough, no `over` and no end they did not give" in err[0], err
+    assert "only if the user's words make it a one-off or temporary exception to that item" in err[0], err
+
+
 def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_it(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -8819,8 +8883,9 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     role = coordinator_role(p)
     # A default project's role prompt stays under its size budget (it had grown to 52.7k chars).
     # 31_210: room for the relay-label and stale_duplicate rules, the machine-wide hold, schedule precheck
-    # and facts-at-send-time rules, the Course check and Progress rule, the overlaps rule and the likely-correction rule
-    assert len(role) <= 31_210, len(role)
+    # and facts-at-send-time rules, the Course check and Progress rule, the overlaps rule, the likely-correction rule,
+    # and the loosening-as-written and restriction-evidence rules
+    assert len(role) <= 32_650, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.
@@ -9249,7 +9314,10 @@ def test_relay_rejection_hands_back_the_users_own_words(env):
     problems = coord.apply(p, [{"type": "charter_update", "section": "Policies",
                                 "text": "Every nightly build must run on the spare widget farm."}],
                            user_turn=True, messages=[bare])
-    assert problems and problems[0].endswith("the charter takes only the user's own verbatim words"), problems
+    assert problems and "the charter takes only the user's own verbatim words. Drop or reword only those words" \
+        in problems[0], problems
+    # The refusal says how to fix it: the user's own words, in any wording, are enough (never a re-ask).
+    assert problems[0].endswith("resend in this turn: the user's own words, in any wording, are enough"), problems
     assert relay.words_back(None) == "" and relay.words_back({"id": 1, "text": "  "}) == ""
 
 

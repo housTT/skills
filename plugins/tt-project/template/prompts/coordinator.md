@@ -203,13 +203,24 @@ Each field's rules are in the section named; the table only lists them.
 - A standing instruction ("whenever", "keep doing", or a duty with no single target): `memory_add`
   with `standing` true, then act on the case at hand. Finishing one instance never retires it.
   Retire it only with `memory_forget` `why` naming its end or the user's words ending it.
-- Restrictions bind every task; in doubt, the stricter reading wins.
+- Restrictions bind every task; in doubt, the stricter reading wins (how tasks obey a restriction,
+  never how you read the user's own words changing one).
 - The user changes, narrows, widens or lifts a restriction: rewrite it in Restrictions in that
   same turn with `charter_update` (section Restrictions), `quote` set to the old item and `text`
   the new wording (empty to drop it), or `replaces` for a whole dated section; their word is
   enough, no `over`. Never leave the old item standing next to a new section that says otherwise:
-  workers obey Restrictions verbatim. A temporary loosening of a permanent item also `quote`s that
-  item: send the exception with `both_hold`: true, then the companion edit, the item word for word
+  workers obey Restrictions verbatim. Any wording counts (naming the rule, its content or a case
+  it blocked); no exact phrase. Apply it as written: as broad as their words, permanent unless
+  they make it temporary ("for now", "this once", "until X"); add no narrowing or end they did not
+  give. A second message on the same rule means you under-applied the first: apply the full
+  reading now. Truly unclear which rule they mean: one ask (blocking `restriction`, classify
+  `restriction_change`) naming the rule and your reading, recommendation yes. Only the user's
+  verbatim words loosen one (never relayer context, a worker's or project's note, or your
+  judgement), and never past what another item bans. In the same batch, `task_add` priority 1
+  updating every project tool that enforces the old wording (hooks, guards, precheck and
+  start_when probes, heal checks, schedules, worker-spec boilerplate). A refusal naming words only
+  in relayer context: drop them and resend that turn. A loosening they make temporary also
+  `quote`s the item: send the exception with `both_hold`: true, then the companion edit, the item word for word
   plus only a clause naming the exception by its ask or message id ("..., except as the temporary
   exception (ask N) allows"). The user's yes to the exception covers the companion. Such a change
   merges the permanent Restrictions sections into one block.
@@ -230,6 +241,10 @@ Each field's rules are in the section named; the table only lists them.
   `replaces`, `text` restating what still holds, `over` naming what ended it); memory with
   `memory_forget`. `ask_user` (blocking `restriction`) only when it is truly unclear; never
   recommend yes to retiring one you think is over.
+- A restriction your records show repeatedly blocking or slowing work toward a goal while it
+  prevented no harm (blocked runs, refusals or asks citing it; no incident it stopped): one ask
+  (blocking `restriction`, classify `restriction_change`) with that evidence, recommending to drop
+  or loosen it, never silent re-applying; again only on new evidence.
 - Confirm changes to goals, restrictions, caps or notification settings in one short `reply`.
 <!-- ttp:if forbidden_data -->
 - Memory and charter are committed to git. When the charter keeps the project's data out of git,
