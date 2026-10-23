@@ -332,9 +332,10 @@ prolonged whole-box outage.
   now. That check also times each ready task dispatch passes over while other runs keep starting:
   one `not_started` event names `overdue:#<task>` once it has been ready with a worker slot free for
   `overdue_m` (15) minutes, or `multilock:#<task>` once it has waited on a busy resource among several
-  it needs for `multilock_h` (1) hour. Its reason names each busy resource and its live holder (a
-  running task, or who holds the `ttp lock` slot, with pid and keeper jobs), or says "no holder:
-  dispatch did not start it". It clears when the task starts. Dispatch also logs once per wait when it
+  it needs for `multilock_h` (1) hour. Its reason is the hold dispatch recorded for the task (the
+  running tasks filling the resource's slots, or who holds its `ttp lock` slot with pid, named as a
+  live holder only while that pid lives), or "no holder: dispatch did not start it"; the check works
+  out no lock, pause or alias itself. It clears when the task starts. Dispatch also logs once per wait when it
   skips a ready task for a busy resource. A `change_probe` event names `change-probe:<id>`: an open
   machine change of this project whose until-probe passed `change_probe_m` (15) minutes ago while the
   task it names is still queued or waiting; it clears when the change closes or the task wakes. A

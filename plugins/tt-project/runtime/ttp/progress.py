@@ -38,10 +38,16 @@ would start it now is Daemon.check_stall's (its _start_hold model), not a second
 per-task part times one ready task dispatch passes over while other runs keep starting and hands the
 keys to `raise_start_waits`, which judges them like the rest (one `not_started` event per key):
 
-- overdue: `overdue:#<task>`, ready with a worker slot free for `overdue_m` (15) minutes, naming each
-  busy resource it needs and its live holder, else "no holder: dispatch did not start it";
-- multilock: `multilock:#<task>`, waiting on a busy resource among several it needs for
-  `multilock_h` (1) hours, naming every busy one and its holder.
+- overdue: `overdue:#<task>`, ready with a worker slot free for `overdue_m` (15) minutes, naming the
+  hold dispatch recorded (a busy slot's running tasks, or a taken lock's holder with its pid and
+  whether it lives), else "no holder: dispatch did not start it";
+- multilock: `multilock:#<task>`, held by a resource among several it needs for `multilock_h` (1)
+  hours, naming the hold dispatch recorded.
+
+The reason is only read from the hold dispatch recorded (Daemon._resource_hold: kind pause, busy or
+lock, the resource, the holders): this module works out no lock, pause or alias of its own, and a
+task dispatch recorded as paused (directly or through a device.locks alias) is never timed. Out of
+scope here: anything that would need this module to check resource state itself.
 
 Either clears at once when the task starts or leaves the queue.
 
@@ -672,6 +678,8 @@ def raise_start_waits(db: DB, cfg: dict | None, conds: list[dict], now: float | 
     the events raised."""
     now = time.time() if now is None else now
     s, st = check_settings(cfg), load(db)
+    conds = [dict(c, reason=hold_reason(c.get("hold"))) for c in conds
+             if (c.get("hold") or {}).get("kind") != "pause"]   # a paused task is never timed
     gone = set()
     for key, r in st["raised"].items():
         if r.get("kind") in START_KINDS:
@@ -682,6 +690,30 @@ def raise_start_waits(db: DB, cfg: dict | None, conds: list[dict], now: float | 
     with db.tx():
         _save(db, st)
         return _emit(db, due, now, where, True)
+
+
+def hold_reason(hold: dict | None) -> str:
+    """The reason text of the hold dispatch recorded for a ready task it did not start (Daemon._resource_hold's
+    data; None: nothing held it). It only formats that record: which pause, slot or lock holds a task
+    is dispatch's to decide, never worked out again here. A lock names a holder only while its recorded
+    pid lives (or cannot be judged here); one whose every holder is gone has no live holder."""
+    if not hold:
+        return "no holder: dispatch did not start it"
+    res, kind = hold.get("resource") or "?", hold.get("kind")
+    if kind == "pause":
+        return f"{res} paused"
+    if kind == "busy":
+        return f"{res} held by running task(s) " + (", ".join(f"#{t}" for t in hold.get("tasks") or []) or "?")
+    hs = [h for h in hold.get("holders") or [] if isinstance(h, dict)]
+
+    def _who(h: dict, state: str) -> str:
+        return f"{h.get('holder') or 'an unnamed holder'} (pid {h.get('pid') or '?'} {state})"
+    live = [h for h in hs if h.get("alive") is not False]
+    if live:
+        return f"{res} lock held by " + "; ".join(_who(h, "alive" if h.get("alive") else "unknown") for h in live)
+    if hs:
+        return f"{res} lock taken, no live holder: " + "; ".join(_who(h, "gone") for h in hs)
+    return f"{res} lock taken, holder unknown"
 
 
 def change_probes(db: DB, s: dict, st: dict, changes: list[dict], now: float) -> tuple[list[dict], set[str]]:

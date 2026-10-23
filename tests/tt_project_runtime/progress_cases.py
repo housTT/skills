@@ -639,7 +639,6 @@ def test_overdue_counts_only_while_a_worker_slot_is_free(env, monkeypatch):
 
 
 def test_overdue_names_each_busy_resource_and_its_live_holder(env, monkeypatch):
-    from ttp import locks
     p, d, now, check = _start_setup(env, monkeypatch)
     holder = _ready_task(p, "Holder", ["exclusive:rig"])
     p.db.update_task(holder, status="running")
@@ -649,26 +648,118 @@ def test_overdue_names_each_busy_resource_and_its_live_holder(env, monkeypatch):
     ev = _start_events(p)
     assert len(ev) == 1 and f"overdue:#{tid}" in ev[0]["text"], ev
     assert f"rig held by running task(s) #{holder}" in ev[0]["text"], ev[0]["text"]
-    # A `ttp lock` slot held right now: its holder label, pid and liveness.
-    p.db.update_task(holder, status="done")
-    p.db.update_task(tid, status="cancelled")
-    other = _ready_task(p, "Needs the bench", ["exclusive:bench"])
-    held = locks.try_take(d._slot_paths("bench"), "task #99 (run 7)", "exclusive")
+
+
+def _held_slot(d, res, pid=None):
+    """A `ttp lock` slot of `res` taken right now, its label naming `pid` (default: this process)."""
+    from ttp import locks
+    f = locks.try_take(d._slot_paths(res), "task #99 (run 7)", "exclusive")
+    if pid is not None:
+        lbl = json.loads(pathlib.Path(f.name).read_text())
+        f.seek(0)
+        f.truncate()
+        f.write(json.dumps({**lbl, "pid": pid}))
+        f.flush()
+    return f
+
+
+def _dead_pid():
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
+def test_overdue_names_a_live_lock_holder_and_its_pid_from_the_recorded_hold(env, monkeypatch):
+    p, d, now, check = _start_setup(env, monkeypatch)
+    tid = _ready_task(p, "Needs the bench", ["exclusive:bench"])
+    held = _held_slot(d, "bench")
     try:
-        waits = d._resource_waits(p.db.task(other))
-        line = waits[0]
-        assert len(waits) == 1, waits
-        assert line.startswith("bench held by task #99 (run 7) since") and f"pid {os.getpid()} alive" in line, line
-        for m in range(16, 32):
+        for m in range(16):
             check(now + m * 60)
         ev = _start_events(p)
-        assert len(ev) == 2 and f"overdue:#{other}" in ev[1]["text"] and "bench held by task #99" in ev[1]["text"], ev
+        assert len(ev) == 1 and f"overdue:#{tid}" in ev[0]["text"], ev
+        assert f"bench lock held by task #99 (run 7) (pid {os.getpid()} alive)" in ev[0]["text"], ev[0]["text"]
+        ctx = {"now": now, "paused": {}, "busy": {}, "committed": None, "logged_out": {}}
+        assert d._start_hold(p.db.task(tid), "claude", ctx) == "resource"
+        rec = ctx["holds"][tid]
+        assert rec["kind"] == "lock" and rec["resource"] == "bench", rec
+        assert [(h["pid"], h["alive"]) for h in rec["holders"]] == [(os.getpid(), True)], rec
     finally:
         held.close()
-    assert d._resource_waits(p.db.task(other)) == []
 
 
-def test_multilock_names_every_busy_resource_and_fires_after_an_hour(env, monkeypatch):
+def test_overdue_never_names_a_dead_lock_holder_as_live(env, monkeypatch):
+    p, d, now, check = _start_setup(env, monkeypatch)
+    tid = _ready_task(p, "Needs the bench", ["exclusive:bench"])
+    dead = _dead_pid()
+    held = _held_slot(d, "bench", pid=dead)
+    try:
+        for m in range(16):
+            check(now + m * 60)
+        ev = _start_events(p)
+        assert len(ev) == 1 and f"overdue:#{tid}" in ev[0]["text"], ev
+        text = ev[0]["text"]
+        assert "held by" not in text and f"bench lock taken, no live holder: task #99 (run 7) (pid {dead} gone)" \
+            in text, text
+    finally:
+        held.close()
+
+
+def test_a_task_paused_through_a_device_lock_alias_is_never_a_lock_wait(env, monkeypatch):
+    """Dispatch holds a task whose device name is paused under another device.locks name; it records a
+    pause, so the stall check never times it nor names a holder (review #3580)."""
+    p, d, now, check = _start_setup(env, monkeypatch)
+    d.cfg["device"] = {**(d.cfg.get("device") or {}), "locks": ["rig-device", "rig"]}
+    tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])
+    p.db.set_kv("paused_resources", {"rig-device": {"reason": "maintenance", "since": now}})
+    held = _held_slot(d, "rig")   # even with its lock taken: the pause is what holds it
+    try:
+        ctx = {"now": now, "paused": p.db.paused_resources(), "busy": {}, "committed": None, "logged_out": {}}
+        assert d._start_hold(p.db.task(tid), "claude", ctx) == "resource"
+        assert ctx["holds"][tid] == {"kind": "pause", "resource": "rig"}
+        for m in range(0, 120, 5):
+            check(now + m * 60)
+        assert _start_events(p) == []
+    finally:
+        held.close()
+
+
+def test_a_task_paused_directly_records_a_pause_and_is_never_a_lock_wait(env, monkeypatch):
+    p, d, now, check = _start_setup(env, monkeypatch)
+    tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])
+    p.db.set_kv("paused_resources", {"rig": {"reason": "maintenance", "since": now}})
+    held = _held_slot(d, "rig")
+    try:
+        ctx = {"now": now, "paused": p.db.paused_resources(), "busy": {}, "committed": None, "logged_out": {}}
+        assert d._start_hold(p.db.task(tid), "claude", ctx) == "paused"
+        assert ctx["holds"][tid] == {"kind": "pause", "resource": "rig"}
+        for m in range(0, 120, 5):
+            check(now + m * 60)
+        assert _start_events(p) == []
+    finally:
+        held.close()
+
+
+def test_raise_start_waits_reads_only_the_recorded_hold(env):
+    """progress.py names what dispatch recorded and never times a recorded pause; it works out no lock,
+    pause or alias of its own."""
+    from ttp import progress
+    p = make(env)
+    now = time.time()
+    tid = _ready_task(p)
+    base = {"kind": "overdue", "key": f"#{tid}", "task": tid, "what": "x", "since": now - 3600, "n": 3600}
+    assert progress.raise_start_waits(p.db, {}, [{**base, "hold": {"kind": "pause", "resource": "rig"}}], now) == []
+    got = progress.raise_start_waits(p.db, {}, [{**base, "hold": {"kind": "lock", "resource": "rig", "holders": [
+        {"holder": "task #4 (run 2)", "pid": 123, "alive": True}]}}], now)
+    assert len(got) == 1 and "rig lock held by task #4 (run 2) (pid 123 alive)" in got[0]["text"], got
+    import inspect
+    src = inspect.getsource(progress.raise_start_waits) + inspect.getsource(progress.hold_reason)
+    for name in ("canonical(", "device_locks(", "paused_resources(", "any_free(", "holders_now(",
+                 "holder_records(", "slot_paths(", "held_labels(", "pid_alive("):
+        assert name not in src, name
+
+
+def test_multilock_names_the_recorded_hold_and_fires_after_an_hour(env, monkeypatch):
     p, d, now, check = _start_setup(env, monkeypatch)
     a = _ready_task(p, "Holds both", ["exclusive:rig", "resource:bench"])
     b = _ready_task(p, "Uses the bench", ["resource:bench"])
@@ -681,8 +772,7 @@ def test_multilock_names_every_busy_resource_and_fires_after_an_hour(env, monkey
     check(now + 60 * 60)
     ev = _start_events(p)
     assert len(ev) == 1 and f"multilock:#{tid}" in ev[0]["text"], ev
-    assert f"bench held by running task(s) #{a}, #{b}" in ev[0]["text"] and f"rig held by running task(s) #{a}" \
-        in ev[0]["text"], ev[0]["text"]
+    assert f"bench held by running task(s) #{a}, #{b}" in ev[0]["text"], ev[0]["text"]
     check(now + 61 * 60)
     assert len(_start_events(p)) == 1
 
@@ -725,17 +815,19 @@ def test_dispatch_logs_a_resource_wait_once(env, monkeypatch):
     p.db.update_task(holder, status="running")
     tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])
     log = lambda: (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    rec = d._resource_hold(p.db.task(tid))
+    assert rec == {"kind": "busy", "resource": "rig", "tasks": [holder]}, rec
     for _ in range(3):
-        d._log_resource_wait(p.db.task(tid))
+        d._log_resource_wait(p.db.task(tid), rec)
     line = f"task {tid}: ready, not started: rig held by running task(s) #{holder}"
     assert log().count(line) == 1, log()
     check(now)                                    # still held: remembered
-    d._log_resource_wait(p.db.task(tid))
+    d._log_resource_wait(p.db.task(tid), rec)
     assert log().count(line) == 1
     p.db.update_task(holder, status="done")
     check(now + 60)                               # free: forgotten, a new wait logs again
     p.db.update_task(holder, status="running")
-    d._log_resource_wait(p.db.task(tid))
+    d._log_resource_wait(p.db.task(tid), rec)
     assert log().count(line) == 2
 
 

@@ -5067,7 +5067,8 @@ class Daemon:
         Per task (_unstarted), while other runs keep starting: a ready task that dispatch would start
         now, or would but for a busy resource, for coordinator.progress_check.overdue_m minutes raises
         `overdue:#<task>`, one waiting on a busy resource among several it needs `multilock:#<task>`
-        after multilock_h hours, naming each busy resource and its live holder."""
+        after multilock_h hours, naming the hold dispatch recorded (_resource_hold). A paused task is
+        never timed."""
         now = time.time()
         last_check = getattr(self, "_stall_checked", 0.0)
         if now - last_check < every_s:
@@ -5090,7 +5091,7 @@ class Daemon:
                "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in ready}}}
         holds = {t["id"]: self._start_hold(t, t["provider"] or core, ctx) for t in ready}
         self._res_wait_logged = getattr(self, "_res_wait_logged", set()) & {i for i, h in holds.items() if h == "resource"}
-        self._unstarted(ready, holds, now, ps)
+        self._unstarted(ready, holds, ctx.get("holds", {}), now, ps)
         if hours <= 0:
             self._stall_ready = {}
             return
@@ -5118,66 +5119,48 @@ class Daemon:
                  (now, "daemon", "observation", f"stall:{last_id}", "high", text[:4000], "queued"))
         log(self.p, f"stall: {len(stuck)} task(s) ready for {hours:g} h or more, no worker run since {when}")
 
-    def _unstarted(self, ready: list[dict], holds: dict[int, str | None], now: float, ps: dict) -> None:
+    def _unstarted(self, ready: list[dict], holds: dict[int, str | None], why: dict[int, dict],
+                   now: float, ps: dict) -> None:
         """check_stall's per-task part: each ready task dispatch would start now (`holds` None: a worker
-        slot is free and nothing holds it), or would but for a busy resource ('resource'), at every check
-        since `since`. Past overdue_m minutes it is `overdue:#<task>`; one waiting on a busy resource among
-        several it needs is `multilock:#<task>` past multilock_h hours. The reason names each busy resource
-        and its live holder (_resource_waits), else 'no holder: dispatch did not start it'. Raised through
-        progress.raise_start_waits: one wake per key, again on escalation; it clears once the task starts."""
+        slot is free and nothing holds it), or would but for a busy slot or a taken lock ('resource' with
+        a busy or lock record in `why`, _start_hold's ctx["holds"]), at every check since `since`. Past
+        overdue_m minutes it is `overdue:#<task>`; one held by a resource among several it needs is
+        `multilock:#<task>` past multilock_h hours. Each condition carries dispatch's recorded hold
+        (`hold`), which progress.hold_reason names. A task held by any pause (direct or a device.locks
+        alias) is never timed: dispatch recorded it as a pause. Raised through progress.raise_start_waits:
+        one wake per key, again on escalation; it clears once the task starts."""
+        timed = {tid for tid, h in holds.items()
+                 if h is None or (h == "resource" and (why.get(tid) or {}).get("kind") in ("busy", "lock"))}
         prev = getattr(self, "_start_waits", {})
-        self._start_waits = {tid: prev.get(tid, now) for tid, h in holds.items() if h in (None, "resource")}
+        self._start_waits = {tid: prev.get(tid, now) for tid in timed}
         conds = []
         for t in ready:
             since = self._start_waits.get(t["id"])
             if since is None:
                 continue
-            waits = self._resource_waits(t) if holds[t["id"]] == "resource" else []
-            multi = bool(waits) and len(coord.task_resources(t)) > 1
+            held = why.get(t["id"]) if holds[t["id"]] == "resource" else None
+            multi = bool(held) and len(coord.task_resources(t)) > 1
             limit = ps["multilock_h"] * 3600 if multi else ps["overdue_m"] * 60
             if not limit or now - since < limit:
                 continue
             conds.append({"kind": "multilock" if multi else "overdue", "key": f"#{t['id']}", "task": t["id"],
                           "what": f"task #{t['id']} {coord.clip(t['title'], 60)} ready, not started",
-                          "since": since, "n": now - since,
-                          "reason": "; ".join(waits) or "no holder: dispatch did not start it"})
+                          "since": since, "n": now - since, "hold": held})
         try:
             for e in progress.raise_start_waits(self.p.db, self.cfg, conds, now, where=self.p):
                 log(self.p, f"stall check: {e['kind']} for {', '.join(e['keys'])}")
         except Exception:
             log(self.p, "stall check: not-started keys not raised\n" + traceback.format_exc())
 
-    def _resource_waits(self, task: dict) -> list[str]:
-        """Each resource that keeps ready `task` from starting now (_resources_free's checks), as
-        '<resource> held by <holders>': the running tasks that fill its slots, else who holds its lock
-        files right now (locks.holders_now: label with project, task and run, pid and whether it lives,
-        a keeper's jobs). Empty when none is busy."""
-        running = self.p.db.q("SELECT id, labels FROM tasks WHERE status='running'")
-        out = []
-        for res, excl in [(r, False) for r in _shared(task)] + [(r, True) for r in _exclusive(task)]:
-            lock = locks.canonical(self.cfg, res)
-            slots = shared.slots(self.p, lock, self.cfg)
-            users = [t for t in running if lock in {locks.canonical(self.cfg, r) for r in
-                                                    _exclusive(t) + ([] if excl else _shared(t))}]
-            if len(users) >= (slots if excl else 2 * slots):
-                out.append(f"{res} held by running task(s) {', '.join('#' + str(t['id']) for t in users)}")
-                continue
-            paths = self._slot_paths(res) if excl else []
-            if paths and not locks.any_free(paths):
-                mine = shared.holder(self.p, res, hold.who(task["id"]), self.cfg)
-                if not any(hold.own_keeper(lb, mine) for lb in locks.held_labels(paths)):
-                    out.append(f"{res} held by {'; '.join(locks.holders_now(paths, self.p)) or 'an unnamed holder'}")
-        return out
-
-    def _log_resource_wait(self, task: dict) -> None:
-        """Log once per wait that dispatch skips ready `task` because a resource it needs is busy, naming
-        each and its holder (check_stall forgets the task once nothing holds it)."""
+    def _log_resource_wait(self, task: dict, held: dict | None) -> None:
+        """Log once per wait that dispatch skips ready `task` because a resource it needs is held, with
+        the hold it recorded (`held`, _resource_hold's; check_stall forgets the task once nothing holds it)."""
         logged = self.__dict__.setdefault("_res_wait_logged", set())
         if task["id"] in logged:
             return
         logged.add(task["id"])
-        waits = "; ".join(self._resource_waits(task)) or "a resource it needs is busy"
-        log(self.p, f"task {task['id']}: ready, not started: {waits}")
+        log(self.p, f"task {task['id']}: ready, not started: "
+                    f"{progress.hold_reason(held) if held else 'a resource it needs is busy'}")
 
     def check_idle_capacity(self, every_s: float = 60) -> None:
         """Model-free idle-capacity wake (idlecap.py): a device resource of the project idle for
@@ -5865,7 +5848,7 @@ class Daemon:
             if why in (None, "resource"):
                 reached.add(task["id"])
             if why == "resource":
-                self._log_resource_wait(task)
+                self._log_resource_wait(task, ctx.get("holds", {}).get(task["id"]))
             if why:
                 continue
             skipped, gated = self._wake_gate(task)
@@ -5946,15 +5929,19 @@ class Daemon:
         guard, a review's prechecks), 'paused' (a paused resource), 'logged_out', 'net' (its API host
         does not resolve), 'gate' (the budget gate or its provider's slots), 'optional', 'device'
         (device task slots), 'budget' (task budget spent), 'caps' (dollar caps) or 'resource' (busy,
-        including `ttp lock` and device-lock aliases). The one copy of dispatch's checks, in its order,
+        including `ttp lock` and device-lock aliases). With 'paused' or 'resource' it records what holds
+        the task in ctx["holds"][task id] (_resource_hold's data): the one record check_stall reads. The one copy of dispatch's checks, in its order,
         so check_stall counts exactly what dispatch would start. Nothing changes but with `reserve`
-        (_resources_free) and ctx's caches: ctx holds now, paused, logged_out (provider -> bool), busy
+        (_resource_hold) and ctx's caches: ctx holds now, paused, logged_out (provider -> bool), busy
         (provider -> running), committed (dollars running work may still spend under the caps; None:
         not read yet); it sets gate (the task's budget gate, once that check is reached)."""
         now = ctx["now"]
+        ctx.setdefault("holds", {}).pop(task["id"], None)
         if self._disk_holds(task) or self._precheck_holds(task, now):
             return "held"
         if coord.task_resources(task) & ctx["paused"].keys():
+            ctx["holds"][task["id"]] = {"kind": "pause", "resource": sorted(coord.task_resources(task)
+                                                                            & ctx["paused"].keys())[0]}
             return "paused"
         if ctx["logged_out"].get(provider) and not self._may_probe(provider, now):
             return "logged_out"
@@ -5980,7 +5967,9 @@ class Daemon:
                 return "caps"
         # Checked last: a task that waits for its resource reserves it, and only a task that
         # would otherwise start now may hold others off the resource.
-        if not self._resources_free(task, reserve=reserve):
+        why = self._resource_hold(task, reserve=reserve)
+        if why:
+            ctx["holds"][task["id"]] = why   # the recorded hold reason (kind, resource, holders)
             return "resource"
         return None
 
@@ -8805,6 +8794,10 @@ class Daemon:
             self.alert("run-start", f"Runs cannot start ({why}). Tasks stay queued and retry every minute.", "high")
 
     def _resources_free(self, task: dict, reserve: bool = False) -> bool:
+        """Whether every resource ready `task` needs is free now (_resource_hold)."""
+        return self._resource_hold(task, reserve) is None
+
+    def _resource_hold(self, task: dict, reserve: bool = False) -> dict | None:
         """Only tasks labelled `exclusive:<name>` hold a resource for their whole run; they share
         its slot count (config `resources`, default 1; on a shared resource the smallest any project
         sharing it gives). A `resource:<name>` label means the task uses
@@ -8815,31 +8808,40 @@ class Daemon:
         `device.locks` are one resource with one slot.
 
         At most twice its slots run at once among the tasks that use a resource either way: more
-        would only queue in `ttp lock` on a worker slot and a wall clock that other work could use."""
+        would only queue in `ttp lock` on a worker slot and a wall clock that other work could use.
+
+        None when all are free, else the first hold found, as data (dispatch's recorded hold reason,
+        which the stall check reads instead of working it out again): {"kind": "pause", "resource"}
+        (paused, directly or through a device.locks alias), {"kind": "busy", "resource", "tasks"} (the
+        running tasks that fill its slots) or {"kind": "lock", "resource", "holders"} (its `ttp lock`
+        slots are taken: each holder's label, pid and alive, from locks.holder_records)."""
         paused = self.p.db.paused_resources().keys()
-        if coord.task_resources(task) & paused:
-            return False
-        if locks.device_locks(self.cfg) and ({locks.canonical(self.cfg, r) for r in coord.task_resources(task)}
-                                             & {locks.canonical(self.cfg, r) for r in paused}):
-            return False   # a pause of one device name holds the tasks that name another
-        running = self.p.db.q("SELECT labels FROM tasks WHERE status='running'")
+        hit = sorted(coord.task_resources(task) & paused)
+        if hit:
+            return {"kind": "pause", "resource": hit[0]}
+        if locks.device_locks(self.cfg):
+            names = {locks.canonical(self.cfg, r) for r in paused}
+            hit = sorted(r for r in coord.task_resources(task) if locks.canonical(self.cfg, r) in names)
+            if hit:   # a pause of one device name holds the tasks that name another
+                return {"kind": "pause", "resource": hit[0]}
+        running = self.p.db.q("SELECT id, labels FROM tasks WHERE status='running'")
 
         def _locks_of(names: list[str]) -> set[str]:
             return {locks.canonical(self.cfg, r) for r in names}
 
         for res in _shared(task):
             lock = locks.canonical(self.cfg, res)
-            users = sum(1 for t in running if lock in _locks_of(_shared(t) + _exclusive(t)))
-            if users >= 2 * shared.slots(self.p, lock, self.cfg):
-                return False
+            users = [t["id"] for t in running if lock in _locks_of(_shared(t) + _exclusive(t))]
+            if len(users) >= 2 * shared.slots(self.p, lock, self.cfg):
+                return {"kind": "busy", "resource": res, "tasks": users}
         for res in _exclusive(task):
             lock = locks.canonical(self.cfg, res)
             limit = shared.slots(self.p, lock, self.cfg)
             # Running exclusive tasks count even before their supervisor has taken its slot; the
             # lock files show the slots `ttp lock` commands hold.
-            busy = sum(1 for t in running if lock in _locks_of(_exclusive(t)))
-            if busy >= limit:
-                return False
+            busy = [t["id"] for t in running if lock in _locks_of(_exclusive(t))]
+            if len(busy) >= limit:
+                return {"kind": "busy", "resource": res, "tasks": busy}
             paths = self._slot_paths(res)
             if not locks.any_free(paths):
                 mine = shared.holder(self.p, res, hold.who(task['id']), self.cfg)
@@ -8847,8 +8849,13 @@ class Daemon:
                     continue   # kept for this task's own detached jobs: its run takes the slot over
                 if reserve:
                     locks.reserve(self._reserve_path(res), mine)
-                return False
-        return True
+                try:
+                    holders = [{"holder": h.get("holder"), "pid": h.get("pid"), "alive": h.get("alive")}
+                               for h in locks.holder_records(paths)]
+                except Exception:   # naming the holder never changes the hold
+                    holders = []
+                return {"kind": "lock", "resource": res, "holders": holders}
+        return None
 
     def _device_max_tasks(self) -> int:
         try:
