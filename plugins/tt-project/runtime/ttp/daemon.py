@@ -6810,6 +6810,9 @@ class Daemon:
             upd["result"] = dump_result({**prev, refwaits.FACTS_KEY: facts})
         what = str((prev.get("waiting_for") if prev.get("status") == "waiting" else None)
                    or d.get("why") or prev.get("summary") or "its start condition")[:300]
+        if prev.get("status") == "waiting" and locks.probe_resources(str(prev.get("retry_when") or "")):
+            self._probe_out.pop(tid, None)   # it names holders from before the evidence; its probe reruns now
+            what = self._wait_what(tid, prev)
         if not str(t["blocked_reason"] or "").startswith(refwaits.HELD_NOTES):
             upd["blocked_reason"] = f"waiting for {what}; {'; '.join(facts)}; {then}"[:500]
         with db.tx():
@@ -7642,7 +7645,7 @@ class Daemon:
                 self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
                                         (self._probe_out.get(tid) or ("",))[0], stale=True)
             nb = now + _retry_s(prev) if held else min(now + _retry_s(prev), since + max_hold)
-            what = refwaits.with_facts(str(prev.get("waiting_for") or prev.get("summary") or "")[:300], prev)
+            what = self._wait_what(tid, prev)
             says = "host unreachable" if rc == 255 else "not yet"
             db = self.p.db
             db.update_task(tid, not_before=nb, blocked_reason=(
@@ -7734,13 +7737,25 @@ class Daemon:
             db.update_task(tid, result=dump_result(prev))
         log(self.p, f"task {tid} job use recovered before its pulled-in check: that check follows its probe")
 
+    def _wait_what(self, tid: int, prev: dict) -> str:
+        """What a waiting task waits for, as its note says it. A wait only on `ttp lock --probe` names who
+        holds each lock as its probe last ran (live holders, with pid and liveness), never the holders its
+        hand-off named, which may have finished since; any other wait, its hand-off's words and the facts
+        found about the tasks and asks they name (refwaits)."""
+        probe = str(prev.get("retry_when") or "")
+        if res := locks.probe_resources(probe):
+            got = self._probe_out.get(tid)
+            lines = locks.probe_lines(got[0], res) if got and got[2] == probe else []
+            return "; ".join(lines)[:300] or f"{', '.join(res)} (its probe checks who holds the lock now)"
+        return refwaits.with_facts(str(prev.get("waiting_for") or prev.get("summary") or "")[:300], prev)
+
     def _stale_wait_event(self, task: dict, prev: dict, since: float, max_hold: float) -> None:
         """Once per wait: its probe has said "not yet" for `max_hold_s`. The task keeps sleeping."""
         db = self.p.db
         fp = f"wait_stale:{task['id']}:{since:.0f}"
         if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
             return
-        what = refwaits.with_facts(str(prev.get("waiting_for") or prev.get("summary") or "")[:300], prev)
+        what = self._wait_what(task["id"], prev)
         probe = str(prev.get("retry_when") or "")
         got = self._probe_out.get(task["id"])
         last = got[0] if got and got[2] == probe else ""

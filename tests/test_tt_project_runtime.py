@@ -32991,6 +32991,59 @@ def test_lock_wait_messages_name_only_live_holders_with_their_pid(env, tmp_path,
     assert locks.holders_now([slot]) == [] and locks.holders([slot]), "released: no live holder, label kept"
 
 
+def _held_build_lock(p, res, holder):
+    """`res` (a placeholder build-folder lock of project p) held now by `holder`, from this process."""
+    from ttp import locks, shared
+    cfg = p.config()
+    paths = locks.slot_paths(shared.locks_dir(p, res, cfg), res, shared.slots(p, res, cfg))
+    return locks.try_take(paths, holder, "build")
+
+
+def test_lock_probe_names_the_live_holder_with_its_pid_and_liveness(env):
+    p = make(env)
+    held = _held_build_lock(p, "build-a", "task #250 (run 725)")
+    try:
+        r = _ttp_run(p, "lock", "--probe", "build-a")
+    finally:
+        held.close()
+    assert r.returncode == 75, r.stdout + r.stderr
+    assert "busy (held by task #250 (run 725) since" in r.stdout and f"pid {os.getpid()} alive" in r.stdout, r.stdout
+    r = _ttp_run(p, "lock", "--probe", "build-a")
+    assert r.returncode == 0 and "#250" not in r.stdout, r.stdout
+
+
+def test_lock_probe_wait_note_names_live_holders_not_the_ones_its_hand_off_saw(env):
+    """A task waiting on `ttp lock --probe` locks: its note names who holds each lock as its probe last
+    ran, with pid and liveness, never the holders its hand-off named once those are done."""
+    from ttp import daemon as dmod, locks
+    p = make(env)
+    old_a, old_b = (p.db.add_task(f"old holder {x}", "s", kind="work", origin="user") for x in "ab")
+    probe = "ttp lock --probe build-a && ttp lock --probe build-b"
+    tid = _due_waiting_task(p, probe, waiting_for=f"build-a held by #{old_a}, build-b held by #{old_b}")
+    assert locks.probe_resources(probe) == ["build-a", "build-b"]
+    assert locks.probe_resources("ttp lock --probe build-a && ttp ci --run 5") == []
+    for t in (old_a, old_b):
+        p.db.update_task(t, status="done")
+    held = [_held_build_lock(p, "build-a", "task #900 (run 9)"), _held_build_lock(p, "build-b", "task #901 (run 10)")]
+    try:
+        d = dmod.Daemon(p.base)
+        d.refresh_ref_waits()   # the old holders are done: the note says so, and never names them as holders
+        note = p.db.task(tid)["blocked_reason"]
+        assert f"held by #{old_a}" not in note and f"held by #{old_b}" not in note, note
+        d.probe_waiting()
+        d._probes[tid][0].wait(_load_scaled(60))
+        d.probe_waiting()
+        p.db.update_task(tid, not_before=time.time() - 1)
+        d.probe_waiting()       # a fresh "not yet": the note is rebuilt from what the probe saw
+        note = p.db.task(tid)["blocked_reason"]
+    finally:
+        for h in held:
+            h.close()
+    assert "probe says not yet" in note, note
+    assert f"#{old_a}" not in note and f"#{old_b}" not in note, note
+    assert "build-a: busy (held by task #900 (run 9) since" in note and f"pid {os.getpid()} alive" in note, note
+
+
 def test_lock_probe_busy_while_reserved_under_any_device_name(env):
     p = _device_project(env)
     from ttp import locks as lk

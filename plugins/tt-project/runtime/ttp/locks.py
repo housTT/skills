@@ -31,6 +31,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -248,6 +249,29 @@ def holders_now(paths: list[Path], where=None) -> list[str]:
     out = holders([x for x in paths if _slot_labels([x])], where, pids=True)
     return out + [f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}{_pid_note(h)}"
                   for h in (shared_holders(paths) if paths else [])]
+
+
+def probe_resources(cmd: str) -> list[str]:
+    """The resources a wait probe checks when it is only `ttp lock --probe <resource>` commands (joined
+    by &&, || or ;), else []."""
+    out = []
+    for part in re.split(r"&&|\|\||;", str(cmd or "")):
+        try:
+            w = shlex.split(part)
+        except ValueError:
+            return []
+        names = [x for x in w[2:] if not x.startswith("-")]
+        if w[:2] != ["ttp", "lock"] or "--probe" not in w or "--timeout" in w or len(names) != 1:
+            return []
+        out.append(names[0])
+    return out
+
+
+def probe_lines(text: str, resources: list[str]) -> list[str]:
+    """The answer lines of `ttp lock --probe` for `resources` in a probe's output ("dev: busy (held by
+    ...)"): who holds each lock as the probe ran, with pid and whether it lives (holders_now)."""
+    return [ln.strip() for ln in str(text or "").splitlines()
+            if any(ln.strip().startswith(f"{r}: ") for r in resources)]
 
 
 def _slot_labels(paths: list[Path]) -> list[str]:
