@@ -1,6 +1,7 @@
 # Driver progress report tests of tests/test_tt_project_runtime.py, which runs this file in its own
 # namespace (see _include_cases there): helpers, fixtures and imports come from that file, and pytest
-# collects these tests under its name. Add new `ttp progress report` tests here, not there.
+# collects these tests under its name. Add new `ttp progress report` and progress and stall check
+# (progress.check) tests here, not there.
 from __future__ import annotations
 
 
@@ -140,3 +141,290 @@ def test_the_daemon_raises_one_keyed_observation_per_stalled_streak(env):
     d.watch_progress(every_s=0)
     ev = raised()
     assert len(ev) == 2 and "5 failures in a row" in ev[1]["text"], ev
+
+
+# ---- the progress and stall check (progress.check, Daemon.check_progress) ----
+
+def _prog_events(p, kind=None):
+    rows = p.db.q("SELECT * FROM events WHERE source='daemon:progress' ORDER BY id")
+    return [r for r in rows if kind is None or r["kind"] == kind]
+
+
+def _prog_waiting(p, title, probe, labels=()):
+    tid = p.db.add_task(title, "spec", labels=list(labels))
+    p.db.update_task(tid, status="waiting", result=json.dumps({"status": "waiting", "retry_when": probe}))
+    return tid
+
+
+def _prog_clear(p, cfg, now, current_probe=None):
+    """Three healthy checks spanning half an hour: the default hysteresis lets a key clear."""
+    from ttp import progress
+    for dt in (0, 60, 1900):
+        assert progress.check(p.db, cfg, p.state, now + dt, current_probe=current_probe) == []
+
+
+def test_progress_no_progress_fires_past_threshold_only_while_work_is_queued(env):
+    from ttp import progress
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("Build the thing", "spec")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 3600, tid))
+    assert progress.check(p.db, p.config(), p.state, now) == []          # 1 h: under the 2 h threshold
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 3 * 3600, tid))
+    got = progress.check(p.db, p.config(), p.state, now)
+    assert [e["kind"] for e in got] == ["no_progress"]
+    assert set(got[0]["keys"]) == {f"task:#{tid}", "project"}
+    ev = _prog_events(p, "no_progress")[0]
+    assert "queued, never started" in ev["text"] and f"task #{tid}" in ev["text"] and ev["status"] == "queued"
+    assert progress.check(p.db, p.config(), p.state, now + 60) == []     # unchanged: no second wake
+    lines, ident = progress.digest_lines(p.db, now + 60)
+    assert lines[0].startswith("## Progress") and f"task:#{tid}" in ident
+    # Nothing queued or running: the clock stops, the keys clear into the history once healthy long enough.
+    p.db.update_task(tid, status="cancelled")
+    _prog_clear(p, p.config(), now + 120)
+    assert progress.digest_lines(p.db, now + 2100) == ([], "")
+    assert "2 cleared" in progress.audit_line(p.db, now - 60, now + 2100)
+    # A finished run resets the clock: a queued task with a recent result is not stuck.
+    t2 = p.db.add_task("Another", "spec")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5 * 3600, t2))
+    p.db.x("INSERT INTO runs(role,task,started,ended,status) VALUES('worker',?,?,?,'ok')", (t2, now + 1800, now + 2000))
+    assert progress.check(p.db, p.config(), p.state, now + 2200) == []
+    # Thresholds are configurable; 0 turns one off.
+    cfg = {"coordinator": {"progress_check": {"task_h": 0, "project_h": 0.01}}}
+    p.db.x("DELETE FROM runs")
+    got = progress.check(p.db, cfg, p.state, now + 2300)
+    assert got and got[0]["keys"] == ["project"]
+
+
+def test_progress_a_key_that_drops_out_for_a_check_neither_clears_nor_wakes_again(env):
+    """Review #3485 finding 1: a stuck queued task drops out whenever every worker slot is briefly
+    full. It woke the coordinator again as new each time it came back (3 wakes in 6 checks)."""
+    from ttp import progress
+    p = make(env)
+    cfg = {"budget": {"max_parallel_workers": 1}}
+    now = time.time()
+    tid = p.db.add_task("Stuck work", "spec")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 3 * 3600, tid))
+    key = f"no_progress:task:#{tid}"
+
+    def busy(on):
+        p.db.x("DELETE FROM runs")
+        if on:
+            p.db.x("INSERT INTO runs(role,started,status) VALUES('worker',?,'running')", (now - 60,))
+
+    wakes = 0
+    for i in range(6):                     # the only slot fills and frees every other check
+        busy(i % 2 == 1)
+        wakes += sum(f"task:#{tid}" in e["keys"] for e in progress.check(p.db, cfg, p.state, now + 60 * i))
+        assert key in progress.load(p.db)["raised"]
+    assert wakes == 1
+    # Healthy for 3 checks but only a few minutes: still raised, shown as not cleared yet.
+    busy(True)
+    for dt in (360, 420):
+        progress.check(p.db, cfg, p.state, now + dt)
+    assert progress.load(p.db)["raised"][key]["ok_n"] == 3
+    assert "not cleared yet" in "\n".join(progress.digest_lines(p.db, now + 420)[0])
+    # Healthy for 3 checks spanning 30 min: cleared, with the time it went healthy.
+    progress.check(p.db, cfg, p.state, now + 300 + 1800)
+    st = progress.load(p.db)
+    assert key not in st["raised"] and st["history"][-1]["key"] == key and st["history"][-1]["cleared"] == now + 300
+    # Stuck again after it cleared: a new raise, one wake.
+    busy(False)
+    got = progress.check(p.db, cfg, p.state, now + 2200)
+    assert got and f"task:#{tid}" in got[0]["keys"]
+    # clear_n and clear_min are settings: 1 check and 0 min clears at once.
+    busy(True)
+    progress.check(p.db, {**cfg, "coordinator": {"progress_check": {"clear_n": 1, "clear_min": 0}}}, p.state, now + 2260)
+    assert key not in progress.load(p.db)["raised"]
+
+
+def test_progress_probe_stall_wakes_once_escalates_and_clears(env):
+    from ttp import progress
+    p = make(env)
+    probe = "ssh box-a test -e /tmp/ready"
+    tid = _prog_waiting(p, "Run the sweep", probe)
+    now = time.time()
+    cur = lambda t: probe if t["id"] == tid else None
+    for i in range(10):
+        progress.note_probe(p.db, tid, probe, 1, "no such file /tmp/ready", now - 4000 + i * 180)
+    progress.note_probe(p.db, tid, probe, 1, "dup verdict", now - 4000 + 9 * 180)   # the same verdict: not counted
+    got = progress.check(p.db, {}, p.state, now, current_probe=cur)
+    assert [(e["kind"], e["keys"]) for e in got] == [("stall", [f"probe:#{tid}"])]
+    ev = _prog_events(p, "stall")[0]
+    assert "not yet 10 times" in ev["text"] and "no such file /tmp/ready" in ev["text"] and ev["task"] == tid
+    assert json.loads(ev["data"])[0]["n"] == 10
+    for i in range(5):                               # still failing, below double: no new wake
+        progress.note_probe(p.db, tid, probe, 1, "no such file /tmp/ready", now + 60 + i)
+    assert progress.check(p.db, {}, p.state, now + 120, current_probe=cur) == []
+    for i in range(5):                               # 20: twice the count at the last wake
+        progress.note_probe(p.db, tid, probe, 1, "no such file /tmp/ready", now + 200 + i)
+    got = progress.check(p.db, {}, p.state, now + 300, current_probe=cur)
+    assert got and "(escalated)" in got[0]["text"]
+    assert progress.check(p.db, {}, p.state, now + 13 * 3600, current_probe=cur)[0]["text"].endswith("(still)")
+    progress.forget_probe(p.db, tid)                 # the probe passed
+    _prog_clear(p, {}, now + 14 * 3600, cur)
+    assert progress.digest_lines(p.db, now + 15 * 3600) == ([], "")
+    hist = progress.load(p.db)["history"]
+    assert hist[-1]["key"] == f"stall:probe:#{tid}" and hist[-1]["wakes"] == 3
+    # A wait on the task's own job is expected to be long: never counted as a stall.
+    own = _prog_waiting(p, "Wait for checks", "ttp checks --result abc")
+    for i in range(30):
+        progress.note_probe(p.db, own, "ttp checks --result abc", 1, "running", now - 7200 + i * 180)
+    assert progress.check(p.db, {}, p.state, now + 15 * 3600, current_probe=lambda t: "ttp checks --result abc") == []
+
+
+def test_progress_flags_a_wait_on_what_it_fixes(env):
+    from ttp import progress
+    p = make(env)
+    p.db.set_kv("paused_resources", {"box-a": {"reason": "broker down", "since": time.time(), "by": "test"}})
+    probe = "ttp lock --probe box-a"
+    tid = _prog_waiting(p, "Fix the box-a broker", probe, labels=["resource:box-a"])
+    now = time.time()
+    for i in range(12):
+        progress.note_probe(p.db, tid, probe, 75, "box-a is paused", now - 5000 + i * 300)
+    got = progress.check(p.db, {}, p.state, now, current_probe=lambda t: probe)
+    assert got and "waits on what it fixes: box-a" in got[0]["text"] and "box-a is paused" in got[0]["text"]
+    assert "waits on what it fixes: box-a" in "\n".join(progress.digest_lines(p.db, now)[0])
+    # Its holder waiting on the task counts the same, whatever the task's title says.
+    p.db.update_task(tid, status="cancelled")
+    p.db.set_kv(progress.STATE_KEY, {})
+    p.db.set_kv("paused_resources", {"box-b": {"reason": "hold", "since": now, "by": "test"},
+                                     "box-c": {"reason": "hold", "since": now, "by": "test"}})
+    t = _prog_waiting(p, "Look into logs", "ttp lock --probe box-b")
+    holder = p.db.add_task("Benchmark", "spec", labels=["resource:box-b"], depends_on=[t])
+    for i in range(12):
+        progress.note_probe(p.db, t, "ttp lock --probe box-b", 75, "busy", now - 5000 + i * 300)
+    got = progress.check(p.db, {}, p.state, now, current_probe=lambda x: "ttp lock --probe box-b")
+    assert got and f"its holder #{holder} waits on this task" in got[0]["text"]
+    # A plain wait on a paused resource it does not fix is a stall, not flagged.
+    for x in (t, holder):
+        p.db.update_task(x, status="cancelled")
+    p.db.set_kv(progress.STATE_KEY, {})
+    t3 = _prog_waiting(p, "Run the model", "ttp lock --probe box-c")
+    for i in range(12):
+        progress.note_probe(p.db, t3, "ttp lock --probe box-c", 75, "busy", now - 5000 + i * 300)
+    got = progress.check(p.db, {}, p.state, now, current_probe=lambda x: "ttp lock --probe box-c")
+    assert got and "fixes" not in got[0]["text"]
+
+
+def test_progress_one_reader_and_one_streak_detector_for_driver_reports(env):
+    """Review #3485 finding 2: the check had its own report file, writer, offset reader and refusal
+    streak detector beside `ttp progress report`'s. One refusal streak woke the coordinator twice and
+    the offset reader lost lines rotated into progress.1.jsonl."""
+    from ttp import progress
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    assert progress.check(p.db, {}, p.state, now) == []                     # no report file: fine
+    # #3467's API is the only one: append(state, rec), KINDS the report kinds, settings() its own.
+    assert progress.KINDS == ("result", "refusal", "stall", "failure")
+    assert progress.settings({})["stall_after"] == 5 and "stall_after" not in progress.check_settings({})
+    assert not hasattr(progress, "read_reports") and not hasattr(progress, "report_stalls")
+    # A refusal streak: watch_progress's observation is its one wake; the check adds no stall for it.
+    _driver_reports(p, os.getpid(), ["refusal"] * 8, key="lock:box-a", t0=now - 600)
+    with open(p.state / progress.LOG, "a") as f:
+        f.write("not json\n[1,2]\n" + json.dumps({"kind": "bogus", "key": "x"}) + "\n" + '{"kind": "refusal", "key": "lock:bo\n')
+    for dt in (0, 60, 120):
+        assert progress.check(p.db, {}, p.state, now + dt) == []
+    d = Daemon(p.base)
+    d.watch_progress(every_s=0)
+    d.watch_progress(every_s=0)
+    assert [e["kind"] for e in _prog_events(p)] == ["observation"]
+    assert progress.load(p.db)["raised"] == {}
+    # Its last refusal still names why a resource that work waits on is stuck.
+    tid = p.db.add_task("Benchmark on box-a", "spec", labels=["resource:box-a"])
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5 * 3600, tid))
+    got = progress.check(p.db, {"coordinator": {"progress_check": {"task_h": 0, "project_h": 0}}}, p.state, now + 180)
+    assert got and got[0]["keys"] == ["resource:box-a"] and "refusal: lock busy (exit 75) #7" in got[0]["text"]
+    # A result made inside a task's run resets that task's clock, also once rotated into progress.1.jsonl.
+    t2 = p.db.add_task("Queued work", "spec")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5 * 3600, t2))
+    rec = progress.record("result", "filler", "checkpoint saved", env={"TTP_TASK": str(t2)}, now=now + 200)
+    progress.append(p.state, rec)
+    progress.append(p.state, {**rec, "kind": "refusal", "ts": now + 201}, max_bytes=1)   # rotates
+    assert rec["task"] == str(t2) and "checkpoint saved" in (p.state / progress.OLD).read_text()
+    cfg = {"coordinator": {"progress_check": {"resource_h": 0, "project_h": 0}}}
+    assert f"task:#{t2}" not in str(progress.check(p.db, cfg, p.state, now + 300))
+    assert float(progress.load(p.db)["results"][f"task:{t2}"]) == rec["ts"]
+
+
+def test_progress_repeated_run_failures_and_schedule_failures_stall(env):
+    from ttp import progress
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("Flaky build", "spec")
+    for i in range(3):
+        p.db.x("INSERT INTO runs(role,task,started,ended,status,exit_code,note) VALUES('worker',?,?,?,'failed',2,?)",
+               (tid, now - 900 + i * 200, now - 800 + i * 200, json.dumps({"error": f"link error in obj {i}"})))
+    cfg = {"coordinator": {"progress_check": {"task_h": 0, "project_h": 0}}}
+    got = progress.check(p.db, cfg, p.state, now)
+    assert got and got[0]["keys"] == [f"runs:#{tid}"] and "3 runs in a row" in got[0]["text"]
+    assert "link error in obj" in got[0]["text"]
+    p.db.x("INSERT INTO runs(role,task,started,ended,status) VALUES('worker',?,?,?,'ok')", (tid, now, now + 10))
+    _prog_clear(p, cfg, now + 60)
+    assert not any(k.startswith("stall:runs:") for k in progress.load(p.db)["raised"])
+    # A schedule failing the same way repeat_n times.
+    p.db.x("INSERT INTO schedules(name,kind,every_s) VALUES('nightly','command',3600)")
+    for i in range(4):
+        progress.note_schedule(p.db, "nightly", f"error: exit {i + 1}", now + i)
+    progress.note_schedule(p.db, "nightly", "skipped: budget low", now + 4)   # an expected skip: neutral
+    assert not any(e["kind"] == "stall" for e in progress.check(p.db, cfg, p.state, now + 2005))
+    progress.note_schedule(p.db, "nightly", "error: exit 9", now + 6)
+    got = progress.check(p.db, cfg, p.state, now + 2007)
+    assert got and got[0]["keys"] == ["schedule:nightly"] and "error: exit 9" in got[0]["text"]
+    progress.note_schedule(p.db, "nightly", "ok", now + 8)                    # a real run ends it
+    _prog_clear(p, cfg, now + 2100)
+    assert "stall:schedule:nightly" not in progress.load(p.db)["raised"]
+
+
+def test_progress_leaves_own_daily_cap_skips_to_the_schedule_budget_observation(env):
+    """Review #3485 finding 3: skips on a schedule's own daily cap were re-detected from status strings
+    and reported a second time beside the daemon's schedule-budget observation; and the daemon's
+    schedule-ran step must still record the skip history and count failures."""
+    from ttp import progress
+    from ttp import schedule as sched
+    from ttp.daemon import SCHEDULE_BUDGET_SOURCE, Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    now = time.time()
+    p.db.x("INSERT INTO schedules(name,kind,every_s,budget_usd_day) VALUES('summary2','llm',3600,1)")
+    row = p.db.one("SELECT * FROM schedules WHERE name='summary2'")
+    for _ in range(7):
+        d._schedule_ran(row, "skipped: daily budget used", None)
+    cfg = {"coordinator": {"progress_check": {"task_h": 0, "resource_h": 0, "project_h": 0}}}
+    assert progress.check(p.db, cfg, p.state, now + 1) == []
+    assert "summary2" not in progress.load(p.db)["scheds"]
+    obs = p.db.q("SELECT * FROM events WHERE source=?", (SCHEDULE_BUDGET_SOURCE,))
+    assert len(obs) == 1 and len(sched.skips(p.db, "summary2")) == 7
+    # Failures through the same step are counted.
+    for i in range(5):
+        d._schedule_ran(row, "error: exit 2", None)
+    got = progress.check(p.db, cfg, p.state, time.time() + 2)
+    assert got and got[0]["keys"] == ["schedule:summary2"]
+
+
+def test_progress_mute_keeps_a_key_quiet_and_events_raise_a_stuck_turn(env):
+    from ttp import coordinator, progress, screen
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("Held work", "spec")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 3 * 3600, tid))
+    screen.mute(p.db, progress.SOURCE, "no progress since", 24, why="known")
+    assert progress.check(p.db, {}, p.state, now) == []
+    assert progress.digest_lines(p.db, now)[0]          # still listed in the digest
+    assert coordinator.EFFORT_EVENT_TRIGGERS["no_progress"] == coordinator.EFFORT_EVENT_TRIGGERS["stall"] == "stuck"
+    assert "progress_check" in __import__("ttp.project", fromlist=["x"]).EXTRA_KEYS["coordinator"]
+
+
+def test_progress_daemon_tick_runs_the_check(env):
+    from ttp import progress
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("Never started", "spec")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - 3 * 3600, tid))
+    d = Daemon(p.base)
+    d.check_progress()
+    assert [e["kind"] for e in _prog_events(p)] == ["no_progress"]
+    d.check_progress()                                  # throttled, and unchanged anyway
+    assert len(_prog_events(p)) == 1
+    assert f"no_progress:task:#{tid}" in progress.load(p.db)["raised"]

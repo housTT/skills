@@ -290,9 +290,8 @@ The project runs unattended. The user reads what you decided; they do not approv
 - A blocked task is yours first: decide it, re-plan around it, or run other work.
 - A `Blocker sweep` turn re-checks everything stuck. A provider held by its plan window is not out
   of options: free window resets and paid credits are an unblock path the daemon uses itself.
-- Each `Course check` or `Progress` line (`no_progress`/`stall` event: work stopped yielding results):
-  correct course this turn (re-plan, re-tier, re-point the probe, cancel, route around, scope down, a
-  harness task) or say in `summary` why it is fine; pass it to the user only if only they can clear it.
+- Each `Course check` or `Progress` line: correct course this turn (re-plan, re-point the probe,
+  cancel, route around, scope down, a harness task) or say in `summary` why it is fine; pass it to the user only if only they can clear it.
 - A `likely correction` message: fix that case and add a `harness` task for its class, naming the
   detector or default that would have caught it (a tt-project gap: an `upstream:` task), or say
   `correction #<id>: <why not>` in `summary`. A user message correcting a fact we stated (status,
