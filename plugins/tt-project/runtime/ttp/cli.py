@@ -2076,6 +2076,8 @@ def _command_key(c) -> str:
         return json.dumps([str(c), host, dict(getattr(c, "env", ()) or ())])
     if getattr(c, "env", ()):
         return json.dumps([str(c), dict(c.env)])
+    if getattr(c, "cwd", ""):   # a pass in the authoring worktree is not a clean checkout's
+        return json.dumps([str(c), {"cwd": c.cwd}])
     try:
         words = shlex.split(c)
     except ValueError:
@@ -2276,7 +2278,7 @@ def cmd_checks(a) -> None:
     unless a harness-tagged check applies to the head and ran or reused a recorded pass. With no
     harness-tagged check configured it runs the default harness plan (push.default_harness_checks). Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
-    from . import checkcap, checkdirs, prguard, push, pushpass
+    from . import checkcap, checkdirs, cleantree, prguard, push, pushpass
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -2356,6 +2358,10 @@ def cmd_checks(a) -> None:
     if state:
         print("ttp checks: not counting uncommitted harness state files the runtime or other tasks write: "
               + ", ".join(state))
+    if runtime_written or state or (untracked := _untracked(git)):
+        what = "uncommitted changes" if runtime_written or state else f"{untracked} untracked file(s)"
+        print(f"ttp checks: {what} in this worktree are not checked: the checks run on a clean checkout of "
+              f"commit {head[:12]}")
     tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
     if a.detach:
         try:
@@ -2370,6 +2376,7 @@ def cmd_checks(a) -> None:
         die(f"ttp checks: {e}")
     log = Path(run_dir) / "checks.log"
     passed, failed, failure, rc, scope_error = True, None, None, None, None
+    clean_note = ""   # why a check found no clean checkout, or what only this worktree has
     fast_skipped, fast_cmds = [], []
     executed, selected = [], []
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
@@ -2504,21 +2511,56 @@ def cmd_checks(a) -> None:
         for line in [] if hit or handover else push.sandbox_lines(todo):
             print(f"ttp checks: {line}", flush=True)
             out.write(f"ttp checks: {line}\n")
-        for c in [] if hit or handover else todo:
-            executed.append(c)
-            # A progress line per check: the commands' own output goes only to checks.log.
-            print(f"ttp checks: running {len(executed)}/{len(todo)}: {c}{push.where(c)}", flush=True)
-            out.write(f"$ {c}{push.where(c)}\n")
-            out.flush()
-            check_start = out.tell()
-            # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
-            group = bool(getattr(a, "own_group", False))
-            env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
-            rc = _run_check(_low_priority(push.check_argv(c, top, env)), group, cwd=top, stdout=out, stderr=subprocess.STDOUT,
-                            env=env, pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
-            if rc != 0:
-                passed, failed = False, c
-                break
+        # Local checks run in a clean checkout of `head` (cleantree), never in this worktree, whose
+        # ignored, untracked or uncommitted files the recorded tree lacks; a remote one copies `head`
+        # itself (remotecheck), one with "cwd": "authoring" runs here and is labelled so.
+        clean = None
+        try:
+            if not (hit or handover) and any(not _in_place(c) for c in todo):
+                try:
+                    clean = cleantree.Checkout(top, head)
+                    if p:
+                        worktree.prepare(p, clean.path)   # the .venv a check may run, as the push queue's
+                    said = f"running in a clean checkout of {head[:12]}: files only on disk in {top} are not seen"
+                    print(f"ttp checks: {said}", flush=True)
+                    out.write(f"ttp checks: {said}\n")
+                except (cleantree.Error, OSError, subprocess.SubprocessError) as e:
+                    failed = next(c for c in todo if not _in_place(c))
+                    out.write(f"$ {failed}\n")
+                    out.flush()
+                    check_start = out.tell()
+                    clean_note = f"it did not run: no clean checkout of {head[:12]} to run it in: {e}"
+                    out.write(f"ttp checks: {clean_note}\n")
+                    passed, rc = False, 1
+            for c in [] if hit or handover or not passed else todo:
+                executed.append(c)
+                cwd = top if _in_place(c) else str(clean.path)
+                note = AUTHORING_NOTE if cleantree.authoring(c) and not push.remote_host(c) else ""
+                # A progress line per check: the commands' own output goes only to checks.log.
+                print(f"ttp checks: running {len(executed)}/{len(todo)}: {c}{push.where(c)}{note}", flush=True)
+                out.write(f"$ {c}{push.where(c)}{note}\n")
+                out.flush()
+                check_start = out.tell()
+                # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
+                group = bool(getattr(a, "own_group", False))
+                env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
+                       "PWD": cwd}
+                rc = _run_check(_low_priority(push.check_argv(c, cwd, env)), group, cwd=cwd, stdout=out,
+                                stderr=subprocess.STDOUT, env=env,
+                                pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
+                if rc != 0:
+                    passed, failed = False, c
+                    if cwd != top:   # what only this worktree has may be what the check missed
+                        out.flush()
+                        with open(log, "rb") as f:
+                            f.seek(check_start)
+                            output = f.read().decode("utf-8", errors="replace")
+                        if clean_note := cleantree.hint(cleantree.authoring_only(top, cwd, str(c), output)):
+                            out.write(f"ttp checks: {clean_note}\n")
+                    break
+        finally:
+            if clean is not None:
+                clean.close()
         if slot and not passed:
             slot.close()
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
@@ -2545,6 +2587,8 @@ def cmd_checks(a) -> None:
         print(f"ttp checks: {CHECKS_HANDOVER}", flush=True)
         sys.exit(75)
     env_problem, also, not_executed = None, False, []
+    # The checks that ran (or whose recorded pass came) from this worktree, not a clean checkout.
+    in_authoring = [str(c) for c in todo if cleantree.authoring(c) and not push.remote_host(c)]
     if not passed:
         # The applicable checks a failure or refusal left unrun stay listed as such, never as passed;
         # those verified through the lineage marker were checked, not left unrun.
@@ -2584,7 +2628,8 @@ def cmd_checks(a) -> None:
                                                      **({"not_run": not_run} if not_run else {}),
                                                      **({"not_executed": not_executed} if not passed else {}),
                                                      **({"env_problem": env_problem} if env_problem else {}),
-                                                     **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {})})
+                                                     **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {}),
+                                                     **({"authoring_tree": in_authoring} if in_authoring else {})})
     source = ("the default harness plan" if any(str(c) == str(failed) for c in defaults)
               else "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --")
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
@@ -2600,7 +2645,8 @@ def cmd_checks(a) -> None:
         if env_problem:
             die(f"ttp checks: {failed!r} failed at import on {head[:12]}: an environment problem, not the "
                 f"head's code: {env_problem} (full output: {log})", 1)
-        die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
+        die(f"ttp checks: {failed!r} failed on {head[:12]}" + (f"; {clean_note}" if clean_note else "")
+            + f" (full output: {log})", 1)
     if fast_cmds:   # a reduced pass verifies nothing: no marker, and only the extras are recorded
         extras = [c for c in todo if str(c) not in set(map(str, fast_cmds))]
         if extras:
@@ -2624,12 +2670,30 @@ def cmd_checks(a) -> None:
         slot.close()
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
     more += f", {len(not_run)} candidate gate(s) not run" if not_run else ""
+    if in_authoring:
+        more += (f"; {len(in_authoring)} ran in the authoring worktree, NOT a clean checkout (\"cwd\": "
+                 f"\"authoring\"): {', '.join(map(repr, in_authoring))}")
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
           + ("recorded as a harness qualification only: it never counts for a PR, an on_pass hand-off or a push"
              if purpose == "harness" else "recorded for the draft PR") + f" (full output: {log})")
 
 
 HARNESS_SKIPPED = "every purpose harness check was skipped as not applicable"
+AUTHORING_NOTE = " (in the authoring worktree, not a clean checkout)"
+
+
+def _in_place(c) -> bool:
+    """Whether `ttp checks` runs check `c` in the worktree itself: it opted out of the clean checkout
+    ("cwd": "authoring"), or it runs on a check host, which gets a copy of the commit (remotecheck)."""
+    from . import cleantree, push
+    return cleantree.authoring(c) or bool(push.remote_host(c))
+
+
+def _untracked(git: list[str]) -> int:
+    """How many untracked files (not ignored) the worktree has: they are not checked."""
+    r = subprocess.run([*git, "status", "--porcelain=v1", "-z", "--untracked-files=normal"], capture_output=True,
+                       text=True)
+    return sum(1 for e in r.stdout.split("\0") if e.startswith("?? "))
 
 
 def _run_task(p: Project | None) -> dict | None:

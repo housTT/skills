@@ -26950,17 +26950,22 @@ def test_ttp_checks_reuses_a_recorded_pass_only_for_the_same_tree_and_commands(e
 
 
 def test_ttp_checks_runs_and_records_in_the_worktree_top_from_a_subdirectory(env, tmp_path, monkeypatch, capsys):
-    """Started in a subdirectory (or with a stale $PWD), every check still runs at the top of the
-    worktree being checked, as `ttp push` runs them, and the log and record name that worktree."""
+    """Started in a subdirectory (or with a stale $PWD), every check still runs at the top of a clean
+    checkout of the worktree's commit, as `ttp push` runs them, and the log and record name that worktree."""
+    import tempfile
+    from pathlib import Path
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     (repo / "sub").mkdir()
     monkeypatch.chdir(repo / "sub")
     monkeypatch.setenv("PWD", str(tmp_path))
     seen = tmp_path / "seen"
     cli.main(["checks", "--", f"test -f a.txt && pwd -P > {seen} && echo \"$PWD\" >> {seen}"])
     top = str(repo.resolve())
-    assert seen.read_text().splitlines() == [top, top], "a check ran outside the worktree's top"
+    ran = seen.read_text().splitlines()
+    assert ran[0] == ran[1] and Path(ran[0]).name == "tree", "a check ran outside the checkout's top"
+    assert Path(ran[0]).parent.name.startswith("ttp-checks-") and not Path(ran[0]).parent.exists()
     head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and rec["head"] == head and rec["worktree"] == top

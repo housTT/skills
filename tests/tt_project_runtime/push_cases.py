@@ -10349,3 +10349,181 @@ def test_own_push_refuses_a_local_working_copy_or_another_projects_folder_as_ori
         assert push.local_remote_problem(p, repo, "origin") == ""
         assert push.tracking_ref("origin", "b") == "refs/remotes/origin/b"
     assert push.tracking_ref("https://example.invalid/x.git", "b").startswith("refs/ttp/url/")
+
+
+def _clean_repo(env, tmp_path, monkeypatch):
+    """_checks_repo with `*.log` ignored and clean checkouts made under tmp_path/tmp."""
+    import tempfile
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    (repo / ".gitignore").write_text("*.log\nbuild/\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.txt").write_text("a\n")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "ignore logs"], check=True)
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp))
+    return p, repo, run, git, tmp
+
+
+def _no_checkouts(repo, tmp):
+    assert not list(tmp.glob("ttp-checks-*")), "a clean checkout was left behind"
+    wts = subprocess.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"], capture_output=True,
+                         text=True).stdout
+    assert wts.count("worktree ") == 1, wts
+
+
+def test_ttp_checks_fails_a_check_that_needs_an_ignored_file_only_on_disk_and_names_it(env, tmp_path, monkeypatch,
+                                                                                         capsys):
+    """A test fixture the `*.log` ignore rule covers was never committed but sat in the authoring
+    worktree: the check read it there and its pass was recorded for a tree without it. The checks run
+    in a clean checkout of the commit, so it fails, and the failure names the file."""
+    from ttp import cli
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    (repo / "tests" / "fixture.log").write_text("data\n")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "cat tests/fixture.log"])
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert "present only in the authoring worktree, not committed: tests/fixture.log" in err
+    assert not json.loads((run / "checks.json").read_text())["passed"]
+    _no_checkouts(repo, tmp)
+    # A check whose output names nothing: the ignored and untracked files under the folder it runs.
+    (repo / "tests" / "new_case.txt").write_text("x\n")
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--", "ls tests >/dev/null; exit 3"])
+    err = capsys.readouterr().err
+    assert "tests/fixture.log" in err and "tests/new_case.txt" in err and "test_a.txt" not in err
+    # Committed, it passes.
+    subprocess.run([*git, "add", "-f", "tests/fixture.log"], check=True)
+    subprocess.run([*git, "commit", "-qm", "fixture"], check=True)
+    (repo / "tests" / "new_case.txt").unlink()
+    cli.main(["checks", "--", "cat tests/fixture.log"])
+    assert json.loads((run / "checks.json").read_text())["passed"]
+    _no_checkouts(repo, tmp)
+
+
+def test_ttp_checks_never_passes_on_uncommitted_files_and_says_which_commit_it_checked(env, tmp_path, monkeypatch,
+                                                                                       capsys):
+    """An uncommitted edit `ttp checks` tolerates (a tracked file the ignore rules match) and an
+    untracked file would each make the check pass in the authoring worktree; the pass would be recorded
+    for HEAD's tree, which has neither. Both fail, and the run says what was not checked and which
+    commit was."""
+    from ttp import cli
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    (repo / "state.log").write_text("no\n")
+    subprocess.run([*git, "add", "-f", "state.log"], check=True)
+    subprocess.run([*git, "commit", "-qm", "tracked log"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (repo / "state.log").write_text("yes\n")
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--fresh", "--", "grep -q yes state.log"])
+    out = capsys.readouterr().out
+    assert f"uncommitted changes in this worktree are not checked: the checks run on a clean checkout of commit {head[:12]}" in out
+    (repo / "state.log").write_text("no\n")
+    (repo / "flag").write_text("x\n")
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--fresh", "--", "test -f flag"])
+    assert f"1 untracked file(s) in this worktree are not checked: the checks run on a clean checkout of commit {head[:12]}" \
+        in capsys.readouterr().out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["head"] == head and not rec["passed"]
+    # A pass is recorded for HEAD's tree, from what HEAD has.
+    cli.main(["checks", "--fresh", "--", "grep -q no state.log && test ! -e flag"])
+    assert json.loads((run / "checks.json").read_text())["passed"]
+    _no_checkouts(repo, tmp)
+
+
+@pytest.mark.parametrize("how", ["pass", "fail", "stop", "interrupt", "timeout"])
+def test_ttp_checks_removes_its_clean_checkout_however_the_checks_end(env, tmp_path, monkeypatch, how):
+    from ttp import cli
+    from pathlib import Path
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    cmd = {"pass": "true", "fail": "false", "timeout": "timeout 1 sleep 30"}.get(how, "true")
+    if how in ("stop", "interrupt"):   # the stop handler raises SystemExit mid-check; Ctrl-C KeyboardInterrupt
+        def stopped(argv, group, **kw):
+            assert Path(kw["cwd"]).is_dir() and Path(kw["cwd"]).name == "tree"
+            raise SystemExit(143) if how == "stop" else KeyboardInterrupt
+        monkeypatch.setattr(cli, "_run_check", stopped)
+    try:
+        cli.main(["checks", "--", cmd])
+    except (SystemExit, KeyboardInterrupt):
+        assert how != "pass"
+    _no_checkouts(repo, tmp)
+
+
+def test_clean_checkouts_a_dead_run_left_are_pruned_and_live_ones_kept(env, tmp_path, monkeypatch):
+    import fcntl
+    from ttp import cleantree, cli
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    dead, live = cleantree.Checkout(repo, "HEAD"), cleantree.Checkout(repo, "HEAD")
+    dead._lock.close()   # its run was killed: nothing holds the lock
+    dead._lock = None
+    old = tmp / "ttp-checks-1-old"   # killed before it took its lock, long ago
+    old.mkdir()
+    os.utime(old, (1, 1))
+    cli.main(["checks", "--", "true"])
+    assert not dead.dir.exists() and not old.exists() and live.path.is_dir()
+    assert str(dead.path) not in subprocess.run([*git, "worktree", "list"], capture_output=True, text=True).stdout
+    live.close()
+    live.close()   # twice is safe
+    _no_checkouts(repo, tmp)
+
+
+def test_ttp_checks_cwd_authoring_runs_in_the_worktree_and_labels_the_pass(env, tmp_path, monkeypatch, capsys):
+    """A check that needs build outputs made in the authoring worktree opts out with "cwd": "authoring":
+    it runs there, and the output and the check record say it did not run from a clean tree."""
+    from ttp import cli, push
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    (repo / "build").mkdir()
+    (repo / "build" / "out.bin").write_text("x")
+    check = "test -f build/out.bin"
+    p.set_config("delivery.push_checks", [{"run": check, "cwd": "authoring"}, "test -f a.txt"])
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert f"running 1/2: {check}{cli.AUTHORING_NOTE}" in out
+    assert "1 ran in the authoring worktree, NOT a clean checkout" in out and repr(check) in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] and rec["authoring_tree"] == [check]
+    _no_checkouts(repo, tmp)
+    # Without the opt-out the same check runs in the clean checkout and fails.
+    p.set_config("delivery.push_checks", [check])
+    with pytest.raises(SystemExit):
+        cli.main(["checks"])
+    assert "build/out.bin" in capsys.readouterr().err
+    # Its pass is not the clean form's (nor the reverse), and only the two cwd values are valid.
+    assert cli._command_key(push.check_list([{"run": check, "cwd": "authoring"}])[0]) != cli._command_key(check)
+    assert push.check_list([{"run": check, "cwd": "clean"}])[0].config() == check
+    assert push.check_problems([{"run": check, "cwd": "/somewhere"}])
+
+
+def test_ttp_checks_clean_checkout_populates_submodules_from_the_worktrees_copies(env, tmp_path, monkeypatch, capsys):
+    """Submodules come from the authoring worktree's copies, never the network; one whose commit is not
+    there fails the checks with a clear message instead of running in the authoring tree."""
+    from ttp import cli
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    src = tmp_path / "subsrc"
+    sgit = ["git", "-C", str(src), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(src)], check=True)
+    (src / "f.txt").write_text("f\n")
+    subprocess.run([*sgit, "add", "."], check=True)
+    subprocess.run([*sgit, "commit", "-qm", "f"], check=True)
+    subprocess.run([*git, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(src), "sub"], check=True)
+    subprocess.run([*git, "commit", "-qm", "sub"], check=True)
+    subprocess.run(["git", "-C", str(src), "remote", "add", "x", "/nonexistent"], check=True)
+    cli.main(["checks", "--", "test -f sub/f.txt && git -C sub rev-parse HEAD"])
+    assert json.loads((run / "checks.json").read_text())["passed"]
+    _no_checkouts(repo, tmp)
+    # A gitlink to a commit only the submodule's origin has: no fall back, a clear failure.
+    (src / "g.txt").write_text("g\n")
+    subprocess.run([*sgit, "add", "."], check=True)
+    subprocess.run([*sgit, "commit", "-qm", "g"], check=True)
+    sha = subprocess.run([*sgit, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    subprocess.run([*git, "update-index", "--cacheinfo", f"160000,{sha},sub"], check=True)
+    subprocess.run([*git, "commit", "-qm", "bump sub"], check=True)
+    subprocess.run([*git, "config", "submodule.sub.ignore", "all"], check=True)   # its copy lags: not a change
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--", "true"])
+    err = capsys.readouterr().err
+    assert f"cannot populate submodule sub at {sha[:12]}" in err and "did not run" in err
+    _no_checkouts(repo, tmp)

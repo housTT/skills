@@ -1,5 +1,15 @@
 # Push checks
 
+## Which tree runs
+
+A pass is recorded for the commit's tree, so the checks run on exactly that tree.
+`ttp checks` runs each local check in a fresh detached checkout of HEAD (`git worktree add --detach` in the system's temporary folder), never in the authoring worktree: an ignored, untracked or uncommitted file there cannot make a check pass. The checkout is removed after a pass, a failure, a timeout or a stop; one a killed run left is removed by the next `ttp checks`.
+Uncommitted changes and untracked files are named as not checked, with the commit that was.
+Submodules come from the authoring worktree's checked-out copies, never the network; a gitlink commit that copy lacks fails the checks with a clear message, never a run in the authoring tree.
+A failure lists up to five files that exist only in the authoring worktree and the check may have needed ("present only in the authoring worktree, not committed: ...").
+`{"run": "...", "cwd": "authoring"}` runs one check in the authoring worktree (it needs build outputs made there); its pass is labelled as not from a clean tree in the output and in `checks.json` (`authoring_tree`). The default is `"clean"`.
+`ttp push`, `ttp land` and the push queue already run their checks in scratch worktrees of the exact commit they push, and remote checks copy it with `git archive` (below).
+
 ## Fast path
 
 Opt-in, off by default: with no `delivery.checks_fast_globs`, every diff runs the full checks.
