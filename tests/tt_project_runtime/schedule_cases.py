@@ -470,3 +470,162 @@ def test_a_schedule_gap_issue_closes_once_all_named_ran_in_the_tick_and_one_with
     assert rows["schedule-gap:1"]["status"] == "open"
     gap = next(r for k, r in rows.items() if k != "schedule-gap:1")
     assert gap["status"] == "fixed" and gap["cleared_why"] == SCHEDULE_GAP_CLEARED
+
+
+def _filler(p, budget_day=None, **payload):
+    """An llm schedule `filler`, due now, with daily cap `budget_day`."""
+    from ttp import schedule as sched
+    sched.upsert(p.db, "filler", "llm", "1h", budget_usd_day=budget_day, description="filler work",
+                 payload={"spec": "do filler work", **payload})
+    _filler_due(p)
+
+
+def _filler_due(p):
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='filler'", (time.time() - 1,))
+
+
+def _budget_issues(p, status="open"):
+    return p.db.q("SELECT watch_key, status FROM issues WHERE source='daemon:schedule-budget' AND status=?", (status,))
+
+
+def _budget_wakes(p):
+    return p.db.q("SELECT text FROM events WHERE source='daemon:schedule-budget' AND kind='observation'")
+
+
+def test_an_own_daily_budget_skip_is_kept_and_raises_one_keyed_observation_until_the_schedule_runs(env):
+    """The case behind it: a schedule with too low a daily cap was skipped about 13 times in 2 h with a
+    green gate; each skip only overwrote last_status, so nobody noticed until the user looked by hand."""
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.gates = {}
+    _filler(p, budget_day=1)
+    p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)", (time.time() - 60, "schedule:filler", 2.0))
+    d.run_schedules()
+    assert [x["reason"] for x in sched.skips(p.db, "filler")] == ["skipped: daily budget used"]
+    assert _budget_issues(p) == [{"watch_key": "schedule-budget:filler", "status": "open"}]
+    wakes = _budget_wakes(p)
+    assert len(wakes) == 1 and "filler" in wakes[0]["text"] and "$2.00 of $1.00" in wakes[0]["text"], wakes
+    # A second skip the same day: kept, but no second issue or wake, even once the first is closed by hand.
+    _filler_due(p)
+    d.run_schedules()
+    p.db.x("UPDATE issues SET status='fixed' WHERE source='daemon:schedule-budget'")
+    _filler_due(p)
+    d.run_schedules()
+    assert len(sched.skips(p.db, "filler")) == 3
+    assert len(_budget_wakes(p)) == 1 and not _budget_issues(p)
+    # Its spend back under the cap: it runs, and the open issue closes itself.
+    p.db.x("UPDATE issues SET status='open' WHERE source='daemon:schedule-budget'")
+    p.db.x("DELETE FROM ledger WHERE source='schedule:filler'")
+    _filler_due(p)
+    d.run_schedules()
+    assert p.db.one("SELECT last_status FROM schedules WHERE name='filler'")["last_status"] == "queued"
+    assert not _budget_issues(p) and len(_budget_issues(p, "fixed")) == 1
+    assert len(sched.skips(p.db, "filler")) == 3, "a run never overwrites the skip history"
+
+
+def test_expected_schedule_skips_are_kept_but_never_raised(env, tmp_path):
+    """A gate held by the budget, a debounce, an open run and a precheck exit 0 are planned skips."""
+    from types import SimpleNamespace
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.gates = {d.cfg.get("core_provider", "claude"): SimpleNamespace(allow_optional=False, level="yellow")}
+    _filler(p, budget_day=1)
+    p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)", (time.time() - 60, "schedule:filler", 2.0))
+    d.run_schedules()   # the gate holds it before its own cap is read
+    d.gates = {}
+    p.db.x("DELETE FROM ledger")
+    tid = p.db.add_task("[filler] open", "x", origin="schedule")
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(["filler"]), tid))
+    _filler_due(p)
+    d.run_schedules()   # its previous run still open
+    p.db.update_task(tid, status="done")
+    _prechecked(p, "echo window empty")
+    _run_precheck_schedule(d)
+    assert [x["reason"] for x in sched.skips(p.db, "filler")] == ["skipped: previous run still open",
+                                                                  "skipped: budget yellow"]
+    assert [x["reason"] for x in sched.skips(p.db, "summary")] == ["skipped: precheck: window empty"]
+    assert not _budget_wakes(p) and not p.db.q("SELECT id FROM issues WHERE source='daemon:schedule-budget'")
+    # A debounce: the last run done on unchanged evidence.
+    sched.upsert(p.db, "filler", "llm", "1h", payload={"spec": "do filler work", "debounce_h": 6})
+    _filler_due(p)
+    d.run_schedules()
+    run = p.db.one("SELECT id FROM tasks WHERE labels=? AND status='queued'", (json.dumps(["filler"]),))["id"]
+    p.db.update_task(run, status="done")
+    p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(?,?,?,?,?)",
+           (run, "worker", "done", time.time() - 120, time.time() - 60))
+    _filler_due(p)
+    d.run_schedules()
+    assert sched.skips(p.db, "filler", 1)[0]["reason"].startswith("skipped: last run done"), sched.skips(p.db, "filler")
+    assert not _budget_wakes(p)
+
+
+def test_a_schedule_runs_budget_is_its_tier_default_or_its_own_and_never_more_than_the_day_has_left(env):
+    """Each run's budget was the whole daily cap, so raising the cap also raised every single run's cap."""
+    from ttp import coordinator as coord
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.gates = {}
+    defaults = p.config()["budget"]["task_default_usd"]
+
+    def queued(budget_day, spent=0.0, **payload):
+        p.db.x("DELETE FROM tasks")
+        p.db.x("DELETE FROM ledger")
+        if spent:
+            p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)", (time.time() - 60, "schedule:filler", spent))
+        _filler(p, budget_day=budget_day, **payload)
+        d.run_schedules()
+        return p.db.one("SELECT budget_usd FROM tasks WHERE labels=?", (json.dumps(["filler"]),))["budget_usd"]
+
+    assert queued(100) == defaults["standard"]                      # not the daily cap
+    assert queued(None, tier="light") == defaults["light"]
+    assert queued(100, budget_usd_run=3) == 3.0
+    assert queued(5, spent=4.0) == pytest.approx(1.0)               # what is left of the day
+    assert queued(5, spent=4.5, budget_usd_run=3) == pytest.approx(0.5)
+    # schedule_set sets and clears it; the file and the action reject a bad one.
+    assert coord.apply(p, [{"type": "schedule_set", "name": "filler", "budget_usd_run": 2.5}]) == []
+    pay = lambda: json.loads(p.db.one("SELECT payload FROM schedules WHERE name='filler'")["payload"])
+    assert pay()["budget_usd_run"] == 2.5
+    assert coord.apply(p, [{"type": "schedule_set", "name": "filler", "tier": "deep"}]) == []
+    assert pay()["budget_usd_run"] == 2.5   # left out: kept
+    assert coord.apply(p, [{"type": "schedule_set", "name": "filler", "budget_usd_run": None,
+                            "clear_fields": ["budget_usd_run"]}]) == []
+    assert "budget_usd_run" not in pay()
+    out = coord.apply(p, [{"type": "schedule_set", "name": "filler", "budget_usd_run": -1}])
+    assert len(out) == 1 and "budget_usd_run" in out[0], out
+    for kind, payload, why in [("llm", {"budget_usd_run": 0}, "positive number"),
+                               ("command", {"command": "true", "budget_usd_run": 1}, "only an llm schedule")]:
+        with pytest.raises(ValueError, match=why):
+            sched.parse_file(json.dumps([{"name": "x", "kind": kind, "every": "1d", "payload": payload}]))
+    assert sched.parse_file(json.dumps([{"name": "x", "kind": "llm", "every": "1d",
+                                         "payload": {"budget_usd_run": 1.5}}]))
+
+
+def test_the_skip_history_survives_a_daemon_restart_is_capped_and_shown(env, capsys):
+    from ttp import cli
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    _filler(p, budget_day=1)
+    for i in range(sched.SKIP_KEEP + 5):
+        sched.record_skip(p.db, "filler", f"skipped: precheck: empty {i}", time.time() - 3600 + i)
+    sched.record_skip(p.db, "other", "skipped: budget red")
+    p.db.conn.close()
+    p = type(p)(p.base)   # a new process: a fresh connection to the same database
+    d = Daemon(p.base)
+    d.gates = {}
+    kept = sched.skips(p.db, "filler", 100)
+    assert len(kept) == sched.SKIP_KEEP and kept[0]["reason"] == f"skipped: precheck: empty {sched.SKIP_KEEP + 4}"
+    assert [x["reason"] for x in sched.skips(p.db, "other")] == ["skipped: budget red"]
+    cli.main(["schedules", p.name, "show", "filler"])
+    shown = json.loads(capsys.readouterr().out)["state"]["recent_skips"]
+    assert len(shown) == 10 and shown[0]["reason"].endswith(f"empty {sched.SKIP_KEEP + 4}")
+    cli.main(["schedules", p.name])
+    assert f"({sched.SKIP_KEEP} skip(s) in 24 h)" in capsys.readouterr().out
+    row = next(r for r in sched.with_costs(p.db) if r["name"] == "filler")
+    assert row["skips_24h"] == sched.SKIP_KEEP and len(row["skips"]) == 5
