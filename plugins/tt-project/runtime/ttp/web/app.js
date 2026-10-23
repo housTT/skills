@@ -250,6 +250,7 @@ function healthHtml(h) {
     (h.breakers || []).map((b) => `<div class="row"><b>${esc(b.provider)}</b><span class="pill lv-red">logged out</span><span>${esc(b.line)}</span></div>`).join("") +
     (h.schedules_broken ? `<div class="row"><span class="pill lv-red">${esc(h.schedules_broken)}</span></div>` : "") +
     (h.health ? `<div class="row"><span class="${/ [1-9]\d* failing/.test(h.health) ? "pill lv-red" : "meta"}">${esc(h.health)}</span></div>` : "") +
+    (h.drivers_stalled || []).map((line) => `<div class="row"><span class="pill lv-yellow">${esc(line)}</span></div>`).join("") +
     (h.coverage ? `<div class="row"><span class="${/missing:/.test(h.coverage) ? "pill lv-yellow" : "meta"}">${esc(h.coverage)}</span></div>` : "") +
     (h.obligations || []).map((line) => `<div class="row"><span class="${/OVERDUE/.test(line) ? "pill lv-yellow" : "meta"}">${esc(line)}</span></div>`).join("") +
     (h.outages || []).map((line) => `<div class="row"><span class="pill ${/OVERDUE/.test(line) ? "lv-red" : "lv-yellow"}">${esc(line)}</span></div>`).join("") +

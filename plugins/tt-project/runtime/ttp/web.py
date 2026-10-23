@@ -461,6 +461,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "schedules_waiting": sched.waiting_line(db),
         "health": heal.line(db, now),
         "coverage": responsibilities.line(db),
+        "drivers_stalled": drivers_stalled(p, cfg, now, tz),
         "obligations": obligations.lines(db, now=now, where=cfg, open_only=True),
         "outages": outagetask.lines(db, now, where=cfg),
         "local_only": local_only_line(db),
@@ -468,6 +469,18 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "upstream": "; ".join(x for x in (upstream.status_line(db, cfg), upstream.fixes_line(p.name, cfg, now),
                                           upstream.forward_line(now)) if x),
     }
+
+
+def drivers_stalled(p: Project, cfg: dict, now: float, tz) -> list[str]:
+    """One line per detached or looping driver whose process still runs but whose last reports are
+    refusals, stalls or failures with no result (progress.stalled): stalled, not running."""
+    from . import progress
+    try:
+        found = progress.stalled(p.state, cfg, now)
+    except Exception:   # a bad report file must not break the status page
+        return []
+    return [f"driver {d['key']} stalled, its process still running: {d['line']} (since {at(d['since'], now, tz)}; "
+            f"{d['source']})" for d in found[:8]]
 
 
 def runtime_receipt(p: Project, db: DB, alive: bool = True, now: float | None = None, where=None) -> dict:

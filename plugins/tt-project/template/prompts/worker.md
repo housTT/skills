@@ -173,6 +173,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`); size each step's timeout to its tool.
   Retry transient faults (busy device, recovering broker, ssh stall) inside it with
   bounded backoff; fail only on a non-transient fault or spent retries.
+  Every detached or looping driver (filler, recheck loop, guard) reports each refusal, failure and
+  counted result in one line: `ttp progress report refusal|failure|stall|result --key <what> "<why>"`
+  (exits 0, daemon up or not); repeats with no result reach the coordinator and show as stalled.
 <!-- ttp:if device -->
   A device or box wait reads its broker's job rows live, never a header it always prints
   (`grep RUNNING`) or a marker file. A wait for a broker hold to end uses `ttp broker-released` on

@@ -127,7 +127,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # detached jobs' use of what they asked for (jobuse.py): sampled every sample_s; cores
                 # used under under_frac of the request, or an unused device, over window_s is under-use
                 # (one job_underuse event; the next check comes within check_cap_s)
-                "job_use": {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800}},
+                "job_use": {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800},
+                # `ttp progress report` (progress.py): stall_after refusals, stalls or failures in a row
+                # with no result, the last within window_s, are a stalled driver (one observation)
+                "progress": {"stall_after": 5, "window_s": 86400}},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     # Lock names that all mean the one device (they share one `ttp lock` slot), and how many tasks
     # tagged needs_device may run at once; `ttp lock` admits one of them at a time to the device.

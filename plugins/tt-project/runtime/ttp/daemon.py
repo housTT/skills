@@ -51,6 +51,7 @@ from . import globalcap as gcap
 from . import coordinator as coord
 from . import coordlimits
 from . import detach
+from . import progress
 from . import downtime
 from . import effort
 from . import failover
@@ -279,6 +280,7 @@ LEASE_STEPS = ("dispatch", "maybe_coordinate", "run_schedules", "start_pushes", 
 HOST_CYCLE_SEEN_KEY = "host_cycle_seen"   # kv: power-cycle intent id -> held or lapsed, each logged or posted once
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
 PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n}} (pageto)
+PROGRESS_KEY = "progress_raised"   # kv: driver key -> its stalled streak's first report (watch_progress)
 STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised} (Daemon.check_stall)
 STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a stall is raised
 STALL_GAP_S = 600      # checks further apart than this (a paused project): readiness counts again
@@ -1097,7 +1099,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -7832,6 +7834,39 @@ class Daemon:
                 self._unpull_check(tid)
         if new or old:
             db.set_kv(jobuse.KV, new)
+
+    def watch_progress(self, every_s: float = 60) -> None:
+        """Drivers' reports (`ttp progress report`, progress.py), model-free, every minute: a key whose
+        last waiting.progress.stall_after reports are refusals, stalls or failures with no result raises
+        one keyed observation to the coordinator with the reasons, once per streak (kv progress_raised:
+        key -> the streak's first report). A result ends the streak; a new streak raises again."""
+        now = time.time()
+        if now - getattr(self, "_progress_read", 0.0) < every_s:
+            return
+        self._progress_read = now
+        s = progress.settings(self.cfg)
+        db = self.p.db
+        raised = db.kv(PROGRESS_KEY, {}) or {}
+        live = {k["key"]: k for k in progress.stalled_keys(progress.entries(self.p.state), s["stall_after"],
+                                                           float(s["window_s"]), now)}
+        keep = {}
+        for key, k in live.items():
+            first = round(float(k["first"].get("ts") or 0), 3)
+            keep[key] = first
+            if raised.get(key) == first:
+                continue
+            reasons = []
+            for r in (k["first"], k["last"]):
+                if (r.get("reason") or "") not in reasons:
+                    reasons.append(r.get("reason") or "")
+            text = (f"Driver {key} made no progress: {progress.describe(k)} (since "
+                    f"{timefmt.long(first, self.p)}; {k['last'].get('source') or 'source unknown'}). "
+                    f"First reason: {reasons[0] or '(none)'}. Fix its cause or stop it; a looping driver that "
+                    f"only retries the same refusal wastes its slot.")
+            self.observe("daemon:progress", text, "normal", key=f"progress:{key}", episode=str(first), whole=True)
+            log(self.p, f"driver {key}: {k['bad']} reports with no result; observation raised")
+        if keep != raised:
+            db.set_kv(PROGRESS_KEY, keep)
 
     def _underuse_event(self, task: dict, entry: dict, now: float, s: dict) -> None:
         db, st = self.p.db, entry["st"]

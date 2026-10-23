@@ -1319,6 +1319,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append("stuck, the project is on it:")
     for t in stuck[:8]:
         lines.append(f"  #{t['id']} {t['wait']['age_text']}: {t['title']} — {t['wait']['text']}")
+    for d in h.get("drivers_stalled") or []:
+        lines.append(f"  {d}")
     for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('review','pushing') "
                   "ORDER BY status, id LIMIT 8"):
         age = f" {since(in_review[t['id']], now)}" if t["id"] in in_review else ""
@@ -3796,6 +3798,31 @@ def cmd_ack_wait(a) -> None:
     print(f"{a.frm} replied (note {n['fp']}); hand-off {a.status} written to {out}")
 
 
+def cmd_progress(a) -> None:
+    """`ttp progress report <kind> --key <key> "<reason>"`: one JSON line in the project's
+    state/progress.jsonl (progress.py). No daemon needed; exit 0 once given a project and a key, even
+    when the line cannot be written, so a driver under `set -e` keeps going."""
+    from . import progress
+    ap = argparse.ArgumentParser(prog="ttp progress report")
+    ap.add_argument("kind", choices=progress.KINDS)
+    ap.add_argument("reason", nargs="?", default="")
+    ap.add_argument("--key", default=a.key)
+    a = ap.parse_intermixed_args(a.words or [])
+    p = here()
+    if not p:
+        die("ttp progress report: no project here (run it in a project or with TTP_PROJECT set)", 2)
+    key = a.key
+    if not key and (job := os.environ.get(progress.JOB_ENV)):
+        key = f"{os.environ.get('TTP_TASK') or 'job'}/{Path(job).stem}"
+    if not (key or "").strip():
+        die("ttp progress report: --key is required outside a `ttp detach` job", 2)
+    rec = progress.record(a.kind, key, a.reason)
+    try:
+        progress.append(p.state, rec)
+    except OSError as e:
+        print(f"ttp progress report: not recorded ({e})", file=sys.stderr)
+
+
 def cmd_detach(a) -> None:
     """Start a long job that outlives this run: `ttp detach <name> -- <command...>`.
 
@@ -3888,6 +3915,8 @@ def cmd_detach(a) -> None:
     pid = None
     from . import activity
     job_env, aid = dict(os.environ), activity.new_id()
+    from .progress import JOB_ENV
+    job_env[JOB_ENV] = str(rc)   # its `ttp progress report` lines name the job (progress.py)
     state = rd.parent.parent if rd.parent.name == "runs" else None
     if state is not None:   # the wrapper appends the job's end to the project's activity log
         job_env.update({activity.ENV_LOG: str(activity.log_path(state)), activity.ENV_ID: aid})
@@ -6880,7 +6909,7 @@ COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
-    ("inside a run", ("note", "notify", "checks", "lock", "detach", "devq", "push", "land", "clip", "sandbox",
+    ("inside a run", ("note", "notify", "progress", "checks", "lock", "detach", "devq", "push", "land", "clip", "sandbox",
                       "skill", "killscan", "svcscan")),
     ("probes (retry_when, start_when)", ("landed", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
@@ -7055,6 +7084,18 @@ def main(argv: list[str] | None = None) -> None:
                    help="high: an urgent report for the coordinator, relayed while the run lives; "
                         "critical is refused")
     s.set_defaults(fn=cmd_notify)
+
+    s = sub.add_parser("progress", help="report a detached or looping driver's results, refusals, stalls and "
+                                        "failures to the daemon (one line from bash; works with the daemon down)")
+    ps = s.add_subparsers(dest="progress_cmd", required=True, help="what to do")
+    m = ps.add_parser("report", help="append one report to the project's progress.jsonl; exit 0 even when it "
+                                     "cannot be written (a warning on stderr), so a driver never stops on it")
+    m.add_argument("--key", help="what the report is about, the same each loop (default inside a `ttp detach` "
+                                 "job: its task and name)")
+    m.add_argument("words", nargs=argparse.REMAINDER, metavar="KIND [REASON]",
+                   help="KIND: result (a counted result; ends a stall), refusal, stall or failure (count toward "
+                        "one); REASON: why, one line (an exit code, the refusal's text); --key may come anywhere")
+    m.set_defaults(fn=cmd_progress)
 
     s = sub.add_parser("upstream", help="upstream notes across machines: receive, forwarding status and targets")
     s.add_argument("--receive", action="store_true", help="file notes sent over ssh (JSON lines on stdin); prints an ack")
