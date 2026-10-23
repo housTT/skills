@@ -200,6 +200,18 @@ decision turn with a replaced system prompt, no tools and a JSON schema costs a 
 coordinator therefore reads a digest and delegates anything needing files or commands.
 The stable part (role, charter, memory) is the system prompt, which providers cache.
 
+## User corrections
+
+When the user corrects a fact the project stated (a status, result, figure or owner), the
+coordinator records it that turn as a `fact` starting `Correction (user msg #<id>):`, superseding
+the entries that stated the old claim, and queues a task to fix any project file that states it.
+For 30 days `Project.user_corrections` lists the newest 10 such entries (2000 characters at most,
+oldest dropped first) under "User corrections (outrank project notes and older output)": first in
+every worker's prompt, ahead of the rest of memory and outside its budget, and as a live section of
+the coordinator's digest, where they are pinned past the memory budget and left out of the other
+recent facts. After that a correction is an ordinary fact again. Workers check that list before
+restating a status from a note, and fix their own project's notes that contradict it.
+
 ## Adding a provider
 
 What each supported CLI offers, with doc links: [providers.md](providers.md).

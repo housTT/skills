@@ -844,6 +844,13 @@ WORKER_POLICY_MIN_CHARS = WORKER_MEMORY_CHARS // 2
 # Room for a worker's unpinned (task-ranked) memory past the pinned entries shown, whatever the
 # charter digest leaves: ranking always has room to show something.
 WORKER_RANKED_MIN_CHARS = 1500
+# A user's correction of a fact (a `fact` whose text starts CORRECTION_PREFIX) is listed first, under
+# CORRECTIONS_HEADER, in every worker's prompt and the coordinator's digest for CORRECTION_DAYS, and no
+# memory budget drops it there; past CORRECTION_MAX entries or CORRECTION_CHARS the oldest go first.
+# Out of that list it is an ordinary fact again (Project.user_corrections).
+CORRECTION_PREFIX = "Correction (user msg #"
+CORRECTIONS_HEADER = "User corrections (outrank project notes and older output)"
+CORRECTION_DAYS, CORRECTION_MAX, CORRECTION_CHARS = 30, 10, 2000
 # Memory kinds archive_hidden_memory may retire once no prompt shows them (never a standing entry).
 ARCHIVABLE_MEMORY_KINDS = ("decision", "fact")
 # An entry that cites the user's word (`user msg #N`, `(user, <date>)`, "the user's words"): the
@@ -1271,13 +1278,28 @@ class Project:
         out.sort(key=lambda e: e.pop("order"))
         return out
 
+    def user_corrections(self, now: float | None = None) -> list[dict]:
+        """The user's corrections of facts younger than CORRECTION_DAYS, oldest first: the newest
+        CORRECTION_MAX that fit CORRECTION_CHARS together (see CORRECTION_PREFIX)."""
+        since = (time.time() if now is None else now) - CORRECTION_DAYS * 86400
+        out, used = [], 0
+        for e in reversed(self._memory_entries()):
+            if e["kind"] != "fact" or not e["body"].startswith(CORRECTION_PREFIX) or _stamp_ts(e["created"]) < since:
+                continue
+            if len(out) == CORRECTION_MAX or used + len(e["line"]) + 1 > CORRECTION_CHARS:
+                break
+            out.append(e)
+            used += len(e["line"]) + 1
+        return out[::-1]
+
     def memory_select(self, limit_chars: int = COORDINATOR_MEMORY_CHARS) -> tuple[list[dict], dict]:
         """The entries a prompt of `limit_chars` gets, whole: every pinned entry (restrictions,
-        preferences, resources, standing entries) first, then the newest decisions and facts that
+        preferences, resources, standing entries, user_corrections) first, then the newest decisions and facts that
         still fit. Pinned entries are kept even past the budget. Also returns the usage numbers for
         the digest."""
         entries = self._memory_entries()
-        pin = lambda e: e["kind"] in PINNED_MEMORY_KINDS or e["standing"]
+        corrected = {e["name"] for e in self.user_corrections()}
+        pin = lambda e: e["kind"] in PINNED_MEMORY_KINDS or e["standing"] or e["name"] in corrected
         pinned = [e for e in entries if pin(e)]
         used = sum(len(e["line"]) + 1 for e in pinned)
         rest = []
@@ -1302,8 +1324,10 @@ class Project:
         then the facts, newest first while all fit `limit_chars`. An entry whose text `restated(text)`
         says the prompt already states (the charter's restrictions) is left out. Usage numbers as
         memory_select's, counting only the entries meant for workers, plus `duplicates` (left out as
-        restated) and `pinned_dropped` (pinned ones past `pinned_limit`)."""
-        entries = [e for e in self._memory_entries() if worker_memory(e)]
+        restated) and `pinned_dropped` (pinned ones past `pinned_limit`). user_corrections are left
+        out: worker_system lists them on their own, outside this budget."""
+        corrected = {e["name"] for e in self.user_corrections()}
+        entries = [e for e in self._memory_entries() if worker_memory(e) and e["name"] not in corrected]
         dup = {e["name"] for e in entries if restated and restated(e.get("body", ""))}
         pinned = [e for e in entries if worker_memory(e) == 1 and e["name"] not in dup]
         pinned_chars = sum(len(e["line"]) + 1 for e in pinned)

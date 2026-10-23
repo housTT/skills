@@ -14235,6 +14235,89 @@ def test_worker_memory_gives_task_ranked_entries_a_floor_past_a_long_charter(env
     assert not any("OLD-PATH" in e["line"] for e in worker_context(p)[1]), "no task: newest facts, as before"
 
 
+def _aged(path, days):
+    """Back-date memory entry `path` by `days` (its `created` front matter)."""
+    from ttp.project import _stamp
+    path.write_text(re.sub(r"^created: \S+", f"created: {_stamp(time.time() - days * 86400)}", path.read_text(),
+                           flags=re.M))
+    return path
+
+
+def test_a_user_correction_leads_worker_prompts_and_the_digest_and_outlives_memory_trimming(env):
+    """A user's correction of a fact is listed under its own heading ahead of the rest of memory, in a
+    worker's prompt and in the coordinator's digest, once each; an ordinary fact is not. Newer facts
+    that fill both memory budgets never push it out."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.project import COORDINATOR_MEMORY_CHARS, CORRECTIONS_HEADER
+    from ttp.prompts import worker_context, worker_system
+    fix = _aged(p.add_memory("Correction (user msg #12): box-a is up; retires 'box-a is down'.", kind="fact"), 2)
+    for i in range(40):
+        _aged(p.add_memory(f"FILLER-{i:02} box-c note. " + "f" * 600, kind="fact"), 1 - i / 100)
+    p.add_memory("PLAIN-FACT box-b runs the nightly job.", kind="fact")
+    assert [e["name"] for e in p.user_corrections()] == [fix.stem]
+    # The coordinator: pinned past its memory budget, listed live under the heading, not twice.
+    shown, use = p.memory_select(COORDINATOR_MEMORY_CHARS)
+    assert fix.stem in [e["name"] for e in shown] and use["shown"] < use["entries"], use
+    coord.system_prompt(p)
+    digest = coord.digest(p, {}, [], [])
+    head = f"## {CORRECTIONS_HEADER}\n[{fix.stem}] Correction (user msg #12): box-a is up"
+    assert head in digest and digest.count("Correction (user msg #12)") == 1, digest
+    cached, delta = coord.recent_memory(p)
+    assert not any(fix.stem in x for x in cached + delta)
+    assert "PLAIN-FACT" not in digest.split(f"## {CORRECTIONS_HEADER}")[1].split("\n## ")[0]
+    # A worker: its own block before the rest of memory, outside the memory budget.
+    assert fix.stem not in [e["name"] for e in worker_context(p)[1]]
+    system = worker_system(p)
+    block = f"# {CORRECTIONS_HEADER.upper()}\n[{fix.stem}] Correction (user msg #12)"
+    assert block in system and system.count("Correction (user msg #12)") == 1, system
+    assert system.index(block) < system.index("# PROJECT MEMORY")
+    assert "PLAIN-FACT" not in system.split(block)[1].split("\n# ")[0]
+    # Without a correction there is no heading anywhere.
+    p.forget_memory(fix.stem)
+    assert CORRECTIONS_HEADER not in coord.digest(p, {}, [], []) and CORRECTIONS_HEADER.upper() not in worker_system(p)
+
+
+def test_user_corrections_drop_past_30_days_and_past_their_cap_oldest_first(env):
+    p = make(env)
+    from ttp.project import CORRECTION_CHARS, CORRECTION_DAYS, CORRECTION_MAX
+    old = _aged(p.add_memory("Correction (user msg #1): runner-1 belongs to the build team.", kind="fact"),
+                CORRECTION_DAYS + 1)
+    fixes = [_aged(p.add_memory(f"Correction (user msg #{10 + i}): job {i} passed.", kind="fact"), 20 - i)
+             for i in range(CORRECTION_MAX + 2)]
+    _aged(p.add_memory("A plain fact about job 3.", kind="fact"), 1)
+    names = [e["name"] for e in p.user_corrections()]
+    assert names == [f.stem for f in fixes[2:]], names   # the oldest two and the stale one dropped
+    assert old.stem not in names
+    # Long ones: the newest that fit CORRECTION_CHARS together.
+    big = [_aged(p.add_memory(f"Correction (user msg #{40 + i}): " + "b" * 500, kind="fact"), 1 - i / 10)
+           for i in range(4)]
+    got = p.user_corrections()
+    assert [e["name"] for e in got] == [f.stem for f in big[1:]], [e["name"] for e in got]
+    assert sum(len(e["line"]) + 1 for e in got) <= CORRECTION_CHARS
+    # A dropped one is an ordinary fact again: still in memory, no longer pinned for the coordinator.
+    assert old.stem in [e["name"] for e in p._memory_entries()]
+
+
+def test_prompts_carry_the_user_correction_rules(env):
+    p = make(env)
+    from ttp.prompts import coordinator_role, worker_system
+    from ttp.project import CORRECTIONS_HEADER
+    role = " ".join(coordinator_role(p).split())
+    rule = role.split("A user message correcting a fact we stated")[1][:400]
+    for want in ("`memory_add` `fact` `Correction (user msg #<id>):", "retires <stale claim>", "`supersedes` each entry",
+                 "`audience` workers", "a light `work` task fixing any project file", "citing the id", "one-line `reply`"):
+        assert want in rule, want
+    assert role.count("Correction (user msg #") == 1, "one copy of the rule"
+    # A worker gets its rule only with the list it reads.
+    assert "USER CORRECTIONS" not in worker_system(p)
+    p.add_memory("Correction (user msg #5): the nightly job passed.", kind="fact")
+    system = " ".join(worker_system(p).split())
+    assert "check the USER CORRECTIONS block: a correction outranks the note" in system
+    assert "fix it in this run and say so in the hand-off" in system and "Never edit another project's" in system
+    assert CORRECTIONS_HEADER.upper().startswith("USER CORRECTIONS")
+
+
 
 def _course_run(db, task, status="failed", ago=60.0, cost=0.5, role="worker", note=None):
     now = time.time()

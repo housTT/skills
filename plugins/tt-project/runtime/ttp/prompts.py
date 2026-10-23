@@ -14,8 +14,9 @@ from . import budget as bud
 from . import chaincap, conflictfix, overlap, replymsg, settinghold, settled, taskfacts, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
-from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, WORKER_RANKED_MIN_CHARS, Project,
-                      code_tasks_may_push, own_push, push_allowed, push_queue_on, WORKER_POLICY_MIN_CHARS)
+from .project import (CORRECTIONS_HEADER, OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, WORKER_RANKED_MIN_CHARS,
+                      Project, code_tasks_may_push, own_push, push_allowed, push_queue_on, worker_memory,
+                      WORKER_POLICY_MIN_CHARS)
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch, recovery_note
 
 
@@ -462,7 +463,8 @@ def _named(alias: str, text: str) -> bool:
 def worker_features(p: Project, task: dict | None = None) -> set[str]:
     """The features whose fenced rules worker.md carries for `task` (feature_blocks): its kind's
     (`harness`, `prs`, `wait`), and the project's or task's devices, device runners (`devq`), jobs on
-    other machines (`remote`) and shared clusters (`clusters`). No task: a `work` task's."""
+    other machines (`remote`) and shared clusters (`clusters`), and `corrections` while the user has
+    corrected a fact (worker_corrections). No task: a `work` task's."""
     from . import machines
     cfg = p.config()
     kind = (task or {}).get("kind") or "work"
@@ -513,7 +515,14 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
     from .hostmap import table
     if table(cfg):
         on.add("hostmap")
+    if worker_corrections(p):   # the rule that reads them comes with the list
+        on.add("corrections")
     return on | unsure
+
+
+def worker_corrections(p: Project) -> list[dict]:
+    """The user's corrections a worker's prompt lists ahead of its memory (Project.user_corrections)."""
+    return [e for e in p.user_corrections() if worker_memory(e)]
 
 
 def worker_system(p: Project, task: dict | None = None) -> str:
@@ -527,9 +536,13 @@ def worker_system(p: Project, task: dict | None = None) -> str:
     # charter only costs tokens.
     # The rest of the charter and memory is mostly the coordinator's: workers get their digest of it.
     charter, mem, use = worker_context(p, task)
-    p.note_memory_shown([e["name"] for e in mem])
+    # The user's corrections come before the rest of memory, outside its budget (Project.user_corrections).
+    fixed = worker_corrections(p)
+    p.note_memory_shown([e["name"] for e in fixed + mem])
     head, mem_head = _worker_heads(p, use["charter_dropped"], len(p._memory_entries()))
     parts.append(head + (charter or "(none)"))
+    if fixed:
+        parts.append(f"# {CORRECTIONS_HEADER.upper()}\n" + "\n".join(e["line"] for e in fixed))
     more = [_PINNED_MORE.format(n=use["pinned_dropped"], path=p.memory_dir)] if use["pinned_dropped"] else []
     if mem or more:
         parts.append(mem_head + "\n".join([e["line"] for e in mem] + more))

@@ -33,8 +33,8 @@ from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_
                  dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, review_subject,
                  reviewed_ids,
                  task_outcome, without_deferral)
-from .project import (COORDINATOR_MEMORY_CHARS, PINNED_MEMORY_KINDS, Project, code_tasks_may_push, durable_append,
-                      own_push, own_push_mode,
+from .project import (CORRECTIONS_HEADER, COORDINATOR_MEMORY_CHARS, PINNED_MEMORY_KINDS, Project, code_tasks_may_push,
+                      durable_append, own_push, own_push_mode,
                       durable_write, pin_verify_mode, push_queue_number, push_queue_on)
 from .runner import stop_runs
 from .providers.base import NULL_OPERATIONS, normalize_action
@@ -443,7 +443,9 @@ def prompt_state(p: Project, now: float | None = None) -> tuple[dict, dict]:
         from .release import runtime_version
         standing = f"# STANDING\n{live['standing']}\n\n" if live["standing"] else ""
         memory = "\n".join(e["line"] for e in entries) or "(no standing memories yet)"
-        recent = [e for e in p.memory_select(COORDINATOR_MEMORY_CHARS)[0] if not _standing_entry(e)]
+        fixed = {e["name"] for e in p.user_corrections(now)}
+        recent = [e for e in p.memory_select(COORDINATOR_MEMORY_CHARS)[0]
+                  if not _standing_entry(e) and e["name"] not in fixed]
         snap = {"at": now, "why": why, "head": f"{rules}{role}",
                 "context": f"# CHARTER\n{charter}\n\n{standing}# MEMORY\n{memory}\n",
                 "rules": live["rules"], "restrictions": restrictions, "role": live["role"],
@@ -476,13 +478,21 @@ def recent_memory(p: Project, now: float | None = None) -> tuple[list[str], list
     taken = took.get("entries") or {}
     live = {e["name"]: e for e in p._memory_entries()}
     shown = p.memory_select(COORDINATOR_MEMORY_CHARS)[0]
-    new = [e for e in shown if not _standing_entry(e) and e["name"] not in taken]
+    fixed = {e["name"] for e in p.user_corrections(now)}   # correction_lines lists them
+    new = [e for e in shown if not _standing_entry(e) and e["name"] not in taken and e["name"] not in fixed]
     changed = [live[n] for n in taken if n in live and _sha(live[n]["line"]) != taken[n]]
     retired = [n for n in taken if n not in live]
     p.note_memory_shown([e["name"] for e in shown] + [n for n in taken if n in live])
     cached = [RECENT_MEMORY_HEADER, *took["lines"]] if took.get("lines") else []
     delta = [e["line"] for e in changed + new] + [f"[{n}] retired, ignore" for n in retired]
     return cached, [RECENT_ADDED_HEADER, *delta] if delta else []
+
+
+def correction_lines(p: Project, now: float | None = None) -> list[str]:
+    """The user's corrections (Project.user_corrections), live every turn ahead of the other recent
+    facts, which leave them out."""
+    fixed = p.user_corrections(now)
+    return [f"## {CORRECTIONS_HEADER}", *(e["line"] for e in fixed)] if fixed else []
 
 
 def _charter_delta(old: str, new: str) -> list[str]:
@@ -814,6 +824,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         shown.append(("machine_ledger", ledger[0]))
         shas[LEDGER_SEEN_KEY] = ledger[1]
     section("prompt_delta", prompt_delta_lines(p, now))
+    section("user_corrections", correction_lines(p, now))
     section("memory_added", memory_digest_lines(memory_view(p, now)))
     area = settled.digest_line(p, now)
     section("settled_areas", [area] if area else [], area, area.split(":")[0] + " (as last turn)")
