@@ -8168,8 +8168,12 @@ class Daemon:
         if v is None and not (self.p.db.kv(sharedchecks.TIP_KEY) or {}).get(key):
             if not self._start_tip_check(tip, ids, key):
                 return None
-            for old in sharedchecks.tip_started(self.p.db, key, tip, ids, now):
+            stale = sharedchecks.tip_started(self.p.db, key, tip, ids, now)
+            for old in stale:
                 shutil.rmtree(self._tip_dir(old), ignore_errors=True)
+            if stale:
+                with contextlib.suppress(OSError, subprocess.SubprocessError):
+                    worktree._git(self.p.root, "worktree", "prune", check=False)
             v = "pending"
         if v == "pass":
             return self._tip_passed(task, ids, tip, now)
@@ -8205,8 +8209,8 @@ class Daemon:
 
     def _start_tip_check(self, tip: str, ids: list[str], key: str) -> bool:
         """Rerun only `ids` on the push-branch tip `tip`, model-free and detached: in a worktree of its own
-        under state/shared-tip/<key>, `python3 -m pytest -q <ids>` with the project's venv, niced like
-        workers, devices masked, killed past checks.shared_tip_timeout_s. Its exit code goes to rc there
+        under state/shared-tip/<key>, `python3 -m pytest -q <ids>` run as a check is (push.check_argv: the
+        project's venv, in the process sandbox), niced like workers, devices masked, killed past checks.shared_tip_timeout_s. Its exit code goes to rc there
         and the worktree is removed once it ends. False when it could not start."""
         d = self._tip_dir(key)
         wt = d / "wt"
@@ -8223,9 +8227,10 @@ class Daemon:
         env = machines.mask_devices({**os.environ, **(worktree.venv_env(venv, path) if venv else {}),
                                      "TTP_NO_DEVICE": "1"})
         level = nice_level(self.cfg.get("runner"))[0]
+        cmd = push.check_argv("python3 -m pytest -q " + shlex.join(ids), top=wt, env=env)
         argv = [sys.executable, "-c", TIP_RUNNER, str(d), str(wt), str(self.p.root),
                 str(sharedchecks.settings(self.cfg)["tip_timeout_s"]),
-                *(["nice", "-n", str(level)] if level else []), "python3", "-m", "pytest", "-q", *ids]
+                *(["nice", "-n", str(level)] if level else []), *cmd]
         try:
             subprocess.Popen(argv, cwd=str(wt), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)

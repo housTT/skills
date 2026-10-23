@@ -651,7 +651,7 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `checks.shared_backoff_h` (default 2); after 3 such reruns it wakes as before. Each shared failure
   is one incident with one fix task and one low feed line. While that fix is open, in review or
   waiting in the push queue, a new failure of the same ids joins its incident and adds no task. A
-  failure no fix owns first reruns only its failing ids on the push-branch tip, model-free and bounded
+  failure no fix owns first reruns only its failing ids on the push-branch tip, model-free, in the process sandbox like any check, and bounded
   by `checks.shared_tip_timeout_s` (default 900): when they pass there, no fix task is added and the
   held tasks wake to rebase onto the tip; when they fail there too, or the rerun proves nothing, the
   incident opens as above. The daily audit lists the tasks held and
