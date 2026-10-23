@@ -634,10 +634,15 @@ def test_prompts_require_home_zone_times_with_abbreviation_never_utc():
     assert "times in the home zone and its abbreviation, never UTC" in review
 
 
-def test_worker_prompt_asks_for_narrow_file_reads():
+def test_worker_prompt_asks_for_batched_file_reads():
+    # Reviewers get the same worker prompt. Each call re-reads the whole context, so the rule asks for
+    # few calls (every range a step needs at once, parallel independent reads), not only narrow ones.
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
-    for part in ("`grep -n` first", "only the ranges you need", "Do not re-read a range you already read"):
+    for part in ("Each call re-reads the whole context", "`grep -n` first", "every range a step needs in one call",
+                 "`sed -n '10,40p;200,260p' f`", "`grep -n -A30 'def name' f`",
+                 "independent reads and searches as parallel tool calls in one message", "Never re-read a range"):
         assert part in text, part
+    assert "only the ranges you need" not in text
 
 
 def test_worker_prompt_ci_wait_wakes_on_a_hung_job():

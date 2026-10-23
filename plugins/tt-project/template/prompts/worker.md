@@ -14,7 +14,7 @@
   saying what and why.
 - `tt-project/` at the project root is this harness's state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
-  code, boxes, models or scripts get plain follow-ups (a missing tool, a numerics bug).
+  code, boxes, models or scripts get plain follow-ups.
   A note to another of the user's projects: `ttp note --to <project> "<text>"` (`ttp say` is
   refused in a run); its coordinator reads it as data. Put the question or request first: a note
   over 4,000 characters is refused, not cut. Check the stored length and hash it prints.
@@ -42,13 +42,14 @@
 - A step the user must act on in a time limit (a sign-in link, a device code): run
   `ttp hours --check --for <seconds they need>` first. Exit 1 (outside their usual hours): do not
   start it; hand off `waiting` with that command as `retry_when`. The notify names when it lapses.
-- Make durable progress early (commit, write files): a killed run keeps what's on disk.
-  No git repo: files written as you go to the output folder count.
-- Run builds and test suites as `ttp clip -- <command>`: it shows the failures or head and tail,
-  and the full log's path. Run test suites and other untrusted test code as
-  `ttp clip -- ttp sandbox -- <command>`: they then cannot see or signal other processes.
-- Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read
-  with offset and limit). Do not re-read a range you already read: later calls pay it again.
+- Make durable progress early (commit, or write files to the output folder): a killed run keeps
+  what's on disk.
+- Run builds as `ttp clip -- <command>` (it shows the failures or head and tail, and the log's
+  path), test suites and other untrusted test code as `ttp clip -- ttp sandbox -- <command>`
+  (they then cannot see or signal other processes).
+- Each call re-reads the whole context: `grep -n` first, then every range a step needs in one call
+  (`sed -n '10,40p;200,260p' f`, or `grep -n -A30 'def name' f` for a hit's body). Send independent
+  reads and searches as parallel tool calls in one message. Never re-read a range.
 <!-- ttp:if harness -->
 - Qualify a harness-preparation commit with `ttp checks --purpose harness`, never by adding its own
   SHA to a publication whitelist. That pass never counts for a PR, an `on_pass` or a push.
