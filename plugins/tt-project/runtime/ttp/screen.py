@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import jevuse, timefmt, watchdup
@@ -68,6 +68,7 @@ class Verdict:
     issue_id: int
     screen: str = "rules"   # rules | jev | dedupe
     jev_out_of_funds: bool = False   # Jev refused for lack of credits; the rules decided instead
+    woke: list[int] = field(default_factory=list)   # the issues this wake is for (their last_woken moves)
 
 
 def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, jev=None,
@@ -77,8 +78,8 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     """Record the observation as an issue and say whether the coordinator should wake for it.
 
     A known open issue wakes again when `repeat` is set (the watcher says each report is a new
-    event), or when it was last seen more than `rewake_after_s` ago (it came back after a quiet
-    spell). Without either, a known open issue stays quiet. An observation an active mute covers
+    event), or when it last woke the coordinator `rewake_after_s` or more ago (a reminder while it
+    holds, or it came back after a quiet spell). Without either, a known open issue stays quiet. An observation an active mute covers
     is recorded and counted but never wakes (see mute). `lifecycle` (RECEIPT or ERROR, from a
     receipt source) is kept on the issue with its subject; see settle_receipts. `whole` (a watcher's JSON
     line with "whole": true) keeps the line as one condition: its text is never split at '; '. `key` (a watcher JSON line's
@@ -93,11 +94,12 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     Jev is not asked (it could only lower it) and no mute covers the observation."""
     pin = pin and hint in SEVERITY_RANK
     v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle, whole, key, episode, pin)
-    if pin:
-        return v
-    m = count_muted(db, source, text, v.severity, whole=whole, key=key)
-    if m and v.wake:
+    if not pin and count_muted(db, source, text, v.severity, whole=whole, key=key) and v.wake:
         v.wake, v.reason = False, f"muted ({v.reason})"
+    if v.wake and v.woke:
+        # Only a wake that happens moves the clock: a muted one reminds once the mute is over.
+        db.x(f"UPDATE issues SET last_woken=? WHERE id IN ({','.join('?' * len(v.woke))})",
+             (time.time(), *v.woke))
     return v
 
 
@@ -127,6 +129,7 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
                    rewake_after_s, repeat, lifecycle, normalize(subject), reraise_window_s(cfg), key.strip(),
                    episode)
         v.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
+        v.woke = [v.issue_id] if v.wake and v.issue_id else []
         return v
     conditions = watcher_conditions(source, text, whole)
     if conditions is None:
@@ -134,6 +137,7 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
         v = _issue(db, fingerprint(source, text), source, title, None, hint, judge, floor, now,
                    rewake_after_s, repeat, lifecycle)
         v.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
+        v.woke = [v.issue_id] if v.wake and v.issue_id else []
         return v
     verdicts = []
     for subject, cond, cleared in conditions:
@@ -148,6 +152,7 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
     best = next((v for v in verdicts if v.wake), None) or (found or verdicts)[0]
     best.severity = max((v.severity for v in found), key=lambda x: SEVERITY_RANK.get(x, 1), default=best.severity)
     best.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
+    best.woke = [v.issue_id for v in verdicts if v.wake and v.issue_id]
     return best
 
 
@@ -186,8 +191,15 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
         if row["status"] == "open" and rank >= floor:
             if repeat:
                 reason = "repeated"
-            elif rewake_after_s is not None and now - float(row["last_seen"] or 0) > rewake_after_s:
-                reason = f"back after {(now - float(row['last_seen'] or 0)) / 3600:.1f} h quiet"
+            elif rewake_after_s is not None:
+                # Counted from its last wake, not its last sighting: a condition reported on every run
+                # never goes quiet, yet still reminds every rewake_after_s while it holds.
+                woken = row.get("last_woken")
+                woken = float(woken if woken is not None else row.get("opened") or row["first_seen"] or 0)
+                quiet = now - float(row["last_seen"] or 0)
+                if now - woken >= rewake_after_s:
+                    reason = (f"back after {quiet / 3600:.1f} h quiet" if quiet >= rewake_after_s
+                              else f"still open {(now - woken) / 3600:.1f} h after its last wake")
         return Verdict(reason != "known issue", row["severity"], reason, fp, row["id"], "dedupe")
 
     severity, verdict_src, reason, info = judge()

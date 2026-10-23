@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS issues (
   first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT,
   severity TEXT DEFAULT 'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT,
   closed REAL, cleared_why TEXT, lifecycle TEXT, subject TEXT, opened REAL, watch_key TEXT, reopens TEXT,
-  episode TEXT, history TEXT);
+  episode TEXT, history TEXT, last_woken REAL);
 
 CREATE TABLE IF NOT EXISTS schedules (
   name TEXT PRIMARY KEY, kind TEXT NOT NULL, every_s INTEGER NOT NULL, at TEXT,
@@ -325,6 +325,7 @@ class DB:
         self._migrate_issue_opened()
         self._migrate_issue_episode()
         self._migrate_issue_history()
+        self._migrate_issue_last_woken()
         self._migrate_schedule_tz()
         self._migrate_task_pin()
         self._migrate_message_context()
@@ -479,6 +480,16 @@ END""")
         with self.tx():
             if "history" not in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
                 self.x("ALTER TABLE issues ADD COLUMN history TEXT")
+
+    def _migrate_issue_last_woken(self) -> None:
+        # When each issue last woke the coordinator (screen.screen: rewake_after_s counts from it).
+        # Older issues start theirs at last_seen, the time the old rule counted from: no re-wake burst.
+        if "last_woken" in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+            return
+        with self.tx():
+            if "last_woken" not in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+                self.x("ALTER TABLE issues ADD COLUMN last_woken REAL")
+                self.x("UPDATE issues SET last_woken=last_seen")
 
     def _migrate_push_landed(self) -> None:
         # Each pushed or landed row's own commit on the branch (pushq._apply; `ttp landed`). Older

@@ -1050,9 +1050,10 @@ def test_screening_wakes_again_on_repeats_and_after_a_quiet_spell(env):
     # The watcher marks it as a new occurrence: wakes every time.
     assert screen(p.db, cfg, "watcher:hw", text, repeat=True).reason == "repeated"
     # Back after more than the window: wakes again, without the window it never does.
-    p.db.x("UPDATE issues SET last_seen=? WHERE id=?", (time.time() - 7 * 3600, first.issue_id))
+    quiet = "UPDATE issues SET last_seen=?, last_woken=? WHERE id=?"
+    p.db.x(quiet, (time.time() - 7 * 3600, time.time() - 7 * 3600, first.issue_id))
     assert not screen(p.db, cfg, "watcher:hw", text).wake
-    p.db.x("UPDATE issues SET last_seen=? WHERE id=?", (time.time() - 7 * 3600, first.issue_id))
+    p.db.x(quiet, (time.time() - 7 * 3600, time.time() - 7 * 3600, first.issue_id))
     again = screen(p.db, cfg, "watcher:hw", text, rewake_after_s=6 * 3600)
     assert again.wake and again.issue_id == first.issue_id and "quiet" in again.reason
     # Below the wake floor, or ignored by the user: repeats stay quiet.
@@ -1060,6 +1061,73 @@ def test_screening_wakes_again_on_repeats_and_after_a_quiet_spell(env):
     assert not info.wake and not screen(p.db, cfg, "watcher:hw", "box-a: all chips up", repeat=True).wake
     p.db.x("UPDATE issues SET status='ignored' WHERE id=?", (first.issue_id,))
     assert not screen(p.db, cfg, "watcher:hw", text, repeat=True).wake
+
+
+def _rewake_rig(env, monkeypatch):
+    """A watcher reporting one held condition on a fake clock: (see(at_h, **kw) -> Verdict, p, scr)."""
+    p = make(env)
+    from ttp import screen as scr
+    cfg = p.config()
+    clock = {"t": 1_800_000_000.0}
+    t0 = clock["t"]
+    monkeypatch.setattr(scr.time, "time", lambda: clock["t"])
+
+    def see(at_h, text="box-a: queue held (3 jobs waiting)", **kw):
+        clock["t"] = t0 + at_h * 3600
+        kw.setdefault("rewake_after_s", 6 * 3600)
+        return scr.screen(p.db, cfg, "watcher:hw", text, "high", key="box-a-queue", **kw)
+    return see, p, scr
+
+
+def test_a_held_condition_reported_every_run_reminds_every_rewake_window(env, monkeypatch):
+    see, p, _scr = _rewake_rig(env, monkeypatch)
+    # Reported every 2 h for a day: woken at the first sighting, then about every 6 h, never in between.
+    woke = [h for h in range(0, 26, 2) if see(h, f"box-a: queue held ({h} jobs waiting)").wake]
+    assert woke == [0, 6, 12, 18, 24]
+    assert len(p.db.q("SELECT id FROM issues")) == 1
+    row = p.db.one("SELECT last_seen, last_woken, count FROM issues")
+    assert row["count"] == 13 and row["last_seen"] == row["last_woken"]
+    assert not see(26).wake and not see(28).wake
+    assert "after its last wake" in see(30).reason
+
+
+def test_a_held_condition_without_a_rewake_window_wakes_once(env, monkeypatch):
+    see, _p, _scr = _rewake_rig(env, monkeypatch)
+    assert [h for h in range(0, 50, 2) if see(h, rewake_after_s=None).wake] == [0]
+
+
+def test_a_muted_held_condition_reminds_only_after_the_mute(env, monkeypatch):
+    see, p, scr = _rewake_rig(env, monkeypatch)
+    assert see(0).wake
+    scr.mute(p.db, "watcher:hw", "queue held", 20, now=1_800_000_000.0 + 3600)
+    assert [h for h in range(2, 21, 2) if see(h).wake] == [], "no reminder while muted"
+    # The mute is over: the overdue reminder comes at the next sighting, then the clock restarts.
+    assert see(22).wake and not see(24).wake and see(28).wake
+
+
+def test_a_migrated_issue_does_not_rewake_at_once_after_the_upgrade(env, monkeypatch):
+    see, p, _scr = _rewake_rig(env, monkeypatch)
+    from ttp.db import DB
+    # A day-old issue, seen every run, from a database without the last_woken column.
+    assert see(0).wake
+    for h in range(2, 25, 2):
+        see(h)
+    p.db.x("ALTER TABLE issues DROP COLUMN last_woken")
+    db = DB(p.db.path)
+    row = db.one("SELECT last_seen, last_woken FROM issues")
+    assert row["last_woken"] == row["last_seen"], "the reminder clock starts at the last sighting"
+    assert not see(26).wake and see(30).wake
+
+
+def test_a_cleared_held_condition_that_returns_wakes_as_new(env, monkeypatch):
+    see, p, scr = _rewake_rig(env, monkeypatch)
+    assert see(0).wake and not see(2).wake
+    assert not see(3, "box-a: cleared: queue held").wake
+    assert p.db.one("SELECT status FROM issues")["status"] == "fixed"
+    back = see(4)
+    assert back.wake and back.reason == "regressed after fix"
+    # The return restarts the reminder clock.
+    assert not see(8).wake and see(10).wake
 
 
 class _FakeJev:
@@ -2344,10 +2412,10 @@ def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     assert wakes() == 2
     # The default window: the same report a day later wakes again; a payload can turn it off.
     out["stdout"] = json.dumps({"text": "box-a: power-cycle", "severity": "high"})
-    p.db.x("UPDATE issues SET last_seen=?", (time.time() - 24 * 3600,))
+    p.db.x("UPDATE issues SET last_seen=?, last_woken=?", (time.time() - 24 * 3600,) * 2)
     d._run_command_watcher({"name": "hw"}, {"command": "x"})
     assert wakes() == 3
-    p.db.x("UPDATE issues SET last_seen=?", (time.time() - 24 * 3600,))
+    p.db.x("UPDATE issues SET last_seen=?, last_woken=?", (time.time() - 24 * 3600,) * 2)
     d._run_command_watcher({"name": "hw"}, {"command": "x", "rewake_after_h": None})
     assert wakes() == 3
 
