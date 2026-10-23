@@ -10739,6 +10739,60 @@ def test_own_push_honors_the_pr_branch_an_update_records(env, monkeypatch, capsy
         push.own_gate(p, repo, remote, "feature/new")
 
 
+def test_a_pr_branch_line_an_update_appends_rewrites_the_branch_label(env):
+    """A `pr_branch:` line a task_update appends to a task's spec sets its branch label as the
+    `pr_branch` field does (`pr_branch: ""` sets no_pr_branch), so label readers (landed.carriers,
+    worktree.fix_branches, the daemon's review queueing) agree with worktree.recorded_pr_branch. The
+    field wins over a line of the same update; reviews keep their labels. task_add labels its line."""
+    from ttp import coordinator as coord, landed, push, worktree
+    p = make(env)
+    owner = p.db.add_task("Speed up the loader", "s", kind="code")
+    theirs = f"ttp/t{owner}-speed-up-the-loader"
+    p.db.update_task(owner, status="done", branch=theirs)
+
+    def labels(tid):
+        return push._labels(p.db.task(tid))
+
+    def update(tid, **a):
+        assert coord.apply(p, [{"type": "task_update", "id": tid, **a}]) == []
+        t = p.db.task(tid)
+        branch = [lb[10:] for lb in labels(tid) if lb.startswith("pr_branch:")]
+        assert (branch or [""] if worktree.NO_PR_BRANCH in labels(tid) else branch or [None]) \
+            == [worktree.recorded_pr_branch(t)], labels(tid)
+        return t
+
+    tid = p.db.add_task("Fix the loader PR", "Fix its CI.", kind="code")
+    p.db.update_task(tid, branch=f"ttp/t{tid}-fix-the-loader-pr", status="running")
+    assert tid not in landed.carriers(p.db, owner) and worktree.fix_branches(p, {"id": 0}, [theirs]) == {}
+    t = update(tid, spec=f"Deliver it onto its PR.\npr_branch: `{theirs}`")
+    assert labels(tid) == [f"pr_branch:{theirs}"]
+    assert landed.carriers(p.db, owner)[tid][1] == owner
+    assert worktree.fix_branches(p, {"id": 0}, [theirs]) == {f"ttp/t{tid}-fix-the-loader-pr": theirs}
+    assert any(lb.startswith("pr_branch:") for lb in push._labels(t))   # the daemon's review-queue check
+    # A later line replaces it; a cleared line carries no branch.
+    update(tid, spec="pr_branch: `feature/b`\nThen `pr_branch: feature/c` is prose, not a line.")
+    assert labels(tid) == ["pr_branch:feature/b"]
+    update(tid, spec='pr_branch: ""')
+    assert labels(tid) == [worktree.NO_PR_BRANCH] and tid not in landed.carriers(p.db, owner)
+    # An update with no line leaves the label alone.
+    update(tid, spec="Also fix the lint.")
+    assert labels(tid) == [worktree.NO_PR_BRANCH]
+    # Field and line in one update (in spec or text): the field wins, in both.
+    p.db.update_task(tid, status="queued")
+    update(tid, spec="pr_branch: `feature/b`", pr_branch="feature/c")
+    assert labels(tid) == ["pr_branch:feature/c"]
+    update(tid, text="pr_branch: `feature/b`", pr_branch="")
+    assert labels(tid) == [worktree.NO_PR_BRANCH]
+    # Reviews go by their labels only.
+    rev = p.db.add_task("Review the loader PR", "s", kind="review", labels=[f"pr_branch:{theirs}"])
+    update(rev, spec="pr_branch: `feature/b`")
+    assert labels(rev) == [f"pr_branch:{theirs}"]
+    # task_add's own line labels it already.
+    assert coord.apply(p, [{"type": "task_add", "title": "Tidy the PR", "kind": "code",
+                            "spec": "pr_branch: `feature/b`\nTidy it."}]) == []
+    assert "pr_branch:feature/b" in labels(p.db.one("SELECT id FROM tasks WHERE title='Tidy the PR'")["id"])
+
+
 def test_own_push_publishes_another_tasks_branch_checked_out_when_only_an_update_names_it(env, monkeypatch):
     """A reported case: a task's pr_branch was set to another task's ttp/t<id>-... branch only by an
     update (task_update's `pr_branch`, or a `pr_branch:` line appended to its spec), never by its

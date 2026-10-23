@@ -509,11 +509,19 @@ UPDATE_SECTION = re.compile(r"^## Update\b.*$", re.M)
 SPEC_CLEARED_PR_BRANCH = re.compile(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?pr_branch:[ \t]*(?:\"\"|''|``)[ \t]*$", re.M)
 
 
+def spec_line_branch(text: str) -> str | None:
+    """The branch the last `pr_branch:` line of `text` names (SPEC_PR_BRANCH), as written; "" when it
+    is `pr_branch: ""` (SPEC_CLEARED_PR_BRANCH); None when `text` has neither."""
+    hits = [(m.start(), m.group("branch")) for m in SPEC_PR_BRANCH.finditer(text or "")]
+    hits += [(m.start(), "") for m in SPEC_CLEARED_PR_BRANCH.finditer(text or "")]
+    return max(hits)[1] if hits else None
+
+
 def recorded_pr_branch(task: dict) -> str | None:
     """The branch `task` is recorded as delivering onto, as written (callers check valid_branch): the
     latest `pr_branch:` line a task_update appended to its spec (UPDATE_SECTION; `pr_branch: ""`
     clears it), else its `pr_branch:<branch>` label (task_add's, from its original spec's line, or a
-    task_update's `pr_branch`). "" when it carries none (a cleared line, NO_PR_BRANCH); None when
+    task_update's `pr_branch` or appended line: coordinator keeps the label in step). "" when it carries none (a cleared line, NO_PR_BRANCH); None when
     nothing names one, so push.pr_branch_of looks at the task it continues. Reviews and harness tasks
     (NEVER_OWN_KINDS) go by their labels only: their specs quote other tasks'."""
     try:
@@ -526,10 +534,8 @@ def recorded_pr_branch(task: dict) -> str | None:
         for start in (m.end() for m in UPDATE_SECTION.finditer(spec)):
             nxt = UPDATE_SECTION.search(spec, start)
             part = spec[start:nxt.start() if nxt else len(spec)]
-            hits = [(m.start(), m.group("branch")) for m in SPEC_PR_BRANCH.finditer(part)]
-            hits += [(m.start(), "") for m in SPEC_CLEARED_PR_BRANCH.finditer(part)]
-            if hits:
-                latest = max(hits)[1]
+            if (named := spec_line_branch(part)) is not None:
+                latest = named
         if latest is not None:
             return latest
     if NO_PR_BRANCH in labels:

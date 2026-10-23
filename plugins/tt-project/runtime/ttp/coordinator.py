@@ -1765,11 +1765,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          f"it starts; add a new one with continues and pr_branch \"\"")
                     if want and not worktree.valid_branch(want):
                         raise ValueError(f"task #{task['id']} rejected: pr_branch {want!r} is not one valid branch name")
-                    labels = upd.get("labels")
-                    labels = json.loads(task["labels"] or "[]") if labels is None else labels
-                    upd["labels"] = [lb for lb in labels if not (isinstance(lb, str) and lb.startswith(
-                        ("pr_branch:", "rebases:")) or lb == worktree.NO_PR_BRANCH)] + \
-                        [f"pr_branch:{want}" if want else worktree.NO_PR_BRANCH]
+                    upd["labels"] = _branch_labels(upd.get("labels", json.loads(task["labels"] or "[]")), want)
                     branch_line = f"pr_branch: `{want}`" if want else 'pr_branch: ""'
                 if a.get("start_after") is not None or a.get("start_when") is not None \
                         or (a.get("why") is not None and deferral(task).get("when")):
@@ -1800,12 +1796,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"#{task['id']} rejected: depends on #{dep} which "
                                          f"{'does not exist' if why == 'does not exist' else 'is ' + why}; "
                                          f"drop or replace depends_on")
-                spec = "\n\n".join(x for x in (a.get("spec") or "", branch_line) if x)
+                spec = a.get("spec") or ""
                 if a.get("text") and upd.get("status", task["status"]) in ("blocked", "cancelled"):
                     upd["blocked_reason"] = a["text"][:500]
                 elif a.get("text"):
                     # Kept as the reason, a note would outlive the state it described.
                     spec = "\n\n".join(x for x in (spec, a["text"]) if x)
+                # Last, so the field wins over a `pr_branch:` line of the same update (recorded_pr_branch).
+                spec = "\n\n".join(x for x in (spec, branch_line) if x)
                 if a.get("priority"):
                     upd["priority"] = int(a["priority"])
                 if any(a.get(k) is not None for k in ("provider", "model", "effort", "pin_verify")):
@@ -1847,6 +1845,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"cancel it and task_add a code task with continues={task['id']}")
                     if hit := settled.turn_note(p, spec, f"task_update: #{task['id']}"):
                         notes.append(hit)
+                    # A `pr_branch:` line it appends sets the branch as the field does: its label follows,
+                    # so label readers (landed.carriers, worktree.fix_branches, the daemon) agree with
+                    # worktree.recorded_pr_branch. Reviews and harness tasks go by their labels only.
+                    if a.get("pr_branch") is None and upd.get("kind", task["kind"]) not in worktree.NEVER_OWN_KINDS \
+                            and (named := worktree.spec_line_branch(spec)) is not None:
+                        upd["labels"] = _branch_labels(upd.get("labels", json.loads(task["labels"] or "[]")), named)
                 if waits or upd.get("status", "blocked") != "blocked":
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
@@ -2551,6 +2555,14 @@ def _failed_latest_review(db, task: dict) -> dict | None:
 NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")
 REBASE_TITLE = re.compile(r"\brebas(?:e|es|ed|ing)\b", re.I)   # a task whose work is a rebase of its branch
 SPEC_PR_BRANCH = worktree.SPEC_PR_BRANCH
+
+
+def _branch_labels(labels: list, branch: str) -> list:
+    """`labels` with its branch labels (pr_branch:, rebases:, NO_PR_BRANCH) replaced by `branch`'s:
+    `pr_branch:<branch>`, or NO_PR_BRANCH for "" (no own branch)."""
+    return [lb for lb in labels if not (isinstance(lb, str) and lb.startswith(("pr_branch:", "rebases:"))
+                                        or lb == worktree.NO_PR_BRANCH)] + \
+        [f"pr_branch:{branch}" if branch else worktree.NO_PR_BRANCH]
 
 
 def _lands_on_push_branch(cfg: dict, spec: str, branch: str) -> bool:
