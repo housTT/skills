@@ -30966,6 +30966,37 @@ def test_a_failed_review_whose_spec_names_another_branch_still_gets_one_fix_pair
     assert dependency_ids(p.db.task(waiter)) == [] and branch != obranch
 
 
+def test_a_failed_review_of_a_rebased_fix_gets_its_pair_unless_a_fix_review_task_exists(env):
+    """The second live case: a fix the coordinator added re-lands an older change by rebasing it (a
+    `rebases:<old branch>` label, the old branch named in its spec). Its review covers both branches,
+    which are not one stack; the branch the review depends on gets the fix. A `Fix review #<id>` task
+    the coordinator already added (its own branch, no continues label) is that one fix: no second."""
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    from ttp.db import continues_id
+    old, obranch, _, _ = _finish_code(env, p, "progress check", {"progress.py": 30})
+    fix = p.db.add_task(f"Fix review #9: rebase #{old}", "rebase it onto the base", kind="code", origin="coordinator")
+    path, fbranch = worktree.ensure(p, p.db.task(fix))   # its rebased commits start from the base
+    _commit(path, "progress.py", "rebased\n")
+    p.db.update_task(fix, branch=fbranch, status="done", spec=f"pr_branch: `{obranch}` rebase it onto the base")
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"rebases:{obranch}"]), fix))
+    rev = p.db.add_task(f"Review #{fix}", f"Review {fbranch}. Its spec: pr_branch: `{obranch}` rebase it.",
+                        kind="review", origin="daemon", depends_on=[fix], labels=[f"auto_review:{fix}"])
+    failed = _fail_review(env, p, rev, [{"title": "ready clock", "spec": "start it when ready"}])
+    (pair,) = p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rev}:%",))
+    assert continues_id(pair) == fix and f"Fix #{pair['id']}" in failed["text"]
+    # The same review with a coordinator-added Fix review task already open: nothing more.
+    for t in p.db.q("SELECT id FROM tasks WHERE labels LIKE ?", (f'%"continues:{rev}"%',)) + [pair]:
+        p.db.x("UPDATE tasks SET status='cancelled', labels='[]' WHERE id=?", (t["id"],))
+    mine = p.db.add_task(f"Fix review #{rev}: ready clock", "s", kind="code", origin="coordinator",
+                         labels=[f"pr_branch:{fbranch}"])
+    d = Daemon(p.base)
+    assert d._fix_failed_review(p.db.task(rev), [{"title": "ready clock", "spec": "x"}], "x") is None
+    assert d._nofix == "" and [t["id"] for t in p.db.q(
+        "SELECT id FROM tasks WHERE title LIKE ? AND status!='cancelled'", (f"Fix review #{rev}:%",))] == [mine]
+
+
 def test_a_failed_review_the_daemon_cannot_fix_wakes_the_coordinator_once(env):
     """No fix follow-ups: its task_failed event (queued: it wakes the coordinator) names why, the branch
     and what waits, with no second event. Fixes over branches that are not one stack: one review_nofix

@@ -9861,7 +9861,9 @@ class Daemon:
             if t["kind"] == "review":
                 rounds, first = rounds + 1, t
             c = continues_id(t)
-        if db.one("SELECT id FROM tasks WHERE labels LIKE ?", (f'%"continues:{review["id"]}"%',)):
+        # One fix per failed review: also one the coordinator added by title, on its own branch label.
+        if db.one("SELECT id FROM tasks WHERE labels LIKE ? OR (title LIKE ? AND status!='cancelled')",
+                  (f'%"continues:{review["id"]}"%', f'Fix review #{review["id"]}:%')):
             return None
         if rounds > AUTO_FIX_ROUNDS:
             self._nofix = f"{rounds} reviews of this stack failed (the daemon fixes at most {AUTO_FIX_ROUNDS} rounds)"
