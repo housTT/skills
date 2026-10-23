@@ -9162,9 +9162,9 @@ class Daemon:
                 f"review of their own. Head {head} of this branch carries their commits: review the chain's whole "
                 f"change as one. The chain's first task's spec (#{hops[0]['id']}): "
                 + coord.clip(hops[0].get("spec"), AUTO_REVIEW_SPEC_CHARS))
-            earlier = [f"#{h['id']}: {str(f['title'])[:120]}" for h in hops
-                       for f in (fs if isinstance(fs := load_result(h.get("result")).get("followups"), list) else [])
-                       if isinstance(f, dict) and f.get("title")]
+            hfups = [(h, load_result(h.get("result")).get("followups")) for h in hops]
+            earlier = [f"#{h['id']}: {str(f['title'])[:120]}" for h, fs in hfups if isinstance(fs, list)
+                       for f in fs if isinstance(f, dict) and f.get("title")]
             if earlier:
                 lines.append("The earlier hops' follow-ups (each `continue:` one is a later hop of this chain; the "
                              "rest are not findings by themselves): " + "; ".join(earlier[:3 * MAX_FOLLOWUPS]))

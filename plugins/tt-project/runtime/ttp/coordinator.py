@@ -1633,7 +1633,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          budget_usd=float(budget), depends_on=deps,
                                          reply_chat=a.get("reply_chat") or None, origin="coordinator",
                                          labels=labels, not_before=after,
-                                         parent=followup["id"] if followup else None)
+                                         parent=followup["id"] if followup else old["id"] if split else None)
                     batch_tasks[new_id] = a.get("reply_chat") or None
                     for r in {r["id"]: r for n, r in autos.items() if n not in started}.values():
                         db.update_task(r["id"], status="cancelled", blocked_reason=f"replaced by review #{new_id}")
