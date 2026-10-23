@@ -24,6 +24,7 @@ CONTEXT = "relayer context (data, not the user's word)"
 WINDOW_S = 3600   # without a turn's own messages, how far back the guard reads inbound messages
 SHINGLE = 5       # words in a phrase the guard matches
 QUOTE_BACK = 600  # chars of the user's words a rejection hands back, so the next turn can quote them
+QUOTE_LABEL = f"{VERBATIM}: \""  # opens the words words_back hands back
 CONTENT = 3       # of them, at least this many not common words: "the push queue is on" is no quote
 _COMMON = set("""a an and are as at be been but by can do does done for from has have if in into is it its
 it's me my no not now of on once or our so than that the their them then there these this those to too up
@@ -89,7 +90,7 @@ def words_back(m: dict | None, limit: int = QUOTE_BACK) -> str:
         return ""
     if len(words) > limit:
         words = f"{words[:limit].rstrip()} [... cut at {limit} of {len(words)} chars]"
-    return f"Message #{m['id']}, {VERBATIM}: \"{words}\""
+    return f"Message #{m['id']}, {QUOTE_LABEL}{words}\""
 
 
 def guard(text: str, messages: list[dict], terms: set[str] | frozenset = frozenset(),

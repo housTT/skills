@@ -966,7 +966,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     for x in rejected:
         tag = "rejected again, as on the turn before: do not send it as is" if rejection_key(x) in again \
             else "your previous turn's action was rejected; fix or drop it"
-        lines.append(f"- [{tag}] {x[:RESEND_CHARS if RESEND_MARK in x or GATE_MARK in x else 500]}{told}")
+        lines.append(f"- [{tag}] {x[:_rejection_cap(x)]}{told}")
     for x in db.kv(NOTES_KEY, []) or []:
         lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
     for x in chaincap.notices(db):
@@ -996,6 +996,15 @@ def fixable_rejection(problem: str) -> bool:
 def task_kinds(p: Project) -> set[str]:
     """The kinds a task_add may name: TASK_KINDS and any a project's own kind-<name>.md prompt adds."""
     return set(TASK_KINDS) | {f.name[len("kind-"):-len(".md")] for f in (p.harness / "prompts").glob("kind-*.md")}
+
+
+def _rejection_cap(x: str) -> int:
+    """Chars of a rejection the digest shows: 500, the whole resend text, or through the end of the user's
+    words a relay rejection hands back (relay.words_back), so the next turn can quote them exactly."""
+    if RESEND_MARK in x or GATE_MARK in x:
+        return RESEND_CHARS
+    i = x.rfind(relay.QUOTE_LABEL)
+    return max(500, i + len(relay.QUOTE_LABEL) + relay.QUOTE_BACK + 60) if i >= 0 else 500
 
 
 def digest_size(parts: list[tuple[str, str]]) -> dict:

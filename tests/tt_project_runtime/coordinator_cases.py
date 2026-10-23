@@ -9227,6 +9227,12 @@ def test_relay_rejection_hands_back_the_users_own_words(env):
     quoted = problems[0].split("user's words (verbatim): ")[1]
     assert f"[... cut at {relay.QUOTE_BACK} of {len(long.strip())} chars]" in quoted
     assert len(quoted) < relay.QUOTE_BACK + 60 and quoted.startswith('"please keep the nightly build green')
+    # The next turn's digest shows the quote whole, through its cut marker (not the 500-char rejection cap).
+    p.db.set_kv(coord.REJECTED_KEY, problems)
+    marker = f"[... cut at {relay.QUOTE_BACK} of {len(long.strip())} chars]"
+    shown = [ln for ln in coord.digest(p, {}, [], []).splitlines() if "relayer context" in ln]
+    assert len(problems[0]) > 500 and shown and marker in shown[0], shown
+    assert quoted in shown[0]
     # Only context, no words of the user's: the old wording, nothing appended.
     bare = p.db.post("in", "", chat="cli", provenance="cli-legacy", context=ctx)
     problems = coord.apply(p, [{"type": "charter_update", "section": "Policies",
