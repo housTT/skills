@@ -138,6 +138,9 @@ METER_EVERY_S = 600
 RED_CLEAR_RATIO = 0.8
 RED_REPEAT_S = 3600
 CLEAN_STOP_KEY = "clean_stop"   # kv: {boot, ts} of the daemon's last clean stop
+SCHEDULE_BUDGET_KEY = "schedule_budget_raised"   # kv: schedule -> when its own-budget skip last raised (_schedule_skip)
+SCHEDULE_BUDGET_SOURCE = "daemon:schedule-budget"
+SCHEDULE_BUDGET_CLEARED = "the schedule ran again or its spend is back under its daily cap"
 SCHEDULE_GAP_KEY = "schedule_gap_names"   # kv: schedule-gap issue key -> the schedules it names (sweep_schedule_gaps)
 SCHEDULE_GAP_CLEARED = "every schedule named ran again"
 LEASE_STALE_S = 180
@@ -4419,6 +4422,10 @@ class Daemon:
             return   # removed while it ran
         payload = json.loads(row["payload"] or "{}")
         sched.mark_ran(db, row, status, home=timefmt.home(self.p))
+        try:
+            self._schedule_skip(row, status)
+        except Exception as e:   # the run is recorded; its skip history and alert are extras
+            log(self.p, f"schedule {row['name']}: skip record failed: {type(e).__name__}: {e}")
         if again is not None:   # a heal check's grace end or settle recheck comes before its period
             db.x("UPDATE schedules SET next_run=MIN(next_run, ?) WHERE name=?", (again, row["name"]))
         elif row["kind"] == "command" and (spec := heal.of(payload)):   # backing off while healthy
@@ -4644,6 +4651,42 @@ class Daemon:
         except Exception:
             log(self.p, "recording a shared-machine condition failed\n" + traceback.format_exc())
 
+    def _schedule_skip(self, s: dict, status: str) -> None:
+        """Keep a skipped trigger in the schedule's skip history (sched.record_skip), whatever held it.
+        A skip for the schedule's own daily cap (`budget_usd_day`, checked only once the budget gate
+        allows optional work) loses runs the project could afford, so it raises one normal keyed
+        observation per schedule (SCHEDULE_BUDGET_SOURCE, key schedule-budget:<name>), at most once a
+        day. Expected skips (the gate, a debounce, an open run, the idle guard, a precheck) are only
+        recorded. Any later status past the cap check (a run queued, or a later gate) closes the issue."""
+        db, name, now = self.p.db, s["name"], time.time()
+        if sched.skip(status):
+            sched.record_skip(db, name, status, now)
+        key = f"schedule-budget:{name}"
+        if sched.own_budget_skip(status):
+            raised = {k: v for k, v in (db.kv(SCHEDULE_BUDGET_KEY) or {}).items() if now - float(v) < 86400}
+            if name in raised:
+                return
+            cap, spent = float(s["budget_usd_day"] or 0), sched.spent_today(db, name)
+            text = (f"Schedule {name} skipped a run: its own daily budget is used (${spent:.2f} of ${cap:.2f} in the "
+                    f"last 24 h) while the budget gate allows optional work, so it loses runs the project could "
+                    f"afford. It retries every {min(sched.BUDGET_RETRY_S, int(s['every_s'])) // 60} min until its "
+                    f"spend falls under the cap. If its runs matter, raise its daily cap (`budget_usd`), lower its "
+                    f"per-run `budget_usd_run`, or run it less often; `ttp schedules <project> show {name}` lists "
+                    f"its recent skips.")
+            raised[name] = now
+            db.set_kv(SCHEDULE_BUDGET_KEY, raised)
+            log(self.p, f"schedule {name}: {status} (${spent:.2f} of ${cap:.2f}); observation raised")
+            self.observe(SCHEDULE_BUDGET_SOURCE, text, "normal", whole=True, key=key)
+            return
+        if sched.budget_skipped(status):
+            return   # the gate held it before its own cap was read
+        for r in db.q("SELECT id, history FROM issues WHERE source=? AND watch_key=? AND status='open'",
+                      (SCHEDULE_BUDGET_SOURCE, key)):
+            history = json.loads(r["history"] or "[]") + [{"ts": now, "action": "closed", "by": "daemon",
+                                                           "why": SCHEDULE_BUDGET_CLEARED}]
+            db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=?, history=? WHERE id=?",
+                 (now, SCHEDULE_BUDGET_CLEARED, json.dumps(history), r["id"]))
+
     def _schedule_llm(self, s: dict, payload: dict) -> str:
         db = self.p.db
         core = self.cfg.get("core_provider", "claude")
@@ -4652,7 +4695,8 @@ class Daemon:
             return f"skipped: budget {gate.level}"
         # A debounced schedule keeps its period owed while it waits on its budget or its own open run.
         held = "deferred" if sched.debounce_s(s["name"], payload) else "skipped"
-        if s["budget_usd_day"] is not None and sched.spent_today(db, s["name"]) >= float(s["budget_usd_day"]):
+        spent = sched.spent_today(db, s["name"]) if s["budget_usd_day"] is not None else 0.0
+        if s["budget_usd_day"] is not None and spent >= float(s["budget_usd_day"]) - 0.005:
             return f"{held}: daily budget used"
         if db.one("SELECT id FROM tasks WHERE origin='schedule' AND labels=? AND status NOT IN "
                   "('done','failed','cancelled')", (json.dumps([s["name"]]),)):
@@ -4762,7 +4806,8 @@ class Daemon:
         with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
             tid = db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
                               kind=payload.get("kind", "work"), tier=payload.get("tier", "standard"),
-                              priority=int(payload.get("priority", 4)), budget_usd=s["budget_usd_day"],
+                              priority=int(payload.get("priority", 4)),
+                              budget_usd=sched.run_budget(self.cfg, s, payload, spent),
                               origin="schedule", labels=[s["name"]])
             if evidence is not None:
                 sched.record_evidence(db, s["name"], tid, evidence)

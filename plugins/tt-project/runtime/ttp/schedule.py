@@ -203,6 +203,52 @@ def mark_ran(db: DB, sched: dict, status: str, now: float | None = None, home: s
           sched["name"]))
 
 
+SKIP_KIND = "schedule_skip"   # events: one record per skipped trigger (record_skip)
+SKIP_KEEP = 50                # skip records kept per schedule; the oldest go first
+
+
+def skip(status: str | None) -> bool:
+    """A trigger that did not run: held by the budget gate, its own budget, an open run, a debounce,
+    the idle guard or its precheck (every such status starts "skipped" or "deferred")."""
+    return bool(status) and status.startswith(("skipped", "deferred"))
+
+
+def own_budget_skip(status: str | None) -> bool:
+    """Held by the schedule's own daily cap (`budget_usd_day`), not by the project's budget gate."""
+    return skip(status) and status.endswith(": daily budget used")
+
+
+def record_skip(db: DB, name: str, status: str, now: float | None = None) -> None:
+    """Keep one skipped trigger in the schedule's skip history (events, kind SKIP_KIND), which the
+    next run never overwrites, unlike last_status. Capped at SKIP_KEEP per schedule."""
+    src = f"schedule-skip:{name}"
+    with db.tx():
+        db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+             (now or time.time(), src, SKIP_KIND, "low", status[:500], json.dumps({"schedule": name}), "record"))
+        db.x("DELETE FROM events WHERE kind=? AND source=? AND id NOT IN "
+             "(SELECT id FROM events WHERE kind=? AND source=? ORDER BY id DESC LIMIT ?)",
+             (SKIP_KIND, src, SKIP_KIND, src, SKIP_KEEP))
+
+
+def skips(db: DB, name: str, limit: int = 10, since: float | None = None) -> list[dict]:
+    """The schedule's latest skipped triggers, newest first: {"ts", "reason"}."""
+    return db.q("SELECT ts, text reason FROM events WHERE kind=? AND source=? AND ts>=? ORDER BY id DESC LIMIT ?",
+                (SKIP_KIND, f"schedule-skip:{name}", since or 0, limit))
+
+
+def run_budget(cfg: dict, s: dict, payload: dict, spent: float | None = None) -> float:
+    """One run's dollar cap: payload `budget_usd_run`, else the task default for its tier
+    (budget.task_default_usd), never the whole daily cap; and never more than what is left of
+    `budget_usd_day` (`spent`: its last-24-h spend)."""
+    from .budget import task_default_usd
+    own = payload.get("budget_usd_run")
+    cap = float(own) if isinstance(own, (int, float)) and not isinstance(own, bool) and own > 0 \
+        else task_default_usd(cfg, payload.get("tier") or "standard")
+    if s.get("budget_usd_day") is not None:
+        cap = min(cap, max(0.0, float(s["budget_usd_day"]) - float(spent or 0)))
+    return round(cap, 2)
+
+
 def failing(status: str | None) -> bool:
     """A run that did nothing because the schedule itself is broken, not because it chose to skip."""
     return bool(status) and (status == "no command" or status.startswith("error"))
@@ -243,6 +289,8 @@ def with_costs(db: DB, home: str | None = None) -> list[dict]:
         r["cost_7d"] = round(float(c["s"]), 2)
         r["payload"] = json.loads(r["payload"] or "{}")
         r["at_text"] = at_text(r, home)
+        r["skips"] = skips(db, r["name"], 5)
+        r["skips_24h"] = len(skips(db, r["name"], SKIP_KEEP, time.time() - 86400))
     return rows
 
 
@@ -337,6 +385,11 @@ def parse_file(text: str | bytes, known: Any = ()) -> list[dict]:
                 raise ValueError(f"{where}: only an llm schedule takes `payload.precheck`")
             if not isinstance(payload["precheck"], str):
                 raise ValueError(f"{where}: `payload.precheck` is a shell command")
+        r = payload.get("budget_usd_run")
+        if r is not None and (isinstance(r, bool) or not isinstance(r, (int, float)) or r <= 0):
+            raise ValueError(f"{where}: `payload.budget_usd_run` is a positive number of dollars or absent")
+        if r is not None and e["kind"] != "llm":
+            raise ValueError(f"{where}: only an llm schedule takes `payload.budget_usd_run`")
         t = payload.get("precheck_timeout_s")
         if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0):
             raise ValueError(f"{where}: `payload.precheck_timeout_s` is a number of seconds")

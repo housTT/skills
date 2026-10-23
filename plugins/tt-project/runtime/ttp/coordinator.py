@@ -81,6 +81,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "command": {"type": "string"}, "timeout_s": {"type": "number"},
             "rewake_after_h": {"type": ["number", "null"]}, "debounce_h": {"type": ["number", "null"]},
+            "budget_usd_run": {"type": ["number", "null"]},
             "precheck": {"type": ["string", "null"]}, "precheck_timeout_s": {"type": "number"},
             "issue_lifecycle": {"type": ["string", "null"]},
             "key": {"type": "string"}, "value": {"type": "string"},
@@ -2072,6 +2073,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             payload["precheck"] = str(a["precheck"]).strip()
                     if a.get("precheck_timeout_s"):
                         payload["precheck_timeout_s"] = a["precheck_timeout_s"]
+                    if "budget_usd_run" in a:   # null: back to its tier's task default
+                        payload.pop("budget_usd_run", None)
+                        r = a["budget_usd_run"]
+                        if r is not None and (isinstance(r, bool) or not isinstance(r, (int, float)) or r <= 0):
+                            raise ValueError(f"schedule_set {a.get('name')!r} rejected: `budget_usd_run` must be "
+                                             f"a positive number of dollars or null")
+                        if r is not None:
+                            payload["budget_usd_run"] = r
                 elif kind == "watcher" and old:
                     payload = kept   # a built-in probe: only its timing and switch change
                 else:

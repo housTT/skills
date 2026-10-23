@@ -4782,6 +4782,8 @@ def cmd_schedules(a) -> None:
         e = sched.entry(r)
         state = {k: r[k] for k in r if k not in ("name", "kind", "every_s", "at", "enabled", "budget_usd_day",
                                                   "description", "payload")}
+        state["recent_skips"] = [{"at": timefmt.short(float(x["ts"]), p), "reason": x["reason"]}
+                                 for x in sched.skips(p.db, a.schedule)]
         print(json.dumps({**e, "state": state}, indent=2, default=str))
         return
     from . import heal
@@ -4799,7 +4801,8 @@ def cmd_schedules(a) -> None:
             at = (at + " " if at else "") + f"(now {heal._secs(slow)}: healthy)"
         print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' ' + at if at else ''}"
               f"{f' timeout {t}s' if t else ''}{f' precheck: {pre[:60]}' if pre else ''}"
-              f"{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")
+              f"{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}"
+              f"{f' ({n} skip(s) in 24 h)' if (n := len(sched.skips(p.db, r['name'], sched.SKIP_KEEP, time.time() - 86400))) else ''}")
 
 
 def cmd_mute(a) -> None:
