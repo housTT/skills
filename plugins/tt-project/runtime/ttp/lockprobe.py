@@ -35,19 +35,36 @@ def line(resource: str, free: bool, locks_dir: Path, res: str, paths: list[Path]
             f"{f'; reserved for {who_r}' if who_r else ''})")
 
 
-def answer(p, cfg: dict, resource: str, shared_mode: bool = False) -> tuple[int, str]:
+def report(resource: str, said: str, free: bool, locks_dir: Path | None = None, res: str = "",
+           paths: list[Path] | None = None, where=None, paused: dict | None = None) -> dict:
+    """`ttp lock --probe --json`: the probe's answer as data. holders are locks.holder_records: a slot a
+    keeper of detached jobs holds names the keeper in pid (alive while it lives), the taker in taker_pid."""
+    out = {"resource": resource, "free": bool(free) and paused is None, "paused": paused is not None,
+           "line": said, "holders": [], "waiting": 0, "reserved_for": None}
+    if paused is not None:
+        return {**out, "reason": paused.get("reason")}
+    if locks_dir is not None:
+        out.update(holders=locks.holder_records(paths or [], where), waiting=len(locks.queued(locks_dir, res)),
+                   reserved_for=locks.reserved_by(locks.reserve_path(locks_dir, res)))
+    return out
+
+
+def answer(p, cfg: dict, resource: str, shared_mode: bool = False, as_json: bool = False) -> tuple[int, str | dict]:
     """(exit code, line) of `ttp lock --probe [--shared] <resource>` in project p: 0 free, 75 busy or
-    paused. --shared on a device lock answers as the plain probe does."""
+    paused; the line is report()'s dict when `as_json`. --shared on a device lock answers as the plain
+    probe does."""
     from . import shared
     if (held := pause(p, cfg, resource)) is not None:
-        return 75, f"{resource}: paused" + (f" ({held['reason']})" if held.get("reason") else "")
+        said = f"{resource}: paused" + (f" ({held['reason']})" if held.get("reason") else "")
+        return 75, report(resource, said, False, paused=held) if as_json else said
     res = locks.canonical(cfg, resource)
     if res in locks.device_locks(cfg) or res.endswith("-device") or resource.endswith("-device"):
         shared_mode = False
     where = shared.locks_dir(p, res, cfg)
     paths = locks.slot_paths(where, res, shared.slots(p, res, cfg))
     free = locks.probe(where, res, paths, shared=shared_mode)
-    return (0 if free else 75), line(resource, free, where, res, paths, p)
+    said = line(resource, free, where, res, paths, p)
+    return (0 if free else 75), report(resource, said, free, where, res, paths, p) if as_json else said
 
 
 def wait_text(p, cfg: dict, found: list[tuple[str, bool]], rest: list[str]) -> str:

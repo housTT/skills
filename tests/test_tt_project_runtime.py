@@ -14333,6 +14333,51 @@ def test_an_exclusive_hold_for_a_detached_job_survives_a_daemon_restart_and_a_de
                                              "ORDER BY id DESC LIMIT 1")["text"]
 
 
+def test_a_slot_handed_to_a_keeper_names_the_keeper_as_its_live_holder_until_it_exits(env, tmp_path, monkeypatch):
+    """The run supervisor that took an exclusive slot exits once its agent ends; the keeper of the run's
+    detached jobs then holds it. `ttp lock --json`, the holder lines and `ttp machines activity` name the
+    keeper's pid (alive), with via "keeper" and the exited taker's pid apart, and nothing reaps the slot or
+    calls it stale while the keeper lives. Once the keeper exits the slot is free again."""
+    p = make(env)
+    from ttp import activity, hold, locks, responsibilities
+    from ttp.daemon import Daemon
+    mine = _board_task(p, "flash")
+    run_dir, release = p.runs / "46", tmp_path / "release"
+    taker = _exclusive_run_detaching(p, mine["id"], 46, run_dir, _until(release)).pid
+    d = Daemon(p.base)
+    paths = d._slot_paths("board")
+
+    def probe_json():
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--json", "board"], capture_output=True, text=True,
+                           env=dict(os.environ, TTP_PROJECT=str(p.base)))
+        return r.returncode, json.loads(r.stdout)
+
+    try:
+        keeper = hold.read(run_dir)["keeper"]
+        assert not locks._alive(taker) and locks._alive(keeper)
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (mine["id"],))   # a done task: only a live pid keeps it
+        rc, got = probe_json()
+        assert rc == 75 and not got["free"] and len(got["holders"]) == 1, got
+        h = got["holders"][0]
+        assert h["holder"] == f"task #{mine['id']} (run 46), detached jobs" and h["pid"] == keeper, h
+        assert h["alive"] is True and h["via"] == "keeper" and h["taker_pid"] == taker and not h["stale"], h
+        assert f"pid {keeper} alive" in got["line"] and "stale" not in got["line"], got["line"]
+        assert f"pid {keeper} alive" in locks.holders_now(paths, p)[0], locks.holders_now(paths, p)
+        monkeypatch.setattr(responsibilities, "_names", lambda _alias, res: res == "board")
+        view = {"holders": []}
+        activity._current("here", p.name, p.state / "locks", view)
+        assert [(x["pid"], x["alive"], x["via"], x["taker_pid"]) for x in view["holders"]] == \
+            [(keeper, True, "keeper", taker)], view
+        d.tend_holds()
+        assert not locks.any_free(paths) and hold.read(run_dir)["keeper"] == keeper, "a live keeper's hold was reaped"
+    finally:
+        release.touch()
+    assert _until_true(lambda: locks.any_free(paths)), "the keeper's hold outlived its job"
+    rc, got = probe_json()
+    assert rc == 0 and got["free"] and got["holders"] == [], got
+    assert locks.holders_now(paths, p) == [] and hold.read(run_dir)["state"] == "released"
+
+
 def test_a_hold_kept_for_a_closed_task_alerts_once_low_never_releases_and_clears_once_released(env, tmp_path):
     p = make(env)
     from ttp import hold, locks

@@ -3467,24 +3467,27 @@ def cmd_goal(a) -> None:
 LOCK_NA = 3   # `ttp lock --probe` outside a project, of a lock only a project keeps: no answer here
 
 
-def _probe_machine_lock(resource: str, shared_mode: bool) -> None:
+def _probe_machine_lock(resource: str, shared_mode: bool, as_json: bool = False) -> None:
     """`ttp lock --probe` outside any project. A resource shared through `ttp machines` keeps its lock
     under ~/.tt-project/locks, where every project takes it: that lock answers, as the plain probe does
     (0 free, 75 busy, paused or reserved). Any other lock lives in some project's state, so there is
-    nothing here to read: it says n/a and exits LOCK_NA."""
+    nothing here to read: it says n/a and exits LOCK_NA. --json prints lockprobe.report instead."""
     from . import fleethold, lockprobe, locks as lk, shared
     if resource not in shared.names({}):
-        print(f"{resource}: n/a (no tt-project project here, and `ttp machines` does not share it)")
+        said = f"{resource}: n/a (no tt-project project here, and `ttp machines` does not share it)"
+        print(json.dumps({"resource": resource, "na": True, "line": said}) if as_json else said)
         sys.exit(LOCK_NA)
     hold = fleethold.covering(resource)
     held = shared.read_pause(resource) or (fleethold.entry(hold) if hold else None)
     if held is not None:
-        print(f"{resource}: paused" + (f" ({held['reason']})" if held.get("reason") else ""))
+        said = f"{resource}: paused" + (f" ({held['reason']})" if held.get("reason") else "")
+        print(json.dumps(lockprobe.report(resource, said, False, paused=held)) if as_json else said)
         sys.exit(75)
     where = shared.root() / resource
     paths = lk.slot_paths(where, resource, shared.machine_slots(resource))
     free = lk.probe(where, resource, paths, shared=shared_mode and not resource.endswith("-device"))
-    print(lockprobe.line(resource, free, where, resource, paths))
+    said = lockprobe.line(resource, free, where, resource, paths)
+    print(json.dumps(lockprobe.report(resource, said, free, where, resource, paths)) if as_json else said)
     sys.exit(0 if free else 75)
 
 
@@ -3520,7 +3523,10 @@ def cmd_lock(a) -> None:
     `ttp lock --probe <resource>` exits 0 when the resource is free, not paused, not reserved and
     nobody queues for it, else 75; with --shared, when no exclusive holder or waiter has it and it is
     neither paused nor reserved. Outside any project, `--probe` answers for a resource `ttp machines`
-    shares (its lock is machine-wide) and says n/a, exit 3, for any other.
+    shares (its lock is machine-wide) and says n/a, exit 3, for any other. `--json` (a probe) prints the
+    answer as JSON: free, paused, waiting, reserved_for and each live holder with its pid and whether it
+    lives; a slot an exclusive run handed to the keeper of its detached jobs names the keeper (pid, via
+    "keeper") and the run supervisor that took it (taker_pid).
     """
     from . import hold, lockprobe, locks as lk
     cmd = list(a.command or [])
@@ -3528,13 +3534,15 @@ def cmd_lock(a) -> None:
         a.disruptive, cmd = True, cmd[1:]
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
+    if a.json:
+        a.probe = True
     if not cmd and not a.probe:
         die("usage: ttp lock [--disruptive] <resource> -- <command...>  |  ttp lock --probe <resource>")
     base = os.environ.get("TTP_PROJECT")
     if not base and a.probe:
         base = next((str(d) for d in [Path.cwd(), *Path.cwd().parents] if Project(d).exists()), None)
     if not base and a.probe:
-        return _probe_machine_lock(a.resource, a.shared)
+        return _probe_machine_lock(a.resource, a.shared, a.json)
     if not base:
         die("ttp lock only works inside a tt-project run (or with TTP_PROJECT set)")
     p = Project(base)
@@ -3574,8 +3582,8 @@ def cmd_lock(a) -> None:
     except OSError as e:
         _unwritable(e)
     if a.probe:   # a paused `ttp lock` exits 75, so its probe must too
-        rc, said = lockprobe.answer(p, cfg, a.resource, a.shared)
-        print(said)
+        rc, said = lockprobe.answer(p, cfg, a.resource, a.shared, a.json)
+        print(json.dumps(said) if a.json else said)
         sys.exit(rc)
     who = shared.holder(p, res, hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID")), cfg)
     held_locks = [x for x in os.environ.get("TTP_LOCKS_HELD", "").split(",") if x]
@@ -7298,6 +7306,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--shared", action="store_true",
                    help="read mode: run alongside other shared holders; exclusive holders and these exclude each other "
                         "(not for device locks)")
+    s.add_argument("--json", action="store_true",
+                   help="probe, printing JSON: free, paused, waiting and each live holder with its pid and whether "
+                        "it lives (a keeper of detached jobs: via \"keeper\", the taker's pid in taker_pid)")
     s.add_argument("resource", help="the resource's name (a device, machine or build folder)")
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after this many seconds (exit 75); 0 waits as long as it takes; "

@@ -101,13 +101,17 @@ def _owner(pid: int) -> dict:
 
 
 def label_pid(f, pid: int) -> None:
-    """Names `pid` as the holder process of the held slot file `f` (a keeper it was handed to)."""
+    """Names `pid` as the holder process of the held slot file `f`: a keeper it was handed to. "pid" stays
+    the live holder's, so whoever judges it sees the keeper, not the taker that exited; the label adds
+    via "keeper" and the taker's pid as taker_pid."""
     try:
         f.seek(0)
         h = json.loads(f.read() or "{}")
+        taker = h.get("pid")
         f.seek(0)
         f.truncate()
-        f.write(json.dumps({**h, **_owner(pid)}))
+        f.write(json.dumps({**h, **_owner(pid), "via": "keeper",
+                            **({"taker_pid": taker} if taker and taker != pid else {})}))
         f.flush()
     except (OSError, ValueError, TypeError):
         pass
@@ -123,6 +127,16 @@ def _pid_note(h: dict) -> str:
     if pid <= 0:
         return ""
     return f", pid {pid}" + ((" alive" if _alive(pid) else " gone") if _judgeable(h) else "")
+
+
+def pid_alive(h: dict) -> bool | None:
+    """Whether the process a label or record names (its "pid": a keeper's once handed to one) lives; None
+    when it names none or this process cannot judge it (_judgeable)."""
+    try:
+        pid = int(h.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    return _alive(pid) if pid > 0 and _judgeable(h) else None
 
 
 def _judgeable(h: dict) -> bool:
@@ -314,6 +328,30 @@ def holders_now(paths: list[Path], where=None) -> list[str]:
     out = holders([x for x in paths if _slot_labels([x])], where, pids=True)
     return out + [f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}{_holder_note(h, where)}"
                   for h in (shared_holders(paths) if paths else [])]
+
+
+def holder_records(paths: list[Path], where=None) -> list[dict]:
+    """holders_now as data (`ttp lock --probe --json`): each slot taken right now, then each shared holder
+    (shared: true), as its label's fields (holder, since, command, pid, node, pidns; a slot handed to a
+    keeper names the keeper in pid, with via "keeper" and taker_pid), plus alive (pid_alive), note
+    (_holder_note's text) and stale (a done task's hold with no live pid)."""
+    out = []
+    for path in paths:
+        if not _slot_labels([path]):
+            continue
+        try:
+            h = json.loads(path.read_text() or "{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(h, dict) and h:
+            out.append((h, False))
+    out += [(h, True) for h in (shared_holders(paths) if paths else []) if isinstance(h, dict)]
+    recs = []
+    for h, sh in out:
+        note = _holder_note(h, where)
+        recs.append({**h, "shared": sh, "alive": pid_alive(h), "note": note.removeprefix(", "),
+                     "stale": "; stale: " in note})
+    return recs
 
 
 _REDIRECT = re.compile(r"^\d*(?:>>?|<|>&|&>)")

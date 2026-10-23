@@ -234,8 +234,11 @@ def _current(alias: str, owner: str, d: Path, view: dict) -> None:
                     h = json.loads(path.read_text() or "{}")
                 except (OSError, ValueError):
                     h = {}
+                h = h if isinstance(h, dict) else {}
                 view["holders"].append({"resource": res, "where": owner, "holder": h.get("holder"),
-                                        "since": h.get("since"), "command": head(h.get("command") or "")})
+                                        "since": h.get("since"), "command": head(h.get("command") or ""),
+                                        "pid": h.get("pid"), "alive": locks.pid_alive(h),
+                                        **{k: h[k] for k in ("via", "taker_pid") if k in h}})
         elif n.endswith(".reserved") and _names(alias, n[:-len(".reserved")]):
             who = locks.reserved_by(path)
             if who:

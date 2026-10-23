@@ -134,8 +134,14 @@ def keep(run_dir: Path, spec: dict, held: list, wanted: list[dict], inherited: l
         resources.append({"resource": w.get("resource"), "path": f.name, "holder": holder,
                           "label": label(holder, run, LABEL)})
         f.seek(0)
+        try:   # the taker's pid stays named until label_pid names the keeper: never a label without one
+            was = json.loads(f.read() or "{}")
+        except ValueError:
+            was = {}
+        owner = {k: was[k] for k in ("pid", "node", "pidns") if isinstance(was, dict) and k in was}
+        f.seek(0)
         f.truncate()
-        f.write(json.dumps({"holder": label(holder, run, LABEL), "since": time.time(), "command": LABEL}))
+        f.write(json.dumps({"holder": label(holder, run, LABEL), "since": time.time(), "command": LABEL, **owner}))
         f.flush()
     rec = {"task": task, "run": run, "since": time.time(), "state": "holding", "resources": resources,
            "jobs": jobs}
