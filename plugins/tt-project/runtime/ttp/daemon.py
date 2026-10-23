@@ -6302,8 +6302,10 @@ class Daemon:
                     log(self.p, f"task {t['id']}: branch {b} exists only on this machine ({ahead} commits ahead)")
                     # A hop whose continuation the daemon queued, with a review still carrying its
                     # branch: the notice goes to the next digest without a turn of its own (chaincap).
-                    # The next hop starts from the base, so without that review it stays queued.
+                    # The next hop starts from the base, so without that review it stays queued. A split's
+                    # branch is carried by its open continue hop, which builds on it.
                     folded = _carrying_review(db, t["id"]) if chaincap.auto_continued(db, t["id"]) else None
+                    hop = None if folded or not chaincap.split_head(t) else self._open_hop(t)
                     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                          (now, f"task:{t['id']}", "local_only", "normal",
                           f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} commit"
@@ -6311,11 +6313,12 @@ class Daemon:
                           f"automatically: deliver it as the charter allows, or cancel the task if the work is "
                           f"not wanted. If it already landed as another commit (re-landed), a task records that "
                           f"with `ttp task {self.p.name} superseded {t['id']} <sha>`.",
-                          "handled" if folded else "queued", t["id"]))
-                    if folded:
+                          "handled" if folded or hop else "queued", t["id"]))
+                    if folded or hop:
                         chaincap.add_notice(db, f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} "
                                                 f"commit{'' if ahead == 1 else 's'} ahead of every remote; its "
-                                                f"review #{folded} carries it.")
+                                                + (f"review #{folded}" if folded else f"continue hop #{hop['id']}")
+                                                + " carries it.")
             if live != told:
                 db.set_kv(KV_LOCAL_ONLY, live or None)
 

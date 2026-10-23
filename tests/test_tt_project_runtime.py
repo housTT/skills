@@ -30925,10 +30925,11 @@ def test_a_mechanical_or_light_continue_hop_is_queued_at_light_tier_and_reads_it
     root, *_ = _finish_code(env, p, "feature", {"a.py": 10}, result=light)
     (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
     assert hop["tier"] == "light" and hop["spec"] == "Run the checks."
-    # A daemon hop of done work is a follow-up (no `continues:` label), yet its worker reads the parent's summary.
+    # The hop of a split (a code task with changes and a `continue:` follow-up) takes its branch over:
+    # its worker starts from that head and reads the parent's summary.
     prompt = worker_prompt(p, p.db.task(hop["id"]), str(p.root), None)
-    assert f"This task continues #{root} feature (done). Its last summary: feature: part done, checks left" in prompt
-    assert "starts from that branch's head" not in prompt
+    assert f"This task continues #{root} feature (done) on branch {p.db.task(root)['branch']}, and starts from " \
+           f"that branch's head. Its last summary: feature: part done, checks left" in prompt
     mech = {"status": "done", "summary": "other: done, push left",
             "followups": [{"title": "mechanical: push other", "spec": "Push it."}]}
     root2, *_ = _finish_code(env, p, "other", {"b.py": 3}, result=mech)
@@ -30948,35 +30949,44 @@ def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordina
     p = make(env)
     from ttp import audit, chaincap
     from ttp import coordinator as coord
-    root, _, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
+    from ttp.db import continues_id
+    root, branch, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
     (hop1,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
-    # The next hop starts from the base, not this branch: this hop's commits get their review first.
-    assert hop1["title"] == "continue: feature" and hop1["status"] == "queued" and len(reviews) == 1
-    assert reviews[0]["status"] == "queued" and f"Review #{reviews[0]['id']} queued by the daemon" in done["text"]
-    assert done["status"] == "handled" and f"Continue hop #{hop1['id']} queued by the daemon (1 new commit)" in done["text"]
+    # A split: its head is unfinished, so no review; the hop takes the branch over and starts at once.
+    head = _git_out(env["repo"], "rev-parse", branch).strip()
+    assert chaincap.split_head(p.db.task(root)) == head and not reviews
+    assert hop1["title"] == "continue: feature" and hop1["status"] == "queued" and continues_id(hop1) == root
+    assert not any(x.startswith("start_when:") for x in _labels(p, hop1["id"]))
+    assert f"Split at head {head[:12]}: no review of it" in done["text"] and "Review #" not in done["text"]
+    assert done["status"] == "handled" and (f"Continue hop #{hop1['id']} queued by the daemon (1 new commit); it "
+                                            f"builds on #{root}'s branch and starts now.") in done["text"]
     assert not p.db.q("SELECT id FROM events WHERE status='queued'"), "a hop with progress woke the coordinator"
     assert [t["id"] for t in chaincap.chain(p.db, hop1["id"])] == [root, hop1["id"]]
+    # One hop at a time: a second task continuing the split head is refused.
+    (problem,) = coord.apply(p, [{"type": "task_add", "title": "continue: feature again", "spec": "s", "kind": "code",
+                                  "continues": root}])
+    assert f"#{hop1['id']} already continues its split head" in problem
     # The next hop commits too: queued again, though its title repeats the earlier hops'.
     _hop(env, p, hop1["id"], {"b.py": 5}, _cont("feature, part 2"))
     (hop2,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (hop1["id"],))
     assert not p.db.q("SELECT id FROM events WHERE status='queued'")
-    assert p.db.q("SELECT id FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([hop1["id"]]),))
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'") and chaincap.split_head(p.db.task(hop1["id"]))
     digest = coord.digest(p, {}, [], [])
     assert "continue hop queued by the daemon" in digest and f"Continue hop #{hop2['id']}" in digest
-    # A local-only notice for a hop the daemon continued, while its review carries the branch, is
-    # folded into the digest too; without that review it goes to the coordinator.
+    # A local-only notice for a split hop is folded into the digest while its open continue hop carries
+    # the branch; once no open hop does, it goes to the coordinator.
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     t1 = p.db.task(hop1["id"])
-    (r1,) = p.db.q("SELECT id FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([hop1["id"]]),))
     d._apply_local_only({"error": None, "tasks": [t1], "reviews": [], "found": ({t1["branch"]: ("abc123", 1)}, True, set())})
     lo = p.db.one("SELECT * FROM events WHERE kind='local_only'")
-    assert lo["status"] == "handled" and any(f"its review #{r1['id']} carries it" in n for n in chaincap.notices(p.db))
-    p.db.update_task(r1["id"], status="cancelled")
+    assert lo["status"] == "handled" and any(f"its continue hop #{hop2['id']} carries it" in n for n in chaincap.notices(p.db))
+    p.db.update_task(hop2["id"], status="cancelled")
     p.db.set_kv("local_only", None)
     p.db.x("DELETE FROM events WHERE kind='local_only'")
     d._apply_local_only({"error": None, "tasks": [t1], "reviews": [], "found": ({t1["branch"]: ("abc123", 1)}, True, set())})
     assert p.db.one("SELECT status FROM events WHERE kind='local_only'")["status"] == "queued"
+    p.db.update_task(hop2["id"], status="queued")
     chaincap.clear_notices(p.db, time.time())
     assert chaincap.notices(p.db) == []
     # A hop with no new commit and no new evidence goes to the coordinator.
@@ -30994,12 +31004,73 @@ def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordina
     assert chaincap.progress(p, chaincap.chain(p.db, hop2["id"]), 2) == ""
     line = next(x for x in audit.lines(p.db) if x.startswith("continue chains"))
     assert f"#{root} feature: 2 hops to #{hop2['id']}" in line and "2 auto" in line
-    # A code hop with changes whose review cannot be queued goes to the coordinator: the next hop
-    # would start without its commits and nothing would review or deliver them.
+    # With review.auto off a split's hop is still queued: it carries the branch; no review is queued.
     p.set_config("review.auto", False)
     other, _, done, reviews = _finish_code(env, p, "widget", {"w.py": 10}, result=_cont("widget"))
-    assert not reviews and not p.db.q("SELECT id FROM tasks WHERE parent=?", (other,))
-    assert done["status"] == "queued" and "Continue hop" not in done["text"]
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (other,))
+    assert not reviews and continues_id(hop) == other and done["status"] == "handled"
+
+
+def test_the_last_hop_of_a_split_chain_gets_its_one_review_listing_the_chain(env):
+    """A split chain is reviewed once, at the head of the first hop that ends without a split: that
+    review names each split hop and their follow-ups and reads the chain's first spec."""
+    p = make(env)
+    from ttp import chaincap
+    root, branch, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
+    (hop1,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    _hop(env, p, hop1["id"], {"b.py": 5}, _cont("feature, part 2"))
+    (hop2,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (hop1["id"],))
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+    _hop(env, p, hop2["id"], {"c.py": 5}, {"status": "done", "summary": "feature: all done",
+                                           "followups": [{"title": "later: docs", "spec": "write docs"}]})
+    assert not chaincap.split_head(p.db.task(hop2["id"]))
+    assert [h["id"] for h in chaincap.split_hops(p.db, p.db.task(hop2["id"]))] == [root, hop1["id"]]
+    (rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review'")
+    assert json.loads(rev["depends_on"]) == [hop2["id"]]
+    s1, s2 = chaincap.split_head(p.db.task(root)), chaincap.split_head(p.db.task(hop1["id"]))
+    assert f"It is the last hop of a split continue chain: #{root} (head {s1[:12]}), #{hop1['id']} (head {s2[:12]})" in rev["spec"]
+    assert f"The chain's first task's spec (#{root}): spec of feature" in rev["spec"]
+    assert f"#{root}: continue: feature" in rev["spec"] and f"#{hop1['id']}: continue: feature, part 2" in rev["spec"]
+    # The split tasks are carried by the chain, not left for the unreviewed sweep.
+    assert p.db.task(hop2["id"])["branch"]
+
+
+def test_a_failed_review_of_a_code_task_with_an_open_continue_hop_gives_the_hop_its_findings(env):
+    """The open hop that builds on the reviewed branch finishes it: it takes the findings (no second
+    task continuing the same work) and the re-review waits on it."""
+    p = make(env)
+    root, branch, _, (rev,) = _finish_code(env, p, "feature", {"a.py": 10})
+    hop = p.db.add_task("continue: feature", "carry on", kind="code", origin="coordinator",
+                        labels=[f"continues:{root}"])
+    _fail_review(env, p, rev["id"], [{"title": "fix the parser", "spec": "the parser drops the last token"}])
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix review%'"), "a second task continues the work"
+    t = p.db.task(hop)
+    assert f"review_fix:{rev['id']}" in _labels(p, hop) and t["spec"].startswith("carry on\n")
+    assert f"Review #{rev['id']}" in t["spec"] and "This task continues that branch" in t["spec"]
+    assert "the parser drops the last token" in t["spec"]
+    (rr,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev["id"],))
+    assert hop in json.loads(rr["depends_on"])
+
+
+def test_a_code_hand_off_that_marks_its_head_wip_is_a_split_with_no_review(env):
+    from ttp import chaincap
+    assert chaincap.marked_split({"split": True}) and chaincap.marked_split({"wip": True})
+    assert chaincap.marked_split({"summary": "Split at the coordinator's split line: code done, tests left"})
+    assert chaincap.marked_split({"summary": "Work stopped past the split line."})
+    assert chaincap.marked_split({}, "tt-project: parser (WIP): tests pending")
+    assert chaincap.marked_split({}, "WIP parser")
+    assert not chaincap.marked_split({"summary": "Splits the parser into two modules"}, "parser: split lexer")
+    assert not chaincap.marked_split({"summary": "split lexer from parser"}, "SWIPE handler")
+    p = make(env)
+    tid, branch, done, reviews = _finish_code(env, p, "parser", {"p.py": 10},
+                                              result={"status": "done", "summary": "Split here: tests left"})
+    head = _git_out(env["repo"], "rev-parse", branch).strip()
+    assert chaincap.split_head(p.db.task(tid)) == head and not reviews
+    assert f"No continue hop finishes its split head: add one with continues #{tid}" in done["text"]
+    assert done["status"] == "queued", "a split with no hop must reach the coordinator"
+    # A finished code task with no split marks gets its review as before.
+    _, _, _, reviews = _finish_code(env, p, "lexer", {"l.py": 10})
+    assert len(reviews) == 1
 
 
 def _fetch_origin(repo, tries=20):
@@ -31038,25 +31109,37 @@ def _land_on_proj(repo, other, branch):
     _fetch_origin(repo)
 
 
-def test_a_daemon_queued_code_hop_starts_only_once_its_predecessors_reviewed_commits_landed(env, monkeypatch):
-    """The next hop starts from the push branch's tip: while the previous hop's review is still queued
-    it would lack that hop's commits, redo them or conflict with them at push time."""
+def test_a_split_hop_starts_at_once_and_never_waits_on_its_own_chains_landing(env, monkeypatch):
+    """A split's hop starts from its branch's head, not the push branch's tip: it never waits on the
+    split's landing, which comes only with the hop's own work. A landed: wait on a task of its own
+    continue chain is refused (task_add and task_update) while that task has not landed."""
+    from ttp import coordinator as coord
     from ttp import daemon as dmod
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     root, branch, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
     (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
-    assert len(reviews) == 1 and reviews[0]["status"] == "queued"
-    assert hop["status"] == "queued" and f"start_when:landed:#{root}" in _labels(p, hop["id"])
-    assert f"it starts once #{root}'s commits land on the push branch" in done["text"] and done["status"] == "handled"
-    d = dmod.Daemon(p.base)
-    _settle_deferred(d, hop["id"])
-    _settle_deferred(d, hop["id"])
-    assert not _ready(p, hop["id"]), "the hop started while its predecessor's review was still queued"
-    assert not _events(p, hop["id"], "deferral_probe_broken")
-    _land_on_proj(repo, other, branch)
-    _settle_deferred(d, hop["id"], until=lambda: _ready(p, hop["id"]))
-    assert _ready(p, hop["id"]), "the hop stayed deferred after its predecessor's commits landed"
+    assert not reviews and hop["status"] == "queued"
+    assert not any(x.startswith("start_when:") for x in _labels(p, hop["id"]))
+    assert "land on the push branch" not in done["text"] and done["status"] == "handled"
+    _settle_deferred(dmod.Daemon(p.base), hop["id"])
+    assert _ready(p, hop["id"]) and not _events(p, hop["id"], "deferral_probe_broken")
+    (problem,) = coord.apply(p, [{"type": "task_update", "id": hop["id"], "start_when": f"landed:#{root}"}])
+    assert f"waits on #{root}, which this task continues" in problem
+    assert not any(x.startswith("start_when:") for x in _labels(p, hop["id"]))
+    p.db.update_task(hop["id"], status="cancelled")
+    (problem,) = coord.apply(p, [{"type": "task_add", "title": "continue: feature", "spec": "s", "kind": "code",
+                                  "continues": root, "start_when": f"landed:#{root}"}])
+    assert f"waits on #{root}, which this task continues" in problem
+    # A wait on a task outside the chain, or on one whose work already landed, is accepted.
+    outside = p.db.add_task("other work", "s", kind="code", origin="coordinator")
+    assert coord.apply(p, [{"type": "task_add", "title": "continue: feature", "spec": "s", "kind": "code",
+                            "continues": root, "start_when": f"landed:#{outside}"}]) == []
+    from ttp import chaincap
+    lineage = [t["id"] for t in chaincap.chain(p.db, root)]
+    assert chaincap.own_wait(p, lineage, f"landed:#{root}")
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (root, "b" * 40, "a" * 40, time.time()))
+    assert chaincap.own_wait(p, lineage, f"landed:#{root}") == ""
 
 
 def test_a_daemon_queued_code_hop_whose_predecessor_already_landed_starts_at_once(env, monkeypatch):
@@ -31090,7 +31173,7 @@ def test_a_daemon_queued_code_hop_waits_for_no_landing_where_its_review_pushes_n
             p.set_config(key, val)
         root, _, done, reviews = _finish_code(env, p, title, {f"{title}.py": 10}, result=_cont(title))
         (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
-        assert len(reviews) == 1 and hop["status"] == "queued"
+        assert not reviews and hop["status"] == "queued"
         assert not any(x.startswith("start_when:") for x in _labels(p, hop["id"])), setup
         assert f"Continue hop #{hop['id']} queued by the daemon" in done["text"] and "land on the push" not in done["text"]
         _settle_deferred(dmod.Daemon(p.base), hop["id"])

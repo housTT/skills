@@ -9862,12 +9862,12 @@ def test_a_coordinator_review_replaces_the_daemons_until_it_starts(env):
 
 
 def test_an_unqueued_continue_follow_up_says_so_and_raises_continue_unqueued_once(env):
-    """A done code hop with changes and one `continue:` follow-up the daemon could not queue (no review
-    to carry its commits) says NOT queued in its task_done and followup_proposed events. Left alone for
-    30 min, it raises one high continue_unqueued event; a task that continues it raises none."""
+    """A done code hop with changes and one `continue:` follow-up the daemon did not queue (automatic
+    hops off) says NOT queued in its task_done and followup_proposed events. Left alone for 30 min, it
+    raises one high continue_unqueued event; a task that continues it raises none."""
     p = make(env)
     from ttp import daemon as dm
-    p.set_config("review.auto", False)
+    p.set_config("chains.auto", False)
     tid, _, done, _ = _finish_code(env, p, "widget", {"w.py": 10}, result=_cont("widget"))
     assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
     assert "Continue hop" not in done["text"] and f"Continue follow-up {dm.UNQUEUED_TAG}" in done["text"]
