@@ -59,7 +59,8 @@ run.
 
 Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the target checkout:
 
-- evals: default `r1_gpqa_diamond`, `swe_bench_verified`, `terminal_bench_2`, the release-spec names;
+- evals: default `r1_gpqa_diamond`, `swe_bench_verified`, `terminal_bench_2`, the release-spec
+  names; the default subset is 10 tasks each;
 - `stage_budget_hours` (default 24) and `suite_budget_hours` (default 8);
 - reference scores;
 - the eval harness: default the tt-inference-server agentic runner;
@@ -91,6 +92,11 @@ Work from cheap to expensive:
 4. Re-run the combined changes together. Changes that draw on the same memory interact.
 5. Estimate each full suite from the samples, with a range. Run it only if the estimate fits
    `suite_budget_hours` before the deadline. A measured stop is a valid result.
+6. When exploration is done, run the full suites on the best version. Split each one so every
+   dispatch finishes inside the grant's per-run timeout; a suite that hits the cap returns
+   nothing. If the subsets plus the stage-11 benchmarks also fit in one run, do a release run
+   too, with per-eval timeouts that sum under the cap so it ends with results rather than at the
+   limit.
 
 ### Fanning out
 
@@ -99,6 +105,11 @@ its own sample, dispatches, and reports the arm with its evidence. A coordinator
 best, the slot ledger and the budget, decides what is kept, and re-runs kept changes together.
 Explorers do not accept their own arms, and every dispatched run is registered with the coordinator
 when it is launched, not when it finishes.
+
+The coordinator also reads results the way [Look at the whole run](#look-at-the-whole-run) asks,
+across arms rather than within one, and sets what to probe next. Not every run needs to be a
+candidate for best: a run whose only purpose is to show where headroom is left — or to rule a
+mechanism out — is worth a slot when the picture is thin.
 
 Give explorers different mechanisms, not one idea at several magnitudes.
 

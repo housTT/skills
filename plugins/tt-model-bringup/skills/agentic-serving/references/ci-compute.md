@@ -16,6 +16,7 @@ share your filesystem. They fetch the implementation from Git refs. So the unit 
     "repo": "<owner>/<ci-repo>",
     "workflow": "<workflow-file.yml>",
     "max_parallel": 6,
+    "run_timeout_hours": 14,
     "runners": [
       {"runner_label": "<label>", "device_type": "<device>", "count": 6}
     ],
@@ -130,6 +131,16 @@ A run that fails for an infrastructure reason — runner offline, image pull, a 
 the model — is not a measurement. Record it, re-dispatch it, and keep it out of the scored set. A
 run that fails because the model crashed, looped or produced malformed output *is* a measurement,
 and belongs in the report.
+
+## Fitting the timeout
+
+`run_timeout_hours` is a hard cap per dispatch: a run that reaches it is killed and returns
+nothing, so the cost is the whole run, not the overrun. Plan against the top of an estimate's
+range, not its midpoint.
+
+Split a full suite across dispatches so each part finishes inside the cap, and keep the split on
+task boundaries so partial results stay scorable. For a run carrying several evals, set per-eval
+timeouts that sum under the cap — then a slow eval loses itself rather than the run.
 
 ## What counts as evidence
 
