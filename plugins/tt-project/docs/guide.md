@@ -320,11 +320,14 @@ prolonged whole-box outage.
   summary, gets one Course check line in the next digest. The daily review's efficiency audit lists
   each correction of the last 24 h with its class fix task, or none.
 - Progress and stall check: each minute the daemon checks, without a model, that work keeps yielding
-  results (a task done, a worker hand-off, a driver's `result` report). A `no_progress` event names a
-  queued task dispatch could start (with a worker slot free), a resource queued or running tasks
-  name, or the whole project, once it has gone `task_h`, `resource_h` or `project_h` (2 each) hours
-  with work queued or running and no result. A queued task's clock starts when it became ready
-  (dependencies met, start time passed, pause lifted), not when it was created. A `stall` event
+  results (a task done, a worker hand-off, a driver's `result` report). It judges only work that has
+  run. A `no_progress` event names a task with a worker run running, a resource running worker runs
+  hold, or the whole project, once it has gone `task_h`, `resource_h` or `project_h` (2 each) hours
+  with no result since the run started (the earliest such run for a resource or the project). A
+  queued task, never started or queued again after a run, is not judged here: the daemon's stall
+  check (`coordinator.stall_wake_h`) owns it, since it knows whether dispatch would start the task
+  now. Known gap: that check wakes only when no worker run at all has started for that long, so one
+  ready task that dispatch passes over while other runs keep starting is not reported. A `stall` event
   names a repeat: a retry_when or start_when probe still saying not yet after `probe_n` (10)
   verdicts and `probe_h` (1) hour (waits
   on the task's own job, a push, CI, another task or a time are left out), a task's or schedule's
@@ -335,7 +338,7 @@ prolonged whole-box outage.
   task itself is meant to fix (or whose holder waits on the task) is flagged "waits on what it fixes".
   Each key wakes the coordinator once, again when its count or stuck time reaches `escalate_x` (2)
   times what it was at the last wake or after `rewake_h` (12) hours. A key that drops out of one
-  check (all worker slots briefly full) is not cleared and never wakes again as new: it clears only
+  check (between two runs) is not cleared and never wakes again as new: it clears only
   after `clear_n` (3) healthy checks in a row spanning `clear_min` (30) minutes (schedule repeats
   also lapse after `quiet_h`, 6, quiet hours). The digest's `Progress` section lists the open keys
   and the daily review lists each with how long it took to clear. Thresholds live under

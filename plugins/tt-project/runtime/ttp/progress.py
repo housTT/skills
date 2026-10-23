@@ -24,15 +24,19 @@ streaks to `streaks`/Daemon.watch_progress: one detector, one wake per stalled d
 
 Progress clock: the time since the last counted result (a task done, a worker hand-off, a driver's
 `result` report for its key, or made inside a task's run), kept per open task, per resource open
-tasks name and for the project. Past its threshold while work is queued or running, one keyed
-`no_progress` event names what is stuck, since when and the last reason seen:
+tasks name and for the project. It judges only work that has run: past its threshold while worker
+runs are running, one keyed `no_progress` event names what is stuck, since when and the last reason:
 
-- task: a queued task dispatch could start (dependencies met, no timer or start_when, no paused
-  resource) that has had no result for `task_h` (2) hours since it became ready while a worker slot
-  is free;
-- resource: a resource named by queued or running tasks with no result on any task naming it for
-  `resource_h` (2) hours;
-- project: no result anywhere for `project_h` (2) hours while tasks are queued or running.
+- task: a task with a worker run running that has had no result for `task_h` (2) hours since the
+  later of that run's start and its last counted result;
+- resource: a resource held by running worker runs with no result on any task naming it for
+  `resource_h` (2) hours since the earliest of those runs started;
+- project: no result anywhere for `project_h` (2) hours since the earliest running worker run started.
+
+A queued task, never started or queued again after a run, is never judged here: whether dispatch
+would start it now is Daemon.check_stall's (its _start_hold model), not a second clock here. Known
+gap: check_stall wakes only when no worker run at all has started for coordinator.stall_wake_h, so
+one ready task that dispatch passes over while other runs keep starting is reported by neither.
 
 Repeat detectors, each one keyed `stall` event with the count, first and last seen and the reason:
 
@@ -48,8 +52,8 @@ Repeat detectors, each one keyed `stall` event with the count, first and last se
 
 Each key wakes once per condition. It wakes again only when its count (or stuck time) reaches
 `escalate_x` (2) times what it was at the last wake, or after `rewake_h` (12) hours. Hysteresis: a
-raised key that drops out of a check is not cleared at once (a stuck task drops out whenever every
-worker slot is briefly full). It stays raised, quiet, and clears only once it has stayed healthy for
+raised key that drops out of a check is not cleared at once (a resource or project key drops out
+between two runs). It stays raised, quiet, and clears only once it has stayed healthy for
 `clear_n` (3) checks in a row spanning at least `clear_min` (30) minutes; coming back before that
 continues the same raise and never wakes as new. Schedule repeats also lapse after `quiet_h` (6)
 hours with no repeat. Each cleared key is kept for the daily review with how long it took. A mute
@@ -209,7 +213,7 @@ def stalled(state: Path, cfg: dict | None, now: float | None = None) -> list[dic
 # ---- progress and stall check (the daemon's check_progress) ----
 
 KEY = "progress_check"          # coordinator.progress_check: thresholds
-STATE_KEY = "progress_state"    # kv: results seen, counters, ready clocks, raised keys, cleared history
+STATE_KEY = "progress_state"    # kv: results seen, counters, raised keys, cleared history
 SOURCE = "daemon:progress"      # the events' source, for observation mutes
 EVENT_KINDS = ("no_progress", "stall")
 # clear_n/clear_min: hysteresis. A raised key clears only after clear_n healthy checks in a row that
@@ -268,7 +272,8 @@ def load(db: DB) -> dict:
     st = db.kv(STATE_KEY) or {}
     if not isinstance(st, dict):
         st = {}
-    for k in ("results", "probes", "scheds", "ready", "raised"):
+    st.pop("ready", None)   # an older build's ready clocks: never-started work is check_stall's
+    for k in ("results", "probes", "scheds", "raised"):
         st.setdefault(k, {})
     st.setdefault("history", [])
     return st
@@ -350,18 +355,10 @@ def _resources(task: dict) -> set[str]:
     return task_resources(task)
 
 
-def _active(db: DB, cfg: dict, now: float) -> tuple[list[dict], list[dict], int, dict]:
-    """(queued tasks dispatch could start, running worker runs with their task, free slots, paused)."""
-    paused = db.paused_resources()
-    ready = []
-    for t in db.ready_tasks():
-        if deferral(t).get("when") or float(t.get("not_before") or 0) > now or _resources(t) & paused.keys():
-            continue
-        ready.append(t)
-    running = db.q("SELECT r.started, r.task, t.labels, t.id tid FROM runs r LEFT JOIN tasks t ON t.id=r.task "
-                   "WHERE r.role!='coordinator' AND r.status='running'")
-    slots = int(((cfg or {}).get("budget") or {}).get("max_parallel_workers", 6) or 0)
-    return ready, running, slots - len(running), paused
+def _running(db: DB) -> list[dict]:
+    """Running worker runs with their task: the only work the no_progress keys judge."""
+    return db.q("SELECT r.id, r.started, r.task, t.labels, t.title, t.blocked_reason, t.status tstatus "
+                "FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.role!='coordinator' AND r.status='running'")
 
 
 def _last_results(db: DB, st: dict, now: float) -> dict[int, float]:
@@ -379,83 +376,65 @@ def _last_results(db: DB, st: dict, now: float) -> dict[int, float]:
     return out
 
 
-def _task_reason(db: DB, t: dict) -> str:
-    if t.get("blocked_reason"):
-        return _clip(t["blocked_reason"])
-    r = db.one("SELECT status, exit_code FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
-               (t["id"],))
-    return f"last run {r['status']}" + (f" (exit {r['exit_code']})" if r and r["exit_code"] not in (None, 0) else "") \
-        if r else "queued, never started"
-
-
-def _ready_clock(st: dict, ready: list[dict], s: dict, now: float) -> dict[int, float]:
-    """Task id -> when a check first saw it ready (dependencies met, deferral or not_before passed,
-    pause lifted, hold cleared), not when it was created: a task that waited days behind a dependency
-    is not stuck the moment it is released. A task gone from the ready set (dispatched, deferred
-    again) keeps its clock until clear_n checks spanning clear_min minutes have not seen it, the
-    same hysteresis as a raised key, so a run that fails and requeues it does not restart it."""
-    clock = st["ready"]
-    ids = {str(t["id"]) for t in ready}
-    for tid in ids:
-        clock[tid] = {"since": float((clock.get(tid) or {}).get("since") or now)}
-    for tid in [k for k in clock if k not in ids]:
-        r = clock[tid]
-        r["gone_n"] = int(r.get("gone_n") or 0) + 1
-        r["gone_since"] = r.get("gone_since") or now
-        if r["gone_n"] >= s["clear_n"] and now - float(r["gone_since"]) >= s["clear_min"] * 60:
-            clock.pop(tid)
-    return {int(t["id"]): clock[str(t["id"])]["since"] for t in ready}
+def _task_reason(db: DB, run: dict) -> str:
+    if run.get("blocked_reason"):
+        return _clip(run["blocked_reason"])
+    r = db.one("SELECT status, exit_code FROM runs WHERE task=? AND role!='coordinator' AND id<? "
+               "ORDER BY id DESC LIMIT 1", (run["task"], run["id"]))
+    return "run running, no result yet" + (
+        f"; previous run {r['status']}" + (f" (exit {r['exit_code']})" if r["exit_code"] not in (None, 0) else "")
+        if r else "")
 
 
 def no_progress(db: DB, cfg: dict, s: dict, st: dict, now: float, open_streaks: dict | None = None) -> list[dict]:
-    """Queued or running work with no counted result past its threshold. A ready task's clock starts
-    when it became ready (`_ready_clock`). `open_streaks`: drivers' report streaks (`streaks`), whose
-    last refusal or failure names why a resource is stuck."""
-    ready, running, free, paused = _active(db, cfg, now)
-    ready_since = _ready_clock(st, ready, s, now)
-    if not ready and not running:
+    """Running work with no counted result past its threshold. Only work that has run is judged: a
+    queued task that never started (or waits to start again) is Daemon.check_stall's. `open_streaks`:
+    drivers' report streaks (`streaks`), whose last refusal or failure names why a resource is stuck."""
+    running = _running(db)
+    if not running:
         return []
+    paused = db.paused_resources()
     last = _last_results(db, st, now)
     out = []
-    if s["task_h"] and free > 0:
-        for t in ready:
-            since = max(ready_since[t["id"]], last.get(t["id"], 0.0))
+    if s["task_h"]:
+        latest: dict[int, dict] = {}
+        for run in running:
+            if run["task"] is not None and run["tstatus"] not in TERMINAL_TASK_STATES and \
+                    float(run["started"] or 0) >= float((latest.get(int(run["task"])) or {}).get("started") or 0):
+                latest[int(run["task"])] = run
+        for tid, run in sorted(latest.items()):
+            since = max(float(run["started"] or now), last.get(tid, 0.0))
             if now - since >= s["task_h"] * 3600:
-                out.append({"kind": "no_progress", "key": f"task:#{t['id']}", "task": t["id"],
-                            "what": f"task #{t['id']} {_clip(t['title'], 60)}", "since": since, "n": now - since,
-                            "reason": _task_reason(db, t)})
+                out.append({"kind": "no_progress", "key": f"task:#{tid}", "task": tid,
+                            "what": f"task #{tid} {_clip(run['title'], 60)}", "since": since, "n": now - since,
+                            "reason": _task_reason(db, run)})
     trouble = db.kv("resource_trouble") or {}
     if s["resource_h"]:
-        named: dict[str, list[tuple[float, dict | None]]] = {}
-        for t in ready:
-            for r in _resources(t):
-                named.setdefault(r, []).append((ready_since[t["id"]], t))
+        held: dict[str, list[float]] = {}
         for run in running:
             for r in _resources({"labels": run.get("labels")}):
-                named.setdefault(r, []).append((float(run["started"] or now), None))
-        for r, starts in sorted(named.items()):
+                held.setdefault(r, []).append(float(run["started"] or now))
+        for r, starts in sorted(held.items()):
             ids = [int(x["id"]) for x in db.q("SELECT id, labels FROM tasks WHERE labels LIKE ?", (f'%:{r}"%',))
                    if r in _resources(x)]
             done = max([last.get(i, 0.0) for i in ids] + [float(st["results"].get(f"resource:{r}") or 0),
                                                           float(st["results"].get(r) or 0)])
-            since = max(done, min(a for a, _ in starts))
+            since = max(done, min(starts))
             if now - since < s["resource_h"] * 3600:
                 continue
             why = (f"paused: {paused[r].get('reason') or '?'}" if r in paused else
                    "resource trouble: its tasks keep failing" if r in trouble else
                    next((f"{x['last']['kind']}: {x['last'].get('reason') or '?'}"
                          for k, x in (open_streaks or {}).items() if x["bad"] and r in k), "")
-                   or next((_task_reason(db, t) for _, t in starts if t), "work on it is running, no result"))
+                   or "work on it is running, no result")
             out.append({"kind": "no_progress", "key": f"resource:{r}", "what": f"resource {r}", "since": since,
                         "n": now - since, "reason": _clip(why)})
     if s["project_h"]:
         done = max([0.0, *last.values(), *(float(v) for v in st["results"].values())])
-        starts = [ready_since[t["id"]] for t in ready] + [float(r["started"] or now) for r in running]
-        since = max(done, min(starts))
+        since = max(done, min(float(r["started"] or now) for r in running))
         if now - since >= s["project_h"] * 3600:
             out.append({"kind": "no_progress", "key": "project", "what": "the project", "since": since,
-                        "n": now - since,
-                        "reason": f"{len(ready)} task(s) queued, {len(running)} worker run(s) running, no result"})
+                        "n": now - since, "reason": f"{len(running)} worker run(s) running, no result"})
     return out
 
 
@@ -656,7 +635,7 @@ def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | N
                 items.append((c, text))
             if not items or not wake:
                 continue
-            head = ("No progress: work is queued or running but produced no result past its threshold."
+            head = ("No progress: running work produced no result past its threshold."
                     if kind == "no_progress" else
                     "Stall: the same not-yet or failure keeps repeating.")
             text = (head + " Re-plan, re-tier, re-point the probe, route around, cancel, or add a harness task "

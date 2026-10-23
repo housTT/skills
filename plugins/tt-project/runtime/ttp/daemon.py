@@ -5033,9 +5033,10 @@ class Daemon:
                         (time.time(), source, "observation", v.fingerprint, v.severity, text[:4000], "queued"))
 
     def check_progress(self, every_s: float = 60) -> None:
-        """Model-free progress and stall check (progress.py): work queued or running with no result past
-        its threshold raises `no_progress`; the same not-yet, refusal or failure repeating raises
-        `stall`. Each key wakes the coordinator once, again on escalation or after a long interval."""
+        """Model-free progress and stall check (progress.py): running work with no result past its
+        threshold raises `no_progress` (never-started work is check_stall's); the same not-yet,
+        refusal or failure repeating raises `stall`. Each key wakes the coordinator once, again on
+        escalation or after a long interval."""
         now = time.time()
         if now - getattr(self, "_progress_checked", 0.0) < every_s:
             return

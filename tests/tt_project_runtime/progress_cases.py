@@ -156,12 +156,15 @@ def _prog_waiting(p, title, probe, labels=()):
     return tid
 
 
-def _prog_ready(p, tid, since):
-    """A queued task that a check first saw ready at `since` (its no_progress clock)."""
-    from ttp import progress
-    st = progress.load(p.db)
-    st["ready"][str(tid)] = {"since": since}
-    p.db.set_kv(progress.STATE_KEY, st)
+def _prog_ran(p, tid, started):
+    """A task with a worker run running since `started` (work that has run: its no_progress clock)."""
+    p.db.update_task(tid, status="running")
+    p.db.x("INSERT INTO runs(role,task,started,status) VALUES('worker',?,?,'running')", (tid, started))
+    return p.db.one("SELECT MAX(id) id FROM runs")["id"]
+
+
+def _task_keys(got, tid):
+    return [k for e in got for k in e["keys"] if k == f"task:#{tid}"]
 
 
 def _prog_clear(p, cfg, now, current_probe=None):
@@ -171,57 +174,55 @@ def _prog_clear(p, cfg, now, current_probe=None):
         assert progress.check(p.db, cfg, p.state, now + dt, current_probe=current_probe) == []
 
 
-def test_progress_no_progress_fires_past_threshold_only_while_work_is_queued(env):
+def test_progress_no_progress_fires_past_threshold_only_while_work_runs(env):
     from ttp import progress
     p = make(env)
     now = time.time()
     tid = p.db.add_task("Build the thing", "spec")
-    _prog_ready(p, tid, now - 3600)
+    run = _prog_ran(p, tid, now - 3600)
     assert progress.check(p.db, p.config(), p.state, now) == []          # 1 h: under the 2 h threshold
-    _prog_ready(p, tid, now - 3 * 3600)
+    p.db.x("UPDATE runs SET started=? WHERE id=?", (now - 3 * 3600, run))
     got = progress.check(p.db, p.config(), p.state, now)
     assert [e["kind"] for e in got] == ["no_progress"]
     assert set(got[0]["keys"]) == {f"task:#{tid}", "project"}
     ev = _prog_events(p, "no_progress")[0]
-    assert "queued, never started" in ev["text"] and f"task #{tid}" in ev["text"] and ev["status"] == "queued"
+    assert "run running, no result yet" in ev["text"] and f"task #{tid}" in ev["text"] and ev["status"] == "queued"
     assert progress.check(p.db, p.config(), p.state, now + 60) == []     # unchanged: no second wake
     lines, ident = progress.digest_lines(p.db, now + 60)
     assert lines[0].startswith("## Progress") and f"task:#{tid}" in ident
-    # Nothing queued or running: the clock stops, the keys clear into the history once healthy long enough.
+    # Nothing running: the clock stops, the keys clear into the history once healthy long enough.
     p.db.update_task(tid, status="cancelled")
+    p.db.x("UPDATE runs SET status='cancelled', ended=? WHERE id=?", (now + 100, run))
     _prog_clear(p, p.config(), now + 120)
     assert progress.digest_lines(p.db, now + 2100) == ([], "")
     assert "2 cleared" in progress.audit_line(p.db, now - 60, now + 2100)
-    # A finished run resets the clock: a queued task with a recent result is not stuck.
+    # A counted result resets the clock: a running task with a recent result is not stuck.
     t2 = p.db.add_task("Another", "spec")
-    _prog_ready(p, t2, now - 5 * 3600)
-    p.db.x("INSERT INTO runs(role,task,started,ended,status) VALUES('worker',?,?,?,'ok')", (t2, now + 1800, now + 2000))
+    _prog_ran(p, t2, now - 5 * 3600)
+    progress.append(p.state, progress.record("result", "filler", "step done", env={"TTP_TASK": str(t2)}, now=now + 2000))
     assert progress.check(p.db, p.config(), p.state, now + 2200) == []
     # Thresholds are configurable; 0 turns one off.
     cfg = {"coordinator": {"progress_check": {"task_h": 0, "project_h": 0.01}}}
-    p.db.x("DELETE FROM runs")
     got = progress.check(p.db, cfg, p.state, now + 2300)
     assert got and got[0]["keys"] == ["project"]
 
 
 def test_progress_a_key_that_drops_out_for_a_check_neither_clears_nor_wakes_again(env):
-    """Review #3485 finding 1: a stuck queued task drops out whenever every worker slot is briefly
-    full. It woke the coordinator again as new each time it came back (3 wakes in 6 checks)."""
+    """Review #3485 finding 1: a key that drops out of a check (its run briefly not seen running) woke
+    the coordinator again as new each time it came back (3 wakes in 6 checks)."""
     from ttp import progress
     p = make(env)
-    cfg = {"budget": {"max_parallel_workers": 1}}
+    cfg = {"coordinator": {"progress_check": {"project_h": 0}}}
     now = time.time()
     tid = p.db.add_task("Stuck work", "spec")
-    _prog_ready(p, tid, now - 3 * 3600)
+    run = _prog_ran(p, tid, now - 3 * 3600)
     key = f"no_progress:task:#{tid}"
 
-    def busy(on):
-        p.db.x("DELETE FROM runs")
-        if on:
-            p.db.x("INSERT INTO runs(role,started,status) VALUES('worker',?,'running')", (now - 60,))
+    def busy(on):                          # on: the run is gone for this check (its task not judged)
+        p.db.x("UPDATE runs SET status=? WHERE id=?", ("failed" if on else "running", run))
 
     wakes = 0
-    for i in range(6):                     # the only slot fills and frees every other check
+    for i in range(6):                     # the run drops out every other check
         busy(i % 2 == 1)
         wakes += sum(f"task:#{tid}" in e["keys"] for e in progress.check(p.db, cfg, p.state, now + 60 * i))
         assert key in progress.load(p.db)["raised"]
@@ -242,37 +243,35 @@ def test_progress_a_key_that_drops_out_for_a_check_neither_clears_nor_wakes_agai
     assert got and f"task:#{tid}" in got[0]["keys"]
     # clear_n and clear_min are settings: 1 check and 0 min clears at once.
     busy(True)
-    progress.check(p.db, {**cfg, "coordinator": {"progress_check": {"clear_n": 1, "clear_min": 0}}}, p.state, now + 2260)
+    progress.check(p.db, {"coordinator": {"progress_check": {"project_h": 0, "clear_n": 1, "clear_min": 0}}}, p.state,
+                   now + 2260)
     assert key not in progress.load(p.db)["raised"]
 
 
-def test_progress_a_task_released_by_its_dependency_starts_its_clock_when_ready(env):
+def test_progress_a_task_released_by_its_dependency_gets_no_task_key_before_it_runs(env):
     """Review #3562: a task that waited 2 days behind a dependency was reported stuck for 48 h on the
-    first check after the dependency finished, before dispatch could start it."""
+    first check after the dependency finished. Never started, it is Daemon.check_stall's."""
     from ttp import progress
     p = make(env)
+    cfg = {"coordinator": {"progress_check": {"resource_h": 0, "project_h": 0}}}
     now = time.time()
     a = p.db.add_task("Dep", "spec")
     b = p.db.add_task("Waits", "spec", depends_on=[a])
     p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 2 * 86400, a, b))
-    progress.check(p.db, p.config(), p.state, now)
-    assert str(b) not in progress.load(p.db).get("ready", {})                  # not ready yet: no clock
+    progress.check(p.db, cfg, p.state, now)
     p.db.update_task(a, status="done")
-    got = progress.check(p.db, p.config(), p.state, now + 60)
-    assert not any(f"task:#{b}" in e["keys"] for e in got), got
-    assert progress.load(p.db).get("ready", {})[str(b)]["since"] == now + 60
-    keys = [k for t in range(2, 8) for e in progress.check(p.db, p.config(), p.state, now + 60 + t * 600)
-            for k in e["keys"] if k == f"task:#{b}"]
-    assert keys == []                                                  # under task_h since it became ready
-    keys = [k for dt in (2 * 3600, 2 * 3600 + 60) for e in progress.check(p.db, p.config(), p.state, now + 60 + dt)
-            for k in e["keys"] if k == f"task:#{b}"]
-    assert keys == [f"task:#{b}"]                                      # once ready_since + task_h passed: one key
+    keys = [k for dt in range(60, 3 * 3600 + 61, 600) for k in _task_keys(progress.check(p.db, cfg, p.state, now + dt), b)]
+    assert keys == [] and "ready" not in progress.load(p.db)
+    # Once it runs, its clock starts at that run's start.
+    _prog_ran(p, b, now + 4 * 3600)
+    assert _task_keys(progress.check(p.db, cfg, p.state, now + 5 * 3600), b) == []
+    assert _task_keys(progress.check(p.db, cfg, p.state, now + 6 * 3600), b) == [f"task:#{b}"]
 
 
-def test_progress_a_task_released_by_start_after_or_a_lifted_pause_starts_its_clock_then(env):
+def test_progress_a_task_released_by_start_after_or_a_lifted_pause_gets_no_key_before_it_runs(env):
     from ttp import progress
     p = make(env)
-    cfg = {"coordinator": {"progress_check": {"resource_h": 0, "project_h": 0}}}
+    cfg = {"coordinator": {"progress_check": {"project_h": 0}}}
     now = time.time()
     t1 = p.db.add_task("Later", "spec", labels=[f"start_after:{now + 3600}"])
     p.db.x("UPDATE tasks SET created=?, not_before=? WHERE id=?", (now - 86400, now + 3600, t1))
@@ -280,47 +279,111 @@ def test_progress_a_task_released_by_start_after_or_a_lifted_pause_starts_its_cl
     p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 86400, t2))
     p.db.set_kv("paused_resources", {"box-a": {"reason": "maintenance", "since": now - 86400, "by": "test"}})
     assert progress.check(p.db, cfg, p.state, now) == []
-    assert progress.load(p.db).get("ready", {}) == {}
-    # The start_after time passes and the pause is lifted: both ready now, neither stuck.
+    # The start_after time passes and the pause is lifted: both ready, never started, never judged here.
     p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (now - 1, t1))
     p.db.set_kv("paused_resources", {})
-    assert progress.check(p.db, cfg, p.state, now + 60) == []
-    assert {k: v["since"] for k, v in progress.load(p.db).get("ready", {}).items()} == {str(t1): now + 60, str(t2): now + 60}
-    got = progress.check(p.db, cfg, p.state, now + 60 + 2 * 3600)
-    assert got and set(got[0]["keys"]) == {f"task:#{t1}", f"task:#{t2}"}
-    # The resource key of a ready task starts there too, not at created.
-    p.db.update_task(t1, status="cancelled")
-    p.db.set_kv("paused_resources", {"box-b": {"reason": "hold", "since": now, "by": "test"}})
-    t3 = p.db.add_task("On box-b", "spec", labels=["resource:box-b"])
-    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 86400, t3))
-    rcfg = {"coordinator": {"progress_check": {"task_h": 0, "project_h": 0}}}
-    progress.check(p.db, rcfg, p.state, now + 3 * 3600)
-    p.db.set_kv("paused_resources", {})
-    assert "resource:box-b" not in str(progress.check(p.db, rcfg, p.state, now + 3 * 3600 + 60))
-    assert "resource:box-b" in str(progress.check(p.db, rcfg, p.state, now + 5 * 3600 + 60))
+    got = [e for dt in range(60, 5 * 3600, 600) for e in progress.check(p.db, cfg, p.state, now + dt)]
+    assert got == [] and progress.load(p.db)["raised"] == {}
 
 
-def test_progress_a_dispatch_flap_keeps_the_ready_clock_until_gone_long_enough(env):
-    """A task dispatched and requeued within the hysteresis keeps when it first became ready; one gone
-    for clear_n checks spanning clear_min minutes loses it."""
+def test_progress_a_dispatch_flap_before_any_run_gets_no_task_key(env):
+    """A task dispatch picks and queues again before its run starts (lost the race for its resource)
+    has never run: no key however long it flaps."""
     from ttp import progress
     p = make(env)
     now = time.time()
     tid = p.db.add_task("Flaky", "spec")
-    progress.check(p.db, p.config(), p.state, now)
-    for i, status in enumerate(("running", "queued", "running", "running", "queued"), 1):
+    got = []
+    for i, status in enumerate(("queued", "running", "queued", "running", "running", "queued") * 3):
         p.db.update_task(tid, status=status)
-        progress.check(p.db, p.config(), p.state, now + 600 * i)
-        assert progress.load(p.db)["ready"][str(tid)]["since"] == now
-    got = progress.check(p.db, p.config(), p.state, now + 2 * 3600)
-    assert got and f"task:#{tid}" in got[0]["keys"]
-    p.db.update_task(tid, status="running")
-    for dt in (3 * 3600, 3 * 3600 + 60, 3 * 3600 + 1800):
-        progress.check(p.db, p.config(), p.state, now + dt)
-    assert str(tid) not in progress.load(p.db)["ready"]
-    p.db.update_task(tid, status="queued")
-    progress.check(p.db, p.config(), p.state, now + 4 * 3600)
-    assert progress.load(p.db)["ready"][str(tid)]["since"] == now + 4 * 3600
+        got += progress.check(p.db, p.config(), p.state, now + 600 * i)
+    assert got == [] and progress.load(p.db)["raised"] == {}
+
+
+def test_progress_a_never_started_task_behind_a_full_slot_gets_no_task_key(env):
+    """Review #3564: a backlog task that waited 3 h behind the only worker slot was reported 'no progress
+    since 3.0 h ago; why: queued, never started' on the first check after the reaped run freed the slot,
+    before dispatch could start it. Never-started work is Daemon.check_stall's, not progress.py's."""
+    from ttp import progress
+    p = make(env)
+    cfg = {"budget": {"max_parallel_workers": 1}, "coordinator": {"progress_check": {"resource_h": 0, "project_h": 0}}}
+    now = time.time()
+    a = p.db.add_task("Running", "spec")
+    run = _prog_ran(p, a, now)
+    b = p.db.add_task("Backlog", "spec")
+    keys = []
+    for dt in range(0, 3 * 3600 + 1, 600):
+        keys += _task_keys(progress.check(p.db, cfg, p.state, now + dt), b)
+    p.db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (now + 3 * 3600, run))
+    p.db.update_task(a, status="failed")
+    keys += _task_keys(progress.check(p.db, cfg, p.state, now + 3 * 3600 + 1), b)
+    assert keys == [] and f"no_progress:task:#{b}" not in progress.load(p.db)["raised"]
+    assert f"no_progress:task:#{a}" in progress.load(p.db)["raised"]      # A ran 3 h with no result: A's key
+
+
+def test_progress_a_never_started_task_gets_no_task_key_after_a_long_gap_between_checks(env):
+    from ttp import progress
+    p = make(env)
+    cfg = {"budget": {"max_parallel_workers": 1}, "coordinator": {"progress_check": {"resource_h": 0, "project_h": 0}}}
+    now = time.time()
+    a = p.db.add_task("Running", "spec")
+    run = _prog_ran(p, a, now)
+    b = p.db.add_task("Backlog", "spec")
+    assert _task_keys(progress.check(p.db, cfg, p.state, now), b) == []
+    p.db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (now + 3 * 3600, run))
+    p.db.update_task(a, status="failed")
+    assert _task_keys(progress.check(p.db, cfg, p.state, now + 3 * 3600 + 1), b) == []    # one gap > task_h
+    assert _task_keys(progress.check(p.db, cfg, p.state, now + 9 * 3600), b) == []
+    assert f"no_progress:task:#{b}" not in progress.load(p.db)["raised"]
+
+
+def test_progress_a_task_that_ran_with_no_result_gets_one_task_key_that_clears_with_hysteresis(env):
+    from ttp import progress
+    p = make(env)
+    cfg = {"coordinator": {"progress_check": {"resource_h": 0, "project_h": 0}}}
+    now = time.time()
+    t = p.db.add_task("Long build", "spec")
+    run = _prog_ran(p, t, now)
+    keys = []
+    for dt in range(0, 3 * 3600 + 1, 600):
+        keys += _task_keys(progress.check(p.db, cfg, p.state, now + dt), t)
+    assert keys == [f"task:#{t}"]                                       # past task_h from its run's start: one wake
+    r = progress.load(p.db)["raised"][f"no_progress:task:#{t}"]
+    assert r["since"] == now and "no result yet" in r["reason"]
+    # A driver's result inside the run resets the clock: the key goes healthy, but clears only after
+    # clear_n checks spanning clear_min minutes.
+    progress.append(p.state, progress.record("result", "filler", "chunk done", env={"TTP_TASK": str(t)},
+                                             now=now + 3 * 3600 + 100))
+    t1 = now + 3 * 3600 + 200
+    for dt in (0, 60, 120):
+        assert progress.check(p.db, cfg, p.state, t1 + dt) == []
+    assert progress.load(p.db)["raised"][f"no_progress:task:#{t}"]["ok_n"] == 3
+    assert progress.check(p.db, cfg, p.state, t1 + 1800) == []
+    st = progress.load(p.db)
+    assert f"no_progress:task:#{t}" not in st["raised"] and st["history"][-1]["key"] == f"no_progress:task:#{t}"
+    # Its run ends with no result and the task is queued again: not judged here until a run starts.
+    p.db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (t1 + 1900, run))
+    p.db.update_task(t, status="queued")
+    assert _task_keys(progress.check(p.db, cfg, p.state, t1 + 9 * 3600), t) == []
+
+
+def test_progress_the_resource_key_ignores_ready_but_unstarted_tasks(env):
+    from ttp import progress
+    p = make(env)
+    cfg = {"coordinator": {"progress_check": {"task_h": 0, "project_h": 0}}}
+    now = time.time()
+    b = p.db.add_task("On box-a", "spec", labels=["resource:box-a"])
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 86400, b))
+    got = []
+    for dt in range(0, 3 * 3600 + 1, 600):
+        got += progress.check(p.db, cfg, p.state, now + dt)
+    assert "resource:box-a" not in str(got) and progress.load(p.db)["raised"] == {}
+    # A run that holds box-a counts: no result on it for resource_h raises the key.
+    c = p.db.add_task("Sweep on box-a", "spec", labels=["resource:box-a"])
+    _prog_ran(p, c, now + 3 * 3600)
+    assert "resource:box-a" not in str(progress.check(p.db, cfg, p.state, now + 4 * 3600))
+    got = progress.check(p.db, cfg, p.state, now + 5 * 3600 + 60)
+    assert got and got[0]["keys"] == ["resource:box-a"]
 
 
 def test_progress_probe_stall_wakes_once_escalates_and_clears(env):
@@ -418,12 +481,12 @@ def test_progress_one_reader_and_one_streak_detector_for_driver_reports(env):
     assert progress.load(p.db)["raised"] == {}
     # Its last refusal still names why a resource that work waits on is stuck.
     tid = p.db.add_task("Benchmark on box-a", "spec", labels=["resource:box-a"])
-    _prog_ready(p, tid, now - 5 * 3600)
+    _prog_ran(p, tid, now - 5 * 3600)
     got = progress.check(p.db, {"coordinator": {"progress_check": {"task_h": 0, "project_h": 0}}}, p.state, now + 180)
     assert got and got[0]["keys"] == ["resource:box-a"] and "refusal: lock busy (exit 75) #7" in got[0]["text"]
     # A result made inside a task's run resets that task's clock, also once rotated into progress.1.jsonl.
-    t2 = p.db.add_task("Queued work", "spec")
-    _prog_ready(p, t2, now - 5 * 3600)
+    t2 = p.db.add_task("Running work", "spec")
+    _prog_ran(p, t2, now - 5 * 3600)
     rec = progress.record("result", "filler", "checkpoint saved", env={"TTP_TASK": str(t2)}, now=now + 200)
     progress.append(p.state, rec)
     progress.append(p.state, {**rec, "kind": "refusal", "ts": now + 201}, max_bytes=1)   # rotates
@@ -493,7 +556,7 @@ def test_progress_mute_keeps_a_key_quiet_and_events_raise_a_stuck_turn(env):
     p = make(env)
     now = time.time()
     tid = p.db.add_task("Held work", "spec")
-    _prog_ready(p, tid, now - 3 * 3600)
+    _prog_ran(p, tid, now - 3 * 3600)
     screen.mute(p.db, progress.SOURCE, "no progress since", 24, why="known")
     assert progress.check(p.db, {}, p.state, now) == []
     assert progress.digest_lines(p.db, now)[0]          # still listed in the digest
@@ -505,8 +568,8 @@ def test_progress_daemon_tick_runs_the_check(env):
     from ttp import progress
     from ttp.daemon import Daemon
     p = make(env)
-    tid = p.db.add_task("Never started", "spec")
-    _prog_ready(p, tid, time.time() - 3 * 3600)
+    tid = p.db.add_task("Long run", "spec")
+    _prog_ran(p, tid, time.time() - 3 * 3600)
     d = Daemon(p.base)
     d.check_progress()
     assert [e["kind"] for e in _prog_events(p)] == ["no_progress"]
