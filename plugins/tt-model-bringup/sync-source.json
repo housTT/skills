@@ -99,7 +99,7 @@
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.txt",
       "blob": "7c661791b3c29bbad8de5ce8d50176d13633657f",
       "source_sha256": "6817dc59aa6d8cdc9c50404aa4e919240f1a07e3ce772dab04ae21d4561bec24",
-      "packaged_sha256": "af6faed6bbb4c3fb89d474258c785b6902081b3e792ce8104f2f5f7ba9d83920"
+      "packaged_sha256": "106ea1d2d010a4237121f8f2c8179d2a6f093ad095f973df369dd60112a11fe8"
     },
     {
       "source": ".agents/requirements.txt",
