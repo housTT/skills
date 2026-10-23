@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import budget as bud
-from . import chaincap, conflictfix, replymsg, settinghold, settled, taskfacts, timefmt
+from . import chaincap, conflictfix, overlap, replymsg, settinghold, settled, taskfacts, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import (OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, WORKER_RANKED_MIN_CHARS, Project,
@@ -694,6 +694,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         replymsg.prompt_block(dict(task)),
         settled.prompt_block(p, dict(task)),
         taskfacts.prompt_block(p, dict(task)),
+        overlap.prompt_block(p, dict(task)),
         restrictions_pointer(p)]
     return "\n\n".join(x for x in parts if x.strip())
 

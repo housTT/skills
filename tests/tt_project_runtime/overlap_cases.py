@@ -1,0 +1,142 @@
+# Parallel code tasks naming the same files (overlap.py): a warning at task_add, in the digest's
+# open tasks and in the worker prompt, never a refusal. Run from tests/test_tt_project_runtime.py
+# (see _include_cases there): helpers, fixtures and imports come from that file.
+from __future__ import annotations
+
+
+def _branch_adding(p, branch, files):
+    """A branch off the root's checked-out base with one commit adding (or changing) `files`."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(p.root), *args], check=True, capture_output=True,
+                              text=True).stdout.strip()
+    home = git("symbolic-ref", "--short", "HEAD")
+    git("checkout", "-q", "-b", branch)
+    for f, text in files.items():
+        (p.root / f).parent.mkdir(parents=True, exist_ok=True)
+        (p.root / f).write_text(text)
+        git("add", f)
+    git("commit", "-q", "-m", f"work on {branch}")
+    head = git("rev-parse", "HEAD")
+    git("checkout", "-q", home)
+    return head
+
+
+def _labels(p, tid):
+    return json.loads(p.db.task(tid)["labels"])
+
+
+def test_task_add_warns_when_another_open_code_task_names_the_same_new_file(env):
+    """#3466 and #3467 each built their own runtime/ttp/progress.py side by side. A new code task
+    whose spec names a file an open code task's spec names is still added, and its result and its
+    open-tasks line in the digest name the other task, the shared path and the fix; once it waits on
+    that task the digest line drops the warning."""
+    from ttp import coordinator as coord
+    p = make(env)
+    first = p.db.add_task("progress check", "Add runtime/ttp/progress.py and tests/tt_project_runtime/"
+                          "progress_cases.py with a stall detector.", kind="code", status="running")
+    assert coord.apply(p, [{"type": "task_add", "title": "driver reports", "kind": "code",
+                            "spec": "Record driver results in `runtime/ttp/progress.py` (append, KINDS)."}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='driver reports'")["id"]
+    want = (f"overlaps #{first} (runtime/ttp/progress.py): build on it, not beside it: "
+            f"start_when landed:#{first} or depends_on [{first}]")
+    assert f"task_add: #{new} added; {want}" in p.db.kv(coord.NOTES_KEY)
+    assert _labels(p, new) == [f"overlap:{first}:{want}"]
+    line = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{new} |"))
+    assert line.endswith(f"| driver reports | {want}"), line
+    p.db.update_task(new, depends_on=json.dumps([first]))
+    line = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{new} |"))
+    assert "overlaps" not in line, line
+    # A plan or question task, or a code task that names other files, gets no warning.
+    for title, kind, spec in (("plan it", "plan", "Plan runtime/ttp/progress.py."),
+                              ("other file", "code", "Change runtime/ttp/relay.py only.")):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": kind, "spec": spec}]) == []
+        tid = p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]
+        assert not [x for x in _labels(p, tid) if x.startswith("overlap:")], title
+    assert not [n for n in p.db.kv(coord.NOTES_KEY) if "overlaps" in n and "driver reports" not in n
+                and f"#{new} " not in n]
+
+
+def test_task_add_flags_a_file_an_unlanded_finished_branch_adds_as_a_new_file(env):
+    """A done code task's branch that has not landed adds runtime/ttp/progress.py: a new task naming
+    that file is warned with the file flagged as new; one that names a file the branch only changes
+    is warned without the flag. Once the records show the task landed, nothing is flagged."""
+    from ttp import coordinator as coord, overlap
+    p = make(env)
+    (p.root / "runtime" / "ttp").mkdir(parents=True, exist_ok=True)
+    (p.root / "runtime/ttp/relay.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(p.root), "add", "runtime/ttp/relay.py"], check=True)
+    subprocess.run(["git", "-C", str(p.root), "commit", "-q", "-m", "relay"], check=True)
+    done = p.db.add_task("progress check", "s", kind="code", status="done")
+    branch = f"ttp/t{done}-progress-check"
+    head = _branch_adding(p, branch, {"runtime/ttp/progress.py": "def append(state, rec): ...\n",
+                                      "runtime/ttp/relay.py": "x = 2\n"})
+    p.db.update_task(done, branch=branch)
+    assert coord.apply(p, [{"type": "task_add", "title": "stall watcher", "kind": "code",
+                            "spec": "Extend plugins/tt-project/runtime/ttp/progress.py with a stall streak."}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='stall watcher'")["id"]
+    note = next(n for n in p.db.kv(coord.NOTES_KEY) if n.startswith(f"task_add: #{new} added; "))
+    assert f"overlaps #{done} (plugins/tt-project/runtime/ttp/progress.py (new file))" in note, note
+    assert f"start_when landed:#{done}" in note
+    assert coord.apply(p, [{"type": "task_add", "title": "relay tweak", "kind": "code",
+                            "spec": "Tidy runtime/ttp/relay.py."}]) == []
+    tweak = p.db.one("SELECT id FROM tasks WHERE title='relay tweak'")["id"]
+    assert overlap.digest_note(p.db.task(tweak)).startswith(f"overlaps #{done} (runtime/ttp/relay.py): "), \
+        _labels(p, tweak)
+    # The diff is read once per head and kept in state/.
+    assert json.loads((p.state / overlap.CACHE).read_text())[head] == [["A", "runtime/ttp/progress.py"],
+                                                                       ["M", "runtime/ttp/relay.py"]]
+    # Landed (the push queue recorded it): no longer an overlap.
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m1', ?, ?, 'main')", (done, head))
+    assert [h["id"] for h in overlap.find(p, "Extend runtime/ttp/progress.py")] == [new]   # its spec, not the branch
+
+
+def test_task_add_gives_no_warning_for_ignored_common_files_hubs_or_bare_names(env):
+    """Files most changes touch never warn: changelogs, changesets, manifests and __init__.py (the
+    overlap.ignore globs), hubs (tracked files over overlap.hub_bytes), and file names without a
+    folder (named in passing). URLs and words like and/or are no paths."""
+    from ttp import coordinator as coord, overlap
+    p = make(env)
+    (p.root / "runtime" / "ttp").mkdir(parents=True, exist_ok=True)
+    (p.root / "runtime/ttp/daemon.py").write_text("#" * 2000 + "\n")
+    subprocess.run(["git", "-C", str(p.root), "add", "runtime/ttp/daemon.py"], check=True)
+    subprocess.run(["git", "-C", str(p.root), "commit", "-q", "-m", "hub"], check=True)
+    p.set_config("overlap.hub_bytes", 1000)
+    common = ("Bump .claude-plugin/plugin.json, runtime/ttp/__init__.py and CHANGELOG.md, add "
+              ".changeset/x.md, wire runtime/ttp/daemon.py; see progress.py, and/or "
+              "https://example.com/runtime/ttp/progress.py.")
+    other = p.db.add_task("first", common, kind="code", status="queued")
+    assert overlap.spec_paths(common, p.root) == ["runtime/ttp/__init__.py", "runtime/ttp/daemon.py"]
+    assert overlap.keep(p, overlap.spec_paths(common, p.root)) == []
+    assert coord.apply(p, [{"type": "task_add", "title": "second", "kind": "code", "spec": common}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='second'")["id"]
+    assert not [x for x in _labels(p, new) if x.startswith("overlap:")]
+    assert not [n for n in p.db.kv(coord.NOTES_KEY) if "overlaps" in n]
+    assert overlap.find(p, "Rename runtime/ttp/other.py") == [] and other
+    # Turned off: no warning even for a real overlap.
+    p.db.add_task("third", "Add runtime/ttp/new_mod.py", kind="code", status="queued")
+    assert overlap.find(p, "Use runtime/ttp/new_mod.py")
+    p.set_config("overlap.enabled", False)
+    assert overlap.find(p, "Use runtime/ttp/new_mod.py") == []
+
+
+def test_worker_prompt_lists_unlanded_branches_that_touch_its_files(env):
+    """A code worker's prompt lists the other unlanded branches (task, branch, head) that add or change
+    a path its spec names, telling it to reuse their module; its own branch and unrelated or landed
+    branches are not listed."""
+    from ttp.prompts import worker_task
+    p = make(env)
+    done = p.db.add_task("progress check", "s", kind="code", status="done")
+    branch = f"ttp/t{done}-progress-check"
+    head = _branch_adding(p, branch, {"runtime/ttp/progress.py": "def append(state, rec): ...\n"})
+    p.db.update_task(done, branch=branch)
+    elsewhere = p.db.add_task("docs", "s", kind="code", status="done")
+    _branch_adding(p, f"ttp/t{elsewhere}-docs", {"docs/guide.md": "x\n"})
+    p.db.update_task(elsewhere, branch=f"ttp/t{elsewhere}-docs")
+    tid = p.db.add_task("stall watcher", "Add a stall streak to runtime/ttp/progress.py.", kind="code")
+    prompt = worker_task(p, p.db.task(tid), str(p.root), None)
+    block = prompt[prompt.index("## Unlanded branches that touch your files"):]
+    assert "reuse their module and API" in block and "never create a second one" in block
+    assert f"- #{done} {branch} at {head[:10]}: runtime/ttp/progress.py (new file)" in block, block
+    assert f"#{elsewhere}" not in block
+    plain = p.db.add_task("relay", "Change runtime/ttp/relay.py.", kind="code")
+    assert "## Unlanded branches" not in worker_task(p, p.db.task(plain), str(p.root), None)

@@ -425,6 +425,14 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   daemon's pushes run at low CPU priority, 10 nice levels below the daemon (`runner.nice`, 0-19;
   0 = normal priority), so they never slow the machine's own work. The daemon and the coordinator
   keep normal priority. Each run's `exit.json` records the level its agent ran at.
+- Parallel code tasks that build the same files: when a code task is added whose spec names repo
+  paths another open code task's spec names, or a finished branch that has not landed adds or
+  changes, the task is still added, but its task_add result and its line in the coordinator's open
+  tasks say `overlaps #<id> (<paths>, new files flagged)` with the fix (`start_when landed:#<id>`
+  or `depends_on`). Its worker's prompt lists those branches and says to reuse their module. Model-free:
+  each branch's diff is read once per head. Config `overlap`: `enabled` (on), `ignore` (globs such as
+  changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
+  150000, touched by most changes, never count) and `branch_days` (14).
 - On macOS, while the project has work (a running run or push, or queued work that can start now)
   and the machine is on AC power, the daemon keeps it from idle and maintenance sleep with
   `caffeinate -i -s`, tied to the daemon's process so it ends with it. A closed lid without an

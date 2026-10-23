@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 from . import locks
 from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -853,6 +854,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         held = anchors.anchor(t) if t["status"] == "blocked" else None
         note = f"{anchors.describe(*held, p)}: {note}" if held else note
+        clash = file_overlap.digest_note(t)
+        note = f"{clash}; {note}" if clash and note else clash or note
         cont = continues_id(t)
         title = clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
         starts = (starts_text(t, now, where=p, db=db) if t["status"] == "queued" else
@@ -1350,6 +1353,17 @@ def start_why(a: dict, cur: dict, when: str | None) -> str | None:
     return why or None
 
 
+def _file_overlaps(p: Project, kind: str, spec: str, skip: set) -> list[dict]:
+    """Other open or unlanded code tasks a new code or harness task's spec names files of (overlap.py);
+    a warning only, so a fault reading them is no overlap."""
+    if kind not in file_overlap.KINDS:
+        return []
+    try:
+        return file_overlap.find(p, spec, skip)
+    except Exception:
+        return []
+
+
 def defer_labels(after: float | None, when: str | None, why: str | None = None) -> list[str]:
     """The labels a deferred task carries (see db.deferral); none when it may start now."""
     if after is None and not when:
@@ -1600,6 +1614,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 kind, pr_ask = _delivery_kind(a.get("kind") or "work", title + "\n" + (a.get("spec") or ""))
                 pin = _task_pin(cfg, a, pin_of(old or followup))
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
+                clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
+                labels += [file_overlap.label(clash)] if clash else []
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=kind, tier=tier,
                                          priority=int(a.get("priority") or 3), **pin,
@@ -1645,6 +1661,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                  f"{why}: it delivers to the push branch with `ttp push`")
                 if stale:
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
+                if clash:
+                    notes.append(f"task_add: #{new_id} added; {file_overlap.warning(clash)}")
                 if hit := settled.turn_note(p, str(a.get("spec") or ""), f"task_add: #{new_id}"):
                     notes.append(hit)
                 if pr_ask:

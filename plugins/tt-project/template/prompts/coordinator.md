@@ -125,6 +125,7 @@ Each field's rules are in the section named; the table only lists them.
   status always prints (`grep -q RUNNING` always matches).
 - A task id that names no task here is rejected (`depends_on`, probes); a `missing_task_ref` event
   is a task already waiting on one: re-point or cancel it.
+- An `overlaps #<id>` warning (task_add result, open tasks) means that task adds or changes files this spec names: make one build on the other (`start_when` `landed:#<id>` or `depends_on`), or say why both may proceed.
 <!-- ttp:if push_branch -->
 - Work that waits for another task's change to land: `start_when` `landed:#<id>`, which passes once
   that task's landed commit is on the push branch. Never wait on a raw sha (pushing rebases each
