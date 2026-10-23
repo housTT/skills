@@ -3823,11 +3823,17 @@ class Daemon:
         # A hand-off with nothing else to decide (no follow-ups or notes, normal severity) starts no turn.
         plain = not fups and not notes and sev == "normal"
         # A done hop whose only proposal is the next `continue:` hop, with progress and under the
-        # chain caps, gets it from the daemon (chaincap). That hop starts from the base, not this
-        # branch, so a code hop's own commits get their review now, as a plain hand-off's do.
+        # chain caps, gets it from the daemon (chaincap). A code task that left its change unfinished
+        # (a split: a `continue:` hop for its branch, or a head its hand-off marks WIP) gets no review:
+        # its hop takes the branch over, and the chain's last hop gets the one review.
         ready = self._continue_ready(dict(task, **upd), fups) \
             if new == "done" and not approval and not notes and sev == "normal" else ""
-        review = self._auto_review(dict(task, **upd), summary) if new == "done" and task["kind"] == "code" else None
+        split = self._split(dict(task, **upd), result, fups) if new == "done" and task["kind"] == "code" else ""
+        if split:
+            text += (f"\nSplit at head {split[:12]}: no review of it; its continue hop builds on this branch, and "
+                     f"the chain's last hop gets the one review.")
+        review = self._auto_review(dict(task, **upd), summary) \
+            if new == "done" and task["kind"] == "code" and not split else None
         if review:
             known = None if review[1] else db.task(review[0])
             text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else
@@ -3861,23 +3867,24 @@ class Daemon:
             text += relay_hint(coord._open_dependents(db, task["id"]))
         if area:
             text += f"\nNo automatic fix: {reviewcap.TRIGGER} (lineage of #{area['root']})."
-        # The hop the daemon queues: the next digest says so. A code hop whose branch has changes and
-        # no review stays with the coordinator, or its commits would never be reviewed or delivered.
-        # With a review, the next hop starts once they landed: from the tip before that, it would lack
-        # them. Commits already on the push branch (another commit carries them) need no wait, and
-        # none is possible where the review delivers no push (no push branch, or pushing is off).
-        changes = bool(ready) and not fix and task["kind"] == "code" and self._has_changes(task)
+        # The hop the daemon queues: the next digest says so. A split's hop takes its branch over and
+        # starts at once, never on the split's landing (that comes only with the hop's own work). A
+        # code hop whose branch has changes and is no split (they already landed under other commits)
+        # starts from the base. With changes and no review that is neither, it stays with the
+        # coordinator, or its commits would never be reviewed or delivered.
+        changes = bool(ready) and not fix and not split and task["kind"] == "code" and self._has_changes(task)
         landed_now = changes and bool(db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)))
-        d = self.cfg.get("delivery") or {}
-        wait = changes and not landed_now and bool(d.get("push_branch")) and push_allowed(d)
-        hop = self._auto_continue(dict(task, **upd), fups, ready, wait) \
-            if ready and not fix and (review or not changes or landed_now) else None
+        hop = self._auto_continue(db.task(task["id"]) or dict(task, **upd), fups, ready) \
+            if ready and not fix and (review or split or not changes or landed_now) else None
         if hop:
             folded.add(id(fups[0]))
             text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (
-                f"; it starts once #{task['id']}'s commits land on the push branch." if wait else ".")
+                f"; it builds on #{task['id']}'s branch and starts now." if split else ".")
         elif new == "done" and any(chaincap.CONT_TITLE.match(str(f["title"])) for f in fups):
             text += f"\nContinue follow-up {UNQUEUED_TAG}: add it with continues #{task['id']} or drop it."
+        elif split:
+            text += (f"\nNo continue hop finishes its split head: add one with continues #{task['id']} (it builds "
+                     f"on this branch), or a review of it if the work is complete.")
         routine = (review is not None and plain) or fix is not None or hop is not None
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
@@ -9029,6 +9036,9 @@ class Daemon:
             return "superseded, landed or queued"
         if any(x["id"] != tid and (continues_id(x) == tid or x["branch"] == t["branch"]) for x in live):
             return "an open task continues it"
+        if chaincap.split_head(t) and db.one("SELECT 1 FROM tasks WHERE labels LIKE ? AND status!='cancelled'",
+                                             (f'%"continues:{tid}"%',)):
+            return "a later hop of its split chain carries it"
         tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{t['branch']}^{{commit}}", check=False)
         if not tip:
             return "no branch"
@@ -9144,6 +9154,20 @@ class Daemon:
         if fups:
             lines.append("Its proposed follow-ups (the coordinator queues them separately; not part of this "
                          "change, so not a finding by themselves): " + "; ".join(fups[:MAX_FOLLOWUPS]))
+        # The last hop of a split chain: one review of the whole chain at its final head.
+        hops = chaincap.split_hops(db, task)
+        if hops:
+            lines.append(f"It is the last hop of a split continue chain: " + ", ".join(
+                f"#{h['id']} (head {chaincap.split_head(h)[:12]})" for h in hops) + " ended unfinished, with no "
+                f"review of their own. Head {head} of this branch carries their commits: review the chain's whole "
+                f"change as one. The chain's first task's spec (#{hops[0]['id']}): "
+                + coord.clip(hops[0].get("spec"), AUTO_REVIEW_SPEC_CHARS))
+            earlier = [f"#{h['id']}: {str(f['title'])[:120]}" for h in hops
+                       for f in (fs if isinstance(fs := load_result(h.get("result")).get("followups"), list) else [])
+                       if isinstance(f, dict) and f.get("title")]
+            if earlier:
+                lines.append("The earlier hops' follow-ups (each `continue:` one is a later hop of this chain; the "
+                             "rest are not findings by themselves): " + "; ".join(earlier[:3 * MAX_FOLLOWUPS]))
         failed = reviewstats.failed_head(db, prior["id"]) if prior else ""
         if prior and failed and not full.startswith(failed[:12]):
             lines.append(f"Review #{prior['id']} failed on an earlier head. "
@@ -9511,14 +9535,38 @@ class Daemon:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return ""
 
-    def _auto_continue(self, task: dict, fups: list[dict], why: str,
-                       wait_landed: bool = False) -> tuple[int, str] | None:
+    def _auto_continue(self, task: dict, fups: list[dict], why: str) -> tuple[int, str] | None:
         """chaincap.auto_hop for a task _continue_ready passed; None when it cannot be queued."""
         try:
-            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why, wait_landed)
+            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why)
         except Exception:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return None
+
+    def _split(self, task: dict, result: dict, fups: list[dict]) -> str:
+        """The head a done code task left unfinished, labelled chaincap.SPLIT_LABEL on it, or '': a
+        branch with changes not yet landed under other commits, and a `continue:` follow-up or a
+        hand-off that marks the head WIP or split (chaincap.marked_split)."""
+        if chaincap.split_head(task):
+            return chaincap.split_head(task)
+        cont = any(chaincap.CONT_TITLE.match(str(f.get("title") or "")) and not upstream.is_note(f) for f in fups)
+        branch = task.get("branch")
+        if not branch:
+            return ""
+        try:
+            head = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False)
+            subject = worktree._git(self.p.root, "log", "-1", "--format=%s", head, check=False) if head else ""
+            if not head or not (cont or chaincap.marked_split(result, subject)) or not self._has_changes(task) \
+                    or self.p.db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)) \
+                    or self._landed_elsewhere(task):
+                return ""
+            labels = json.loads(task.get("labels") or "[]")
+            self.p.db.update_task(task["id"], labels=[*labels, f"{chaincap.SPLIT_LABEL}{head}"])
+        except Exception as e:
+            log(self.p, f"task {task['id']}: its split was not read: {e}")
+            return ""
+        log(self.p, f"task {task['id']}: split at {head[:12]}: no review until its last continue hop finishes")
+        return head
 
     def _has_changes(self, task: dict) -> bool:
         """Whether a task's branch changes anything against the base; True when that cannot be read."""
@@ -9590,10 +9638,14 @@ class Daemon:
                                       TERMINAL_TASK_STATES)
                       if '"pr_fix:' in t["labels"] and (self._stack_root(t) == root
                                                        or (key and f'"pr_fix:{key}"' in t["labels"]))), None)
+        # An open continue hop that builds on the reviewed branch (a split's hop) finishes that branch:
+        # it takes these findings, and the re-review waits on it. A separate fix would be a second
+        # task continuing the same work.
+        hop = None if prfix else self._open_hop(code)
         with db.tx():
-            if prfix:
-                fid = prfix["id"]
-                fbranch = prfix["branch"] or f"ttp/t{fid}-{worktree.slug(prfix['title'])}"
+            if prfix or hop:
+                fid = (prfix or hop)["id"]
+                fbranch = (prfix or hop)["branch"] or f"ttp/t{fid}-{worktree.slug((prfix or hop)['title'])}"
             else:
                 fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
                                   priority=review["priority"], origin="daemon",
@@ -9668,15 +9720,17 @@ class Daemon:
                               + ([push.REVIEW_ONLY_LABEL] if only else []) + ([push.LAND_LABEL] if lands else [])
                               + ([f"pr_branch:{onto}"] if publish and onto else []),
                               **(pin_of(review) or pin_of(code)))
-            if prfix:
+            if prfix or hop:
+                owner = (f"failed too. This task is the PR's one fixer: fix its blocking findings as well." if prfix
+                         else f"failed. This task continues that branch: fix its blocking findings as well, in this "
+                              f"task's own work.")
                 extra = "\n".join([
                     f"Review #{review['id']} ({review['title']}) of code task #{code['id']} (branch "
-                    f"{code['branch']}, head {head}) failed too. This task is the PR's one fixer: fix its blocking "
-                    f"findings as well. Re-review #{rid} checks each once this task is done.",
+                    f"{code['branch']}, head {head}) {owner} Re-review #{rid} checks each once this task is done.",
                     f"Findings to fix:\n{found}",
                     f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"])
-                db.update_task(fid, spec=f"{prfix['spec'] or ''}\n{extra}",
-                               labels=[*json.loads(prfix["labels"] or "[]"), f"review_fix:{review['id']}"])
+                db.update_task(fid, spec=f"{(prfix or hop)['spec'] or ''}\n{extra}",
+                               labels=[*json.loads((prfix or hop)["labels"] or "[]"), f"review_fix:{review['id']}"])
                 for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (fid,)):
                     if r["dir"]:
                         coord._append_update(Path(r["dir"], "steer.md"), extra, f"review-fix-{review['id']}")
@@ -9693,9 +9747,25 @@ class Daemon:
             moved = [t["id"] for t in coord._open_dependents(db, review["id"])]
             coord._take_over_dependents(db, review["id"], rid)
         log(self.p, f"review {review['id']} failed: "
-                    + (f"PR fix #{fid} takes its findings" if prfix else f"queued fix #{fid}") + f" and re-review #{rid}"
+                    + (f"PR fix #{fid} takes its findings" if prfix else f"continue hop #{fid} takes its findings"
+                       if hop else f"queued fix #{fid}") + f" and re-review #{rid}"
                     + (f"; moved {moved} onto it" if moved else ""))
         return fid, rid, moved
+
+    def _open_hop(self, code: dict) -> dict | None:
+        """The open code task, oldest first, that continues code task `code`'s branch (`continues:`, directly
+        or through its chain), other than a fix of a review: a split's hop. None when there is none."""
+        for t in self.p.db.q("SELECT * FROM tasks WHERE kind='code' AND status NOT IN (?,?,?) AND id>? "
+                             "AND labels LIKE '%continues:%' ORDER BY id", (*TERMINAL_TASK_STATES, code["id"])):
+            if '"review_fix:' in (t["labels"] or "") or '"pr_fix:' in (t["labels"] or ""):
+                continue
+            c, seen = continues_id(t), {t["id"]}
+            while c is not None and c not in seen and c != code["id"] and (x := self.p.db.task(c)):
+                seen.add(c)
+                c = continues_id(x)
+            if c == code["id"]:
+                return t
+        return None
 
     def pr_findings_owner(self, key: str, rec: dict, what: str) -> tuple[dict | None, bool]:
         """The one open task that owns a PR's open findings (pr-watch's record `rec` for PR `key`),

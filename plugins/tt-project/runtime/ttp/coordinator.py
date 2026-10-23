@@ -1551,7 +1551,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"task_add {title[:80]!r}: forced past review #{prior['id']}, which accepted "
                                  f"{head[:12]}: {clip(a.get('reason'), 200)}")
                 old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
-                followup = old if old and old["status"] == "done" else None
+                # A split code task's hop takes its branch over (chaincap.split_head): one hop at a time.
+                split = bool(old and old["status"] == "done" and chaincap.split_head(old))
+                if split and (hop := db.one("SELECT id FROM tasks WHERE labels LIKE ? AND status NOT IN (?,?,?)",
+                                            (f'%"continues:{old["id"]}"%', *TERMINAL_TASK_STATES))):
+                    raise ValueError(f"task_add continues #{old['id']} rejected: #{hop['id']} already continues "
+                                     f"its split head; update #{hop['id']} instead")
+                followup = old if old and old["status"] == "done" and not split else None
                 if old:   # a continue chain over its cap, or in an area under review_area_cap (chaincap)
                     if past := chaincap.check_add(p, cfg, old["id"], a.get("reason")):
                         notes.append(past)
@@ -1604,6 +1610,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     after, when = _start_args(a, {}, p)
                 except MissingTaskRef as e:
                     raise MissingTaskRef(f"{json.dumps(title, ensure_ascii=False)}: {e}") from None
+                if when and a.get("continues") is not None and (stuck := chaincap.own_wait(
+                        p, [t["id"] for t in chaincap.chain(db, int(a["continues"]))], when)):
+                    raise ValueError(f"task_add rejected: {stuck}")
                 labels += defer_labels(after, when, start_why(a, {}, when))
                 stale = marker_only_probe(when, p.root)
                 why = prguard.spec_problem(db, a.get("spec") or "")
@@ -1756,6 +1765,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         after, when = _start_args(a, cur, p)
                     except MissingTaskRef as e:
                         raise MissingTaskRef(f"#{task['id']} rejected: {e}") from None
+                    if when and when != cur.get("when") and (stuck := chaincap.own_wait(
+                            p, [t["id"] for t in chaincap.chain(db, task["id"])[:-1]], when)):
+                        raise ValueError(f"#{task['id']} rejected: {stuck}")
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
                     upd["labels"] = without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))

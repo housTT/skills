@@ -23,12 +23,16 @@ evidence); that override is recorded as an OVERRIDE_EVENT.
 
 Model-free hop (`chains.auto`, on by default): a done task whose only proposal is one `continue:`
 follow-up, in a lineage below every cap, that made progress gets the follow-up queued by the daemon
-with `continues` set (an AUTO_EVENT). The next hop starts from the base, not that task's branch, so a
-code task whose branch has changes gets its review queued first; without one the coordinator
-decides. That hop then waits (start_when `landed:#<task>`) until the reviewed commits are on the push
-branch, unless they already are or nothing pushes there (no push branch, or pushing is off). The
-notice, and a local_only notice for a branch its review still carries, go to the next digest
-(NOTICES_KEY) without waking the coordinator. Anything else still goes to it.
+with `continues` set (an AUTO_EVENT). A hop of a done task starts from the base, not its branch, with
+one exception: a split. A code task whose branch has changes and that proposes a `continue:` hop, or
+whose hand-off marks its head unfinished (marked_split), ended as a split (SPLIT_LABEL, split:<head>):
+its head is work in progress. It gets no review, and its hop takes the branch over (`continues:`, so
+it starts from that head) and starts at once: a start_when `landed:` on a task of its own chain could
+never pass, as those commits land only with the hop's own work (own_wait refuses it). The open tasks
+that waited on the split task wait on the hop. The last hop, the first that ends without a split,
+gets the chain's one review (split_hops). The notice, and a local_only notice for a branch its review
+still carries, go to the next digest (NOTICES_KEY) without waking the coordinator. Anything else
+still goes to it.
 """
 from __future__ import annotations
 
@@ -55,6 +59,12 @@ FOLLOWS = "follows:"   # label of a task_add that `continues` a done task: a lin
 NOTICES_KEY = "chain_notices"   # kv: [{ts, text}]: hops the daemon queued, shown once in the next digest
 MAX_CHAIN = 200
 MAX_NOTICES = 30
+SPLIT_LABEL = "split:"   # a done code task that ended as a split: split:<its head>
+# A split hand-off's own words: a summary that opens "Split at/here/..." or names the split line, a head
+# commit subject that says WIP.
+SPLIT_SUMMARY = re.compile(r"(?i)^\W*split\b(?=\s*(?:at|here|mid|after|before|because|per|on|by|[(:;,.]|$))"
+                           r"|\bpast the split line\b")
+WIP_SUBJECT = re.compile(r"(?:^|[\s(\[])WIP(?=$|[\s):\]])|\(work in progress\)")
 
 
 def caps(cfg: dict) -> dict:
@@ -220,6 +230,52 @@ def hop_ready(p, cfg: dict, task: dict, fup: dict) -> str:
     return progress(p, ch, len(ch) - 1)
 
 
+def marked_split(result: dict, subject: str = "") -> bool:
+    """Whether a code hand-off marks its head unfinished: `"split": true` or `"wip": true`, a summary in a
+    split's words (SPLIT_SUMMARY), or a head commit whose subject says WIP."""
+    result = result if isinstance(result, dict) else {}
+    return result.get("split") is True or result.get("wip") is True \
+        or bool(SPLIT_SUMMARY.search(str(result.get("summary") or ""))) or bool(WIP_SUBJECT.search(subject or ""))
+
+
+def split_head(task: dict | None) -> str:
+    """The head a done code task left unfinished (its SPLIT_LABEL), or ''."""
+    try:
+        labels = json.loads((task or {}).get("labels") or "[]")
+    except ValueError:
+        return ""
+    return next((lb[len(SPLIT_LABEL):] for lb in labels if isinstance(lb, str) and lb.startswith(SPLIT_LABEL)), "") \
+        if isinstance(labels, list) else ""
+
+
+def split_hops(db: DB, task: dict) -> list[dict]:
+    """The split tasks `task` finishes, root first: each task before it in its chain, back to the first
+    that did not end as a split."""
+    ch = chain(db, task["id"])[:-1]
+    out: list[dict] = []
+    for t in reversed(ch):
+        if not split_head(t):
+            break
+        out.append(t)
+    return out[::-1]
+
+
+def own_wait(p, lineage: list[int], probe: str | None) -> str:
+    """Why a start_when `probe` on a task that continues the tasks of `lineage` (directly or through
+    its chain) can never pass, or '': a `landed:` wait on one of them whose work has not landed, as
+    that work lands only with this task's own."""
+    from . import landed
+    for ref in landed.task_refs(probe):
+        n = int(ref) if ref.isdigit() else 0
+        if n in lineage and not p.db.one("SELECT 1 FROM task_superseded WHERE task=? UNION ALL "
+                                         "SELECT 1 FROM task_landings WHERE task=?", (n, n)):
+            return (f"start_when {str(probe).strip()[:160]!r} waits on #{n}, which this task continues (directly or "
+                    f"through its continue chain), and #{n}'s work has not landed: it lands only with this task's "
+                    f"own work, so the wait could never pass. Drop the start_when (a continue hop starts at once "
+                    f"from its chain's branch), or wait on a task outside its chain")
+    return ""
+
+
 def hop_tier(task: dict, fup: dict) -> str:
     """The tier of the hop queued for `fup`: the parent's, or lower when the follow-up asks for it with
     `"tier"` or a `mechanical:` title (light). Never above the parent's: a hop that needs more is
@@ -229,12 +285,10 @@ def hop_tier(task: dict, fup: dict) -> str:
     return want if want in TIERS and TIERS.index(want) < TIERS.index(tier) else tier
 
 
-def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None,
-             wait_landed: bool = False) -> tuple[int, str] | None:
+def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tuple[int, str] | None:
     """Queue `fup` when hop_ready (`why`, when the caller checked it already): (new task id, why it
-    progressed), else None. With `wait_landed` (a code hop whose commits are not on the push branch
-    yet), the new hop starts only once they landed (start_when `landed:#<task>`): it starts from the
-    branch tip, so before that it would lack them and redo them or conflict with them at push time."""
+    progressed), else None. The hop of a split task (split_head) takes its branch over and starts at
+    once; it never waits on that task's landing, which comes only with the hop's own work."""
     from . import coordinator as coord
     db = p.db
     why = hop_ready(p, cfg, task, fup) if why is None else why
@@ -245,8 +299,6 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None,
     action = {"type": "task_add", "title": title, "spec": str(fup.get("spec") or ""), "kind": task["kind"],
               "tier": hop_tier(task, fup), "priority": task["priority"], "budget_usd": task["budget_usd"],
               "continues": task["id"]}
-    if wait_landed:
-        action.update(start_when=f"landed:#{task['id']}", why=f"#{task['id']}'s commits land on the push branch")
     saved = db.kv(coord.NOTES_KEY)   # the coordinator's own notes for its next digest stay as they were
     try:
         problems = coord.apply(p, [action])
