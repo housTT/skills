@@ -92,6 +92,27 @@ Work from cheap to expensive:
 5. Estimate each full suite from the samples, with a range. Run it only if the estimate fits
    `suite_budget_hours` before the deadline. A measured stop is a valid result.
 
+### Fanning out
+
+Run arms in parallel when the grant allows it. An explorer owns one hypothesis: it predicts, sizes
+its own sample, dispatches, and reports the arm with its evidence. A coordinator holds the current
+best, the slot ledger and the budget, decides what is kept, and re-runs kept changes together.
+Explorers do not accept their own arms, and every dispatched run is registered with the coordinator
+when it is launched, not when it finishes.
+
+Give explorers different mechanisms, not one idea at several magnitudes.
+
+### Sizing a sample
+
+Estimate a sample's CI time before dispatching it, and size it to the thing it has to separate.
+Too small to beat the noise is spent compute that decides nothing; a full suite to settle what a
+sample answers is worse.
+
+Shape follows the claim. A concurrency change needs enough simultaneous conversations to actually
+load the pool and the scheduler. A precision or long-context change needs long and free-running
+replies. A cache change needs repeated multi-turn traffic. A task count that makes one of these
+valid can make another meaningless.
+
 Write these to `doc/agentic_evals/`:
 
 - `plan.json`

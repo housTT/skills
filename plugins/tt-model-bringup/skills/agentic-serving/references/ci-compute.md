@@ -116,7 +116,8 @@ gh workflow run "$WORKFLOW" -R "$REPO" \
 `gh workflow run` does not return the run id. Resolve it by polling for a run newer than the
 dispatch whose `run-name` or head matches the arm, and record it before dispatching the next one.
 Untracked runs are the usual way a stage loses a machine: it cannot tell whether a slot is busy, so
-it either over-dispatches or sits idle.
+it either over-dispatches or sits idle. With several explorers dispatching, the ledger is shared
+state — register a run at launch, not at collection.
 
 Poll with `gh run list -R "$REPO" --json databaseId,status,conclusion,displayTitle` on an interval
 measured in minutes. Count runs in `queued` and `in_progress` against `max_parallel` and dispatch
