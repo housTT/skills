@@ -64,7 +64,7 @@ def coordinator_features(p: Project) -> set[str]:
     if bool(str(d.get("push_branch") or "").strip()) and push_allowed(d):
         on.add("push_branch")
     # checkgaps.wait opens a check:<sig> gap for any delivery.push_checks, push branch or not.
-    if push.check_list(d.get("push_checks")):
+    if push.all_checks(d):
         on.add("push_checks")
     if push_queue_on(cfg):
         on.add("push_queue")

@@ -140,7 +140,7 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
     """delivery.push_checks on `new` in scratch worktree `wt`, as `ttp push` runs them on its rebased
     head: 0 when they pass. With none configured, only a docs-only change passes."""
     d = p.config().get("delivery") or {}
-    checks = push.with_host(push.check_list(d.get("push_checks")), d.get("checks_host"))
+    checks = push.with_host(push.check_list(push.repo_checks(d, wt, p)[0]), d.get("checks_host"))
     if not checks:
         if code := push.code_paths(wt, base, new):
             say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}); not landing")
@@ -358,7 +358,7 @@ def _dry(p: Project, repo: Path, branch: str, base: str, full: str, commits: lis
             f"fast-forwards {branch} from {base[:10]} to {new[:10]}"
         say(f"dry run: {how}")
         d = p.config().get("delivery") or {}
-        checks = push.with_host(push.check_list(d.get("push_checks")), d.get("checks_host"))
+        checks = push.with_host(push.check_list(push.repo_checks(d, wt, p)[0]), d.get("checks_host"))
         if not checks:
             if code := push.code_paths(wt, base, new):
                 say(f"dry run: no checks configured, and this change touches more than docs ({', '.join(code[:3])}); "

@@ -10527,3 +10527,110 @@ def test_ttp_checks_clean_checkout_populates_submodules_from_the_worktrees_copie
     err = capsys.readouterr().err
     assert f"cannot populate submodule sub at {sha[:12]}" in err and "did not run" in err
     _no_checkouts(repo, tmp)
+
+
+def _harness_worktree(p, tmp_path, monkeypatch):
+    """A committed harness repo and a worktree of it, as a harness task checks its change in."""
+    h = ["git", "-C", str(p.harness), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*h, "add", "-A"], check=True)
+    subprocess.run([*h, "commit", "-qm", "base", "--allow-empty"], check=True)
+    wt = tmp_path / "hwt"
+    subprocess.run([*h, "worktree", "add", "-q", "--detach", str(wt)], check=True)
+    monkeypatch.chdir(wt)
+    return wt
+
+
+def test_harness_repo_never_runs_the_code_repos_push_checks(env, tmp_path, monkeypatch, capsys):
+    """In a project whose harness repo is not its code repo, `ttp checks` on a harness change runs no
+    code repo check: with no list of its own it runs the built-in harness default (and
+    push_checks' purpose harness entries under --purpose harness), says so, and records where its
+    checks came from. The code repo still runs delivery.push_checks."""
+    from ttp import cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    p.set_config("delivery.push_checks", [f"echo code >> {log}"])
+    cli.main(["checks"])
+    assert log.read_text().split() == ["code"]
+    assert json.loads((run / "checks.json").read_text())["checks_from"] == "delivery.push_checks"
+    log.unlink()
+    wt = _harness_worktree(p, tmp_path, monkeypatch)
+    assert push.harness_repo(p, wt) and push.harness_repo(p, p.harness) and not push.harness_repo(p, repo)
+    capsys.readouterr()
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert not log.exists(), "a harness change ran the code repo's checks"
+    assert push.HARNESS_UNSET in out and "never a pass of the code checks" in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["checks_from"] == "the built-in harness default"
+    assert f"echo code >> {log}" not in rec["commands"] and rec["commands"][0].startswith("git diff --check")
+    cli.main(["checks", "--purpose", "harness"])
+    assert not log.exists()
+    assert "running the default harness plan" in capsys.readouterr().out
+    # A purpose harness entry of push_checks is the harness repo's own: it still runs there.
+    _fake_check_plan_ttp(tmp_path, monkeypatch, log)
+    p.set_config("delivery.push_checks", [f"echo code >> {log}", {"run": HARNESS_PLAN, "purpose": "harness"}])
+    cli.main(["checks", "--purpose", "harness", "--fresh"])
+    assert log.read_text().split() == ["plan"]
+
+
+def test_push_checks_by_repo_picks_each_repos_list(env, tmp_path, monkeypatch, capsys):
+    """delivery.push_checks_by_repo gives the harness repo (`harness`) and a code repo (its folder
+    name, absolute path, or path relative to the project root) their own lists; a repo it does not
+    name keeps delivery.push_checks, and the settings fingerprints change only once it is set."""
+    from ttp import checkgaps, cli, push, reviewreuse
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "log"
+    p.set_config("delivery.push_checks", [f"echo code >> {log}"])
+    sig, key = checkgaps.config_sig(p.config()), reviewreuse.check_key(p.config())
+    by = {"harness": [f"echo harness >> {log}"], "work": [f"echo work >> {log}"]}
+    cli.main(["config", p.name, "delivery.push_checks_by_repo", json.dumps(by)])
+    assert p.config()["delivery"]["push_checks_by_repo"] == by
+    assert checkgaps.config_sig(p.config()) != sig and reviewreuse.check_key(p.config()) != key
+    cli.main(["checks"])
+    assert log.read_text().split() == ["work"]
+    assert json.loads((run / "checks.json").read_text())["checks_from"] == "delivery.push_checks_by_repo['work']"
+    log.unlink()
+    _harness_worktree(p, tmp_path, monkeypatch)
+    cli.main(["checks"])
+    assert log.read_text().split() == ["harness"]
+    assert json.loads((run / "checks.json").read_text())["checks_from"] == "delivery.push_checks_by_repo.harness"
+    d = {"push_checks": ["true"]}
+    for k in (str(repo), os.path.relpath(repo, p.root)):
+        assert push.repo_checks({**d, "push_checks_by_repo": {k: ["false"]}}, repo, p) == (
+            ["false"], f"delivery.push_checks_by_repo[{k!r}]")
+    assert push.repo_checks({**d, "push_checks_by_repo": {"other": ["false"]}}, repo, p) == (
+        ["true"], "delivery.push_checks")
+    # The harness key never matches a code repo, even one whose folder is called harness.
+    assert push.repo_checks({**d, "push_checks_by_repo": {"harness": ["false"]}}, repo, p)[0] == ["true"]
+    assert [str(c) for c in push.all_checks({**d, "push_checks_by_repo": by})] == [
+        "true", f"echo harness >> {log}", f"echo work >> {log}"]
+
+
+def test_single_repo_push_checks_are_unchanged(env, tmp_path, monkeypatch):
+    """With no push_checks_by_repo, a code repo gets delivery.push_checks as before and every
+    fingerprint of the check settings is the one it was."""
+    import hashlib
+    from ttp import checkgaps, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    d = {"push_checks": ["pytest -q", {"run": "true", "if_exists": "a.txt"}]}
+    assert push.repo_checks(d, repo, p) == (d["push_checks"], "delivery.push_checks")
+    assert push.repo_checks(d, repo) == (d["push_checks"], "delivery.push_checks")
+    assert push.checks_config(d) == d["push_checks"]
+    assert checkgaps.config_sig({"delivery": d}) == hashlib.sha256(
+        json.dumps(d["push_checks"], sort_keys=True).encode()).hexdigest()
+    assert [str(c) for c in push.all_checks(d)] == ["pytest -q", "true"]
+
+
+@pytest.mark.parametrize("value", ['["pytest -q"]', '"pytest -q"', '{"harness": 5}', '{"harness": {"run": "x"}}',
+                                   '{"harness": ["run the tests and make sure they pass"]}', '{" ": ["true"]}'])
+def test_push_checks_by_repo_rejects_malformed_values(env, tmp_path, monkeypatch, capsys, value):
+    from ttp import cli, project, push
+    p = make(env)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", p.name, "delivery.push_checks_by_repo", value])
+    assert e.value.code and "delivery.push_checks_by_repo" in capsys.readouterr().err
+    assert "push_checks_by_repo" not in (p.raw_config().get("delivery") or {})
+    assert push.by_repo_problems(json.loads(value))
+    problems = project.config_problems({"delivery": {"push_checks_by_repo": json.loads(value)}})
+    assert any(x.startswith("delivery.push_checks_by_repo: ") for x in problems)
+    assert not project.config_problems({"delivery": {"push_checks_by_repo": {"harness": ["true"]}}})

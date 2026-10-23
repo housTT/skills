@@ -2305,17 +2305,8 @@ def cmd_checks(a) -> None:
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
     purpose = getattr(a, "purpose", None) or "candidate"
-    checks_host = (cfg.get("delivery") or {}).get("checks_host")   # where checks without a host run
-    own = push.with_host(push.check_list((cfg.get("delivery") or {}).get("push_checks")), checks_host)
-    not_run: list[str] = []
-    default_harness = False
-    if purpose == "harness":
-        if bad := push.check_problems((cfg.get("delivery") or {}).get("push_checks")):
-            die("ttp checks --purpose harness: delivery.push_checks is malformed, so nothing is qualified: "
-                + "; ".join(bad), 1)
-        default_harness = not any(c.purpose == "harness" for c in own)
-        not_run = [f"not run: candidate publication gate: {c}" for c in own if c.purpose == "candidate"]
-        own = [c for c in own if c.purpose != "candidate"]
+    d = cfg.get("delivery") or {}
+    checks_host = d.get("checks_host")   # where checks without a host run
     # The checks run at the top of the worktree being checked, as `ttp push` runs them, wherever in
     # it this was started: a repo-relative check started in a subdirectory would test the wrong place.
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
@@ -2324,10 +2315,34 @@ def cmd_checks(a) -> None:
     head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if not top or not head:
         die("ttp checks: run it in the change's git worktree")
+    # The repo being checked picks its list (push.repo_checks): the harness repo never runs the code repo's.
+    configured, source = push.repo_checks(d, Path(top), p)
+    own = push.with_host(push.check_list(configured), checks_host)
+    harness_unset = source == push.HARNESS_UNSET
+    if harness_unset:
+        print(f"ttp checks: {push.HARNESS_UNSET} (delivery.{push.BY_REPO}.{push.HARNESS_KEY}), so the code "
+              "repo's delivery.push_checks do not run here, only their purpose harness entries"
+              + ("" if purpose == "harness" else "; running the built-in harness default (a whitespace check, "
+                 "and pytest of " + " and ".join(push.HARNESS_TEST_DIRS) + " where they exist)")
+              + ". Its pass is this repo's own, never a pass of the code checks")
+        source = "delivery.push_checks (purpose harness entries)" if purpose == "harness" \
+            else "the built-in harness default"
+    not_run: list[str] = []
+    default_harness = False
+    if purpose == "harness":
+        if bad := push.check_problems(d.get("push_checks") if harness_unset else configured):
+            die(f"ttp checks --purpose harness: {source} is malformed, so nothing is qualified: "
+                + "; ".join(bad), 1)
+        default_harness = not any(c.purpose == "harness" for c in own)
+        not_run = [f"not run: candidate publication gate: {c}" for c in own if c.purpose == "candidate"]
+        own = [c for c in own if c.purpose != "candidate"]
+    elif harness_unset:
+        own = push.with_host(push.default_harness_checks(Path(top), _checks_base(p, Path(top), own), ""),
+                             checks_host)
     defaults = push.default_harness_checks(Path(top), _checks_base(p, Path(top), own)) if default_harness else []
     if defaults:   # no configured harness plan: the built-in one qualifies the head
         own += defaults
-        print("ttp checks: delivery.push_checks has no purpose harness check; running the default harness plan "
+        print(f"ttp checks: {source} has no purpose harness check; running the default harness plan "
               "(a whitespace check, and pytest of " + " and ".join(push.HARNESS_TEST_DIRS) + " where they exist)")
     if p:
         from . import worktree
@@ -2343,10 +2358,10 @@ def cmd_checks(a) -> None:
     mine = push.with_host(mine, checks_host)
     if dropped:
         print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
-              f"delivery.push_checks already runs it")
+              f"{source} already runs it")
     cmds = own + mine
     if not cmds:
-        die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
+        die(f"ttp checks: the project sets no {source} for this repo; give the repository's test commands after "
             "`--`, e.g. ttp checks -- pytest -q")
     own_harness = bool(p) and Path(top).resolve() == p.harness.resolve()
     dirty, runtime_written, state = _checks_dirty(git, purpose == "harness", own_harness)
@@ -2397,7 +2412,7 @@ def cmd_checks(a) -> None:
             todo, again = _ran_again(todo, own, vpy)
             if again:
                 said = (f"not running {', '.join(map(repr, again))} after `--` again: a scoped "
-                        f"delivery.push_checks entry runs it on this head")
+                        f"{source} entry runs it on this head")
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
             fcfg = p.config() if p else None
@@ -2622,7 +2637,7 @@ def cmd_checks(a) -> None:
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
                                                      **({"verified": verified_cmds, "verified_through": mark["sha"]}
                                                         if verified_cmds else {}),
-                                                     "purpose": purpose,
+                                                     "purpose": purpose, "checks_from": source,
                                                      **({"fast_path": True, "skipped_project_checks": fast_skipped}
                                                         if fast_cmds else {}),
                                                      **({"not_run": not_run} if not_run else {}),
@@ -2631,7 +2646,7 @@ def cmd_checks(a) -> None:
                                                      **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {}),
                                                      **({"authoring_tree": in_authoring} if in_authoring else {})})
     source = ("the default harness plan" if any(str(c) == str(failed) for c in defaults)
-              else "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --")
+              else source if any(str(c) == str(failed) for c in own) else "ttp checks --")
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
     if not passed:
         from . import trim
@@ -2673,6 +2688,8 @@ def cmd_checks(a) -> None:
     if in_authoring:
         more += (f"; {len(in_authoring)} ran in the authoring worktree, NOT a clean checkout (\"cwd\": "
                  f"\"authoring\"): {', '.join(map(repr, in_authoring))}")
+    if harness_unset:
+        more += f"; {push.HARNESS_UNSET}: the built-in harness default ran, not the code repo's checks"
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
           + ("recorded as a harness qualification only: it never counts for a PR, an on_pass hand-off or a push"
              if purpose == "harness" else "recorded for the draft PR") + f" (full output: {log})")
@@ -5618,12 +5635,12 @@ def cmd_config(a) -> None:
             minutes(a.key.split(".", 1)[1], val)
         except ValueError as e:
             die(str(e).replace("; the default is used", ""))
-    if a.key == "delivery.push_checks":
-        from .push import checks_of
+    if a.key in ("delivery.push_checks", "delivery.push_checks_by_repo"):
+        from .push import checks_by_repo_of, checks_of
         try:
-            val = checks_of(val)
+            val = checks_of(val) if a.key == "delivery.push_checks" else checks_by_repo_of(val)
         except ValueError as e:
-            die(str(e))
+            die(str(e) if a.key == "delivery.push_checks" else f"{a.key}: {e}")
     if run and (k := _user_only_change(p.raw_config(), a.key, val)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
@@ -6183,7 +6200,7 @@ def _refresh_plan_digests(p: Project, files: list[str], busy: set[str] = frozens
     from . import checkplan, push
     h, plans = p.harness, []
     try:
-        checks = push.check_list((p.config().get("delivery") or {}).get("push_checks"))
+        checks = push.all_checks(p.config().get("delivery") or {})
     except Exception:
         return []
     for c in checks:

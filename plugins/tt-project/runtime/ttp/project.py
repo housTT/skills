@@ -407,13 +407,14 @@ EXTRA_KEYS = {
     # fast_forward_also: more branches each push moves to the pushed commit, fast-forward only (off: unset).
     # mirror_remotes: {remote, branch} tables each push also sends the pushed commit to, fast-forward only.
     # allow_protected_push_branch: lets the push branch be main, master or the remote's default (off: unset).
+    # push_checks_by_repo: a check list per repo ("harness", a repo path or folder name), push.repo_checks.
     # own_push_remote: where `ttp push --own` publishes task branches (a remote's name, a URL, or a map
     # keyed by repo path or folder name); unset: the push branch's remote, else origin (push.own_push_remote).
     # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
     # push_solo_paths: pathspecs a batch takes at most one change touching (pushq.SOLO_PATHS); push_cap_tests:
     # the name regex of prompt size cap tests, whose lone failure sends a trim-to-fit fix (conflictfix.CAP_TESTS).
-    "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
+    "delivery": {"base_ref", "push_branch", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
                  "push_solo_paths", "push_cap_tests",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
@@ -668,7 +669,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
             elif isinstance(v, dict) and _known_keys(path + [str(k)]) is not None:
                 walk(v, path + [str(k)])
     walk(raw, [])
-    from .push import (allow_protected, applicability_problems, backup_problem, bump_problems, check_problems,   # push imports this module
+    from .push import (allow_protected, applicability_problems, backup_problem, by_repo_problems,   # push imports this module
+                       bump_problems, check_problems,
                        fast_forward_check, lands_locally, mirror_check, push_branch_problem, scalar_problem)
     delivery = raw.get("delivery") or {}
     out += [why for why in [backup_problem(delivery)] if why]
@@ -684,6 +686,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         out.append(str(e))
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root)]
+    out += [f"delivery.push_checks_by_repo: {p}" for p in by_repo_problems(delivery.get("push_checks_by_repo"))]
     for k in ("checks_fast_globs", "checks_fast_exclude"):
         v = delivery.get(k)
         if v is not None and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):

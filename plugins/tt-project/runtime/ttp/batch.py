@@ -689,7 +689,8 @@ class Batch:
         if not (allowed is None or allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
             return self._all("refused", "refused", "this project does not allow pushing (delivery.push_allowed)")
         try:
-            checks = push.with_host(push.check_list(self.d.get("push_checks")), self.d.get("checks_host"))
+            checks = push.with_host(push.check_list(push.repo_checks(self.d, self.repo, self.p)[0]),
+                                    self.d.get("checks_host"))
             rounds = push.rounds_of(self.d.get("push_rounds"))
             self.cfg = push.bump_of(self.d.get("version_bump"))
             now = "/".join(push.target(self.p, self.repo))

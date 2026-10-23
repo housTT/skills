@@ -1228,12 +1228,14 @@ EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"   # git's empty tree: a 
 HARNESS_TEST_DIRS = ("runtime/tests", "bin/tests")   # the harness's own tests, where it has them
 
 
-def default_harness_checks(repo: Path, base: str = "") -> list[Check]:
+def default_harness_checks(repo: Path, base: str = "", purpose: str = "harness") -> list[Check]:
     """The plan `ttp checks --purpose harness` runs when delivery.push_checks has no purpose harness
     check: a whitespace check of `base` (the push target, else HEAD's parent, else the empty tree)
     to HEAD, and pytest of each of the harness's own test folders it has (`if_exists`: a missing one
     is skipped, never passed). All are tagged harness, so the whitespace check alone qualifies a
-    head with no tests. A configured purpose harness check replaces the whole plan."""
+    head with no tests. A configured purpose harness check replaces the whole plan. `purpose` ""
+    leaves them untagged: what a candidate `ttp checks` runs in the harness repo when no repo
+    checks are configured for it (HARNESS_UNSET)."""
     if not base:
         r = subprocess.run(["git", "-C", str(repo), "rev-parse", "-q", "--verify", "HEAD^{commit}^"],
                            capture_output=True, text=True)
@@ -1244,7 +1246,7 @@ def default_harness_checks(repo: Path, base: str = "") -> list[Check]:
         c.if_exists = d
         out.append(c)
     for c in out:
-        c.purpose = "harness"
+        c.purpose = purpose
     return out
 
 
@@ -1625,6 +1627,86 @@ def _repo_keys(repo: Path) -> tuple[list[Path], str]:
     paths = [Path(x).resolve() for x in (top, str(Path(common).parent) if common else "") if x]
     main = Path(common).parent if common and Path(common).name == ".git" else Path(top or repo)
     return paths, main.name
+
+
+BY_REPO = "push_checks_by_repo"
+HARNESS_KEY = "harness"   # the push_checks_by_repo key of the project's own harness repo
+HARNESS_UNSET = "no repo checks configured for the harness repo"
+
+
+def harness_repo(p: Project | None, repo: Path) -> bool:
+    """Whether `repo` (its checkout or any worktree of it) is the project's own harness repo: it
+    shares the harness's git directory. A harness with no git repo of its own never matches."""
+    if p is None or not (p.harness / ".git").exists():
+        return False
+    mine, theirs = (_git(r, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+                    for r in (repo, p.harness))
+    return bool(mine and theirs) and Path(mine).resolve() == Path(theirs).resolve()
+
+
+def repo_checks(d: dict, repo: Path, p: Project | None = None) -> tuple[Any, str]:
+    """The check list for `repo` (delivery settings `d`) and where it came from. The
+    delivery.push_checks_by_repo entry that names it: `harness` for the project's own harness repo,
+    else the repo's path (absolute, or relative to the project root) or its main checkout's folder
+    name, as own_push_remote keys them. Else, for the harness repo, only push_checks' `purpose:
+    harness` entries (HARNESS_UNSET): the code repo's other push_checks are not its checks. Else
+    delivery.push_checks, as for a single-repo project."""
+    by = d.get(BY_REPO)
+    harness = harness_repo(p, repo)
+    if isinstance(by, dict) and by:
+        if harness and HARNESS_KEY in by:
+            return by[HARNESS_KEY], f"delivery.{BY_REPO}.{HARNESS_KEY}"
+        paths, name = _repo_keys(repo)
+        root = p.root if p is not None else None
+        for k, v in by.items():
+            if k == HARNESS_KEY:
+                continue
+            path = Path(k).expanduser()
+            if k == name or ("/" in k or k.startswith("~")) \
+                    and (path if path.is_absolute() or root is None else root / path).resolve() in paths:
+                return v, f"delivery.{BY_REPO}[{k!r}]"
+    if harness:
+        return [c.config() for c in check_list(d.get("push_checks")) if c.purpose == "harness"], HARNESS_UNSET
+    return d.get("push_checks"), "delivery.push_checks"
+
+
+def all_checks(d: dict) -> list[Check]:
+    """Every configured check: delivery.push_checks and each push_checks_by_repo list."""
+    by = d.get(BY_REPO)
+    return check_list(d.get("push_checks")) + [c for v in (by.values() if isinstance(by, dict) else ())
+                                              for c in check_list(v)]
+
+
+def checks_config(d: dict) -> Any:
+    """The check settings a fingerprint covers: delivery.push_checks alone (as before) unless
+    push_checks_by_repo is set, then both."""
+    by = d.get(BY_REPO)
+    return [d.get("push_checks"), by] if by else d.get("push_checks")
+
+
+def by_repo_problems(v: Any) -> list[str]:
+    """Why a delivery.push_checks_by_repo value is malformed, one line each: not a map from a repo key
+    (`harness`, a repo path or a folder name) to a check list, or an entry push_checks would refuse."""
+    if v is None:
+        return []
+    if not isinstance(v, dict):
+        return [f"{v!r}: not a map from a repo (\"{HARNESS_KEY}\", a repo path or a folder name) to its check list"]
+    out = []
+    for k, x in v.items():
+        if not isinstance(k, str) or not k.strip():
+            out.append(f"{k!r}: not a repo key (\"{HARNESS_KEY}\", a repo path or a folder name)")
+        elif not isinstance(x, (str, list)):
+            out.append(f"{k}: {x!r} is not a check list")
+        else:
+            out += [f"{k}: {why}" for why in check_problems(x)]
+    return out
+
+
+def checks_by_repo_of(v: Any) -> dict:
+    """A delivery.push_checks_by_repo value, each list as push_checks stores it; ValueError if malformed."""
+    if bad := by_repo_problems(v):
+        raise ValueError("; ".join(bad))
+    return {k: checks_of(x) for k, x in (v or {}).items()}
 
 
 def own_push_remote(d: dict, repo: Path) -> str:
@@ -3354,7 +3436,7 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
         print(f"ttp push: {e}", file=sys.stderr)
         return CHECKS_FAILED
     # none: only a docs-only change may go (_rounds)
-    checks = with_host(check_list(d.get("push_checks")), d.get("checks_host"))
+    checks = with_host(check_list(repo_checks(d, repo, p)[0]), d.get("checks_host"))
     try:
         remote, branch, own = resolve(p, repo, own)
         rounds = rounds_of(d.get("push_rounds"))
@@ -3625,7 +3707,7 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
     if _git(top, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         print("ttp push: uncommitted changes; commit first", file=sys.stderr)
         return REFUSED
-    if not check_list(d.get("push_checks")):   # refuse now, not after the task handed off waiting
+    if not check_list(repo_checks(d, top, p)[0]):   # refuse now, not after the task handed off waiting
         base = own_base(p, top, remote)
         if code := code_paths(top, base) if base else ["(no push target to compare with)"]:
             more = f" and {len(code) - 3} more" if len(code) > 3 else ""

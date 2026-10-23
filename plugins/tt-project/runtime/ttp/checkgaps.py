@@ -22,7 +22,7 @@ FINISHED = ("done", "failed", "cancelled")
 
 
 def config_sig(cfg: dict) -> str:
-    checks = (cfg.get("delivery") or {}).get("push_checks")
+    checks = push.checks_config(cfg.get("delivery") or {})
     return hashlib.sha256(json.dumps(checks, sort_keys=True).encode()).hexdigest()
 
 
@@ -113,7 +113,7 @@ def wait(p, task: dict, result: dict, run_dir: Path, cfg: dict) -> dict | None:
         # Only this project's code worktrees; never act on another project's harness or state.
         if path.resolve() != p.root.resolve() and not path.resolve().is_relative_to(p.worktrees.resolve()):
             return None
-        if check.config() not in [c.config() for c in push.check_list((cfg.get("delivery") or {}).get("push_checks"))]:
+        if check.config() not in [c.config() for c in push.check_list(push.repo_checks(cfg.get("delivery") or {}, path, p)[0])]:
             return None
         if worktree._git(path, "rev-parse", "HEAD") != head:
             return None
@@ -140,7 +140,7 @@ def wait(p, task: dict, result: dict, run_dir: Path, cfg: dict) -> dict | None:
         gap["config"] = current
         try:
             record = json.loads((run_dir / push.RECORDED).read_text())
-            own = {str(c) for c in push.check_list((cfg.get("delivery") or {}).get("push_checks"))}
+            own = {str(c) for c in push.check_list(push.repo_checks(cfg.get("delivery") or {}, path, p)[0])}
             extras = [str(c) for c in record.get("commands", []) if str(c) not in own]
         except (OSError, ValueError, TypeError, AttributeError):
             extras = []
@@ -169,7 +169,7 @@ def rerun(daemon) -> None:
     p, cfg = daemon.p, daemon.cfg
     gaps = p.db.kv(KEY, {})
     current = config_sig(cfg)
-    configured = [c.config() for c in push.check_list((cfg.get("delivery") or {}).get("push_checks"))]
+    configured = [c.config() for c in push.all_checks(cfg.get("delivery") or {})]
     for key, gap in list(gaps.items()):
         live = [tid for tid in gap["tasks"] if _waiting(p, key, tid)]
         if gap["check"] not in configured and not live:

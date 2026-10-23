@@ -164,6 +164,8 @@ USER_SETTABLE = {
     # the commands that must pass first.
     "delivery.push_branch": str,
     "delivery.push_checks": lambda v: push.checks_of(v),
+    # Per-repo check lists ("harness", a repo path or folder name -> a push_checks list), push.repo_checks.
+    "delivery.push_checks_by_repo": lambda v: push.checks_by_repo_of(v),
     # The ssh alias the checks run on (remotecheck) when the project may not run them here; "" for here.
     "delivery.checks_host": lambda v: push.checks_host_of(v),
     # The files holding the version that `ttp push` bumps once above the tip, plus a changeset.

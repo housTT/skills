@@ -822,18 +822,19 @@ def _pytest_dirs(segments: list[list[str]], cwd: str | None, subshell: bool = Fa
 
 def _check_runs() -> list[tuple[str, set[str], set[tuple[str, str]]]]:
     """(the check, its paths, its selecting options) for each pytest run in the project's configured
-    checks (`delivery.push_checks`, what `ttp checks` runs). Read fresh: a project may change them."""
+    checks (`delivery.push_checks` and push_checks_by_repo, what `ttp checks` runs). Read fresh: a
+    project may change them."""
     base = os.environ.get("TTP_PROJECT")
     if not base:
         return []
     from .project import Project
-    from .push import check_list
+    from .push import all_checks
     p = Project(base)
     if not p.exists():
         return []
     out = []
     top = "/top"   # checks run from the repository's top; a cd out of it makes the run unclear
-    for c in check_list((p.config().get("delivery") or {}).get("push_checks")):
+    for c in all_checks(p.config().get("delivery") or {}):
         for args, d in _pytest_dirs(_segments(str(c)), top, "(" in str(c)):
             if d is None or not (d + "/").startswith(top + "/"):
                 continue

@@ -9388,7 +9388,7 @@ class Daemon:
         directory), or None when nothing started: the queue is off, the project sets no checks, or
         the worktree is gone or holds another head."""
         d = self.cfg.get("delivery") or {}
-        if not full or not pushq.enabled(self.p, self.cfg) or not push.check_list(d.get("push_checks")):
+        if not full or not pushq.enabled(self.p, self.cfg) or not push.all_checks(d):
             return None
         path = self.p.worktrees / f"t{task['id']}"
         try:

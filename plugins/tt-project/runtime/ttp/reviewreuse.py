@@ -22,8 +22,10 @@ _LABEL = re.compile(r"review_head:([0-9a-f]{40})@([0-9a-f]+)")
 
 
 def check_key(cfg: dict) -> str:
-    """A short key for the project's check set (delivery.push_checks): other checks, other key."""
-    checks = (cfg.get("delivery") or {}).get("push_checks")
+    """A short key for the project's check set (delivery.push_checks, and push_checks_by_repo once
+    set): other checks, other key."""
+    from .push import checks_config
+    checks = checks_config(cfg.get("delivery") or {})
     return hashlib.sha1(json.dumps(checks, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
