@@ -62,9 +62,9 @@ def slot_paths(locks_dir: Path, resource: str, slots: int) -> list[Path]:
     return [Path(locks_dir) / f"{resource}.{i}.lock" for i in range(max(int(slots or 1), 1))]
 
 
-def try_take(paths: list[Path], holder: str, what: str = "", key: str = ""):
+def try_take(paths: list[Path], holder: str, what: str = "", key: str = "", extra: dict | None = None):
     """The open file of the first free slot, now held and labelled with its holder (and `key`, what
-    the holder runs, when given); None if all are taken."""
+    the holder runs, when given, and the fields of `extra`, such as job_fields); None if all are taken."""
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
         f = open(path, "a+")
@@ -76,7 +76,7 @@ def try_take(paths: list[Path], holder: str, what: str = "", key: str = ""):
         f.seek(0)
         f.truncate()
         f.write(json.dumps({"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {}),
-                            **_owner(os.getpid())}))
+                            **(extra or {}), **_owner(os.getpid())}))
         f.flush()
         return f
     return None
@@ -98,6 +98,30 @@ def _owner(pid: int) -> dict:
     """The fields a slot label gives the process that holds it: its pid, and where that pid means
     something (host and PID namespace), so a reader elsewhere does not judge it."""
     return {"pid": int(pid), "node": os.uname().nodename, "pidns": _pid_ns()}
+
+
+def job_fields(env=None) -> dict:
+    """What a slot label adds for a taker inside a `ttp detach` job (TTP_DETACHED and the job's .rc in
+    TTP_DETACH_RC): the job's name, its .rc and the pid `ttp detach` recorded for it (its wrapper's, from
+    its .started file) as job, job_rc and job_pid; {} anywhere else."""
+    from .progress import JOB_ENV
+    env = os.environ if env is None else env
+    rc = env.get(JOB_ENV)
+    if not rc or not env.get("TTP_DETACHED"):
+        return {}
+    from .detach import started
+    try:
+        pid = int(started(Path(rc)).read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        pid = 0
+    return {"job": Path(rc).stem, "job_rc": str(rc), **({"job_pid": pid} if pid > 1 else {})}
+
+
+def _job_note(h: dict) -> str:
+    """" (detached job <name>, job pid N)" for a label job_fields filled, else ""."""
+    if not h.get("job"):
+        return ""
+    return f" (detached job {h['job']}" + (f", job pid {h['job_pid']}" if h.get("job_pid") else "") + ")"
 
 
 def label_pid(f, pid: int) -> None:
@@ -176,7 +200,7 @@ def _holder_note(h: dict, where=None) -> str:
     from .project import Project
     note, lbl = _pid_note(h), hold.parse(h.get("holder"))
     if not isinstance(where, Project) or not lbl or lbl["project"] not in (None, where.name):
-        return note or ", pid unknown"
+        return (note or ", pid unknown") + _job_note(h)
     try:   # an unreadable database or a run id that is not a number: only what the label says
         run = where.db.one("SELECT pid, status, dir, boot_id, note FROM runs WHERE id=?", (int(lbl["run"]),))
         task = where.db.one("SELECT status FROM tasks WHERE id=?", (lbl["task"],))
@@ -200,6 +224,7 @@ def _holder_note(h: dict, where=None) -> str:
                         f"{'running' if runs else 'ended'}")
         if jobs:
             note += "; " + ", ".join(jobs[:3]) + (f" +{len(jobs) - 3} more" if len(jobs) > 3 else "")
+    note += _job_note(h)
     if task and task["status"] == "done" and not live:
         note += f"; stale: task #{lbl['task']} is done"
     return note
@@ -228,7 +253,7 @@ class SharedHold:
             f.close()
 
 
-def try_take_shared(paths: list[Path], holder: str, what: str = "") -> SharedHold | None:
+def try_take_shared(paths: list[Path], holder: str, what: str = "", extra: dict | None = None) -> SharedHold | None:
     """A shared hold of the resource: a read lock on every slot, so no exclusive holder has one;
     None if one has. The label ends in SHARED_MARK."""
     files = []
@@ -252,7 +277,7 @@ def try_take_shared(paths: list[Path], holder: str, what: str = "") -> SharedHol
         lf = open(tmp, "a+")
         fcntl.flock(lf, fcntl.LOCK_EX)
         lf.write(json.dumps({"holder": holder + SHARED_MARK, "since": time.time(), "command": what[:300],
-                             **_owner(os.getpid())}))
+                             **(extra or {}), **_owner(os.getpid())}))
         lf.flush()
         os.rename(tmp, d / name)
     except OSError:
@@ -795,12 +820,13 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
 
 
 def take_in_turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], holder: str, what: str = "",
-                 fair: bool = False, past_multi: bool = False):
+                 fair: bool = False, past_multi: bool = False, extra: dict | None = None):
     """try_take (try_take_shared for a shared ticket), but only when this ticket's turn has come
     (my_turn), so a later waiter never takes the one slot an earlier one is about to."""
     if not turn(locks_dir, resource, ticket, paths, fair, past_multi):
         return None
-    return try_take_shared(paths, holder, what) if is_shared(ticket) else try_take(paths, holder, what)
+    return (try_take_shared(paths, holder, what, extra=extra) if is_shared(ticket)
+            else try_take(paths, holder, what, extra=extra))
 
 
 def turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], fair: bool = False,

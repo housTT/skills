@@ -16679,7 +16679,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 29_000), ("question", 24_000)):
+    for kind, cap in (("code", 29_100), ("question", 24_000)):   # code: +100 for `ttp detach --lock`
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -28115,8 +28115,9 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     # The rules a code or a question task reads on every call stay under their budgets (they had
     # grown to 20.5k chars for every task, shared clusters, device runners and remote drivers included).
     # 13.6k: +1 rule, the one line a looping driver reports its refusals with (`ttp progress report`).
+    # 13.7k: +1 clause, `ttp detach --lock` holding a job's locks for its life.
     rules = {k: feature_blocks(src, worker_features(p, t)) for k, t in (("code", code), ("question", question))}
-    assert len(rules["code"]) <= 13_600, len(rules["code"])
+    assert len(rules["code"]) <= 13_700, len(rules["code"])
     assert len(rules["question"]) <= 10_000, len(rules["question"])
     # A question task cannot detach, so it skips the pointer to the long-running script rules.
     assert "references/long-running-scripts.md" in rules["code"]

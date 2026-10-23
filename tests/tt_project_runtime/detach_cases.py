@@ -354,3 +354,125 @@ def test_lost_markers_go_only_into_state_and_run_folders(env, tmp_path, monkeypa
     monkeypatch.chdir(own)
     assert detach._mark_lost_first("job.rc", "it never started") == "it never started"
     assert detach.lost(own / "job.rc").read_text().strip() == "it never started"
+
+
+# `ttp detach --lock <resource>`: the job takes its locks all or nothing through `ttp lock` (cmd_lock)
+# before its command starts and holds them for the job's life.
+
+def _lock_job_env(env, p, run_dir, task="41", run="7"):
+    return {"TTP_HOME": str(env["home"]), "TTP_HOST": "testhost", "TTP_RUN_DIR": str(run_dir),
+            "TTP_TASK": task, "TTP_RUN_ID": run}
+
+
+def _held_now(p, res):
+    from ttp import shared
+    return [x for x in shared.held(p) if x.startswith(f"{res}: ")]
+
+
+def _probe_json(p, run_env, res):
+    r = subprocess.run([sys.executable, str(TTP), "lock", "--probe", "--json", res],
+                       env={**os.environ, "TTP_PROJECT": str(p.base), **run_env}, capture_output=True, text=True, timeout=60)
+    return r.returncode, json.loads(r.stdout)
+
+
+def test_detach_without_lock_prints_and_records_exactly_as_before(env, tmp_path):
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    r = _ttp_run(p, "detach", "job1", "--", "true", env=_lock_job_env(env, p, run_dir))
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / "job1.rc").resolve()
+    job = json.loads((run_dir / "detached.json").read_text())[0]
+    lines = r.stdout.splitlines()
+    assert lines == [f"detached job1 (pid {job['pid']})", f"log: {rc.with_suffix('.log')}", f"rc:  {rc}",
+                     f"hand off: status waiting, retry_when \"{TTP} detach --check {rc}\""], lines
+    assert job["command"] == "true" and "locks" not in job
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+
+
+def test_detach_lock_holds_one_or_two_locks_for_the_jobs_life_and_lets_go_once_its_rc_is_written(env, tmp_path):
+    p = make(env)
+    for n, names in enumerate((["rig-a"], ["rig-a", "rig-b"])):
+        run_dir = p.runs / str(7 + n)
+        run_dir.mkdir(parents=True)
+        go, ran = tmp_path / f"go{n}", tmp_path / f"ran{n}"
+        flags = [w for x in names for w in ("--lock", x)]
+        cmd = ["sh", "-c", f"touch {shlex.quote(str(ran))}; {shlex.join(_until(go))}"]
+        run_env = _lock_job_env(env, p, run_dir, run=str(7 + n))
+        r = _ttp_run(p, "detach", "job", *flags, "--", *cmd, env=run_env)
+        assert r.returncode == 0, r.stderr
+        assert f"locks: {','.join(names)} (taken all or nothing" in r.stdout, r.stdout
+        rc = (run_dir / "job.rc").resolve()
+        job = json.loads((run_dir / "detached.json").read_text())[0]
+        assert job["locks"] == names
+        try:
+            assert _until_true(ran.exists)
+            for res in names:   # held by this task's run and job while it runs
+                assert _held_now(p, res), res
+                code, said = _probe_json(p, run_env, res)
+                h = said["holders"][0]
+                assert code == 75 and h["holder"] == f"task #41 (run {7 + n})" and h["alive"] is True, said
+                assert h["job"] == "job" and h["job_pid"] == job["pid"] and h["job_rc"] == str(rc), h
+                assert f"(detached job job, job pid {job['pid']})" in h["note"], h["note"]
+            assert _ttp_run(p, "detach", "--check", str(rc)).returncode == 1
+        finally:
+            go.touch()
+        assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+        for res in names:
+            assert _until_true(lambda: not _held_now(p, res)), res
+            assert _probe_json(p, run_env, res)[0] == 0
+
+
+def test_detach_lock_lets_go_once_the_job_is_lost(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    ran = tmp_path / "ran"
+    cmd = ["sh", "-c", f"touch {shlex.quote(str(ran))}; {shlex.join(_until(tmp_path / 'never'))}"]
+    r = _ttp_run(p, "detach", "job", "--lock", "rig-a,rig-b", "--", *cmd, env=_lock_job_env(env, p, run_dir))
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / "job.rc").resolve()
+    pid = json.loads((run_dir / "detached.json").read_text())[0]["pid"]
+    assert _until_true(ran.exists) and _held_now(p, "rig-a") and _held_now(p, "rig-b")
+    os.killpg(pid, signal.SIGKILL)   # a kill or a reboot: the job is gone without an .rc
+    assert _until_true(lambda: detach.state(rc)[0] == "lost"), detach.state(rc)
+    assert not rc.exists() and not _held_now(p, "rig-a") and not _held_now(p, "rig-b")
+
+
+def test_detach_lock_holds_nothing_while_another_task_holds_one_of_them(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    go, ran = tmp_path / "go", tmp_path / "ran"
+    other = _lock(_lock_env(env, p, TTP_TASK="99", TTP_RUN_ID="3"), "rig-b", cmd=_until(go))
+    try:
+        assert _until_true(lambda: bool(_held_now(p, "rig-b")))
+        r = _ttp_run(p, "detach", "job", "--lock", "rig-a", "--lock", "rig-b", "--", "touch", str(ran),
+                     env=_lock_job_env(env, p, run_dir))
+        assert r.returncode == 0, r.stderr
+        rc = (run_dir / "job.rc").resolve()
+        assert _until_true(lambda: _queue_len(p, "rig-a") == 1 and _queue_len(p, "rig-b") == 1)
+        time.sleep(0.5)   # several polls: rig-a is free, yet the job keeps it free while it waits for rig-b
+        assert not _held_now(p, "rig-a") and not ran.exists() and detach.state(rc)[0] == "running"
+    finally:
+        go.touch()
+    assert other.wait(timeout=60) == 0
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0" and ran.exists()
+    assert not _held_now(p, "rig-a") and not _held_now(p, "rig-b")
+
+
+def test_detach_lock_on_a_paused_resource_exits_75_and_starts_nothing(env, tmp_path):
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    p.db.set_kv("paused_resources", {"rig-b": {"reason": "maintenance", "since": time.time()}})
+    r = _ttp_run(p, "detach", "job", "--lock", "rig-a,rig-b", "--", "touch", str(tmp_path / "ran"),
+                 env=_lock_job_env(env, p, run_dir))
+    assert r.returncode == 75 and "rig-b is paused (maintenance)" in r.stderr, (r.returncode, r.stderr)
+    assert "retry_when `ttp lock --probe rig-a,rig-b`" in r.stderr
+    assert not (run_dir / "detached.json").exists() and not (run_dir / "job.log").exists()
+    assert _queue_len(p, "rig-a") == 0 and not (tmp_path / "ran").exists()
+    r = _ttp_run(p, "detach", "--remote", "box", "job", "--lock", "rig-a", "--", "true", env=_lock_job_env(env, p, run_dir))
+    assert r.returncode != 0 and "--lock is for a local job" in r.stderr, r.stderr

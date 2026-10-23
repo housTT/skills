@@ -261,7 +261,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - Anything still running when you stop must be detached (`ttp detach <name> -- <cmd>` writes
   `<name>.log` and `.rc` in your run folder and prints the `retry_when`), or it dies with you.
 <!-- ttp:if wait -->
-  Add `--cores N` / `--devices N` when the command does not show them. Use `ttp detach`, not
+  Add `--cores N` / `--devices N` when the command does not show them; `--lock <resource>`
+  (repeatable) holds those locks, all or nothing, for the job's life. Use `ttp detach`, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
 - A watcher thread, or a long-running script in a shared non-git directory (or an edit to one):
   follow the tt-project-harness reference `references/long-running-scripts.md`.

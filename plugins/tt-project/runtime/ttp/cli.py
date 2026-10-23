@@ -3802,6 +3802,7 @@ def cmd_lock(a) -> None:
             waiting = False
             lk.record_wait(wait_dir, wait_key, started, time.time())
 
+    job = lk.job_fields()   # inside a `ttp detach` job (its --lock): the label names the job and its pid
     tickets: list = []
     atexit.register(lambda: [lk.dequeue(t) for t in tickets])   # however this ends; a dead process's ticket is dropped too
     for L in todo:
@@ -3832,10 +3833,11 @@ def cmd_lock(a) -> None:
         for L in todo:
             try:
                 if L["mine"]:
-                    f = (lk.try_take_shared if a.shared else lk.try_take)(L["paths"], L["who"], " ".join(cmd))
+                    f = (lk.try_take_shared if a.shared else lk.try_take)(L["paths"], L["who"], " ".join(cmd),
+                                                                         extra=job)
                 else:
                     f = lk.take_in_turn(L["where"], L["res"], L["ticket"], L["paths"], L["who"], " ".join(cmd),
-                                        past_multi=past_multi)
+                                        past_multi=past_multi, extra=job)
             except OSError as e:
                 for g in fs:
                     g.close()
@@ -4027,7 +4029,10 @@ def cmd_detach(a) -> None:
     resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py), or
     until the host a `--remote-host` job drives reset or its remote pid died (detach.remote_verdict).
     `--resumable` records the job's argv, cwd and environment (no secrets) so the daemon can start it
-    again after a host reboot cut it short, while its task still waits on it (daemon._relaunch_jobs)."""
+    again after a host reboot cut it short, while its task still waits on it (daemon._relaunch_jobs).
+    `--lock <resource>` (repeatable, or A,B) runs the job's command under one `ttp lock` of them all
+    (_lock_job): the job takes them all or nothing before its command starts and holds them until the
+    command ends, before its .rc is written, or its processes are gone (a job found lost)."""
     from . import detach, jobuse
     from . import locks as lk
     from .push import _boxed, _own_ttp
@@ -4053,6 +4058,11 @@ def cmd_detach(a) -> None:
         die("--rows and --after go with --check")
     if a.check is None and getattr(a, "mirror", None):
         die("--mirror goes with --check --host")
+    job_locks = list(dict.fromkeys(n for x in getattr(a, "lock", None) or [] for n in x.split(",") if n))
+    if getattr(a, "lock", None) and (a.remote or a.check is not None):
+        die("--lock is for a local job: it holds the locks here while the job runs")
+    if getattr(a, "lock", None) and not job_locks:
+        die("usage: ttp detach <name> --lock <resource> [--lock <resource>...] -- <command...>")
     if getattr(a, "resumable", False) and (a.remote or a.check is not None):
         die("--resumable is for a local job: a --remote one already outlives a reboot here")
     rhost = getattr(a, "remote_host", None)
@@ -4099,6 +4109,9 @@ def cmd_detach(a) -> None:
     rc, logf = rd / f"{a.name}.rc", rd / f"{a.name}.log"
     if any(f.exists() for f in (rc, logf, detach.queued(rc), detach.lost(rc))):
         die(f"a detached job named {a.name} already ran in this run; pick another name")
+    asked = cmd
+    if job_locks:
+        cmd = _lock_job(job_locks, cmd)
     pid = None
     from . import activity
     job_env, aid = dict(os.environ), activity.new_id()
@@ -4140,7 +4153,8 @@ def cmd_detach(a) -> None:
                  "boot": boot_id(), "queued": pid is None, "command": " ".join(cmd)[:300],
                  **({"resumable": True} if getattr(a, "resumable", False) else {}),
                  **({"remote": remote} if remote else {}),
-                 "requested": jobuse.requested(cmd, os.environ, getattr(a, "cores", None),
+                 **({"locks": job_locks} if job_locks else {}),
+                 "requested": jobuse.requested(asked, os.environ, getattr(a, "cores", None),
                                                getattr(a, "devices", None), getattr(a, "mem_gb", None),
                                                jobuse.daemon_env(rd.parent.parent / "daemon.pid")
                                                if rd.parent.name == "runs" else None)})
@@ -4148,7 +4162,28 @@ def cmd_detach(a) -> None:
     how = (f"(pid {pid})" if pid else
            "(queued: this command's sandbox would end it, so the daemon starts it within seconds)")
     print(f"detached {a.name} {how}\nlog: {logf}\nrc:  {rc}\n"
-          f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
+          + (f"locks: {','.join(job_locks)} (taken all or nothing before the command starts, held until it "
+             f"ends; a paused one ends the job with exit 75)\n" if job_locks else "")
+          + f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
+
+
+def _lock_job(names: list, cmd: list) -> list:
+    """`ttp detach --lock A --lock B`: the job's command as `ttp lock A,B -- <command...>`, so the job takes
+    them by ttp lock's rules unchanged (all or nothing, in arrival order, device, reserved and nested rules;
+    a detached job's wait has no run cap) and holds them for the command's life; its label names the task,
+    run and job (locks.job_fields). A paused one refuses the job here at once, exit 75, as ttp lock does."""
+    from . import lockprobe
+    base = os.environ.get("TTP_PROJECT")
+    if not base:
+        die("ttp detach --lock only works inside a tt-project run (or with TTP_PROJECT set)")
+    p = Project(base)
+    cfg = p.config()
+    for n in names:
+        if (held := lockprobe.pause(p, cfg, n)) is not None:
+            why = f" ({held['reason']})" if held.get("reason") else ""
+            die(f"{n} is paused{why}, so the job did not start; hand the task back as waiting, retry_when "
+                f"`ttp lock --probe {','.join(names)}`", 75)
+    return [sys.executable, str(Path(__file__).resolve().parents[2] / "bin" / "ttp"), "lock", ",".join(names), "--", *cmd]
 
 
 # Sets $b to the host's boot id, as the remote side of `ttp detach --remote` records it (below) and
@@ -4228,7 +4263,7 @@ def _start_options(a) -> None:
     no option, so they count as if they came before the name. Any other option there is refused, so it
     never runs as the command."""
     words = list(a.command or [])
-    known = {"--cores": int, "--devices": int, "--mem-gb": float, "--resumable": None,
+    known = {"--cores": int, "--devices": int, "--mem-gb": float, "--resumable": None, "--lock": list,
              **({"--dir": str} if a.remote else {"--remote-host": str, "--remote-pid": str, "--remote-marker": str})}
     while words and words[0].startswith("-") and words[0] != "--":
         w = words.pop(0)
@@ -4245,6 +4280,9 @@ def _start_options(a) -> None:
             if not words or words[0] == "--":
                 die(f"{key} needs a value")
             val = words.pop(0)
+        if kind is list:   # repeatable
+            a.lock = [*(getattr(a, "lock", None) or []), val]
+            continue
         try:
             setattr(a, key[2:].replace("-", "_"), kind(val))
         except ValueError:
@@ -7639,6 +7677,10 @@ def main(argv: list[str] | None = None) -> None:
                    "device run appends each step's result to it and fsyncs it as the step ends, not only an "
                    "end-of-run summary, so a reboot or crash keeps the steps already done")
     s.add_argument("--after", type=int, metavar="N", help="with --rows: the line count already seen (default 0)")
+    s.add_argument("--lock", action="append", metavar="RESOURCE",
+                   help="repeatable (or A,B): the job runs its command under one `ttp lock` of them all, so it takes "
+                   "them all or nothing by ttp lock's rules before the command starts and holds them until it ends "
+                   "(its .rc) or its processes are gone; a paused one exits 75 at once and starts nothing")
     s.add_argument("--resumable", action="store_true",
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
                    "starts it again while the task still waits on it, with no model run (up to "
