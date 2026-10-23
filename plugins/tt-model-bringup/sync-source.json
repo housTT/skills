@@ -43,14 +43,14 @@
       "destination": "prompts/model_bringup_multigoal/06-full-model.check.sh",
       "blob": "836320fcff1f6ac4a5bf5fe740bf387c00001db9",
       "source_sha256": "d71d21efed8cd079a8a58ac8d1c572f00149cab8ea2838c182b9c1fb07805846",
-      "packaged_sha256": "f245efb36879554d56b764a5734e178a5d7d8a7b74182b768b9660f0f48db6ae"
+      "packaged_sha256": "570f39713b951ceae5e32bf2b0bf68740cfbc36db4f31248baef96774e202713"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/06-full-model.txt",
       "destination": "prompts/model_bringup_multigoal/06-full-model.txt",
       "blob": "bff9bb890a6052bfa0fff9f06f12891ce1ad0f10",
       "source_sha256": "9ffedb6e7af6dcbbd32fc8002b5add7cd599967ef163eb9e0191af47bb14cf09",
-      "packaged_sha256": "9ffedb6e7af6dcbbd32fc8002b5add7cd599967ef163eb9e0191af47bb14cf09"
+      "packaged_sha256": "ec087875c12ffd55187ef478d0223993b8e19fb997b7ea061793ca1d11526e22"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/07-optimized-full-model.check.sh",
@@ -78,14 +78,14 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.check.sh",
       "blob": "54873057b0cd77d369de89e8732a5f7bf6810027",
       "source_sha256": "e5860d4f3d9a3f5076062814db09b403ad7de9d0bef6d8aeec02325bccb626ba",
-      "packaged_sha256": "014708dffd476cd46967f2a62bf867a2d3bcf89090f56b20f9faefbd78767098"
+      "packaged_sha256": "edaa7a79857c4193d160a42de1e7c5315639a90e441ab370b5fc33cd0eb76cf0"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.txt",
       "destination": "prompts/model_bringup_multigoal/09-vllm.txt",
       "blob": "fc930a5472158d07221c2c5440786a7c5aed9ed2",
       "source_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727",
-      "packaged_sha256": "25bbd0ae23662362c57f0b054622453703b546defa54f0d1eebae748bc519500"
+      "packaged_sha256": "5b05170f500899fc542bee53b2f5d3e59c01ef59ae0c6aded8fbb720de38fcdf"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
@@ -99,7 +99,7 @@
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.txt",
       "blob": "7c661791b3c29bbad8de5ce8d50176d13633657f",
       "source_sha256": "6817dc59aa6d8cdc9c50404aa4e919240f1a07e3ce772dab04ae21d4561bec24",
-      "packaged_sha256": "d918a1cf738823ae15717b848c8f16d0a4cd0366d0377884b7a62a8cc8c6a361"
+      "packaged_sha256": "c4ff962430a858da07e44fc5a7b60084597bc992e5e57bbb07ad5aa3722db788"
     },
     {
       "source": ".agents/requirements.txt",
@@ -141,7 +141,7 @@
       "destination": "skills/full-model/SKILL.md",
       "blob": "de994d5552a74b4f1cdcaf64f6ba364178b8d5a4",
       "source_sha256": "0618a7bd6ee01f995cb98dd73a9b2c46d8fd3daab9fcecdafde67501c529d2f8",
-      "packaged_sha256": "92b37989d9dd4a93e2f8501571849cf8d9432c68d187569bf2bc23bcb7ad1a87"
+      "packaged_sha256": "8d9c326e34f64d3a978031757e8e1fc051cf5175e804e0dfdec6ba337fc096c3"
     },
     {
       "source": ".agents/skills/full-model/agents/openai.yaml",
@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "f46fc472ed5f6d791874f5ee7c14efd0393f6c6179ab27905d5211b473f1c6e4"
+      "packaged_sha256": "26c3180e0a5bd2eb12874e28a2fccf40325b6a45c4a1d6a0f6fe751d470acffa"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "b20dc786698ac19960f90e9fe80c3e00f5ef3fe1c8b07aef6f7bfa49ac296242"
+      "packaged_sha256": "6a7906399af62d1e359c510b1803871ddbb8c482c3915cee8abc7d5905a319f2"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -323,7 +323,7 @@
       "destination": "runtime/readiness_check/contract_vllm.py",
       "blob": "17532121d80665f4e761c0accf1804b47a9e24a0",
       "source_sha256": "1cad43e6e36705297dbfa5416b38cf4ee555a564a2463066f1676ffc5ac8a5a7",
-      "packaged_sha256": "1cad43e6e36705297dbfa5416b38cf4ee555a564a2463066f1676ffc5ac8a5a7"
+      "packaged_sha256": "71758f9307b58758a65f5c748a186d9b24b9faf01f19f2d1000963d8797cc34f"
     },
     {
       "source": "models/common/readiness_check/generate.py",

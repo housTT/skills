@@ -130,6 +130,20 @@ def test_installed_gates_fail_critical_for_missing_evidence(installed, stage):
     assert "can't open file" not in result.stderr
 
 
+def valid_serving_contract():
+    return {
+        'plugin': {'repository': 'tenstorrent/vllm-tt-plugin', 'commit': 'a' * 40},
+        'vllm': {'version': 'v0.0.0'},
+        'documents_read': ['docs/MODEL_INTERFACE.md'],
+        'rows': [
+            {'item': 'logprobs', 'kind': 'request_feature', 'status': 'supported',
+             'evidence': 'doc/full_model/logprobs.log'},
+            {'item': 'supports_prefix_caching', 'kind': 'capability', 'status': 'not_supported',
+             'declaration': 'documented default', 'reason': 'prefix caching is not implemented'},
+        ],
+    }
+
+
 def test_full_model_gate_accepts_valid_evidence_and_rejects_context_reduction(installed):
     plugin, target, env = installed
     model = target / 'models/autoports/org_model'
@@ -142,6 +156,8 @@ def test_full_model_gate_accepts_valid_evidence_and_rejects_context_reduction(in
     (output / 'tt_completion.txt').write_text(' '.join(f'word{i}' for i in range(60)))
     contract = doc / 'context_contract.json'
     contract.write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 8192}))
+    (doc / 'full_model').mkdir()
+    (doc / 'full_model/serving_contract.json').write_text(json.dumps(valid_serving_contract()))
     env['MODEL_DIR'] = str(model)
     gate = plugin / 'prompts/model_bringup_multigoal/06-full-model.check.sh'
     result = run('bash', str(gate), cwd=target, env=env)
@@ -150,6 +166,65 @@ def test_full_model_gate_accepts_valid_evidence_and_rejects_context_reduction(in
     result = run('bash', str(gate), cwd=target, env=env)
     assert result.returncode == 2
     assert 'without device-DRAM capacity evidence' in result.stderr
+
+
+@pytest.mark.parametrize('mutate, message', [
+    (lambda c: None, None),
+    (lambda c: c['rows'].append({'item': 'penalties', 'kind': 'request_feature', 'status': 'missing'}),
+     'unfinished full-model work'),
+    (lambda c: c['plugin'].update(commit='main'), '40-character'),
+    (lambda c: c['rows'][0].pop('evidence'), 'requires evidence'),
+    (lambda c: c['rows'].append({'item': 'hook', 'kind': 'call', 'status': 'plugin_owned',
+                                 'record': 'doc/vllm_integration/plugin_changes.md'}), 'does not exist'),
+    (lambda c: c['rows'][0].update(kind=['request_feature']), 'kind must be one of'),
+    (lambda c: c['rows'][0].update(status={'name': 'supported'}), 'status must be one of'),
+])
+def test_serving_contract_checker(tmp_path, mutate, message):
+    checker = PLUGIN / 'scripts/check_serving_contract.py'
+    model = tmp_path / 'models/autoports/org_model'
+    args = (sys.executable, str(checker), '--model-dir', str(model), '--require-contract')
+    result = run(*args, cwd=tmp_path)
+    assert result.returncode == 2
+    assert 'Missing serving contract' in result.stderr
+    contract = valid_serving_contract()
+    mutate(contract)
+    (model / 'doc/full_model').mkdir(parents=True)
+    (model / 'doc/full_model/serving_contract.json').write_text(json.dumps(contract))
+    result = run(*args, cwd=tmp_path)
+    if message is None:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 2
+        assert message in result.stderr
+
+
+@pytest.mark.parametrize('stage', ['06-full-model', '09-vllm'])
+@pytest.mark.parametrize('field, value', [('kind', ['request_feature']), ('status', {'name': 'supported'})])
+def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, field, value):
+    plugin, target, env = installed
+    model = target / 'models/autoports/org_model'
+    doc = model / 'doc'
+    (doc / 'autoregressive').mkdir(parents=True)
+    (doc / 'full_model').mkdir()
+    (model / 'readiness_vllm').mkdir()
+    completion = ' '.join(f'word{i}' for i in range(60))
+    (doc / 'autoregressive/autoregressive_meta.json').write_text(json.dumps({'tt': {'token_ids': list(range(60))}}))
+    (doc / 'autoregressive/tt_completion.txt').write_text(completion)
+    (model / 'readiness_vllm/vllm_qualitative_outputs.json').write_text(json.dumps(
+        [{'prompt': 'p', 'greedy_completion': completion, 'sampled_completion': completion}]))
+    (doc / 'context_contract.json').write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 8192}))
+    contract = valid_serving_contract()
+    path = doc / 'full_model/serving_contract.json'
+    path.write_text(json.dumps(contract))
+    env['MODEL_DIR'] = str(model)
+    gate = plugin / 'prompts/model_bringup_multigoal' / (stage + '.check.sh')
+    result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 0, result.stderr + result.stdout
+    contract['rows'][0][field] = value
+    path.write_text(json.dumps(contract))
+    result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 2, result.stderr
+    assert f'{field} must be one of' in result.stderr
 
 
 def test_standalone_tti_checker_resolves_package_and_rejects_stock_evidence(installed):

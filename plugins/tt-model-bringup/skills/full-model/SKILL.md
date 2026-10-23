@@ -40,6 +40,34 @@ Prompt length is a logical API input. The full model and generator must accept v
 
 Batch handling is part of the capability contract. Optimize primarily for batch-1 single-user latency, but do not hard-code batch 1 into the model, generator, cache, page tables, position handling, sampling, or output formatting. Support larger batches through the same low-level API and test up to batch 32 when the target hardware, memory, and harness allow it. If batch 32 cannot run, record the largest tested batch and the hard physical limit.
 
+## Serving Contract Check
+
+Find serving gaps before the generator, sampler, and datatype policy are optimized and frozen. Before you choose the sampler and fix the low-level generator API, resolve and pin the serving stack as [serving stack setup](../vllm-integration/references/serving-stack.md) describes. This check only reads the pinned plugin checkout. It does not install the stack or launch a server, and it is not vLLM integration work.
+
+Read the pinned plugin's model interface guide (currently `docs/MODEL_INTERFACE.md`) and every document it links for setup, execution, lifecycle, capabilities, decode reload, and other extension contracts that the model could use. Inspect the pinned plugin source where those documents do not say which adapter calls or declarations the plugin uses. Read its device test suite (`tests/tt`). Then write `models/autoports/<model>/doc/full_model/serving_contract.json`:
+
+```json
+{
+  "plugin": {"repository": "tenstorrent/vllm-tt-plugin", "commit": "<40-character SHA>"},
+  "vllm": {"version": "<recommended release or ref>"},
+  "documents_read": ["docs/MODEL_INTERFACE.md", "docs/MODEL_SETUP.md"],
+  "rows": [
+    {"item": "logprobs", "kind": "request_feature", "status": "supported", "evidence": "<test or artifact path>"},
+    {"item": "supports_prefix_caching", "kind": "capability", "status": "not_supported",
+     "declaration": "<key and value, or documented default>", "reason": "<why the model does not implement it>"}
+  ]
+}
+```
+
+Add one row for each adapter call, `model_capabilities` declaration, and request feature that the plugin calls or tests, such as sampling parameters, seeds, logprobs, penalties, chunked prefill, prefix caching, and async decode. `kind` is `call`, `capability`, or `request_feature`. `status` is one of:
+
+- `supported`: the generator provides it; `evidence` names the test or artifact;
+- `not_supported`: an existing documented declaration or its documented default states it; `declaration` names it, and `reason` explains the effect on requests and why the model does not implement it;
+- `plugin_owned`: the [plugin changes](../vllm-integration/references/plugin-changes.md) rules assign the gap to the plugin; `record` is the justification record path relative to the model directory;
+- `missing`: the plugin test suite or the serving goal requires it, and the generator does not provide it.
+
+Missing rows are full-model work, and the stage gate rejects them. Do not plan to close a row with a new plugin capability, environment variable, or `--additional-config` option. A gap that is smaller to close in the plugin is still a model gap when the model owns the behavior.
+
 ## How To Approach It
 
 Read the HuggingFace reference model and the reports for the working TTNN blocks before writing the wrapper. Understand the whole autoregressive path: input IDs, embeddings, masks, position IDs, cache layout, block calls, logits, sampling, and generated token feedback.
@@ -220,6 +248,7 @@ Done means all of these are true and recorded:
 - HF model id or local checkpoint, hardware, mesh, branch/commit, and environment;
 - selected block/decoder implementation and why;
 - model wrapper and generator contracts;
+- serving contract: pinned plugin and vLLM pair, and `doc/full_model/serving_contract.json` with no missing rows;
 - carried-forward decoder contract: weight/activation/KV/CCL dtype policy, tensor-group exceptions, and residual layout;
 - state-dict mapping, tied-embedding behavior if relevant, and real-weight loading behavior;
 - KV-cache, page-table or position handling, prompt lengths, and repeated decode reuse;
