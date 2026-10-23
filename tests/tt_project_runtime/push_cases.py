@@ -6309,6 +6309,8 @@ def test_a_rebase_task_builds_on_its_own_branch_and_its_review_publishes_back_on
     path, branch = worktree.ensure(p, t)
     assert branch.startswith(f"ttp/t{t['id']}-")
     assert _git_out(path, "rev-parse", "HEAD") == _git_out(p.root, "rev-parse", "feature/x")
+    # Where the rebase started is recorded, so --own keeps what feature/x gains after it.
+    assert worktree.rebase_start(p.root, t["id"]) == _git_out(p.root, "rev-parse", "feature/x")
     prompt = worker_task(p, t, str(path), branch)
     assert "rebases branch feature/x" in prompt and "under a lease" in prompt
     # A title without "rebase" keeps pr_branch.
@@ -10817,10 +10819,11 @@ def test_own_push_publishes_another_tasks_branch_checked_out_when_only_an_update
         assert push.own_target(p, repo) == ("origin", theirs), how
 
 
-def _rebase_setup(env, monkeypatch, checks=("true",), spec_line="pr_branch: {old}"):
+def _rebase_setup(env, monkeypatch, checks=("true",), spec_line="pr_branch: {old}", record=True):
     """An earlier task's branch `old` on origin (the tip `theirs`, not on the push branch) and a
     running task labelled rebases:<old> whose spec names it, on its own branch with a rebased head
-    that does not fast-forward `old`."""
+    that does not fast-forward `old`; `theirs` recorded as where its rebase started, as
+    worktree.ensure records it (`record` False: nothing recorded, as for a task dispatched before)."""
     p, repo, origin, other = _push_setup(env, monkeypatch, list(checks))
     owner = p.db.add_task("First example", "s", kind="code")
     old = f"ttp/t{owner}-example"
@@ -10835,6 +10838,9 @@ def _rebase_setup(env, monkeypatch, checks=("true",), spec_line="pr_branch: {old
     monkeypatch.setenv("TTP_TASK", str(tid))
     _git_out(repo, "checkout", "-q", "-B", own)
     _commit(repo, "old.txt", "old, rebased\n")
+    if record:
+        from ttp import worktree
+        worktree.record_rebase_start(repo, tid, theirs)
     return p, repo, origin, other, tid, old, theirs
 
 
@@ -10854,11 +10860,19 @@ def test_own_push_publishes_a_rebase_onto_the_branch_it_rebases_under_a_lease(en
     assert _ttp("push", "--own") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", old) == head
     assert "under a lease" in capsys.readouterr().err
-    # The reported case: the rebased branch itself checked out.
-    _git_out(repo, "checkout", "-q", "-B", old)
+    # A fast-forward of what it published goes too.
     _commit(repo, "more.txt", "more\n")
-    assert push.own_target(p, repo) == ("origin", old)
     assert _ttp("push", "--own") == 0 and _git_out(origin, "rev-parse", old) == _git_out(repo, "rev-parse", "HEAD")
+    # The reported case: the rebased branch itself checked out, replacing the tip the rebase started
+    # from (a non-fast-forward).
+    _git_out(other, "push", "-q", "-f", "origin", f"{theirs}:refs/heads/{old}")
+    _git_out(repo, "checkout", "-q", "-B", old)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", theirs, head]).returncode != 0
+    assert push.own_target(p, repo) == ("origin", old)
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", old) == head
+    assert "under a lease" in capsys.readouterr().err
     # A pr_branch task (no rebase) still only fast-forwards.
     p.db.update_task(tid, labels=json.dumps([f"pr_branch:{old}"]))
     assert not push.own_lease(p, old)
@@ -10874,6 +10888,41 @@ def test_own_push_lease_keeps_a_branch_that_moved_during_the_checks(env, monkeyp
     assert _ttp("push", "--own") == push_rejected()
     moved = _git_out(origin, "rev-parse", old)
     assert moved != theirs and moved == _git_out(other, "rev-parse", "HEAD")
+
+
+def test_own_push_rebase_keeps_a_commit_pushed_after_the_rebase_started(env, monkeypatch, capsys):
+    """A commit pushed to the rebased branch after the rebase was built on it, and before --own (so
+    the tip read at push time already has it), is never overwritten: --own refuses, naming it. Once
+    HEAD holds it (rebased again onto the new tip), the rebase goes, and the commit stays."""
+    from ttp import push
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch)
+    _commit(other, "late.txt", "late\n")
+    late = _git_out(other, "rev-parse", "HEAD")
+    _git_out(other, "push", "-q", "origin", f"HEAD:refs/heads/{old}")
+    assert _ttp("push", "--own") == push.REJECTED
+    err = capsys.readouterr().err
+    assert late[:10] in err and "would lose" in err, err
+    assert _git_out(origin, "rev-parse", old) == late
+    # Rebased again onto the new tip: HEAD holds the late commit's change, so nothing is lost.
+    _git_out(repo, "cherry-pick", late)
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    tip = _git_out(origin, "rev-parse", old)
+    assert tip == _git_out(repo, "rev-parse", "HEAD") and (repo / "late.txt").read_text() == "late\n"
+
+
+def test_own_push_rebase_with_no_recorded_start_keeps_every_commit_head_lacks(env, monkeypatch, capsys):
+    """With no recorded start (a task dispatched before it was recorded), any commit of the remote
+    branch HEAD lacks by patch refuses the rebase; recording the tip as the start lets it go."""
+    from ttp import push, worktree
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch, record=False)
+    assert worktree.rebase_start(repo, tid) == ""
+    assert _ttp("push", "--own") == push.REJECTED
+    err = capsys.readouterr().err
+    assert theirs[:10] in err and "no rebase start is recorded" in err
+    assert f"git update-ref {worktree.REBASE_START_REF}{tid} {theirs}" in err
+    assert _git_out(origin, "rev-parse", old) == theirs
+    worktree.record_rebase_start(repo, tid, theirs)
+    assert _ttp("push", "--own") == 0 and _git_out(origin, "rev-parse", old) == _git_out(repo, "rev-parse", "HEAD")
 
 
 def push_rejected():

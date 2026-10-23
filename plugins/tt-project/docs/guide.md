@@ -1047,8 +1047,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `ttp push --own` may push to, and every push that publishes as with `--own` (a notes branch, a
   `pr_branch:` or `rebases:` task). The branch is the one the task was built on (its latest
   `pr_branch:` record, else its `rebases:` label, else that of the task it continues); a `rebases:`
-  branch is replaced under a lease on the tip `--own` read, never force-pushed plainly or created,
-  and a `pr_branch:` branch only fast-forwards. `on`, set explicitly: the task's own or carried branch, created
+  branch is replaced only when every commit it gained since the rebase started (the tip the
+  dispatcher built the task on, recorded as `refs/ttp/rebase-start/t<id>`; without one, every commit)
+  is in HEAD by patch, else `--own` refuses, naming them, and the task rebases again onto the new
+  tip. It then goes under a lease on the tip `--own` read before its checks, never force-pushed
+  plainly or created, and a `pr_branch:` branch only fast-forwards. `on`, set explicitly: the task's own or carried branch, created
   on the remote when new. `existing_only`: only onto a branch the remote already has; it never
   creates one. Unset reads as `existing_only` with one exception: a code task's `ttp push --own`
   still creates its own `ttp/t<id>-...` branch while `delivery.draft_prs` is on, the documented

@@ -2471,13 +2471,32 @@ def delivery_source(p: Project, task: dict | None) -> tuple[dict | None, str, bo
 def own_lease(p: Project, branch: str) -> bool:
     """Whether `ttp push --own` publishes onto `branch` as a rebase: the running task, or a code task
     the running review covers, delivers onto it by a `rebases:` record (delivery_source). Such a push
-    replaces the branch under a lease on the tip it read (publish), never as a plain force push, and
-    never creates it. Never outside a run, never for `--own-branch`."""
+    replaces the branch only when every commit it has beyond the tip the rebase started from is in
+    HEAD, and then under a lease on the tip it read (publish); never as a plain force push, and it
+    never creates the branch. Never outside a run, never for `--own-branch`."""
+    return own_rebase(p, branch) is not None
+
+
+def own_rebase(p: Project, branch: str) -> dict | None:
+    """The task whose `rebases:` record makes `ttp push --own` publish onto `branch` as a rebase
+    (own_lease), or None."""
     task = os.environ.get("TTP_TASK")
     if not task or os.environ.get(OWN_BRANCH_ENV):
-        return False
-    rows = [r for r in [_task_row(p, task)] + _reviewed(p, task) if r]
-    return any((found := delivery_source(p, r))[2] and found[1] == branch for r in rows)
+        return None
+    for r in [_task_row(p, task)] + _reviewed(p, task):
+        if r and (found := delivery_source(p, r))[2] and found[1] == branch:
+            return found[0]
+    return None
+
+
+def unkept(repo: Path, head: str, tip: str, start: str = "") -> list[str]:
+    """The commits of `tip` (the remote branch a rebase replaces) that `head` lacks, by patch
+    (`git cherry`): those beyond `start` (the tip the rebase started from, when recorded), else all of
+    them. Replacing the branch with `head` would lose each one. ["?"] when git cannot tell."""
+    out = _git(repo, "cherry", head, tip, *([start] if start else []))
+    if out.returncode != 0:
+        return ["?"]
+    return [ln.split()[1] for ln in out.stdout.splitlines() if ln.startswith("+ ")]
 
 
 def never_published(repo: Path, d: dict, branch: str, timeout: float = 30) -> bool:
@@ -3079,7 +3098,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None,
             base: str | None = None, ff_only: bool = False, recorded: dict | None = None,
             check_run_dir: str | None = None, reuse: Callable[[str, list, list], str] | None = None,
-            host: str = "", lease: bool = False) -> int:
+            host: str = "", lease: bool = False, start: str = "",
+            start_ref: str = "") -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
@@ -3092,9 +3112,14 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     `reuse(tree, commands, envs)` names a pass `ttp checks` recorded of exactly those commands on HEAD's
     tree under the same environment (pushpass.check_envs), or gives "": with one, nothing runs again.
     `host` (delivery.checks_host) is where those recorded commands run, as the project's checks do.
-    `lease` (own_lease: a rebase of `branch`) replaces the remote branch instead of fast-forwarding it,
-    only with `--force-with-lease` on the tip read before the checks: a branch that moved since is
-    not overwritten, and one the remote lacks is refused (a rebase never creates its branch)."""
+    `lease` (own_lease: a rebase of `branch`) replaces the remote branch instead of fast-forwarding it.
+    It is refused when the remote tip has a commit HEAD lacks (by patch) beyond `start`, the tip the
+    rebase started from (worktree.rebase_start, kept at `start_ref`; without one, any such commit):
+    work pushed to the branch after the rebase began is never lost; the task rebases again onto the
+    new tip. Then it
+    goes only with `--force-with-lease` on the tip read before the checks, so a branch that moves
+    during them is not overwritten either. One the remote lacks is refused (a rebase never creates
+    its branch)."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -3115,6 +3140,15 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         say(f"{remote} has no branch {branch} (or it cannot be read): a rebase replaces an existing branch "
             f"under a lease and never creates one; not pushing")
         return REFUSED
+    if lease and not local and (lost := unkept(repo, head, read, start)):
+        more = f" and {len(lost) - 5} more" if len(lost) > 5 else ""
+        since = f"since the rebase started from {start[:10]}" if start else "(no rebase start is recorded)"
+        say(f"{remote}/{branch} has {len(lost)} commit(s) {since} that HEAD lacks: "
+            f"{', '.join(c[:10] for c in lost[:5])}{more}; replacing the branch would lose them, so it is "
+            f"not pushed. Rebase again onto {read[:10]} ({remote}/{branch}'s tip) so HEAD holds them; if HEAD "
+            f"already holds them in another form, record that tip as the start: "
+            f"git update-ref {start_ref or worktree.REBASE_START_REF + '<task id>'} {read}")
+        return REJECTED
     if not checks and (code := code_paths(repo, base) if base else ["(no push target to compare with)"]):
         more = f" and {len(code) - 3} more" if len(code) > 3 else ""
         say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "
@@ -3497,10 +3531,13 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
         # shared branch this work leaves from: always fetch it (cheap), so none sees a stale base.
         base = own_base(p, repo, remote)
-        lease = own_lease(p, branch)   # a rebase replaces the branch it rebases, under a lease
+        # A rebase replaces the branch it rebases, keeping what it gained since the rebase started.
+        rebase = own_rebase(p, branch)
+        lease, start = rebase is not None, worktree.rebase_start(repo, rebase["id"]) if rebase else ""
+        start_ref = f"{worktree.REBASE_START_REF}{rebase['id']}" if rebase else ""
         rc = publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
                      timed=lambda s: record_check_s(p, s), base=base,
-                     ff_only=own_ff_only(branch) and not lease, lease=lease,
+                     ff_only=own_ff_only(branch) and not lease, lease=lease, start=start, start_ref=start_ref,
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
                      reuse=lambda tree, cmds, envs: _own_pass(p, tree, cmds, envs), host=d.get("checks_host") or "")
     else:

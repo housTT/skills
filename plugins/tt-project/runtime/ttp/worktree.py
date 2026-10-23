@@ -456,7 +456,9 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
     if not exists:
         _git(p.root, "fetch", "--quiet", "origin", check=False, timeout=timeout)
     # A rebase starts from the branch it rebases, even when it also continues a review.
-    start = carried_head(p, task) if carried or (delivery_branch(task) or ("", False))[1] else None
+    rebase = (delivery_branch(task) or ("", False))[1]
+    start = carried_head(p, task) if carried or rebase else None
+    started = start if rebase else None
     start = start or (None if carried else continued_head(p, task)) or carried_head(p, task)
     try:
         start = start or resolve_base(p)
@@ -470,6 +472,8 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
         return
     # New, or left behind with nothing of its own by an attempt that timed out: (re)made at its start.
     _git(p.root, "worktree", "add", "-B" if exists else "-b", branch, str(path), start, timeout=timeout, env=env)
+    if started:
+        record_rebase_start(p.root, task["id"], started)
 
 
 _VALID_BRANCHES: dict[str, bool] = {}
@@ -575,6 +579,21 @@ def named_branch(task: dict) -> str:
     except (ValueError, TypeError):
         return ""
     return next((lb[8:] for lb in labels if isinstance(lb, str) and lb.startswith("rebases:")), "")
+
+
+REBASE_START_REF = "refs/ttp/rebase-start/t"   # + task id: the tip of the branch a rebase task started from
+
+
+def record_rebase_start(repo: Path, task_id: int, sha: str) -> None:
+    """Record `sha`, the tip of the branch a `rebases:` task was built on, as where its rebase
+    started (REBASE_START_REF): `ttp push --own` replaces that branch only when every commit it has
+    beyond this start is in the rebased HEAD (push.publish), so work pushed to it since is never lost."""
+    _git(repo, "update-ref", f"{REBASE_START_REF}{task_id}", sha, check=False)
+
+
+def rebase_start(repo: Path, task_id: int) -> str:
+    """The commit record_rebase_start recorded for task `task_id`, or "" when none was."""
+    return _git(repo, "rev-parse", "--verify", "--quiet", f"{REBASE_START_REF}{task_id}^{{commit}}", check=False)
 
 
 def delivery_branch(task: dict) -> tuple[str, bool] | None:

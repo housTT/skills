@@ -9561,7 +9561,9 @@ class Daemon:
         elif elsewhere and (old := worktree.rebased_branch(task)) and d.get("push_allowed", True):
             lines.append(f"It rebases {old} and delivers back onto {elsewhere}, not {d['push_branch']}. If it "
                          f"passes, publish it with `ttp push --own --detach` from the change's worktree: a rebase "
-                         f"cannot fast-forward {old}, so that push replaces it under a lease on the tip it reads. "
+                         f"cannot fast-forward {old}, so that push replaces it only when the change holds every "
+                         f"commit {old} gained since the rebase started (else it refuses, naming them: the "
+                         f"change needs rebasing again), then under a lease on the tip it reads. "
                          f"Never force-push it another way, never run plain `ttp push` and do not approve it for "
                          f"the push queue.")
         elif elsewhere and d.get("push_allowed", True):
