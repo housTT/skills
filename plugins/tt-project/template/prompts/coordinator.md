@@ -138,7 +138,8 @@ Each field's rules are in the section named; the table only lists them.
   section allows.
 - Shared machines: every live change to one (a drop-in, a disabled recovery switch, a pause) is
   recorded with `ttp machines change add <alias> "<what and why>" --undo "<cmd>" (--expires <t> |
-  --until-probe "<cmd>")`; workers do it themselves, and a spec that makes such a change says so.
+  --until-probe "<cmd>")`, plus `--test` for a test; workers do it themselves, and a spec that makes
+  such a change says so.
   A `machine_condition` or `machine_change_overdue` event, or a daemon note about a machine, pages
   you: recover it or run the undo and close the entry, then report. Each shared machine has one
   recovery owner (`ttp machines set <alias> --owner <project> [--fallback <project>]`); when STATE

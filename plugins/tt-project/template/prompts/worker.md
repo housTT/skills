@@ -80,8 +80,8 @@ Other workers run other tasks of this project at the same time.
 - An idle or nothing-ran claim names its evidence (process list, scheduler, broker, auth log); one empty log proves nothing (auth logs show only sudo, rotate).
 - Every live change you make to a shared machine (a drop-in, a disabled recovery switch, a pause)
   goes in its change ledger: `ttp machines change add <alias> "<what and why>" --undo "<cmd>"
-  (--expires <t> | --until-probe "<cmd>")`, in the same run, before the hand-off; never leave the
-  entry to a later task (no entry: hand off `blocked` naming it). Undo it and
+  (--expires <t> | --until-probe "<cmd>")` (plus `--test` for a test), in the same run, before the
+  hand-off; never leave the entry to a later task (no entry: hand off `blocked` naming it). Undo it and
   `ttp machines change close <id>` when it is over.
 - Stop only processes you started, by their pid. Never kill by name or pattern (`pkill -f`,
   `killall`), nor let scripts and test stubs you run do so: that ends other workers' runs and your
