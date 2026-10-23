@@ -36,7 +36,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, ends, quietgate, reviewstats, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
+from . import budget, chaincap, correction, ends, quietgate, reviewstats, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -318,6 +318,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(f"tasks continued from an earlier one: {len(cont)}: " + ", ".join(
             f"#{t['id']} {_short(t['title'], 50)} continues #{t['of']} (${t['of_usd']:.2f} + ${t['usd']:.2f})"
             for t in cont[:TOP]) + _more(cont))
+    if fixes := correction.audit_line(db, since):
+        out.append(fixes)
     if chains := chaincap.audit_line(db, since, TOP):
         out.append(chains)
     if shared := sharedchecks.audit_line(db, since):

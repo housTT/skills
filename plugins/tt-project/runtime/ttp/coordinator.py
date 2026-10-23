@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -702,10 +702,11 @@ def with_cached(context: str, cached: str) -> str:
 
 
 def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int],
-                 seen: dict | None = None) -> tuple[list[tuple[str, str]], dict]:
+                 seen: dict | None = None, corrections: dict | None = None) -> tuple[list[tuple[str, str]], dict]:
     """The turn's digest as (section, text) pairs in order, and the hash of each COLLAPSIBLE section,
     to store as `seen` for the next turn. With `seen`, a collapsible section whose hash is unchanged
-    is shown as one line."""
+    is shown as one line. `corrections`: {message id: why} of the likely corrections among `msg_ids`
+    (correction.flag; worked out here when not given)."""
     db = p.db
     now = time.time()
     home = timefmt.home(p)
@@ -826,6 +827,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("coverage", responsibilities.digest_lines(db))
     section("blocker_sweep", sweep.digest_lines(db, event_ids, now, p.config()))
     course_lines, course_id = course.digest_lines(db, p.config(), now)
+    if missed := correction.digest_lines(db, now):
+        course_lines = (course_lines or [course.HEADER]) + missed
+        course_id += "\ncorrection:" + missed[0].split(" pointed out")[0]
     section("course_check", course_lines, course_id,
             f"## Course check: {len(course_lines) - 1} lines (as last turn; correct course or say why it is fine)")
     mem = memory_budget_line(p)
@@ -947,7 +951,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("upstream", lines)
     lines = ["\n# NEW EVENTS"]
     if msg_ids:
-        for m in db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids):
+        rows = db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids)
+        flagged = ({int(k): v for k, v in corrections.items()} if corrections is not None
+                   else correction.flag(db, p.config(), rows, now))
+        for m in rows:
             prov = m["provenance"] or "unknown"
             # Only PR approvals need an approving channel; the verbatim words decide everything else.
             ok = "yes" if prov in prguard.APPROVING else ("no (PR ready/merge only; its verbatim words are the "
@@ -956,6 +963,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                     f"chat={m['chat'] or '-'}]")
             if m["broadcast"]:   # `ttp say --all`: every project got these words; none relays them on
                 head += f" [{broadcast.label(m['broadcast'])}]"
+            if m["id"] in flagged:
+                head += correction.tag(flagged[m["id"]])
             if (m["context"] or "").strip():   # relayed with the relayer's own text: keep the two apart
                 lines.append(f"{head} {relay.VERBATIM}: {m['text']}")
                 lines.append(f"  {relay.CONTEXT}: {m['context']}")

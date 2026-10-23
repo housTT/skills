@@ -14369,3 +14369,94 @@ def test_course_check_collapses_while_unchanged_and_reports_its_size(env):
     assert f"#{other}" in dict(coord.digest_parts(p, {}, [], [], seen)[0])["course_check"]
     print(f"\ncourse check digest tokens: healthy {healthy['tokens']} (section absent), tripped "
           f"{tripped['tokens']} (section {tripped['sections']['course_check']} chars)")
+
+
+def _rows(p, *mids):
+    return p.db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(mids))}) ORDER BY id", mids)
+
+
+def test_correction_flags_a_phrase_or_any_message_during_an_open_stall_but_not_a_plain_question(env):
+    """A message pointing out a miss is a likely correction: by a generic phrase, or by arriving while
+    something says the project is stuck (a stall event, a Course check line). A plain question is not."""
+    from ttp import coordinator as coord, correction
+    p = make(env)
+    plain = p.db.post("in", "What is the status of the build?", chat="c1")
+    why = p.db.post("in", "Why does it keep failing? It keeps failing to notice the lack of progress", chat="c1")
+    curly = p.db.post("in", "Why didn’t anyone catch the dead worker?", chat="c1")
+    assert correction.flag(p.db, p.config(), _rows(p, plain, why, curly)) == {
+        why: "phrase 'keeps failing'", curly: "phrase 'why didn't'"}
+    digest = coord.digest(p, {}, [], [plain, why])
+    assert f"user message #{why} " in digest and "[likely correction: phrase 'keeps failing']" in digest
+    assert digest.count("likely correction") == 1, "the plain question was tagged"
+    # A stall event not yet handled (the no-progress detector's hook) flags any message.
+    ev = p.db.x("INSERT INTO events(ts,source,kind,text) VALUES(?,?,?,?)", (time.time(), "daemon", "no_progress", "x"))
+    assert correction.flag(p.db, p.config(), _rows(p, plain)) == {plain: "open stall"}
+    p.db.x("UPDATE events SET status='handled'")
+    assert correction.flag(p.db, p.config(), _rows(p, plain)) == {}
+    # So does an open Course check line.
+    tid = p.db.add_task("port the kernel", "s", origin="user")
+    for _ in range(3):
+        _course_run(p.db, tid)
+    assert correction.flag(p.db, p.config(), _rows(p, plain)) == {plain: "open Course check"}
+    assert ev is not None
+
+
+def test_correction_without_a_class_fix_gets_one_course_check_line_that_a_harness_task_clears(env):
+    from types import SimpleNamespace
+    from ttp import coordinator as coord, correction, course
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+
+    def turn(rid, note, actions, summary="handled"):
+        d._finish_coordinator({"id": rid, "dir": "x", "started": time.time()},
+                              SimpleNamespace(structured={"actions": actions, "summary": summary}, error="",
+                                              final_text=""), "ok", note)
+
+    mid = p.db.post("in", "You missed that the queue was stuck for a day", chat="c1")
+    flagged = correction.flag(p.db, p.config(), _rows(p, mid))
+    reply = [{"type": "reply", "chat": "c1", "text": "fixed the queue"}]
+    turn(1, {"messages": [mid], "corrections": {str(mid): flagged[mid]}}, reply)
+    lines, _ = course.digest_lines(p.db, p.config())
+    assert lines == []   # no other Course check condition: the correction line brings its header
+    digest = coord.digest(p, {}, [], [])
+    assert course.HEADER in digest and f"user message #{mid} pointed out a miss" in digest
+    assert f"correction #{mid}: <why not>" in digest
+    turn(2, {}, [{"type": "noop"}])   # the turn that saw it: shown once, never again
+    assert "correction without a class fix" not in coord.digest(p, {}, [], [])
+    # A turn that adds a harness task for the class records it, and no line follows.
+    mid2 = p.db.post("in", "Nobody noticed the watcher died", chat="c1")
+    turn(3, {"messages": [mid2], "corrections": {str(mid2): "phrase 'nobody noticed'"}},
+         reply + [{"type": "task_add", "kind": "harness", "title": "detect a dead watcher", "spec": "s"}])
+    assert "correction without a class fix" not in coord.digest(p, {}, [], [])
+    tid = p.db.one("SELECT id FROM tasks WHERE title='detect a dead watcher'")["id"]
+    assert {r["msg"]: r["fix"] for r in p.db.kv(correction.KEY)} == {mid: "", mid2: f"#{tid}"}
+    # A stated reason clears it too; so does a harness task added after the turn, before the next digest.
+    mid3 = p.db.post("in", "Why didn't you retry?", chat="c1")
+    turn(4, {"messages": [mid3], "corrections": {str(mid3): "phrase 'why didn't'"}}, reply,
+         summary=f"correction #{mid3}: a one-off network blip, no class gap")
+    mid4 = p.db.post("in", "Still failing, why hasn't anyone looked?", chat="c1")
+    turn(5, {"messages": [mid4], "corrections": {str(mid4): "phrase 'why hasn't'"}}, reply)
+    assert f"#{mid4} pointed out" in coord.digest(p, {}, [], [])
+    later = p.db.add_task("catch silent retries", "s", kind="harness", origin="coordinator")
+    assert "correction without a class fix" not in coord.digest(p, {}, [], [])
+    turn(6, {}, [{"type": "noop"}])
+    assert {r["msg"]: r["fix"] for r in p.db.kv(correction.KEY)}[mid4] == f"#{later}"
+
+
+def test_correction_audit_lists_each_correction_of_the_day_with_its_class_fix(env):
+    from ttp import audit, correction
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("detect a dead watcher", "s", kind="harness", origin="coordinator")
+    p.db.set_kv(correction.KEY, [
+        {"msg": 7, "ts": now - 2 * 86400, "why": "phrase 'you missed'", "fix": "", "shown": True},   # too old
+        {"msg": 8, "ts": now - 3600, "why": "phrase 'nobody noticed'", "fix": f"#{tid}", "shown": False},
+        {"msg": 9, "ts": now - 600, "why": "open Course check", "fix": "", "shown": True},
+        {"msg": 10, "ts": now - 60, "why": "phrase 'why didn't'", "fix": "reason", "shown": False}])
+    line = (f"corrections from the user or a chat: 3, 1 with a class fix: #8 (phrase 'nobody noticed') class fix "
+            f"#{tid}; #9 (open Course check) none; #10 (phrase 'why didn't') none (reason given)")
+    assert correction.audit_line(p.db, now - 86400) == line
+    assert line in audit.lines(p.db, now)
+    p.db.set_kv(correction.KEY, [])
+    assert not any("corrections from" in x for x in audit.lines(p.db, now))

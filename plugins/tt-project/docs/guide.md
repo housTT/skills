@@ -303,6 +303,14 @@ prolonged whole-box outage.
   finished ones; and the last `idle_turns` (6) coordinator turns in a row that decided nothing.
   Thresholds live under `coordinator.course_check` (0 turns one off). The coordinator corrects course
   in that turn or says why it is fine.
+- Corrections: a user or chat message that points out a miss is a likely correction, flagged
+  model-free when it matches a short generic phrase list ("why didn't", "keeps failing", "stuck for",
+  "you missed", "nobody noticed", ...) or arrives while a stall event, a Course check or Resource
+  trouble line, or an earlier correction is open. The digest tags it; the coordinator fixes the case
+  and adds a `harness` task for the class (the detector or default that would have caught it). A turn
+  that added neither that nor an `upstream:` task, and gave no `correction #<id>: <why>` in its
+  summary, gets one Course check line in the next digest. The daily review's efficiency audit lists
+  each correction of the last 24 h with its class fix task, or none.
 - Promises: a coordinator reply or notify that commits to a deliverable or a time ("I'll report the
   sha by 15:00", "ETA 18:30") is always recorded as a promise. It holds the chat, the promised
   words, the due time (the time it names, in the home zone, else `coordinator.promise_default_h`, 6,

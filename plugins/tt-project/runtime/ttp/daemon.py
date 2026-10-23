@@ -46,6 +46,7 @@ from . import cachettl
 from . import chaincap
 from . import checkcap
 from . import conflictfix
+from . import correction
 from . import credits
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -3045,6 +3046,10 @@ class Daemon:
         evs = note.get("events", [])
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
+        try:
+            correction.settle(db, note, actions, str((out or {}).get("summary") or ""), float(r.get("started") or 0))
+        except Exception:   # bookkeeping: the turn is settled either way
+            log(self.p, "correction record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         decided = len(_decisions(actions))
         self._log_decided(r, note, decided)
         if not decided:
@@ -5588,9 +5593,10 @@ class Daemon:
                                                    [m["id"] for m in msgs], gates, now,
                                                    coord.charter_conflicts(self.p), lowered)
             unblock = ", ".join(triggers)
+            flagged = correction.flag(db, self.cfg, msgs, now)   # likely corrections, tagged in the digest
             # Every turn sees background sections the previous turn saw as one line each.
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
-                                              db.kv(coord.DIGEST_SEEN_KEY) or {})
+                                              db.kv(coord.DIGEST_SEEN_KEY) or {}, flagged)
             # The sections rendered from the prompt snapshot end the cached context block.
             cached, parts = coord.split_cached(parts)
             prompt = "\n".join(text for _, text in parts)
@@ -5604,6 +5610,7 @@ class Daemon:
                                  "budget_usd": budget, **({"sizing": sized["info"]} if sized["info"] else {}),
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
                                  "triggers": triggers, **({"lowered": lowered} if lowered else {}),
+                                 **({"corrections": {str(k): v for k, v in flagged.items()}} if flagged else {}),
                                  **({"wake_due": due} if due else {}),
                                  "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {})})
         except Exception as e:
