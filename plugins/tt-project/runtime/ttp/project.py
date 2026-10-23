@@ -376,7 +376,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "failover": {"snapshot_every_s": 900, "snapshot_keep": 3},
     # A new code task whose spec names files another open or unlanded code task adds or changes gets a
     # warning at task_add, and its worker the list of those branches (overlap.py). Never counted: the
-    # `ignore` globs, and hubs (tracked files over hub_bytes); branches of the last branch_days days.
+    # `ignore` globs, hubs (tracked files over hub_bytes), folders and the files delivery.push_checks
+    # names; branches of the last branch_days days.
     "overlap": {"enabled": True, "hub_bytes": 150000, "branch_days": 14,
                 "ignore": ["CHANGELOG*", ".changeset/*", "changesets/*", "plugin.json", "marketplace.json",
                            "package.json", "package-lock.json", "__init__.py"]},

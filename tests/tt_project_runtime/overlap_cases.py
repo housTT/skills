@@ -136,3 +136,38 @@ def test_worker_prompt_lists_unlanded_branches_that_touch_its_files(env):
     assert f"#{elsewhere}" not in block
     plain = p.db.add_task("relay", "Change runtime/ttp/relay.py.", kind="code")
     assert "## Unlanded branches" not in worker_task(p, p.db.task(plain), str(p.root), None)
+
+
+def test_task_add_gives_no_warning_for_folders_or_the_required_check_files(env):
+    """Nearly every spec names its folder ('in plugins/tt-project (runtime/ttp)') and the required
+    suite: neither is an overlap. Folders the repo has are no paths, and the files the check commands
+    (delivery.push_checks) name never count, however small; a shared runtime/ttp/progress.py still warns."""
+    from ttp import coordinator as coord, overlap
+    p = make(env)
+    files = ["plugins/tt-project/runtime/ttp/relay.py", "plugins/tt-project/runtime/ttp/webapp.py",
+             "tests/test_plugin_catalogue.py", "tests/test_tt_project_plugin.py",
+             "tests/test_tt_project_runtime.py", "tests/tt_project_runtime/relay_cases.py"]
+    for f in files:
+        (p.root / f).parent.mkdir(parents=True, exist_ok=True)
+        (p.root / f).write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(p.root), "add", *files], check=True)
+    subprocess.run(["git", "-C", str(p.root), "commit", "-q", "-m", "tree"], check=True)
+    overlap._ls_cache.clear()
+    suite = ("python3 -m pytest -q tests/test_tt_project_plugin.py tests/test_tt_project_runtime.py "
+             "tests/test_plugin_catalogue.py")
+    p.set_config("delivery.push_checks", [suite, "claude plugin validate plugins/tt-project --strict"])
+    accept = f"Acceptance: `{suite}` green; cases in tests/tt_project_runtime."
+    relay = f"In plugins/tt-project (runtime/ttp): fix the relay's retry. {accept}"
+    web = f"In plugins/tt-project (runtime/ttp): show spend in the web app. {accept}"
+    assert overlap.spec_paths(relay, p.root) == ["tests/test_tt_project_plugin.py", "tests/test_tt_project_runtime.py",
+                                                 "tests/test_plugin_catalogue.py"]
+    assert overlap.keep(p, overlap.spec_paths(relay, p.root)) == []
+    first = p.db.add_task("relay retry", relay, kind="code", status="running")
+    assert coord.apply(p, [{"type": "task_add", "title": "web spend", "kind": "code", "spec": web}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='web spend'")["id"]
+    assert not [x for x in _labels(p, new) if x.startswith("overlap:")]
+    assert not [n for n in p.db.kv(coord.NOTES_KEY) if "overlaps" in n]
+    # A shared file still warns, with the folder and suite left out of the warning.
+    p.db.update_task(first, spec=relay + " Add runtime/ttp/progress.py.")
+    hits = overlap.find(p, web + " Use runtime/ttp/progress.py.")
+    assert [(h["id"], h["paths"]) for h in hits] == [(first, [("runtime/ttp/progress.py", False)])]

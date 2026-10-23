@@ -12,7 +12,9 @@ the digest's open tasks, naming the other task, the shared paths (new files flag
 `start_when landed:#<id>` or `depends_on`. A code worker's prompt lists the unlanded branches
 that touch what its spec names (prompt_block). Common files never count: the `overlap.ignore`
 globs (changelogs, changesets, manifests, `__init__.py`) and hubs, tracked files larger than
-`overlap.hub_bytes`, which most changes touch in passing. No network, no model.
+`overlap.hub_bytes`, which most changes touch in passing, and the files the check commands
+(`delivery.push_checks`) name, which specs cite as the required suite. Folders are no paths. No
+network, no model.
 """
 from __future__ import annotations
 
@@ -78,13 +80,13 @@ def _dirs(files: list[str]) -> set[str]:
 
 def spec_paths(text: str, root: Path) -> list[str]:
     """The repo paths `text` names: slash paths with a known source extension, or whose folder the
-    repo has. Bare file names (named in passing) and URLs are left out."""
+    repo has. Bare file names (named in passing), the repo's folders and URLs are left out."""
     text = re.sub(r"\b[a-z]+://\S+", " ", text or "")
     known = [f for f in settled.files_in(text) if "/" in f]
     plain = [t for t in _PLAIN.findall(text) if t not in known and "." not in t.rsplit("/", 1)[-1]]
     if plain:
         dirs = _dirs(tracked(root))
-        plain = [t for t in plain if t.rsplit("/", 1)[0] in dirs]
+        plain = [t for t in plain if t.rsplit("/", 1)[0] in dirs and t.rstrip("/") not in dirs]
     return list(dict.fromkeys(f.removeprefix("./") for f in known + plain))
 
 
@@ -106,11 +108,21 @@ def _hub(path: str, root: Path, hub_bytes: int) -> bool:
     return False
 
 
+def _check_paths(p) -> list[str]:
+    """The repo paths the project's check commands (delivery.push_checks) name: specs cite them as
+    the required suite, not as files they change."""
+    from . import push
+    cmds = push.check_list((p.config().get("delivery") or {}).get("push_checks"))
+    return spec_paths(" ".join(cmds), p.root) if cmds else []
+
+
 def keep(p, paths) -> list[str]:
-    """`paths` without ignored files and hubs."""
+    """`paths` without ignored files, hubs and the files the check commands name."""
     s = settings(p)
     hub = int(s.get("hub_bytes") or 0)
-    return [f for f in paths if not _ignored(f, s.get("ignore")) and not _hub(f, p.root, hub)]
+    checks = _check_paths(p)
+    return [f for f in paths if not _ignored(f, s.get("ignore")) and not _hub(f, p.root, hub)
+            and not any(same(f, c) for c in checks)]
 
 
 def _cache_path(p) -> Path:

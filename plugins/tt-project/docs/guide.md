@@ -432,7 +432,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   or `depends_on`). Its worker's prompt lists those branches and says to reuse their module. Model-free:
   each branch's diff is read once per head. Config `overlap`: `enabled` (on), `ignore` (globs such as
   changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
-  150000, touched by most changes, never count) and `branch_days` (14).
+  150000, touched by most changes, never count) and `branch_days` (14). Folders and the files the
+  check commands (`delivery.push_checks`) name never count either: specs cite those as the required suite.
 - On macOS, while the project has work (a running run or push, or queued work that can start now)
   and the machine is on AC power, the daemon keeps it from idle and maintenance sleep with
   `caffeinate -i -s`, tied to the daemon's process so it ends with it. A closed lid without an
