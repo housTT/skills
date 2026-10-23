@@ -61,11 +61,17 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
 
    | Run | Items | Command |
    |---|---|---|
-   | capture | `source:graph`, `source:cache` | `TT_METAL_CACHE=<cache dir> TT_METAL_RISCV_DEBUG_INFO=1 OPA_GRAPH_CAPTURE=<capture file> PYTHONPATH=<plugin-root>/pytest_plugins:$PYTHONPATH pytest -p opa_graph_capture --timeout <s> <node id>` |
+   | capture | `source:graph`, `source:cache` | `TT_METAL_OPERATION_TIMEOUT_SECONDS=900 TT_METAL_CACHE=<cache dir> TT_METAL_RISCV_DEBUG_INFO=1 OPA_GRAPH_CAPTURE=<capture file> PYTHONPATH=<plugin-root>/pytest_plugins:$PYTHONPATH pytest -p opa_graph_capture --timeout <s> <node id>` |
    | profile | `source:tracy` | `python -m tracy -p -r -v -m "pytest --timeout <s> <node id>"` (needs a profiler build), live |
 
    With only `source:cache`, drop `OPA_GRAPH_CAPTURE`, `PYTHONPATH` and `-p opa_graph_capture`;
    with only `source:graph`, drop `TT_METAL_CACHE` and `TT_METAL_RISCV_DEBUG_INFO`.
+
+   A cold capture or cache run must set `TT_METAL_OPERATION_TIMEOUT_SECONDS=900`, overriding any
+   shorter generic device-run default while preserving its triage callback. Compilation and queued
+   execution before a small host readback can legitimately exceed 30 seconds; the 15-minute
+   operation watchdog prevents that backlog from being misclassified as a device hang. This is
+   separate from the pytest timeout below, which still bounds the whole test.
 
    Run both from the tt-metal checkout with `TT_METAL_HOME` set to it in the job's environment:
    the broker does not set it, and without it `tracy` looks for its capture tools under the wrong

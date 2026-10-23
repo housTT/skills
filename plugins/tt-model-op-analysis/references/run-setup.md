@@ -169,7 +169,8 @@ is `no`, and skipping it when a CI job runs the test on this profile. With the q
 
 - the cost: the checkout must be at the pinned commit and built (`same_commit.py`; otherwise a
   checkout and a rebuild first), and the run compiles every kernel from nothing, up to
-  `ci_pytest_timeout_s` or 1400 s;
+  `ci_pytest_timeout_s` or 1400 s, with the measured-source phase's 900 s device-operation
+  watchdog for the cold capture;
 - the risk of skipping: the static phase goes ahead on a test nobody ran here; if it later fails on
   this device, the measurements have nothing to read, and moving to another test or commit is a
   new run, traced again.
