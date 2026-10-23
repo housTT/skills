@@ -167,6 +167,20 @@ prolonged whole-box outage.
   `review.light_paths` glob list narrows light further: every non-doc file must match one of its
   globs (unset or empty: any path may go light). The review run's note records the pick and the
   rule behind it (`review_tier`).
+- Hand-off checks (`worker.handoff_checks`, unset by default): the project's own model-free commands
+  the daemon runs on each worker's hand-off before it accepts it, posts its `reply_chat` reply or
+  queues its review or push. Each entry is `{"name", "run", "timeout_s" (60), "kinds"}` (`kinds`: the
+  task kinds it applies to, default all), for example
+  `{"name": "done says what it verified", "run": "python3 checks/handoff.py {result}", "kinds": ["work"]}`.
+  `run` runs from the project root with the hand-off's path in `TTP_RESULT_JSON` (and `TTP_TASK_ID`,
+  `TTP_TASK_KIND`), also put, quoted, in place of `{result}`; nothing else from the task reaches the
+  command line. They check done, needs-review, blocked and failed hand-offs, not waits. Exit 0 passes.
+  Exit 1 sends the run back at once with no attempt spent: the next run is told the check's name and
+  the last 2 KB of its output, and nothing is posted or queued until a hand-off passes. After
+  `worker.handoff_check_max_sendbacks` send-backs (default 2) the task goes to review with its result
+  and branch kept, and its one coordinator event names the check and its output. Any other exit or a
+  timeout is a broken check: the hand-off is accepted and the coordinator gets one
+  `handoff_check_broken` event per check and failure. `ttp config` reports malformed entries.
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
   daemon queues the review of each finished code task in the same step that records its hand-off
   (`review.auto`, on by default). A review whose head carries commits of another task whose latest
