@@ -107,7 +107,7 @@ def test_endpoint_verify_sends_a_bearer_get_to_models_and_keeps_the_key_out_of_e
         def __exit__(self, *exc):
             return False
 
-    def urlopen(req, timeout=None):
+    def urlopen(self, req, timeout=None):
         sent.append((req.get_method(), req.full_url, req.get_header("Authorization"), timeout))
         if len(sent) == 1:
             return Resp()
@@ -116,10 +116,33 @@ def test_endpoint_verify_sends_a_bearer_get_to_models_and_keeps_the_key_out_of_e
         if len(sent) == 3:
             raise urllib.error.URLError(f"refused for {_EP_KEY}")
         raise TimeoutError(f"timed out sending {_EP_KEY}")
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", urlopen)
     assert endpoint.verify(_EP_URL, _EP_KEY) == (True, "HTTP 200")
     assert sent[0] == ("GET", f"{_EP_URL}/models", f"Bearer {_EP_KEY}", endpoint.VERIFY_TIMEOUT_S)
     assert endpoint.VERIFY_TIMEOUT_S <= 30
     for want in ("HTTP 401 Unauthorized", "cannot reach", "TimeoutError"):
         ok, msg = endpoint.verify(_EP_URL, _EP_KEY)
         assert not ok and want in msg and _EP_KEY not in msg, msg
+
+
+@pytest.mark.parametrize("target", ["https://other.example.org/models", "http://api.example.com/v1/models"])
+def test_endpoint_verify_never_forwards_the_key_on_a_cross_host_or_downgraded_redirect(monkeypatch, target):
+    import email.message
+    import io
+    import urllib.response
+    from ttp import endpoint
+    calls = []
+
+    def https_open(self, req):
+        calls.append((req.full_url, req.get_header("Authorization")))
+        h = email.message.Message()
+        h["Location"] = target
+        r = urllib.response.addinfourl(io.BytesIO(b""), h, req.full_url, 302)
+        r.msg = "Found"
+        return r
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", https_open)
+    monkeypatch.setattr(urllib.request.HTTPHandler, "http_open",
+                        lambda self, req: calls.append((req.full_url, req.get_header("Authorization"))))
+    ok, msg = endpoint.verify(_EP_URL, _EP_KEY)
+    assert not ok and "302 redirect to" in msg and "key not sent" in msg and _EP_KEY not in msg, msg
+    assert calls == [(f"{_EP_URL}/models", f"Bearer {_EP_KEY}")]

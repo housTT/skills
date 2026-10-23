@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from .project import load_secrets, save_secret
@@ -32,17 +33,25 @@ def base_url(url: str) -> str:
     return url
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the default handler would resend the Authorization header to the new target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        host = urllib.parse.urlsplit(newurl).netloc or "another location"
+        raise urllib.error.URLError(f"HTTP {code} redirect to {host}; key not sent")
+
+
 def verify(url: str, key: str, timeout: float = VERIFY_TIMEOUT_S) -> tuple[bool, str]:
     """GET <url>/models with the key as a bearer token. Returns (ok, message); the message never holds the key."""
     req = urllib.request.Request(f"{url}/models", headers={"Authorization": f"Bearer {key}",
                                                            "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
             return (True, f"HTTP {r.status}")
     except urllib.error.HTTPError as e:
         msg = f"HTTP {e.code}" + (f" {e.reason}" if e.reason else "")
     except urllib.error.URLError as e:
-        msg = f"cannot reach {url}: {e.reason}"
+        msg = str(e.reason) if "redirect to" in str(e.reason) else f"cannot reach {url}: {e.reason}"
     except Exception as e:   # timeouts, bad responses
         msg = f"{type(e).__name__}: {e}"
     return (False, msg.replace(key, "<key>") if key else msg)
