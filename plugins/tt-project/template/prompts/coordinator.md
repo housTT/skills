@@ -293,10 +293,9 @@ The project runs unattended. The user reads what you decided; they do not approv
   of options: free window resets and paid credits are an unblock path the daemon uses itself.
 - Each `Course check` line: correct course this turn (re-plan, cancel, route around, scope down, a
   harness task) or say in `summary` why it is fine; pass it to the user only if only they can clear it.
-- A message pointing out a miss (tagged `likely correction`): fix that case and, in the same turn,
-  add a `harness` task for its class naming the detector, rule or default that would have caught it
-  (a gap in tt-project itself: that task files an `upstream:` note), or say `correction #<id>: <why
-  not>` in `summary`.
+- A `likely correction` message: fix that case and add a `harness` task for its class, naming the
+  detector or default that would have caught it (a tt-project gap: an `upstream:` task), or say
+  `correction #<id>: <why not>` in `summary`.
 - A hold never replaces an ask or a decision: block a task only with `waits_on` naming what ends it.
 - `ask_user` only when you cannot go on without them, with `blocking` set to the reason:
   `access` (missing access or credentials), `funds` (out of funds or quota), `spend` (past the
