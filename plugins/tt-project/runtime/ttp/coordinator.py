@@ -1387,8 +1387,10 @@ def starts_text(task: dict, now: float | None = None, plain: bool = False, where
     """'starts <time>' / 'starts when: <probe>' for a task that waits to start; '' otherwise.
     `plain` (what the user sees): 'starts when <why>', or 'when a check passes', never the probe.
     Times are in the home zone `where` (a Project, zone name or ZoneInfo); UTC without one.
-    With `db`, a probe on a task that does not exist reads as broken (BROKEN_START), never as a plan."""
+    With `db`, a probe on a task that does not exist reads as broken (BROKEN_START), never as a plan,
+    and a dependency left in 'review' that holds the task is named first (review_holds)."""
     now = time.time() if now is None else now
+    held = review_holds(task, db, now)
     d = deferral(task)
     missing = landed.missing_task_refs(db, d.get("when")) if db is not None and d.get("when") else []
     if missing:
@@ -1396,7 +1398,7 @@ def starts_text(task: dict, now: float | None = None, plain: bool = False, where
             "" if plain else f" (start_when: {clip(d['when'], 160)})")
     after = d.get("after") if (d.get("after") or 0) > now and (task.get("not_before") or 0) > now else None
     if not after and not d.get("when"):
-        return ""
+        return held
     if not d.get("when"):
         when = ""
     elif plain:
@@ -1405,7 +1407,20 @@ def starts_text(task: dict, now: float | None = None, plain: bool = False, where
                 else "when a check passes")
     else:
         when = f"when: {clip(d['when'], 160)}" + (f" ({clip(d['why'], 160)})" if d.get("why") else "")
-    return "starts " + (f"{_clock(after, where)}" + (f", then {when}" if when else "") if after else when)
+    text = "starts " + (f"{_clock(after, where)}" + (f", then {when}" if when else "") if after else when)
+    return f"{held}; {text}" if held else text
+
+
+def review_holds(task: dict, db, now: float) -> str:
+    """'waits on #<id> (in review <h>h)' for each dependency of queued `task` that is left in 'review'
+    and still holds it (DB.unmet_dependencies), so a task never waits on one silently; '' otherwise."""
+    if db is None or task.get("status") != "queued" or not dependency_ids(task):
+        return ""
+    unmet = db.unmet_dependencies([task]).get(task["id"]) or []
+    since = db.review_since() if unmet else {}
+    held = [x for x in dict.fromkeys(unmet) if x in since]
+    return ("waits on " + ", ".join(f"#{x} (in review {(now - float(since[x] or now)) / 3600:.1f}h)" for x in held)
+            if held else "")
 
 
 BROKEN_START = "broken"   # starts_text's lead word for a start_when on a task that does not exist

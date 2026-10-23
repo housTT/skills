@@ -340,12 +340,69 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
     why. A task with no branch on record needs `ref`: when it names a branch (looked up also in the
     repositories of its runs' worktrees) that does not hold `sha`, that branch is the task's work in a
     second repository; else only `sha` on `ref` is needed (_record_branchless). `repo`, a path, is searched
-    first, before the task's own repositories and the project root."""
+    first, before the task's own repositories and the project root.
+
+    A code task in 'review' is accepted on the same checks (its work landed), a harness task in 'review'
+    or done (with no `ref` or `repo`) when `sha` is merged into the harness checkout's HEAD and its
+    worktree branch has nothing unmerged (_record_harness); one left in 'review' is then closed as done."""
     task = p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
-    if task.get("status") != "done":
-        raise ValueError(f"not recorded: task #{tid} is {task.get('status')}, not done")
+    status, kind = task.get("status"), task.get("kind")
+    if status != "done" and not (status == "review" and kind in ("code", "harness")):
+        raise ValueError(f"not recorded: task #{tid} is {status}, not done"
+                         + (" or a code or harness task in review" if status == "review" else ""))
+    if kind == "harness" and not ref and not repo:
+        words = _record_harness(p, task, sha)
+    else:
+        words = _record_work(p, task, sha, ref, repo)
+    if status == "review":
+        full = p.db.one("SELECT sha FROM task_superseded WHERE task=? ORDER BY ts DESC LIMIT 1", (tid,))["sha"]
+        words += _close_review(p, task, full)
+    return words
+
+
+def _record_harness(p, task: dict, sha: str) -> str:
+    """record_superseded for a harness task: `sha` is a commit of the harness checkout, in its HEAD,
+    and the task's worktree branch has no commit HEAD lacks."""
+    from . import harnesstree
+    tid, h = task["id"], p.harness
+    if not (h / ".git").exists():
+        raise ValueError(f"not recorded: the harness {h} is not a git repository")
+    full = _commit(h, sha)
+    if not full:
+        raise ValueError(f"no commit {sha} in the harness {h}")
+    if _git(h, "merge-base", "--is-ancestor", full, "HEAD").returncode != 0:
+        raise ValueError(f"not recorded: {full[:10]} is not merged into the harness (not in its HEAD)")
+    if harnesstree.unmerged(p, tid):
+        raise ValueError(f"not recorded: branch {harnesstree.branch(tid)} of task #{tid} has commits not "
+                         f"merged into the harness")
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
+           (tid, "", full, time.time()))
+    return f"task #{tid}: recorded as superseded by {full[:10]} (merged into the harness)"
+
+
+def _close_review(p, task: dict, sha: str) -> str:
+    """Close `task`, left in 'review', as done now that `sha` carries its work: the words to add."""
+    from .db import dump_result, load_result
+    now, line = time.time(), f"its work is in {sha[:10]}, recorded with `ttp task superseded`"
+    with p.db.tx():
+        prev = load_result((p.db.task(task["id"]) or task).get("result"))
+        result = {**prev, "status": "done", "superseded_by": sha,
+                  "summary": f"{str(prev.get('summary') or '').rstrip()} ({line})".strip()[:1500]}
+        if not p.db.conn.execute("UPDATE tasks SET status='done', blocked_reason=NULL, result=?, updated=? "
+                                 "WHERE id=? AND status='review'",
+                                 (dump_result(result), now, task["id"])).rowcount:
+            return ""
+        p.db.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                          (now, f"task:{task['id']}", "task_superseded", "normal",
+                           f"#{task['id']} {task['title']}: {line}; closed as done.", "handled", task["id"]))
+    return "; it was in review and is now done"
+
+
+def _record_work(p, task: dict, sha: str, ref: str | None, repo: str | None) -> str:
+    """record_superseded for a task's branch, or with `ref` for one that never had a branch."""
+    tid = task["id"]
     branch = task.get("branch") or ""
     repos = _task_repos(p, tid)
     if repo:

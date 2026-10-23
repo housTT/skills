@@ -7748,13 +7748,16 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("task", help="add, list, show, cancel or requeue tasks by hand (requeue: a blocked or "
                                     "stopped task runs again; add may wait for --start-when or --start-after); "
                                     "set-when re-points a task not yet started; superseded records a done task's "
-                                    "work as landed under another commit")
+                                    "work as landed under another commit (also a code task in review whose work "
+                                    "landed, or a harness task in review whose commit is merged into the harness: "
+                                    "it is then closed as done)")
     s.add_argument("name", help="the project")
     s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "set-when", "superseded"],
                    help="what to do")
     s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/set-when/superseded: the task id")
     s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
-                   "superseded: the commit on the push branch that carries the task's work")
+                   "superseded: the commit on the push branch that carries the task's work (for a harness task: "
+                   "the commit merged into the harness)")
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
                    "second repository the task worked in, any of its branches); for a task with no branch on record, "
                    "required: the branch of a second repository that holds its work, or a ref the commit is on; a commit already on that "

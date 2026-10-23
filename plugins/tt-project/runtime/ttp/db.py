@@ -891,14 +891,19 @@ END""")
 
     def unmet_dependencies(self, tasks: list[dict]) -> dict[int, list]:
         """Task id -> the dependencies it still waits on. Only 'done' satisfies a dependency, with
-        one exception: a review's dependency on the task it reviews, while that task waits in
-        'review'. Only the review can move it on, so waiting for 'done' would stall both; any
-        other prerequisite of the review still has to finish."""
-        states = {r["id"]: r for r in self.q("SELECT id, status, branch FROM tasks WHERE status IN ('done','review')")}
+        two exceptions: a review's dependency on the task it reviews, while that task waits in
+        'review' (only the review can move it on, so waiting for 'done' would stall both; any other
+        prerequisite of the review still has to finish), and a harness task in 'review' whose commit
+        the daemon found merged into the harness (HARNESS_MERGED_KEY): its work is live already."""
+        states = {r["id"]: r for r in self.q("SELECT id, status, kind, branch FROM tasks "
+                                             "WHERE status IN ('done','review')")}
+        merged = (self.kv(HARNESS_MERGED_KEY, {}) or {}) if any(
+            r["status"] == "review" and r["kind"] == "harness" for r in states.values()) else {}
         out: dict[int, list] = {}
         for t in tasks:
-            out[t["id"]] = [d for d in dependency_ids(t) if d not in states or (states[d]["status"] != "done"
-                            and not (t.get("kind") == "review" and reviews_task(t, states[d])))]
+            out[t["id"]] = [d for d in dependency_ids(t) if d not in states or (
+                states[d]["status"] != "done" and not (t.get("kind") == "review" and reviews_task(t, states[d]))
+                and not (states[d]["kind"] == "harness" and str(d) in merged))]
         return out
 
     def dead_dependencies(self) -> list[tuple[dict, Any, str]]:
@@ -1028,6 +1033,9 @@ def chat_floor(chat_min: str | None, project_min: str | None) -> str:
     and a chat can only raise it."""
     return max((chat_min or "normal", project_min or "normal"), key=lambda n: SEVERITY_RANK.get(n, -1))
 RESULT_MAX_CHARS = 20000
+
+
+HARNESS_MERGED_KEY = "harness_merged"   # kv: harness task id in 'review' -> its commit merged into the harness
 
 
 def dependency_ids(task: dict) -> list:

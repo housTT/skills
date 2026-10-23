@@ -30475,6 +30475,157 @@ def _daemon_reviews(p, tid=None):
     return p.db.q(q + " AND depends_on=?", (json.dumps([tid]),)) if tid else p.db.q(q)
 
 
+def _harness_in_review(p, title, summary, ended):
+    tid = _harness_task(p, title)
+    p.db.update_task(tid, status="review", result=json.dumps({"status": "needs_review", "summary": summary}))
+    _ran(p, tid, ended)
+    return tid
+
+
+def _unmerged_harness_commit(p, title):
+    """A harness task whose commit sits on its own worktree branch, not merged into the harness."""
+    from ttp import harnesstree
+    other = _harness_task(p, "busy in the checkout")
+    _harness_run(p, other)
+    tid = _harness_task(p, title)
+    own = harnesstree.workdir(p, tid)
+    _commit_in_harness_tree(own, f"prompts/{title.replace(' ', '-')}.md", "more\n", "unmerged edit")
+    p.db.x("UPDATE runs SET status='ok', ended=? WHERE task=?", (time.time(), other))
+    p.db.update_task(other, status="done")
+    return tid, _hgit(own, "rev-parse", "HEAD").strip()
+
+
+def test_the_review_sweep_reviews_an_unmerged_harness_task_once(env):
+    """A harness task left in review with its commit not merged into the harness gets one review-only
+    review from the sweep, never a second while one is open or ended since it entered review; it stays in
+    review and holds its dependent, whose start note names it."""
+    from ttp import coordinator as coord
+    from ttp import push
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, sha = _unmerged_harness_commit(p, "tune prompts")
+    p.db.update_task(tid, status="review", result=json.dumps({"status": "needs_review",
+                                                              "summary": f"committed {sha[:12]}"}))
+    _ran(p, tid, time.time() - 1900)
+    dep = p.db.add_task("after it", "s", kind="code", origin="coordinator", depends_on=[tid])
+    d = Daemon(p.base)
+    _sweep(d)
+    (rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review'")
+    assert rev["title"] == f"Review #{tid}: tune prompts" and rev["origin"] == "daemon"
+    assert f"ttp/harness-t{tid}" in rev["spec"] and "review only" in rev["spec"]
+    assert push.REVIEW_ONLY_LABEL in json.loads(rev["labels"]) and json.loads(rev["depends_on"]) == [tid]
+    assert p.db.one("SELECT id FROM events WHERE kind='review_swept' AND task=?", (tid,))
+    assert p.db.task(tid)["status"] == "review"
+    assert p.db.unmet_dependencies([p.db.task(dep)])[dep] == [tid]
+    assert coord.starts_text(p.db.task(dep), db=p.db).startswith(f"waits on #{tid} (in review ")
+    for status in ("queued", "running", "done", "failed"):
+        p.db.update_task(rev["id"], status=status)
+        _sweep(d)
+        assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1, status
+        assert p.db.task(tid)["status"] == "review", status
+
+
+def test_a_merged_harness_task_in_review_unblocks_its_dependent_and_is_closed(env):
+    """A harness task in review whose commit is in the harness's HEAD counts as done for depends_on at
+    the next sweep pass, then after review.sweep_after_s is closed as done with no review queued. A code
+    task in review still holds its dependents: code needs done as before."""
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    from ttp.db import HARNESS_MERGED_KEY
+    p = make(env)
+    _commit_in_harness_tree(p.harness, "prompts/merged.md", "x\n", "merged edit")
+    sha = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    tid = _harness_in_review(p, "merged fix", f"committed {sha[:10]} in the harness", time.time() - 60)
+    dep = p.db.add_task("after it", "s", kind="code", origin="coordinator", depends_on=[tid])
+    code = p.db.add_task("code in review", "s", kind="code", origin="coordinator")
+    p.db.update_task(code, status="review")
+    cdep = p.db.add_task("after the code", "s", kind="code", origin="coordinator", depends_on=[code])
+    assert dep not in [t["id"] for t in p.db.ready_tasks()]
+    assert coord.starts_text(p.db.task(dep), db=p.db).startswith(f"waits on #{tid} (in review ")
+    d = Daemon(p.base)
+    _sweep(d)
+    assert p.db.kv(HARNESS_MERGED_KEY) == {str(tid): sha}
+    assert p.db.task(tid)["status"] == "review", "closed before review.sweep_after_s"
+    ready = [t["id"] for t in p.db.ready_tasks()]
+    assert dep in ready and cdep not in ready
+    assert coord.starts_text(p.db.task(dep), db=p.db) == ""
+    p.db.set_kv(HARNESS_MERGED_KEY, {str(tid): sha, str(code): sha})   # only a harness task counts
+    assert p.db.unmet_dependencies([p.db.task(cdep)])[cdep] == [code]
+    p.db.x("UPDATE runs SET ended=? WHERE task=?", (time.time() - 1900, tid))
+    _sweep(d)
+    t = p.db.task(tid)
+    assert t["status"] == "done" and json.loads(t["result"])["harness_merged"] == sha
+    assert "merged into the harness" in json.loads(t["result"])["summary"]
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+    assert p.db.task(code)["status"] == "review"
+    _sweep(d)   # a task that left review drops out at the next pass
+    assert p.db.kv(HARNESS_MERGED_KEY) == {}
+
+
+def test_a_harness_task_whose_review_failed_is_left_to_the_coordinator(env):
+    """A merged harness task whose review since it entered review failed (or asked for changes) is not
+    closed by the sweep; one whose review passed is."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    _commit_in_harness_tree(p.harness, "prompts/merged.md", "x\n", "merged edit")
+    sha = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    tid = _harness_in_review(p, "merged fix", f"committed {sha}", time.time() - 1900)
+    rev = p.db.add_task(f"Review #{tid}: merged fix", "s", kind="review", origin="daemon", depends_on=[tid])
+    p.db.update_task(rev, status="failed")
+    d = Daemon(p.base)
+    _sweep(d)
+    assert p.db.task(tid)["status"] == "review"
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1
+    p.db.update_task(rev, status="done")
+    _sweep(d)
+    t = p.db.task(tid)
+    assert t["status"] == "done" and f"review #{rev} passed" in json.loads(t["result"])["summary"]
+
+
+def test_superseded_accepts_a_task_in_review_only_when_its_work_is_merged(env, capsys):
+    """`ttp task superseded` takes a harness task in review whose commit is merged into the harness and
+    closes it as done; it refuses a commit not merged yet, a task with unmerged commits on its worktree
+    branch, a code task in review whose commit is not on the push branch, and other kinds in review."""
+    from ttp import cli
+    p = make(env)
+
+    def ttp_task(*args):
+        try:
+            cli.main(["task", p.name, *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    tid, unmerged = _unmerged_harness_commit(p, "pending edit")
+    p.db.update_task(tid, status="review")
+    assert ttp_task("superseded", str(tid), unmerged) not in (0, None)
+    assert "is not merged into the harness" in capsys.readouterr().err
+    _commit_in_harness_tree(p.harness, "prompts/other.md", "y\n", "merged edit")
+    merged = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    assert ttp_task("superseded", str(tid), merged) not in (0, None)
+    assert f"ttp/harness-t{tid} of task #{tid} has commits not merged" in capsys.readouterr().err
+    assert p.db.task(tid)["status"] == "review"
+    assert not p.db.q("SELECT * FROM task_superseded WHERE task=?", (tid,))
+    done = _harness_in_review(p, "landed edit", "ok", time.time())
+    assert ttp_task("superseded", str(done), merged[:12]) == 0
+    assert f"recorded as superseded by {merged[:10]}" in capsys.readouterr().out
+    t = p.db.task(done)
+    assert t["status"] == "done" and json.loads(t["result"])["superseded_by"] == merged
+    assert p.db.one("SELECT id FROM events WHERE kind='task_superseded' AND task=?", (done,))
+    code = p.db.add_task("code in review", "s", kind="code", origin="coordinator")
+    p.db.update_task(code, status="review")
+    assert ttp_task("superseded", str(code), merged, "--ref", "main") not in (0, None)
+    capsys.readouterr()
+    assert p.db.task(code)["status"] == "review"
+    plan = p.db.add_task("a plan in review", "s", kind="plan", origin="coordinator")
+    p.db.update_task(plan, status="review")
+    assert ttp_task("superseded", str(plan), merged) not in (0, None)
+    assert "not done or a code or harness task in review" in capsys.readouterr().err
+    queued = _harness_task(p, "queued edit")
+    p.db.update_task(queued, status="queued")
+    assert ttp_task("superseded", str(queued), merged) not in (0, None)
+    assert f"task #{queued} is queued, not done" in capsys.readouterr().err
+
+
 def test_replay_2800_a_done_code_task_left_with_no_review_gets_exactly_one(env, monkeypatch):
     """Replay of #2800: a code task committed, its checks passed (recorded model-free from its on_pass),
     its done hand-off proposed one follow-up, and no review was queued. The invariant queues exactly one

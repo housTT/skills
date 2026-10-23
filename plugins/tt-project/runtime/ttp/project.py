@@ -254,7 +254,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # stacks, the daemon queues no automatic fix for it and the coordinator re-plans (reviewcap).
     # The daily review's self-efficiency audit lists tasks blocked longer than blocked_long_h hours.
     # A code task left in review with no review sweep_after_s (0 off) after its last run gets one
-    # from the daemon (sweep_reviews), which only queues reviews and never closes a task. A done code
+    # from the daemon (sweep_reviews), which only queues reviews and never closes a task. A harness
+    # task gets one too, unless its commit is merged into the harness: then it is closed as done. A done code
     # task with an unlanded head and no review gets one too (sweep_unreviewed): at most
     # unreviewed_per_pass (0 off) per pass, for tasks updated within unreviewed_max_age_h hours.
     # A review whose head carries a change with a failed review and an open fix waits for that fix

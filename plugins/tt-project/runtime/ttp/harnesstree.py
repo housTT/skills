@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -32,6 +33,7 @@ IDENT = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
 REPORTED_KEY = "harness_merge_reported"   # kv: task id -> the branch head a conflict was reported for
 CONFLICT_KEY = "harness_merge_conflicted"  # kv: task id -> [branch head, harness HEAD, "conflict"|"refused"] last seen
 MERGE_MSG = "tt-project: land harness task"   # the start of land's merge message (MERGE_MSG mid-merge)
+SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 
 
 def path(p: Project, tid: int) -> Path:
@@ -160,6 +162,44 @@ def land(p: Project, tid: int) -> str:
     _git(p.harness, "branch", "-d", b)
     _set_conflicted(p, tid, None)
     return outcome or "merged"
+
+
+def named_commits(task: dict) -> list[str]:
+    """The commit hashes harness task `task`'s hand-off names (its `commit`, `head` or `sha`, then any
+    hash in its summary), unresolved, in order."""
+    from .db import load_result
+    res = load_result(task.get("result"))
+    named = [str(res.get(k) or "").strip() for k in ("commit", "head", "sha")]
+    named += SHA_RE.findall(str(res.get("summary") or ""))
+    return [c for c in dict.fromkeys(named) if SHA_RE.fullmatch(c)]
+
+
+def unmerged(p: Project, tid: int) -> int:
+    """How many commits harness task `tid`'s worktree branch has that the harness checkout's HEAD does
+    not (0 without the branch; -1 when git cannot tell)."""
+    b = branch(tid)
+    if _git(p.harness, "rev-parse", "--verify", "-q", f"refs/heads/{b}").returncode != 0:
+        return 0
+    ahead = _git(p.harness, "rev-list", "--count", f"HEAD..{b}")
+    return int(ahead.stdout.strip() or 0) if ahead.returncode == 0 else -1
+
+
+def merged_commit(p: Project, task: dict) -> str:
+    """The commit harness task `task` handed off with (named_commits), once it is in the harness
+    checkout's HEAD (its main line), or "": no harness repo, no named commit the harness has, one of
+    them not in HEAD, or commits on the task's worktree branch not merged yet. Hashes the harness does
+    not have (of another repository) are skipped."""
+    if not _is_repo(p) or unmerged(p, task["id"]):
+        return ""
+    found = ""
+    for c in named_commits(task):
+        full = _git(p.harness, "rev-parse", "--verify", "-q", f"{c}^{{commit}}")
+        if full.returncode != 0:
+            continue
+        if _git(p.harness, "merge-base", "--is-ancestor", full.stdout.strip(), "HEAD").returncode != 0:
+            return ""
+        found = found or full.stdout.strip()
+    return found
 
 
 def landing_merge(h: Path) -> bool:
