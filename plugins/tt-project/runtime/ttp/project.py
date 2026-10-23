@@ -314,8 +314,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # sweep (ttp.gitlocks). Every sweep_every_s the daemon commits charter and memory files a failed
     # commit left uncommitted (see Project.sweep_harness).
     "harness_git": {"timeout_s": 120, "sweep_every_s": 600},
-    # A command watcher's known open issue wakes the coordinator again once it was last seen more
-    # than rewake_after_h ago (null = never), or every time its observation says "repeat": true.
+    # A command watcher's known open issue wakes the coordinator again every rewake_after_h
+    # while it is still reported (null = never by time alone), or every time its observation says "repeat": true.
     # same_subject_warn: a watcher that opens more issues than this on one subject in 24 h gets a log
     # line and a digest and daily-review note, no wake (0: off). reraise_window_h: a keyed issue that a
     # run reporting nothing closed, sent again under its key within this many hours at the same or a

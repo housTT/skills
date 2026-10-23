@@ -78,8 +78,8 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     """Record the observation as an issue and say whether the coordinator should wake for it.
 
     A known open issue wakes again when `repeat` is set (the watcher says each report is a new
-    event), or when it last woke the coordinator `rewake_after_s` or more ago (a reminder while it
-    holds, or it came back after a quiet spell). Without either, a known open issue stays quiet. An observation an active mute covers
+    event), or when it last woke the coordinator `rewake_after_s` or more ago (a reminder every
+    `rewake_after_s` while it is still reported). Without either, a known open issue stays quiet. An observation an active mute covers
     is recorded and counted but never wakes (see mute). `lifecycle` (RECEIPT or ERROR, from a
     receipt source) is kept on the issue with its subject; see settle_receipts. `whole` (a watcher's JSON
     line with "whole": true) keeps the line as one condition: its text is never split at '; '. `key` (a watcher JSON line's

@@ -1,7 +1,7 @@
 # Watchers
 
 `kind: command` schedules; scripts under `watchers/` in the harness.
-One JSON line per observation: `{"text", "severity", "repeat", "whole", "key", "episode", "pin_severity"}`; `"repeat": true` wakes the coordinator on every new occurrence, otherwise a known one wakes again after `screen.rewake_after_h` quiet.
+One JSON line per observation: `{"text", "severity", "repeat", "whole", "key", "episode", "pin_severity"}`; `"repeat": true` wakes the coordinator on every new occurrence, otherwise a known one wakes again every `screen.rewake_after_h` while it is still reported (null: never by time alone).
 Write a line as `<subject>: <item>; <item>`: each item is one issue (counts masked), an item may start with `now`, `still:`, `changed:` or `cleared:`, and `cleared: <item>` closes it.
 A JSON line with `"whole": true` is one observation instead: one issue for all the text after its subject, never split at `; ` (a long title is truncated); a leading `cleared:` closes it.
 An optional `"key"` (a short stable string) is the issue's identity instead of its text, so a changed text under the same key updates that issue and opens no new one.
