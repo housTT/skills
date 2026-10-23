@@ -170,6 +170,9 @@ def prefetch(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -
     """Runs the checks before the transaction that records `task`'s hand-off; verdict reads it."""
     if not applies(cfg, task, handoff):
         return
+    now = time.time()
+    for k in [k for k, (until, _) in _seen.items() if until <= now]:
+        _seen.pop(k, None)
     _seen[(str(p.root), int(task["id"]), _digest(handoff))] = (time.time() + SEEN_TTL_S,
                                                               run(p, cfg, task, handoff, run_dir))
 

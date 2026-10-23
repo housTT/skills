@@ -3676,9 +3676,13 @@ class Daemon:
         # never holds a hand-off back: the coordinator hears once per check.
         sent_back = int(load_result(task["result"]).get(handoffcheck.KEY) or 0)
         hcheck_text = ""
-        checked = handoffcheck.verdict(self.p, self.cfg, task, handoff, run_dir) \
-            if status == "ok" and not waiting and not _daemon_precheck(r, handoff) and not refusal and not push_quiet \
-            and not _push_rechecked(task) else {}
+        checked: dict = {}
+        if status == "ok" and not waiting and not refusal and not push_quiet and not _daemon_precheck(r, handoff) \
+                and not _push_rechecked(task):
+            try:
+                checked = handoffcheck.verdict(self.p, self.cfg, task, handoff, run_dir)
+            except Exception:   # never lose a hand-off to the checks themselves
+                log(self.p, "hand-off checks failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         for b in checked.get("broken") or []:
             fp = handoffcheck.broken_fingerprint(b)
             log(self.p, f"task {task['id']}: hand-off check '{b['name']}' is broken ({b['why']}); accepted")
