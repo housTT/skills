@@ -92,42 +92,36 @@ Work from cheap to expensive:
 4. Re-run the combined changes together. Changes that draw on the same memory interact.
 5. Estimate each full suite from the samples, with a range. Run it only if the estimate fits
    `suite_budget_hours` before the deadline. A measured stop is a valid result.
-6. When exploration is done, run the full suites on the best version. Split each one so every
-   dispatch finishes inside the grant's per-run timeout; a suite that hits the cap returns
-   nothing. If the subsets plus the stage-11 benchmarks also fit in one run, do a release run
-   too, with per-eval timeouts that sum under the cap so it ends with results rather than at the
-   limit.
+6. When exploration ends, run the full suites on the best version, split so each dispatch finishes
+   inside the grant's per-run timeout. If the subsets plus the stage-11 benchmarks fit one run,
+   add a release run with per-eval timeouts summing under the cap.
 
 ### Fanning out
 
 Run arms in parallel when the grant allows it. An explorer owns one hypothesis and iterates on it:
-predict, size the sample, dispatch, wait, then read what came back against the estimate it wrote
-first. The gap between the two is the finding — a result that matched a wrong estimate and one
-that matched a right one point in different directions. It keeps going on its own thread until the
-hypothesis is settled or its budget ends, then reports the arm with its evidence.
+predict, size, dispatch, wait, then read the result against the estimate it wrote first. It runs
+its own thread until the hypothesis settles or its budget ends, then reports the arm with its
+evidence.
 
 A coordinator holds the current best, the slot ledger and the budget, decides what is kept, and
-re-runs kept changes together. Explorers do not accept their own arms, and every dispatched run is
-registered with the coordinator when it is launched, not when it finishes.
+re-runs kept changes together. Explorers do not accept their own arms; every dispatched run
+registers with the coordinator at launch, not at completion.
 
-The coordinator reads widely where an explorer reads deeply: everything the runs leave behind, the
-way [Look at the whole run](#look-at-the-whole-run) asks, across arms rather than within one,
-looking for where headroom is still left. What to probe next comes from that. Not every run needs
-to be a candidate for best — one whose only purpose is to show where the room is, or to rule a
-mechanism out, is worth a slot when the picture is thin.
+The coordinator reads wide where an explorer reads deep — everything the runs leave behind, across
+arms, the way [Look at the whole run](#look-at-the-whole-run) asks — and sets what to probe next.
+Not every run has to be a candidate for best: one that only locates headroom or rules a mechanism
+out earns a slot when the picture is thin.
 
 Give explorers different mechanisms, not one idea at several magnitudes.
 
 ### Sizing a sample
 
-Estimate a sample's CI time before dispatching it, and size it to the thing it has to separate.
-Too small to beat the noise is spent compute that decides nothing; a full suite to settle what a
-sample answers is worse.
+Estimate a sample's CI time before dispatching, and size it to what it has to separate. Too small
+to beat the noise decides nothing; a full suite to settle what a sample answers costs more.
 
-Shape follows the claim. A concurrency change needs enough simultaneous conversations to actually
-load the pool and the scheduler. A precision or long-context change needs long and free-running
-replies. A cache change needs repeated multi-turn traffic. A task count that makes one of these
-valid can make another meaningless.
+Shape follows the claim: concurrency needs enough simultaneous conversations to load the pool and
+scheduler, precision and long context need long free-running replies, caching needs repeated
+multi-turn traffic. A count valid for one is meaningless for another.
 
 Write these to `doc/agentic_evals/`:
 
