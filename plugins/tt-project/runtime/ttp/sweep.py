@@ -510,10 +510,15 @@ def review_diagnosis(db: DB, tid: int, now: float, hold_of: Callable[[dict], str
         f": {summary}" if summary else "")
 
 
+def _clock(state: dict) -> float:
+    """When the sweep last counted: its last turn, or a later model-free skip's receipt (sweepskip)."""
+    return max(_num(state.get("last")), _num(state.get("receipt")))
+
+
 def _signals(db: DB, state: dict, live: list[dict], now: float, rearm_only: bool = False) -> list[str]:
-    """What changed since the last sweep that may unblock something. rearm_only: of signal()'s
-    requests, only those that may end a hold no turn lifts (a pause ending)."""
-    last = float(state.get("last") or 0)
+    """What changed since the last sweep (or its receipt) that may unblock something. rearm_only: of
+    signal()'s requests, only those that may end a hold no turn lifts (a pause ending)."""
+    last = _clock(state)
     out = [str(s.get("why") or "signal") for s in (db.kv(SIGNAL_KEY, []) or []) if isinstance(s, dict)
            and (not rearm_only or s.get("rearm") or str(s.get("why") or "").startswith("pause ended"))]
     paused_now = {i["resource"] for i in live if i["kind"] == "paused"}
@@ -576,7 +581,7 @@ def due(db: DB, cfg: dict, now: float | None = None) -> str | None:
     if not live or db.one("SELECT id FROM events WHERE kind=? AND status='queued' LIMIT 1", (SWEEP_KIND,)):
         return None
     state = db.kv(STATE_KEY, {}) or {}
-    since = now - float(state.get("last") or 0)
+    since = now - _clock(state)
     if since >= every:
         outs = outcomes(db)
         prev = state.get("items") or {}

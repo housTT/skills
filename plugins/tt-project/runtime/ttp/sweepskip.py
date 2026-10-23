@@ -1,0 +1,234 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Skip a blocker sweep turn model-free when nothing in it can move without the daemon (sweep.py).
+
+Before the daemon queues a blocker sweep (Daemon.blocker_sweep), it names what ends each stuck item
+without a turn (end()):
+- a user pause: a user-pause probe, a pause the user set on a resource, or a cover recorded on one;
+- a time: a start_after or a hold's `waits_on until` still ahead, a promise, mitigation or outage not
+  due yet;
+- a working model-free probe: a deferral's start_when within coordinator.defer_max_days, a hold's
+  `waits_on when` or a waiting task's retry_when, whose last answer is a fresh "not yet" (landed:#id
+  is such a probe); a retry_when past waiting.max_hold_s is overdue;
+- an open user ask a blocked task's hold is anchored on (`waits_on ask`) or names (sweep's `ask`);
+- a free resource a hold waits on (`waits_on resource`, which the daemon lifts);
+- a review younger than coordinator.review_backlog_h whose review task is queued or running.
+
+The turn is skipped only when every item has such an end, the items and each one's status, spec,
+reason and end are what they were at the last sweep a turn ran (MODEL_KEY), that sweep was less than
+MAX_AGE_H ago, and nothing else needs a turn: no signal() request pending, no inbound message
+unhandled, no other queued event but routine ones (quietgate.routine_kinds), no task pushing past
+coordinator.review_backlog_h, no loop and no ask held past ask_rethink_h. A new or changed item, a
+broken or stale probe, a deferral past defer_max_days, a pause the coordinator set, a dependency or
+probe task that failed, was cancelled or does not exist, a review past its expected time, or an item
+with no model-free end starts the sweep turn as before.
+
+A skip writes a receipt (RECEIPTS_KEY: each item and what ends it, with the estimated saving, the
+quiet gate's mean coordinator turn) and sets sweep.STATE_KEY `receipt`, which the sweep's clock counts
+from (sweep._clock). `ttp status` and the web feed show the latest receipt as one low line; the daily
+review counts model sweeps and skipped ones. Coordinator effort is unchanged: the saving is the turn
+not taken."""
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from typing import Any, Callable
+
+from . import anchors, ends, holdloops, landed, quietgate, sweep, timefmt
+from .db import DB, dependency_ids, deferral, load_result
+
+MODEL_KEY = "blocker_sweep_model"        # kv: {ts, n, fps: {key: fp}}: the last sweep a turn ran
+RECEIPTS_KEY = "blocker_sweep_receipts"  # kv: [{ts, model, why, items: [[key, end]], usd}]
+MAX_AGE_H = 24.0
+KEEP_S = 8 * 86400
+DEFER_MAX_DAYS = 14.0
+MAX_HOLD_S = 6 * 3600.0
+DEAD = ("failed", "cancelled")
+
+Probe = Callable[[int], Any]   # task id -> (rc, ts, probe) of its last probe answer, or None
+
+
+def _f(v: Any, default: float) -> float:
+    try:
+        return float(default if v is None else v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _dead_refs(db: DB, t: dict, probe: str | None = None) -> str:
+    """Why task `t` can never move on its own: a dependency or a task its probe names is missing,
+    failed or cancelled ('' when none)."""
+    ids = [d for d in dependency_ids(t) if isinstance(d, int)]
+    ids += [int(r) for r in landed.task_refs(probe) if r.isdigit()]
+    if landed.missing_task_refs(db, probe):
+        return "its probe names a missing task"
+    for d in ids:
+        st = (db.task(d) or {}).get("status")
+        if st is None or st in DEAD:
+            return f"#{d} is {st or 'missing'}"
+    return ""
+
+
+def _probe_end(probe: Any, got: Any, now: float, what: str) -> str | None:
+    """`what` once the daemon's last answer to `probe` is a fresh "not yet", else None."""
+    if not isinstance(probe, str) or not probe.strip():
+        return None
+    if not (isinstance(got, (tuple, list)) and len(got) >= 3 and got[2] == probe):
+        return None
+    if got[0] not in ends.NOT_YET_RCS or now - _f(got[1], 0) > sweep.PROBE_FRESH_S:
+        return None
+    return f"{what} `{sweep._clip(probe, 120)}`"
+
+
+def end(db: DB, cfg: dict, i: dict, now: float, probe_of: Probe | None = None, asks: dict | None = None) -> str | None:
+    """What ends sweep item `i` without a turn (see the module doc), or None when a turn must judge it."""
+    c = cfg.get("coordinator") or {}
+    where = cfg
+    if i.get("ends") == "due":
+        return "its due time"
+    if i["kind"] == "paused":
+        return "user pause" if i.get("ends") == "user" else None   # a pause the coordinator set is its own
+    t = db.task(i["task"]) if i.get("task") else None
+    if t is None:
+        return None
+    if _dead_refs(db, t, deferral(t).get("when")):
+        return None
+    if i.get("ends") == "user":
+        return "user pause"
+    if i.get("ends") == "time":
+        return f"starts after {timefmt.long(_f(t['not_before'], now), where)}"
+    probe_of = probe_of or (lambda _tid: None)
+    if i["kind"] == "deferred":
+        d = deferral(t)
+        if now - _f(d.get("since") or t["created"], now) >= _f(c.get("defer_max_days"), DEFER_MAX_DAYS) * 86400:
+            return None
+        return f"start_when {sweep._clip(d.get('when'), 120)}" if (i.get("watch") or {}).get("failing") else None
+    if i["kind"] == "review":
+        backlog = _f(c.get("review_backlog_h"), sweep.REVIEW_BACKLOG_H) * 3600
+        if i.get("age_s") is None or i["age_s"] >= backlog:
+            return None
+        for r in db.q("SELECT id, status, depends_on, labels FROM tasks WHERE kind='review' AND id>? "
+                      "AND status IN ('queued','running') ORDER BY id DESC", (t["id"],)):
+            if t["id"] in dependency_ids(r) or f"auto_review:{t['id']}" in (r["labels"] or ""):
+                return f"review #{r['id']}"
+        return None
+    if i["kind"] == "waiting":
+        prev = load_result(t["result"])
+        if now - _f(prev.get("waiting_since"), now) > _f((cfg.get("waiting") or {}).get("max_hold_s"), MAX_HOLD_S):
+            return None   # overdue: past the wait's own limit
+        probe = prev.get("retry_when")
+        if _dead_refs(db, t, probe):
+            return None
+        return _probe_end(probe, probe_of(t["id"]), now, "retry_when")
+    if i["kind"] != "blocked":
+        return None
+    got = anchors.anchor(t)
+    if got:
+        kind, value = got
+        if kind == "ask":
+            return f"open ask #{value}" if value.isdigit() and int(value) in (asks or {}) else None
+        if kind == "until":
+            return f"until {timefmt.long(_f(value, 0), where)}" if _f(value, 0) > now else None
+        if kind == "resource":
+            return f"resource {value} free"
+        if kind == "when":
+            return None if _dead_refs(db, t, value) else _probe_end(value, probe_of(t["id"]), now, "when")
+    a = i.get("ask") or {}
+    return f"open ask #{a['id']}" if a.get("id") in (asks or {}) else None
+
+
+def _fp(db: DB, i: dict, e: str | None) -> str:
+    """The item as a turn would judge it: its kind, status, spec, reason, end and its dependencies' states."""
+    t = db.task(i["task"]) if i.get("task") else None
+    deps = [[d, (db.task(d) or {}).get("status")] for d in dependency_ids(t) if isinstance(d, int)] if t else []
+    return hashlib.sha256(json.dumps([i["key"], i["kind"], i["status"], i["spec_sha"], i["reason"], e, deps],
+                                     default=str).encode()).hexdigest()[:16]
+
+
+def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | None = None) -> dict:
+    """{skip: bool, why: why a turn is needed ('' on a skip), ends: {key: end or None}, fps: {key: fp}}."""
+    asks = sweep._open_asks(db)
+    got = {i["key"]: end(db, cfg, i, now, probe_of, asks) for i in live}
+    fps = {i["key"]: _fp(db, i, got[i["key"]]) for i in live}
+    out = {"skip": False, "why": "", "ends": got, "fps": fps}
+    model = db.kv(MODEL_KEY) or {}
+    state = db.kv(sweep.STATE_KEY, {}) or {}
+    prev = state.get("items") or {}
+    backlog = _f((cfg.get("coordinator") or {}).get("review_backlog_h"), sweep.REVIEW_BACKLOG_H) * 3600
+    routine = sorted(quietgate.routine_kinds(cfg))
+    checks = (
+        (lambda: [k for k, e in got.items() if not e], "no model-free end: {}"),
+        (lambda: not isinstance(model, dict) or not model.get("fps"), "no model sweep on record"),
+        (lambda: now - _f(model.get("ts"), 0) >= MAX_AGE_H * 3600, "the last model sweep is 24 h old"),
+        (lambda: model.get("fps") != fps, "items changed since the last model sweep"),
+        (lambda: db.kv(sweep.SIGNAL_KEY, []), "a signal is pending"),
+        (lambda: db.one("SELECT id FROM messages WHERE direction='in' AND handled=0 LIMIT 1"), "a message waits"),
+        (lambda: db.one(f"SELECT id FROM events WHERE status='queued' AND kind NOT IN "
+                        f"({','.join('?' * (len(routine) + 1))}) LIMIT 1", (sweep.SWEEP_KIND, *routine)),
+         "another event needs a turn"),
+        (lambda: db.one("SELECT id FROM tasks WHERE status='pushing' AND updated<? LIMIT 1", (now - backlog,)),
+         "a task is pushing past its expected time"),
+        (lambda: holdloops.flagged(db) or [i["key"] for i in live if sweep.loop(db, i, prev.get(i["key"]))], "a loop"),
+        (lambda: sweep.rethink(db, cfg, live, now), "an ask held past its rethink time"),
+    )
+    for test, why in checks:
+        if hit := test():
+            out["why"] = why.format(", ".join(hit[:5])) if isinstance(hit, list) else why
+            return out
+    out["skip"] = True
+    return out
+
+
+def swept(db: DB, got: dict, now: float) -> None:
+    """A sweep turn was queued: what later skips must match."""
+    n = int((db.kv(sweep.STATE_KEY, {}) or {}).get("n") or 0)
+    db.set_kv(MODEL_KEY, {"ts": now, "n": n, "fps": got["fps"]})
+
+
+def skip(db: DB, got: dict, why: str, now: float) -> dict:
+    """Write the receipt and count it as the sweep for the interval clock; returns it."""
+    model = db.kv(MODEL_KEY) or {}
+    rec = {"ts": now, "model": _f(model.get("ts"), 0), "why": sweep._clip(why, 200),
+           "items": [[k, e] for k, e in sorted(got["ends"].items())], "usd": quietgate._turn_usd(db)}
+    with db.tx():
+        keep = [r for r in (db.kv(RECEIPTS_KEY) or []) if isinstance(r, dict) and now - _f(r.get("ts"), 0) < KEEP_S]
+        db.set_kv(RECEIPTS_KEY, keep + [rec])
+        db.set_kv(sweep.STATE_KEY, {**(db.kv(sweep.STATE_KEY, {}) or {}), "receipt": now})
+    return rec
+
+
+def text(rec: dict, where, now: float) -> str:
+    """The receipt as one line."""
+    items = "; ".join(f"{k} ({e})" for k, e in rec.get("items") or [])
+    return sweep._clip(f"blocker sweep skipped model-free at {timefmt.short(rec['ts'], where, now)}: "
+                       f"{len(rec.get('items') or [])} item(s) unchanged since the model sweep at "
+                       f"{timefmt.short(_f(rec.get('model'), 0), where, now)}, each ends without a turn: {items}", 400)
+
+
+def latest(db: DB) -> dict | None:
+    """The newest receipt, while no model sweep came after it."""
+    recs = [r for r in (db.kv(RECEIPTS_KEY) or []) if isinstance(r, dict)]
+    model = _f((db.kv(MODEL_KEY) or {}).get("ts"), 0)
+    return recs[-1] if recs and _f(recs[-1].get("ts"), 0) > model else None
+
+
+def status_lines(db: DB, now: float, where) -> list[str]:
+    rec = latest(db)
+    return [text(rec, where, now)] if rec else []
+
+
+def feed(db: DB, now: float, where) -> list[dict]:
+    """The web feed's one low row for the latest receipt (state 'status': never an alert)."""
+    rec = latest(db)
+    return [{"id": None, "ts": rec["ts"], "kind": "sweep", "severity": "low", "state": "status",
+             "text": text(rec, where, now)}] if rec else []
+
+
+def counts(db: DB, since: float, until: float | None = None) -> dict:
+    """Model sweeps and skipped ones in [since, until), and the estimated dollars the skips saved."""
+    until = time.time() if until is None else until
+    model = (db.one("SELECT COUNT(*) n FROM events WHERE kind=? AND ts>=? AND ts<?", (sweep.SWEEP_KIND, since, until))
+             or {}).get("n") or 0
+    recs = [r for r in (db.kv(RECEIPTS_KEY) or []) if isinstance(r, dict) and since <= _f(r.get("ts"), 0) < until]
+    return {"model": int(model), "skipped": len(recs), "usd": round(sum(_f(r.get("usd"), 0) for r in recs), 4)}

@@ -1336,6 +1336,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines.extend(h.get("obligations") or [])
     from . import mitigate
     lines.extend(mitigate.status_lines(db, now, tz))
+    from . import sweepskip
+    lines.extend(sweepskip.status_lines(db, now, tz))
     lines.extend(h.get("outages") or [])
     from . import screen as scr
     for m in scr.mutes(db, now):

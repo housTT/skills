@@ -104,6 +104,7 @@ from . import sharedchecks
 from . import startcheck
 from . import startgate
 from . import sweep
+from . import sweepskip
 from . import timefmt
 from . import ttr
 from . import turngate
@@ -5401,9 +5402,17 @@ class Daemon:
                     ctx["logged_out"][prov] = self._logged_out(prov)
                 return self._start_hold(t, prov, ctx)
             self.sweep_unreviewed(force=True)   # its data pass: no finished change sits unreviewed into it
+            # Every item ends model-free and nothing changed since the last model sweep: a receipt, no turn.
+            got = sweepskip.check(db, self.cfg, sweep.items(db, now, self.cfg), now, probe_of=self._probe_rc.get)
+            if got["skip"]:
+                rec = sweepskip.skip(db, got, why, now)
+                log(self.p, f"blocker sweep skipped model-free ({why}): {len(rec['items'])} item(s) unchanged, "
+                            f"each ends without a turn; ~${rec['usd']:.2f} saved")
+                return
             eid = sweep.start(db, self.cfg, why, now, hold_of=hold_of)
             if eid:
-                log(self.p, f"blocker sweep queued ({why})")
+                sweepskip.swept(db, got, now)
+                log(self.p, f"blocker sweep queued ({why}; a turn: {got['why']})")
         except Exception:   # a sweep that cannot start must not stop the tick
             log(self.p, "blocker sweep failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
 

@@ -13,7 +13,8 @@ the project could have saved. Model-free; the review grades it.
 - coordinator turns that decided nothing (no action but `noop`), and idle and
   starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost,
   and turns the daemon skipped as repeats of one that decided nothing (turngate.py) or as quiet while
-  every open task was held (quietgate.py), with the saving;
+  every open task was held (quietgate.py), with the saving; blocker sweeps the model ran and those
+  skipped model-free (sweepskip.py), with the saving;
 - spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
   done task by kind and tier;
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
@@ -35,7 +36,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, ends, quietgate, reviewstats, schedule, sharedchecks, suitecost, turngate, unblock, upstream
+from . import budget, chaincap, ends, quietgate, reviewstats, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -341,6 +342,10 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     quiet = quietgate.skipped(db, since)
     if quiet["n"]:
         out.append(f"coordinator turns skipped ({quietgate.QUIET}): {quiet['n']}, ~${quiet['usd']:.2f} saved")
+    sweeps = sweepskip.counts(db, since, now)
+    if sweeps["model"] or sweeps["skipped"]:
+        out.append(f"blocker sweeps: {sweeps['model']} by the model, {sweeps['skipped']} skipped model-free "
+                   f"(unchanged, every item ends without a turn), ~${sweeps['usd']:.2f} saved")
     done = finished(db, since)
     if done:
         work = sum(float(t["spent_usd"] or 0) for t in done)
@@ -402,7 +407,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "failed_runs": failed_runs(db, since), "lost_runs": lost_runs(db, since),
             "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
             "coordinator_turns": coordinator_turns(db, since),
-            "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since),
+            "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "sweeps": sweepskip.counts(db, since, now),
             "finished": done, "per_outcome": per_outcome(done),
             "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
