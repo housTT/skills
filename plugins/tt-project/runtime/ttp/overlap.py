@@ -178,10 +178,9 @@ def branches(p, skip=()) -> list[dict]:
             out.append({"id": r["id"], "branch": r["branch"], "head": head, "files": files})
     if len(cache) != size:
         keepers = dict(list(cache.items())[-CACHE_MAX:])
+        from .project import durable_write
         try:
-            tmp = _cache_path(p).with_suffix(".tmp")
-            tmp.write_text(json.dumps(keepers))
-            tmp.replace(_cache_path(p))
+            durable_write(_cache_path(p), json.dumps(keepers))
         except OSError:
             pass
     return out

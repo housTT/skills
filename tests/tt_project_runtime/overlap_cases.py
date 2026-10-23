@@ -21,10 +21,6 @@ def _branch_adding(p, branch, files):
     return head
 
 
-def _labels(p, tid):
-    return json.loads(p.db.task(tid)["labels"])
-
-
 def test_task_add_warns_when_another_open_code_task_names_the_same_new_file(env):
     """#3466 and #3467 each built their own runtime/ttp/progress.py side by side. A new code task
     whose spec names a file an open code task's spec names is still added, and its result and its
