@@ -33209,6 +33209,51 @@ def test_lock_wait_note_names_the_probes_live_holders_and_agrees_with_the_probe(
     assert f"pid {os.getpid()} alive" in said[1], said
 
 
+def test_status_and_web_show_a_lock_waits_live_holders_not_its_stored_note(env):
+    """`ttp status` and the web app's task row build a lock wait's note from the probe's answer when shown:
+    the holder now (pid and liveness), or free, never the holder its stored note or hand-off named; a note
+    from the hand-off's words becomes the locks now; a wait that names no lock keeps its stored note."""
+    from ttp import cli, lockprobe
+    from ttp.web import state_payload
+    p = make(env)
+    old = p.db.add_task("old holder", "s", kind="work", origin="user")
+    new = p.db.add_task("holder now", "s", kind="work", origin="user")
+    tid = _due_waiting_task(p, "ttp lock --probe build-a >/dev/null", waiting_for=f"build-a held by #{old}")
+    hand = _due_waiting_task(p, "ttp lock --probe build-a && ttp lock --probe build-b",
+                             waiting_for=f"build-a and build-b held by task #{old}")
+    plain = _due_waiting_task(p, "test -e /tmp/never", waiting_for=f"the board task #{old} uses")
+    later = time.time() + 3600
+    held = _held_build_lock(p, "build-a", "x")
+    try:
+        _relabel(held, f"task #{old} (run {_run_row(p, old, pid=os.getpid())})")
+        stored = f"waiting for {lockprobe.answer(p, p.config(), 'build-a')[1]}; its probe says not yet; next try 20:00"
+        assert f"task #{old} (run" in stored, stored
+        p.db.update_task(tid, not_before=later, blocked_reason=stored)
+        p.db.update_task(hand, not_before=later, blocked_reason=f"waiting for build-a and build-b held by task #{old}; "
+                                                                f"locks: build-a, build-b")
+        p.db.update_task(plain, not_before=later, blocked_reason=f"waiting for the board task #{old} uses")
+        _relabel(held, f"task #{new} (run {_run_row(p, new, pid=os.getpid())})")
+        said = _ttp_run(p, "lock", "--probe", "build-a").stdout.strip()
+        assert f"task #{new} (run" in said and f"pid {os.getpid()} alive" in said, said
+
+        def shown():
+            rows = {t["id"]: t["blocked_reason"] for t in state_payload(p, p.db)["tasks"]}
+            out = {ln.split(":", 1)[0].split()[0]: ln for ln in cli.status_text(p).splitlines() if "waiting, next" in ln}
+            return rows, out
+        rows, out = shown()
+        assert rows[tid] == f"waiting for {said}; its probe says not yet; next try 20:00", rows[tid]
+        assert said in out[f"#{tid}"] and f"#{old}" not in out[f"#{tid}"], out
+        assert rows[hand] == f"waiting for {said}; build-b: free" and said in out[f"#{hand}"], (rows[hand], out)
+        assert f"#{old}" not in rows[hand] + out[f"#{hand}"], (rows[hand], out)
+        assert rows[plain] == f"waiting for the board task #{old} uses" and f"#{old}" in out[f"#{plain}"], out
+    finally:
+        held.close()
+    rows, out = shown()   # nobody holds it now: free, and the task retries at its next try
+    assert rows[tid] == "waiting for build-a: free; its probe says not yet; next try 20:00", rows[tid]
+    assert "build-a: free" in out[f"#{tid}"] and "busy" not in out[f"#{tid}"], out
+    assert rows[hand] == "waiting for build-a: free; build-b: free", rows[hand]
+
+
 def test_lock_probe_busy_while_reserved_under_any_device_name(env):
     p = _device_project(env)
     from ttp import locks as lk

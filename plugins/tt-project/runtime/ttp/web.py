@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, heal, identity, obligations, outagetask, projpause, pushq, release, responsibilities, sweep, timefmt, waits
+from . import credits, heal, identity, lockprobe, obligations, outagetask, projpause, pushq, release, responsibilities, sweep, timefmt, waits
 from . import schedule as sched
 from . import startgate, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -306,8 +306,11 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                               "ORDER BY COALESCE(not_before, 0), id")]
     deferred = [t for t in deferred if t["starts"]]
     later = {t["id"] for t in deferred}
-    waiting = [t for t in db.q("SELECT id, title, not_before, blocked_reason FROM tasks WHERE status='queued' "
+    waiting = [t for t in db.q("SELECT id, title, not_before, blocked_reason, result FROM tasks WHERE status='queued' "
                                "AND not_before>? ORDER BY not_before", (now,)) if t["id"] not in later]
+    probed: dict = {}   # a wait on locks names their holders now, not the ones its stored note saw
+    for t in waiting:
+        t["blocked_reason"] = lockprobe.live_note(p, cfg, load_result(t.pop("result")), t["blocked_reason"], probed)
     queued = [t for t in db.q("SELECT id, depends_on FROM tasks WHERE status='queued' AND (not_before IS NULL OR "
                               "not_before<=?)", (now,)) if t["id"] not in later]
     # A task on a paused resource is held, not ready: it is listed under its resource instead.
@@ -593,12 +596,15 @@ def state_payload(p: Project, db: DB) -> dict:
     job_use = db.kv("job_use", {}) or {}
     paused = db.paused_resources()
     entered = sweep.entered_map(db, [t for t in tasks if t["status"] == "blocked"], now)
+    cfg, probed = p.config(), {}
     for t in tasks:
         t["job_use"] = [f"job {j['name']}: {j['line']}" for j in job_use.values() if j.get("task") == t["id"]] or None
         t["review_since"] = in_review.get(t["id"])
         t["outcome"] = task_outcome(t)   # changes_needed for a review that asked for changes
         result = load_result(t["result"])
         t["result"] = str(result.get("summary") or "")[:600]
+        if t["status"] == "queued":   # a wait on locks names their holders now (lockprobe.live_note)
+            t["blocked_reason"] = lockprobe.live_note(p, cfg, result, t["blocked_reason"], probed)
         pushed = result.get("pushed")
         t["pushed"] = [{k: x.get(k) for k in ("branch", "sha", "version", "status")} for x in pushed
                        if isinstance(x, dict)] or None if isinstance(pushed, list) else None   # what the push queue pushed for a review

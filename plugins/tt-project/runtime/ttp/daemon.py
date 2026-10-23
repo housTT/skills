@@ -7779,9 +7779,7 @@ class Daemon:
         found, rest = locks.lock_probe_parts(str(prev.get("retry_when") or ""))
         if found:
             try:   # an unwritable or corrupt shared lock dir must not break a hand-off or a tick
-                cfg = self.p.config()
-                lines = [lockprobe.answer(self.p, cfg, r, sh)[1] for r, sh in found]
-                return ("; ".join(lines) + (f"; then `{' ; '.join(rest)}`" if rest else ""))[:300]
+                return lockprobe.wait_text(self.p, self.p.config(), found, rest)
             except Exception as e:
                 cause = f"{type(e).__name__}: {e}"
                 if cause not in self._wait_what_errs:   # once per cause, not every tick

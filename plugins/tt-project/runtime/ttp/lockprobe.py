@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """The answer of `ttp lock --probe <resource>`, in one place: the probe prints it, and a task waiting on
-such probes has its note built from it (Daemon._wait_what), so the two always name the same live
-holders (locks.holders_now: pid and liveness, a done task's hold marked stale), never the holders a
-hand-off once saw."""
+such probes has its note built from it (Daemon._wait_what) and rebuilt from it whenever the note is shown
+(live_note: `ttp status`, the web app), so all name the same live holders (locks.holders_now: pid and
+liveness, a done task's hold marked stale), never the holders a hand-off or an earlier note once saw."""
 from __future__ import annotations
 
 import sys
@@ -48,3 +48,64 @@ def answer(p, cfg: dict, resource: str, shared_mode: bool = False) -> tuple[int,
     paths = locks.slot_paths(where, res, shared.slots(p, res, cfg))
     free = locks.probe(where, res, paths, shared=shared_mode)
     return (0 if free else 75), line(resource, free, where, res, paths, p)
+
+
+def wait_text(p, cfg: dict, found: list[tuple[str, bool]], rest: list[str]) -> str:
+    """What a wait on `ttp lock --probe` commands waits for, now: each lock as its probe answers (`found`,
+    from locks.lock_probe_parts), then the probe's other commands (`rest`). Raises what the probe raises."""
+    lines = [answer(p, cfg, r, sh)[1] for r, sh in found]
+    return ("; ".join(lines) + (f"; then `{' ; '.join(rest)}`" if rest else ""))[:300]
+
+
+def _segment(text: str, resource: str) -> tuple[int, int] | None:
+    """Where `text` holds a lock line of `resource` as `line` or `answer` wrote it ("<r>: free", "<r>: paused",
+    "<r>: busy (...)" or "<r>: paused (...)", nested parentheses included), else None."""
+    start = 0
+    while (i := text.find(f"{resource}: ", start)) >= 0:
+        start, j = i + 1, i + len(resource) + 2
+        if i and text[i - 1] not in " `(":
+            continue
+        for word in ("free", "busy", "paused"):
+            if text.startswith(word, j):
+                k = j + len(word)
+                if text.startswith(" (", k):
+                    depth, k = 0, k + 1
+                    for k in range(k, len(text)):
+                        depth += {"(": 1, ")": -1}.get(text[k], 0)
+                        if not depth:
+                            return i, k + 1
+                    return i, len(text)   # cut off at the note's length: the rest is this line's
+                if word != "busy":
+                    return i, k
+    return None
+
+
+def live_note(p, cfg: dict, result: dict, note: str, cache: dict | None = None) -> str:
+    """A waiting task's note as a reader shows it (`ttp status`, the web app): on a wait whose probe is
+    `ttp lock --probe` commands, each lock's line is the probe's answer now (its live holders with pid and
+    liveness, or free), never the holders the stored note or hand-off named, which may have changed since
+    the daemon wrote it. Lines the note lacks (a note from the hand-off's words) make it "waiting for
+    <the locks now>". Any other wait, a note the daemon manages (held: ...) or a probe that fails: `note`
+    as stored. `cache` shares answers across the tasks of one listing."""
+    if result.get("status") != "waiting" or str(note or "").startswith("held: "):
+        return note
+    found, rest = locks.lock_probe_parts(str(result.get("retry_when") or ""))
+    if not found:
+        return note
+    cache = {} if cache is None else cache
+    try:
+        for key in found:
+            if key not in cache:
+                cache[key] = answer(p, cfg, *key)[1]
+    except Exception:
+        return note
+    out, whole = str(note or ""), True
+    for r, sh in found:
+        if (seg := _segment(out, r)) is None:
+            whole = False
+            break
+        out = out[:seg[0]] + cache[(r, sh)] + out[seg[1]:]
+    if whole:
+        return out
+    return ("waiting for " + "; ".join(cache[k] for k in found)
+            + (f"; then `{' ; '.join(rest)}`" if rest else ""))[:500]
