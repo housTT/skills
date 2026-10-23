@@ -329,8 +329,16 @@ prolonged whole-box outage.
   with no result since the run started (the earliest such run for a resource or the project). A
   queued task, never started or queued again after a run, is not judged here: the daemon's stall
   check (`coordinator.stall_wake_h`) owns it, since it knows whether dispatch would start the task
-  now. Known gap: that check wakes only when no worker run at all has started for that long, so one
-  ready task that dispatch passes over while other runs keep starting is not reported. A `stall` event
+  now. That check also times each ready task dispatch passes over while other runs keep starting:
+  one `not_started` event names `overdue:#<task>` once it has been ready with a worker slot free for
+  `overdue_m` (15) minutes, or `multilock:#<task>` once it has waited on a busy resource among several
+  it needs for `multilock_h` (1) hour. Its reason names each busy resource and its live holder (a
+  running task, or who holds the `ttp lock` slot, with pid and keeper jobs), or says "no holder:
+  dispatch did not start it". It clears when the task starts. Dispatch also logs once per wait when it
+  skips a ready task for a busy resource. A `change_probe` event names `change-probe:<id>`: an open
+  machine change of this project whose until-probe passed `change_probe_m` (15) minutes ago while the
+  task it names is still queued or waiting; it clears when the change closes or the task wakes. A
+  task with a start_when, a paused resource or a future start time is never overdue. A `stall` event
   names a repeat: a retry_when or start_when probe still saying not yet after `probe_n` (10)
   verdicts and `probe_h` (1) hour (waits
   on the task's own job, a push, CI, another task or a time are left out), a task's or schedule's

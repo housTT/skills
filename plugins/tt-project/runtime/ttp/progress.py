@@ -34,9 +34,20 @@ runs are running, one keyed `no_progress` event names what is stuck, since when 
 - project: no result anywhere for `project_h` (2) hours since the earliest running worker run started.
 
 A queued task, never started or queued again after a run, is never judged here: whether dispatch
-would start it now is Daemon.check_stall's (its _start_hold model), not a second clock here. Known
-gap: check_stall wakes only when no worker run at all has started for coordinator.stall_wake_h, so
-one ready task that dispatch passes over while other runs keep starting is reported by neither.
+would start it now is Daemon.check_stall's (its _start_hold model), not a second clock here. Its
+per-task part times one ready task dispatch passes over while other runs keep starting and hands the
+keys to `raise_start_waits`, which judges them like the rest (one `not_started` event per key):
+
+- overdue: `overdue:#<task>`, ready with a worker slot free for `overdue_m` (15) minutes, naming each
+  busy resource it needs and its live holder, else "no holder: dispatch did not start it";
+- multilock: `multilock:#<task>`, waiting on a busy resource among several it needs for
+  `multilock_h` (1) hours, naming every busy one and its holder.
+
+Either clears at once when the task starts or leaves the queue.
+
+Machine changes: `change-probe:<id>`, one `change_probe` event once an open machine change of this
+project with an until-probe has had it pass for `change_probe_m` (15) minutes while the task it
+names is still queued or waiting. It clears at once when the change closes or the task wakes.
 
 Repeat detectors, each one keyed `stall` event with the count, first and last seen and the reason:
 
@@ -215,12 +226,24 @@ def stalled(state: Path, cfg: dict | None, now: float | None = None) -> list[dic
 KEY = "progress_check"          # coordinator.progress_check: thresholds
 STATE_KEY = "progress_state"    # kv: results seen, counters, raised keys, cleared history
 SOURCE = "daemon:progress"      # the events' source, for observation mutes
-EVENT_KINDS = ("no_progress", "stall")
+# Each key kind's event kind. check's own: no_progress, stall and change-probe. overdue and multilock
+# are Daemon.check_stall's never-started tasks (raise_start_waits): they only pass through these keys,
+# wakes and hysteresis; their readiness is its _start_hold model, never a clock here.
+EVENTS = {"no_progress": "no_progress", "stall": "stall", "change-probe": "change_probe",
+          "overdue": "not_started", "multilock": "not_started"}
+EVENT_KINDS = ("no_progress", "stall", "change_probe", "not_started")
+CHECK_KINDS = ("no_progress", "stall", "change-probe")
+START_KINDS = ("overdue", "multilock")
+HEADS = {"no_progress": "No progress: running work produced no result past its threshold.",
+         "stall": "Stall: the same not-yet or failure keeps repeating.",
+         "change_probe": "Machine change due its undo: its until-probe passed, the task that owns it still waits.",
+         "not_started": "Not started: dispatch passes over a ready task while a worker slot is free."}
 # clear_n/clear_min: hysteresis. A raised key clears only after clear_n healthy checks in a row that
 # span clear_min minutes: at the daemon's 60 s check that is 3 checks and half an hour, long enough
 # for slots that fill and free, short enough that a fixed key leaves the digest within the hour.
 CHECK_DEFAULTS = {"task_h": 2, "resource_h": 2, "project_h": 2, "probe_n": 10, "probe_h": 1, "repeat_n": 5,
-                  "fail_n": 3, "escalate_x": 2, "rewake_h": 12, "quiet_h": 6, "clear_n": 3, "clear_min": 30}
+                  "fail_n": 3, "escalate_x": 2, "rewake_h": 12, "quiet_h": 6, "clear_n": 3, "clear_min": 30,
+                  "overdue_m": 15, "multilock_h": 1, "change_probe_m": 15}
 HEADER = "## Progress (stuck work: re-plan, re-tier, re-point the probe, route around, cancel or fix the cause)"
 BAD_RUNS = ("failed", "timeout", "stalled")
 # Waits expected to be long, whose producer has its own clock: the task's own detached job or checks,
@@ -559,7 +582,12 @@ def _line(c: dict, now: float, where: Any = None) -> str:
     text += f"; why: {c['reason'] or '?'}"
     if c.get("selfref"):
         text += f"; {c['selfref']}"
-    return f"[{c['key']}] {text}"
+    return f"[{_key(c)}] {text}"
+
+
+def _key(c: dict) -> str:
+    """The key an event shows: bare for its own kind's (task:#3), with the kind for another (overdue:#3)."""
+    return c["key"] if EVENTS.get(c["kind"]) == c["kind"] else f"{c['kind']}:{c['key']}"
 
 
 def _since(ts: float, now: float, where: Any) -> str:
@@ -572,11 +600,14 @@ def _since(ts: float, now: float, where: Any) -> str:
     return f"{_dur(now - ts)} ago"
 
 
-def _decide(st: dict, conds: list[dict], s: dict, now: float) -> list[tuple[dict, str]]:
+def _decide(st: dict, conds: list[dict], s: dict, now: float, kinds: tuple = CHECK_KINDS,
+            gone: set | frozenset = frozenset()) -> list[tuple[dict, str]]:
     """(condition, why it wakes: new, escalated or still) for each key due a wake; updates `raised`.
     A raised key missing from this check counts one healthy check (ok_n, since ok_since) and moves to
     `history` only after clear_n of them spanning clear_min minutes (hysteresis); seen again before
-    that, it continues its raise: no new wake, and escalation still measured from its last wake."""
+    that, it continues its raise: no new wake, and escalation still measured from its last wake.
+    Only raised keys of `kinds` (the caller's detectors) are judged; one in `gone` (its condition
+    really ended: the task started, the change closed) clears at once."""
     due, seen = [], set()
     for c in conds:
         key = f"{c['kind']}:{c['key']}"
@@ -592,11 +623,11 @@ def _decide(st: dict, conds: list[dict], s: dict, now: float) -> list[tuple[dict
                                                      if why else {})}
         if why:
             due.append((c, why))
-    for key in [k for k in st["raised"] if k not in seen]:
+    for key in [k for k, r in st["raised"].items() if k not in seen and r.get("kind") in kinds]:
         r = st["raised"][key]
         r["ok_n"] = int(r.get("ok_n") or 0) + 1
         r["ok_since"] = r.get("ok_since") or now
-        if r["ok_n"] < s["clear_n"] or now - float(r["ok_since"]) < s["clear_min"] * 60:
+        if key not in gone and (r["ok_n"] < s["clear_n"] or now - float(r["ok_since"]) < s["clear_min"] * 60):
             continue
         st["raised"].pop(key)
         st["history"].append({"key": key, "kind": r.get("kind"), "what": r.get("what"), "raised": r.get("first"),
@@ -605,11 +636,12 @@ def _decide(st: dict, conds: list[dict], s: dict, now: float) -> list[tuple[dict
 
 
 def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | None = None, where: Any = None,
-          current_probe: Callable[[dict], str | None] | None = None, wake: bool = True) -> list[dict]:
+          current_probe: Callable[[dict], str | None] | None = None, wake: bool = True,
+          changes: list[dict] | None = None) -> list[dict]:
     """One pass: read drivers' results, find every stuck condition, raise one event per kind for the
-    keys due a wake (muted keys only counted) and clear the keys healthy long enough. Returns the
+    keys due a wake (muted keys only counted) and clear the keys healthy long enough. `changes`: this
+    project's open machine-ledger changes (None: change-probe keys are not judged). Returns the
     events raised."""
-    from . import screen as scr
     now = time.time() if now is None else now
     cfg = cfg or {}
     s = check_settings(cfg)
@@ -620,33 +652,94 @@ def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | N
     _take_results(st, recs, now)
     conds = (no_progress(db, cfg, s, st, now, streaks(recs)) + probe_stalls(db, s, st, now, current_probe)
              + run_stalls(db, s, now) + schedule_stalls(db, s, st, now))
-    due = _decide(st, conds, s, now)
-    events = []
+    kinds, gone = CHECK_KINDS, set()
+    if changes is None:
+        kinds = tuple(k for k in CHECK_KINDS if k != "change-probe")
+    else:
+        got, gone = change_probes(db, s, st, changes, now)
+        conds += got
+    due = _decide(st, conds, s, now, kinds, gone)
     with db.tx():
         _save(db, st)
-        for kind in EVENT_KINDS:
-            items = []
-            for c, why in due:
-                if c["kind"] != kind:
-                    continue
-                text = _line(c, now, where) + ("" if why == "new" else f" ({why})")
-                if scr.count_muted(db, SOURCE, text, "normal", now, whole=True, key=c["key"]):
-                    continue
-                items.append((c, text))
-            if not items or not wake:
+        return _emit(db, due, now, where, wake)
+
+
+def raise_start_waits(db: DB, cfg: dict | None, conds: list[dict], now: float | None = None,
+                      where: Any = None) -> list[dict]:
+    """Raise Daemon.check_stall's ready tasks that dispatch does not start (overdue and multilock
+    conditions it built from its _start_hold model) through the same keys, wakes, mutes and hysteresis
+    as check. A key whose task is no longer queued (it started, or ended) clears at once. Returns
+    the events raised."""
+    now = time.time() if now is None else now
+    s, st = check_settings(cfg), load(db)
+    gone = set()
+    for key, r in st["raised"].items():
+        if r.get("kind") in START_KINDS:
+            t = db.task(int(key.rsplit("#", 1)[1])) if key.rsplit("#", 1)[-1].isdigit() else None
+            if not t or t["status"] != "queued":
+                gone.add(key)
+    due = _decide(st, conds, s, now, START_KINDS, gone)
+    with db.tx():
+        _save(db, st)
+        return _emit(db, due, now, where, True)
+
+
+def change_probes(db: DB, s: dict, st: dict, changes: list[dict], now: float) -> tuple[list[dict], set[str]]:
+    """Open machine changes of this project (`changes`, the ledger's) whose until-probe passed
+    `change_probe_m` minutes ago while the task that made the change, or its until-task, is still
+    queued or waiting: the change is due its undo, and its owner sleeps. The ledger pages the
+    coordinator that the change is overdue but wakes no task. Also returns the raised keys whose
+    condition ended: the change closed or its task no longer waits."""
+    out, gone, open_ids = [], set(), set()
+    for c in changes:
+        open_ids.add(str(c.get("id")))
+        try:
+            tid = int(c.get("task") or c.get("until_task") or 0)
+        except (TypeError, ValueError):
+            tid = 0
+        t = db.task(tid) if tid else None
+        if not t:
+            continue
+        if t["status"] not in ("queued", "waiting"):
+            gone.add(f"change-probe:{c.get('id')}")
+            continue
+        passed = c.get("probe_passed")
+        if not s["change_probe_m"] or not passed or now - float(passed) < s["change_probe_m"] * 60:
+            continue
+        out.append({"kind": "change-probe", "key": str(c.get("id")), "task": tid, "n": 1, "since": float(passed),
+                    "what": f"machine change #{c.get('id')} on {c.get('alias')} ({_clip(c.get('what'), 60)}), "
+                            f"owned by task #{tid} ({t['status']})",
+                    "reason": f"its until-probe passed; undo `{_clip(c.get('undo'), 80)}` and close it, "
+                              f"or wake task #{tid}"})
+    gone |= {k for k, r in st["raised"].items() if r.get("kind") == "change-probe"
+             and k.split(":", 1)[1] not in open_ids}
+    return out, gone
+
+
+def _emit(db: DB, due: list[tuple[dict, str]], now: float, where: Any, wake: bool) -> list[dict]:
+    """One queued event per event kind for the keys due a wake (muted keys only counted)."""
+    from . import screen as scr
+    events = []
+    for kind in EVENT_KINDS:
+        items = []
+        for c, why in due:
+            if EVENTS.get(c["kind"], c["kind"]) != kind:
                 continue
-            head = ("No progress: running work produced no result past its threshold."
-                    if kind == "no_progress" else
-                    "Stall: the same not-yet or failure keeps repeating.")
-            text = (head + " Re-plan, re-tier, re-point the probe, route around, cancel, or add a harness task "
-                    "for the cause:\n" + "\n".join(f"- {t}" for _, t in items))
-            fp = f"{kind}:" + ",".join(c["key"] for c, _ in items)
-            task = items[0][0].get("task") if len(items) == 1 else None
-            data = json.dumps([{k: c.get(k) for k in ("key", "what", "since", "last", "n", "reason", "selfref")}
-                               for c, _ in items])
-            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
-                 "VALUES(?,?,?,?,?,?,?,?,?)", (now, SOURCE, kind, fp[:300], "normal", text[:4000], data, "queued", task))
-            events.append({"kind": kind, "keys": [c["key"] for c, _ in items], "text": text})
+            text = _line(c, now, where) + ("" if why == "new" else f" ({why})")
+            if scr.count_muted(db, SOURCE, text, "normal", now, whole=True, key=c["key"]):
+                continue
+            items.append((c, text))
+        if not items or not wake:
+            continue
+        text = (HEADS[kind] + " Re-plan, re-tier, re-point the probe, route around, cancel, or add a harness task "
+                "for the cause:\n" + "\n".join(f"- {t}" for _, t in items))
+        fp = f"{kind}:" + ",".join(_key(c) for c, _ in items)
+        task = items[0][0].get("task") if len(items) == 1 else None
+        data = json.dumps([{k: c.get(k) for k in ("key", "what", "since", "last", "n", "reason", "selfref")}
+                           for c, _ in items])
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
+             "VALUES(?,?,?,?,?,?,?,?,?)", (now, SOURCE, kind, fp[:300], "normal", text[:4000], data, "queued", task))
+        events.append({"kind": kind, "keys": [_key(c) for c, _ in items], "text": text})
     return events
 
 

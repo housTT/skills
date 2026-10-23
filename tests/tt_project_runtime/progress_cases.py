@@ -576,3 +576,232 @@ def test_progress_daemon_tick_runs_the_check(env):
     d.check_progress()                                  # throttled, and unchanged anyway
     assert len(_prog_events(p)) == 1
     assert f"no_progress:task:#{tid}" in progress.load(p.db)["raised"]
+
+
+# Ready tasks dispatch does not start (Daemon.check_stall's per-task part) and machine changes whose
+# until-probe passed while their task sleeps -------------------------------------------------------
+
+def _start_events(p):
+    return _prog_events(p, "not_started")
+
+
+def _start_setup(env, monkeypatch):
+    """_stall_setup with the whole-project stall wake off: the per-task part runs on its own."""
+    p, d, now, check = _stall_setup(env, monkeypatch)
+    d.cfg["coordinator"]["stall_wake_h"] = 0
+    return p, d, now, check
+
+
+def _ready_task(p, title="Ready", labels=()):
+    return p.db.add_task(title, "s", kind="work", tier="light", origin="coordinator", labels=list(labels))
+
+
+def test_overdue_fires_past_threshold_once_escalates_and_clears_when_the_task_starts(env, monkeypatch):
+    from ttp import progress
+    p, d, now, check = _start_setup(env, monkeypatch)
+    tid = _ready_task(p)
+    for m in range(15):
+        check(now + m * 60)
+    assert _start_events(p) == [], "under overdue_m (15 min)"
+    check(now + 15 * 60)
+    ev = _start_events(p)
+    assert len(ev) == 1 and ev[0]["status"] == "queued", ev
+    assert f"overdue:#{tid}" in ev[0]["text"] and "no holder: dispatch did not start it" in ev[0]["text"], ev[0]["text"]
+    for m in range(16, 30):
+        check(now + m * 60)
+    assert len(_start_events(p)) == 1, "one wake per key"
+    check(now + 30 * 60)
+    assert len(_start_events(p)) == 2, "again once its wait doubled (escalation)"
+    p.db.update_task(tid, status="running")
+    check(now + 31 * 60)
+    st = progress.load(p.db)
+    assert f"overdue:#{tid}" not in st["raised"], "a started task clears at once"
+    assert [h["key"] for h in st["history"]] == [f"overdue:#{tid}"]
+    assert len(_start_events(p)) == 2
+
+
+def test_overdue_counts_only_while_a_worker_slot_is_free(env, monkeypatch):
+    p, d, now, check = _start_setup(env, monkeypatch)
+    d.cfg.setdefault("budget", {})["max_parallel_workers"] = 1
+    _ready_task(p)
+    p.db.x("INSERT INTO runs(task,role,started,status,provider) VALUES(NULL,'worker',?,'running',?)",
+           (now, d.cfg.get("core_provider") or "claude"))
+    run = p.db.one("SELECT MAX(id) id FROM runs")["id"]
+    for m in range(40):
+        check(now + m * 60)
+    assert _start_events(p) == [], "a full worker gate is not dispatch passing the task over"
+    p.db.x("UPDATE runs SET status='ok', ended=? WHERE id=?", (now + 40 * 60, run))
+    for m in range(40, 55):
+        check(now + m * 60)
+    assert _start_events(p) == [], "the clock starts when the slot frees"
+    check(now + 55 * 60)
+    assert len(_start_events(p)) == 1
+
+
+def test_overdue_names_each_busy_resource_and_its_live_holder(env, monkeypatch):
+    from ttp import locks
+    p, d, now, check = _start_setup(env, monkeypatch)
+    holder = _ready_task(p, "Holder", ["exclusive:rig"])
+    p.db.update_task(holder, status="running")
+    tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])
+    for m in range(16):
+        check(now + m * 60)
+    ev = _start_events(p)
+    assert len(ev) == 1 and f"overdue:#{tid}" in ev[0]["text"], ev
+    assert f"rig held by running task(s) #{holder}" in ev[0]["text"], ev[0]["text"]
+    # A `ttp lock` slot held right now: its holder label, pid and liveness.
+    p.db.update_task(holder, status="done")
+    p.db.update_task(tid, status="cancelled")
+    other = _ready_task(p, "Needs the bench", ["exclusive:bench"])
+    held = locks.try_take(d._slot_paths("bench"), "task #99 (run 7)", "exclusive")
+    try:
+        waits = d._resource_waits(p.db.task(other))
+        line = waits[0]
+        assert len(waits) == 1, waits
+        assert line.startswith("bench held by task #99 (run 7) since") and f"pid {os.getpid()} alive" in line, line
+        for m in range(16, 32):
+            check(now + m * 60)
+        ev = _start_events(p)
+        assert len(ev) == 2 and f"overdue:#{other}" in ev[1]["text"] and "bench held by task #99" in ev[1]["text"], ev
+    finally:
+        held.close()
+    assert d._resource_waits(p.db.task(other)) == []
+
+
+def test_multilock_names_every_busy_resource_and_fires_after_an_hour(env, monkeypatch):
+    p, d, now, check = _start_setup(env, monkeypatch)
+    a = _ready_task(p, "Holds both", ["exclusive:rig", "resource:bench"])
+    b = _ready_task(p, "Uses the bench", ["resource:bench"])
+    for t in (a, b):
+        p.db.update_task(t, status="running")
+    tid = _ready_task(p, "Needs both", ["exclusive:rig", "resource:bench"])
+    for m in range(0, 60, 5):
+        check(now + m * 60)
+    assert _start_events(p) == [], "a wait on several resources is not overdue at 15 min"
+    check(now + 60 * 60)
+    ev = _start_events(p)
+    assert len(ev) == 1 and f"multilock:#{tid}" in ev[0]["text"], ev
+    assert f"bench held by running task(s) #{a}, #{b}" in ev[0]["text"] and f"rig held by running task(s) #{a}" \
+        in ev[0]["text"], ev[0]["text"]
+    check(now + 61 * 60)
+    assert len(_start_events(p)) == 1
+
+
+def test_overdue_never_fires_for_a_start_when_a_paused_resource_or_a_future_start(env, monkeypatch):
+    p, d, now, check = _start_setup(env, monkeypatch)
+    _ready_task(p, "Deferred", ["start_when:test -f /nonexistent/flag"])
+    _ready_task(p, "Paused rig", ["exclusive:rig"])
+    p.db.set_kv("paused_resources", {"rig": {"reason": "maintenance", "since": now}})
+    later = _ready_task(p, "Later")
+    p.db.update_task(later, not_before=now + 86400)
+    for m in range(0, 120, 5):
+        check(now + m * 60)
+    assert _start_events(p) == []
+
+
+def test_start_waits_wake_once_across_a_flap(env, monkeypatch):
+    """A ready task that is held for one check (a pause) restarts its clock but continues its raised
+    key: no second wake as new; the clear needs the hysteresis."""
+    from ttp import progress
+    p, d, now, check = _start_setup(env, monkeypatch)
+    tid = _ready_task(p, "Flaps", ["exclusive:rig"])
+    for m in range(16):
+        check(now + m * 60)
+    assert len(_start_events(p)) == 1
+    p.db.set_kv("paused_resources", {"rig": {"reason": "maintenance", "since": now}})
+    check(now + 16 * 60)
+    p.db.set_kv("paused_resources", {})
+    for m in range(17, 29):
+        check(now + m * 60)
+    assert f"overdue:#{tid}" in progress.load(p.db)["raised"], "a one-check flap does not clear the key"
+    for m in range(29, 40):
+        check(now + m * 60)
+    assert len(_start_events(p)) == 1, "back past the threshold: the same raise, no new wake"
+
+
+def test_dispatch_logs_a_resource_wait_once(env, monkeypatch):
+    p, d, now, check = _start_setup(env, monkeypatch)
+    holder = _ready_task(p, "Holder", ["exclusive:rig"])
+    p.db.update_task(holder, status="running")
+    tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])
+    log = lambda: (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    for _ in range(3):
+        d._log_resource_wait(p.db.task(tid))
+    line = f"task {tid}: ready, not started: rig held by running task(s) #{holder}"
+    assert log().count(line) == 1, log()
+    check(now)                                    # still held: remembered
+    d._log_resource_wait(p.db.task(tid))
+    assert log().count(line) == 1
+    p.db.update_task(holder, status="done")
+    check(now + 60)                               # free: forgotten, a new wait logs again
+    p.db.update_task(holder, status="running")
+    d._log_resource_wait(p.db.task(tid))
+    assert log().count(line) == 2
+
+
+def test_change_probe_fires_once_and_clears_when_the_change_closes_or_the_task_wakes(env):
+    from ttp import progress
+    p = make(env)
+    now = time.time()
+    cfg = {"coordinator": {"progress_check": {"task_h": 0, "resource_h": 0, "project_h": 0}}}
+    tid = _prog_waiting(p, "Waits on its drop-in", "test -f /nonexistent/done")
+    ch = {"id": 5, "alias": "box-a", "what": "a test drop-in", "undo": "rm -f /etc/drop-in", "by": p.name,
+          "task": tid, "probe": "test -f /nonexistent/done"}
+    assert progress.check(p.db, cfg, p.state, now, changes=[ch]) == [], "probe not passed"
+    ch["probe_passed"] = now
+    assert progress.check(p.db, cfg, p.state, now + 600, changes=[ch]) == [], "under change_probe_m (15 min)"
+    got = progress.check(p.db, cfg, p.state, now + 16 * 60, changes=[ch])
+    assert [(e["kind"], e["keys"]) for e in got] == [("change_probe", ["change-probe:5"])], got
+    ev = _prog_events(p, "change_probe")[0]
+    assert f"task #{tid}" in ev["text"] and "rm -f /etc/drop-in" in ev["text"], ev["text"]
+    for dt in (17, 30, 90, 600):
+        assert progress.check(p.db, cfg, p.state, now + dt * 60, changes=[ch]) == [], "fires once"
+    assert progress.check(p.db, cfg, p.state, now + 601 * 60, changes=None) == [], "ledger unread: left as is"
+    assert "change-probe:5" in progress.load(p.db)["raised"]
+    # The change closes: the key clears at once.
+    assert progress.check(p.db, cfg, p.state, now + 602 * 60, changes=[]) == []
+    assert "change-probe:5" not in progress.load(p.db)["raised"]
+    # A second change whose task wakes (runs): cleared at once too.
+    ch2 = {**ch, "id": 6, "probe_passed": now + 602 * 60}
+    got = progress.check(p.db, cfg, p.state, now + 620 * 60, changes=[ch2])
+    assert [e["keys"] for e in got] == [["change-probe:6"]]
+    p.db.update_task(tid, status="running")
+    assert progress.check(p.db, cfg, p.state, now + 621 * 60, changes=[ch2]) == []
+    st = progress.load(p.db)
+    assert "change-probe:6" not in st["raised"] and {"change-probe:5", "change-probe:6"} <= {h["key"] for h in st["history"]}
+
+
+def test_change_probe_wakes_once_across_a_flap_of_its_probe(env):
+    from ttp import progress
+    p = make(env)
+    now = time.time()
+    cfg = {"coordinator": {"progress_check": {"task_h": 0, "resource_h": 0, "project_h": 0}}}
+    tid = _prog_waiting(p, "Waits", "test -f /nonexistent/done")
+    ch = {"id": 7, "alias": "box-a", "what": "x", "undo": "y", "by": p.name, "task": tid, "probe_passed": now}
+    assert len(progress.check(p.db, cfg, p.state, now + 16 * 60, changes=[ch])) == 1
+    gone = {k: v for k, v in ch.items() if k != "probe_passed"}    # the probe said not yet once
+    assert progress.check(p.db, cfg, p.state, now + 17 * 60, changes=[gone]) == []
+    ch["probe_passed"] = now + 18 * 60
+    for m in (18, 40, 60):
+        assert progress.check(p.db, cfg, p.state, now + m * 60, changes=[ch]) == []
+    assert "change-probe:7" in progress.load(p.db)["raised"]
+
+
+def test_check_progress_passes_only_this_projects_machine_changes(env, monkeypatch):
+    from ttp import machine_ledger, progress
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    got = {}
+    mine = {"id": 1, "by": p.name}
+    monkeypatch.setattr(machine_ledger, "changes", lambda: [mine, {"id": 2, "by": "another"}])
+    monkeypatch.setattr(progress, "check", lambda *a, **k: got.update(k) or [])
+    d.check_progress()
+    assert got["changes"] == [mine]
+    d._progress_checked = 0
+
+    def broken():
+        raise OSError("unreadable")
+    monkeypatch.setattr(machine_ledger, "changes", broken)
+    d.check_progress()
+    assert got["changes"] is None

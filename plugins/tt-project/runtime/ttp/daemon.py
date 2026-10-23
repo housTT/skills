@@ -5035,13 +5035,20 @@ class Daemon:
     def check_progress(self, every_s: float = 60) -> None:
         """Model-free progress and stall check (progress.py): running work with no result past its
         threshold raises `no_progress` (never-started work is check_stall's); the same not-yet,
-        refusal or failure repeating raises `stall`. Each key wakes the coordinator once, again on
-        escalation or after a long interval."""
+        refusal or failure repeating raises `stall`; a machine change of this project whose until-probe
+        passed while its task still waits raises `change_probe`. Each key wakes the coordinator once,
+        again on escalation or after a long interval."""
         now = time.time()
         if now - getattr(self, "_progress_checked", 0.0) < every_s:
             return
         self._progress_checked = now
-        for e in progress.check(self.p.db, self.cfg, self.p.state, now, where=self.p, current_probe=_current_probe):
+        try:
+            changes = [c for c in machine_ledger.changes() if c.get("by") == self.p.name]
+        except Exception as e:   # an unreadable ledger: its keys are left as they are
+            log(self.p, f"progress check: machine ledger not read: {e}")
+            changes = None
+        for e in progress.check(self.p.db, self.cfg, self.p.state, now, where=self.p, current_probe=_current_probe,
+                                changes=changes):
             log(self.p, f"progress check: {e['kind']} for {', '.join(e['keys'])}")
 
     def check_stall(self, every_s: float = 60) -> None:
@@ -5054,8 +5061,13 @@ class Daemon:
         worker run ends the stall.
 
         Held tasks are never counted or listed: each hold has its own alert. Accepted gap: a hold
-        that is itself wrong (a lock that never clears, a probe that can never pass) is not
-        reported here; the lock, hold and wait checks cover it."""
+        that is itself wrong (a probe that can never pass) is not reported here; the hold and wait
+        checks cover it.
+
+        Per task (_unstarted), while other runs keep starting: a ready task that dispatch would start
+        now, or would but for a busy resource, for coordinator.progress_check.overdue_m minutes raises
+        `overdue:#<task>`, one waiting on a busy resource among several it needs `multilock:#<task>`
+        after multilock_h hours, naming each busy resource and its live holder."""
         now = time.time()
         last_check = getattr(self, "_stall_checked", 0.0)
         if now - last_check < every_s:
@@ -5063,11 +5075,12 @@ class Daemon:
         self._stall_checked = now
         db = self.p.db
         hours = float(self.cfg["coordinator"].get("stall_wake_h", 3) or 0)
+        ps = progress.check_settings(self.cfg)
         # Dispatch does not run (settling, no config) or did not run between checks (a paused
         # project, a long tick): readiness counts again from now.
-        if hours <= 0 or now - self._started < STALL_SETTLE_S or self.cfg_status == "unavailable" \
-                or self.settling() or now - last_check > STALL_GAP_S:
-            self._stall_ready = {}
+        if (hours <= 0 and not ps["overdue_m"] and not ps["multilock_h"]) or now - self._started < STALL_SETTLE_S \
+                or self.cfg_status == "unavailable" or self.settling() or now - last_check > STALL_GAP_S:
+            self._stall_ready, self._start_waits = {}, {}
             return
         core = self.cfg.get("core_provider", "claude")
         ready = db.ready_tasks()
@@ -5075,9 +5088,14 @@ class Daemon:
             "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' GROUP BY provider")}
         ctx = {"now": now, "paused": db.paused_resources(), "busy": busy, "committed": None,
                "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in ready}}}
+        holds = {t["id"]: self._start_hold(t, t["provider"] or core, ctx) for t in ready}
+        self._res_wait_logged = getattr(self, "_res_wait_logged", set()) & {i for i, h in holds.items() if h == "resource"}
+        self._unstarted(ready, holds, now, ps)
+        if hours <= 0:
+            self._stall_ready = {}
+            return
         seen = getattr(self, "_stall_ready", {})
-        self._stall_ready = {t["id"]: seen.get(t["id"], now) for t in ready
-                             if self._start_hold(t, t["provider"] or core, ctx) is None}
+        self._stall_ready = {tid: seen.get(tid, now) for tid, h in holds.items() if h is None}
         stuck = [t for t in ready if now - self._stall_ready.get(t["id"], now) >= hours * 3600]
         if not stuck:
             return
@@ -5099,6 +5117,67 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", f"stall:{last_id}", "high", text[:4000], "queued"))
         log(self.p, f"stall: {len(stuck)} task(s) ready for {hours:g} h or more, no worker run since {when}")
+
+    def _unstarted(self, ready: list[dict], holds: dict[int, str | None], now: float, ps: dict) -> None:
+        """check_stall's per-task part: each ready task dispatch would start now (`holds` None: a worker
+        slot is free and nothing holds it), or would but for a busy resource ('resource'), at every check
+        since `since`. Past overdue_m minutes it is `overdue:#<task>`; one waiting on a busy resource among
+        several it needs is `multilock:#<task>` past multilock_h hours. The reason names each busy resource
+        and its live holder (_resource_waits), else 'no holder: dispatch did not start it'. Raised through
+        progress.raise_start_waits: one wake per key, again on escalation; it clears once the task starts."""
+        prev = getattr(self, "_start_waits", {})
+        self._start_waits = {tid: prev.get(tid, now) for tid, h in holds.items() if h in (None, "resource")}
+        conds = []
+        for t in ready:
+            since = self._start_waits.get(t["id"])
+            if since is None:
+                continue
+            waits = self._resource_waits(t) if holds[t["id"]] == "resource" else []
+            multi = bool(waits) and len(coord.task_resources(t)) > 1
+            limit = ps["multilock_h"] * 3600 if multi else ps["overdue_m"] * 60
+            if not limit or now - since < limit:
+                continue
+            conds.append({"kind": "multilock" if multi else "overdue", "key": f"#{t['id']}", "task": t["id"],
+                          "what": f"task #{t['id']} {coord.clip(t['title'], 60)} ready, not started",
+                          "since": since, "n": now - since,
+                          "reason": "; ".join(waits) or "no holder: dispatch did not start it"})
+        try:
+            for e in progress.raise_start_waits(self.p.db, self.cfg, conds, now, where=self.p):
+                log(self.p, f"stall check: {e['kind']} for {', '.join(e['keys'])}")
+        except Exception:
+            log(self.p, "stall check: not-started keys not raised\n" + traceback.format_exc())
+
+    def _resource_waits(self, task: dict) -> list[str]:
+        """Each resource that keeps ready `task` from starting now (_resources_free's checks), as
+        '<resource> held by <holders>': the running tasks that fill its slots, else who holds its lock
+        files right now (locks.holders_now: label with project, task and run, pid and whether it lives,
+        a keeper's jobs). Empty when none is busy."""
+        running = self.p.db.q("SELECT id, labels FROM tasks WHERE status='running'")
+        out = []
+        for res, excl in [(r, False) for r in _shared(task)] + [(r, True) for r in _exclusive(task)]:
+            lock = locks.canonical(self.cfg, res)
+            slots = shared.slots(self.p, lock, self.cfg)
+            users = [t for t in running if lock in {locks.canonical(self.cfg, r) for r in
+                                                    _exclusive(t) + ([] if excl else _shared(t))}]
+            if len(users) >= (slots if excl else 2 * slots):
+                out.append(f"{res} held by running task(s) {', '.join('#' + str(t['id']) for t in users)}")
+                continue
+            paths = self._slot_paths(res) if excl else []
+            if paths and not locks.any_free(paths):
+                mine = shared.holder(self.p, res, hold.who(task["id"]), self.cfg)
+                if not any(hold.own_keeper(lb, mine) for lb in locks.held_labels(paths)):
+                    out.append(f"{res} held by {'; '.join(locks.holders_now(paths, self.p)) or 'an unnamed holder'}")
+        return out
+
+    def _log_resource_wait(self, task: dict) -> None:
+        """Log once per wait that dispatch skips ready `task` because a resource it needs is busy, naming
+        each and its holder (check_stall forgets the task once nothing holds it)."""
+        logged = self.__dict__.setdefault("_res_wait_logged", set())
+        if task["id"] in logged:
+            return
+        logged.add(task["id"])
+        waits = "; ".join(self._resource_waits(task)) or "a resource it needs is busy"
+        log(self.p, f"task {task['id']}: ready, not started: {waits}")
 
     def check_idle_capacity(self, every_s: float = 60) -> None:
         """Model-free idle-capacity wake (idlecap.py): a device resource of the project idle for
@@ -5785,6 +5864,8 @@ class Daemon:
                 continue
             if why in (None, "resource"):
                 reached.add(task["id"])
+            if why == "resource":
+                self._log_resource_wait(task)
             if why:
                 continue
             skipped, gated = self._wake_gate(task)
