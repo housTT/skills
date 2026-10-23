@@ -3908,6 +3908,20 @@ def result(marker: Path, pushed_only: bool = False) -> int:
     return 0
 
 
+def unpushed(marker: Path) -> str:
+    """Why the finished push of `marker` did not land (as `--result` reads it), or '' when it pushed,
+    still runs, finished with nothing to push or its marker cannot be read: the daemon then wakes a
+    task waiting on it at its own tier, as for failed checks."""
+    m = _read(Path(marker))
+    if m.get("kind") == "batch":
+        out = m.get("outcome")
+        return f"batch {out}" + (f" ({m['message']})" if m.get("message") else "") \
+            if out and out not in ("pushed", "landed", "nothing") else ""
+    if m.get("status") in (None, "pushed", "running", "queued"):
+        return ""
+    return str(m.get("reason") or f"exit {m.get('exit')}")
+
+
 def _pid_alive(pid: Any) -> bool:
     try:
         os.kill(int(pid), 0)

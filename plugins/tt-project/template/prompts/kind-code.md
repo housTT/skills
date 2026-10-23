@@ -11,7 +11,8 @@
   command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`). It reuses
   a recorded pass for the same tree and commands. If they outlast a tool call,
   run `ttp checks --detach -- <cmds>`: its output and exit code go to the run's directory, never
-  the worktree. Hand off `waiting` with the `retry_when` it prints;
+  the worktree. Hand off `waiting` with the `retry_when` it prints and no `wake_tier` (its wake is light;
+  failed checks wake you at your tier);
   that probe also wakes the task if the checks were killed. If only recording the result is
   left after them, put that final hand-off (`done` or `needs_review`) in `on_pass`: a pass on
   the same head records it without a model run; a failure wakes the task at its tier with the output.
@@ -41,7 +42,8 @@
 - It refuses uncommitted changes, rebases onto the target, runs the project's checks on
   the final head, starts over if the branch moved, and pushes without force.
 - Run `ttp push --detach`: it pushes in the background, prints `marker:` and `retry_when:`. Hand off
-  `waiting` with that `retry_when`, `next_step` "report the push" and `retry_after_s` 900. NEVER put plain
+  `waiting` with that `retry_when`, `next_step` "report the push", `retry_after_s` 900 and no `wake_tier`
+  (a push that did not land wakes you at your tier). NEVER put plain
   `ttp push` in the background yourself.
 - On resume, run that `retry_when`: it prints `ttp push: pushed <sha> to <branch>`, or `ttp push: not pushed` with the
   exit code and log tail. Report the sha or the failure. A push that "ended

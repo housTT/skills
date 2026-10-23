@@ -23,6 +23,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -674,7 +675,9 @@ def wake_tier(tier: str, prev: dict, cfg: dict | None = None, harness=None) -> s
     wake (`escalated_wake`) or a `next_step` too long to be one step means judgment: the hand-off's
     `wake_tier` wins, and without one a long `next_step` wakes at the task's own tier. A wait that a
     wake already handed back unchanged (`stale_wakes`) wakes at light whatever it asks: only a light
-    wake that found work and escalated runs above it."""
+    wake that found work and escalated runs above it. So does a wait on another project's reply
+    (ackwait.is_probe) or on a `ttp checks --result` / `ttp push --result` (result_wait): the daemon
+    escalates failed checks and a push that did not land itself."""
     if not isinstance(prev, dict) or prev.get("status") != "waiting":
         return None
     tier = tier if tier in TIER_ORDER else "standard"
@@ -682,10 +685,28 @@ def wake_tier(tier: str, prev: dict, cfg: dict | None = None, harness=None) -> s
         return TIER_ORDER[0]
     if ackwait.is_probe(prev.get("retry_when"), cfg, harness) and not prev.get("escalated_wake"):
         return TIER_ORDER[0]   # another project's reply: its on_pass_cmd settles it, a wake only reads it
+    if result_wait(prev.get("retry_when")) and not prev.get("escalated_wake"):
+        return TIER_ORDER[0]   # a passed result only needs reporting; a failed one comes escalated
     want = "light" if mechanical_step(prev) else prev.get("wake_tier")
     if want not in TIER_ORDER:
         want = "light" if (prev.get("retry_when") or prev.get("waiting_for")) and not next_step(prev) else tier
     return min(want, tier, key=TIER_ORDER.index)
+
+
+def result_wait(probe) -> tuple[str, str] | None:
+    """("checks", run dir) or ("push", marker) when a retry_when is one `ttp checks --result <run dir>` or
+    `ttp push --result <marker> [--pushed]` command, else None. Both exit 1 while the result is pending,
+    so the daemon wakes nothing before it is final."""
+    if not isinstance(probe, str):
+        return None
+    try:
+        words = shlex.split(probe)
+    except ValueError:
+        return None
+    if len(words) < 4 or os.path.basename(words[0]) != "ttp" or words[1] not in ("checks", "push"):
+        return None
+    args = [w for w in words[2:] if not (words[1] == "push" and w == "--pushed")]
+    return (words[1], args[1]) if len(args) == 2 and args[0] == "--result" and not args[1].startswith("-") else None
 
 
 def stale_wakes(prev: dict) -> int:

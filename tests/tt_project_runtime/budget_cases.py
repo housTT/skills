@@ -1584,6 +1584,93 @@ def test_an_unclear_checks_wait_falls_back_to_a_light_wake(env, monkeypatch, tmp
 
 
 
+def test_result_waits_wake_at_light_whatever_they_ask_unless_escalated(env):
+    from ttp import budget as bud
+    long_step = "read the checks, then fix what failed and push " * 10
+    for probe in ("/opt/x/bin/ttp checks --result /tmp/run-1", "ttp push --result '/tmp/a b/push-1.json'",
+                  "ttp push --result /tmp/push-1.json --pushed", "ttp push --pushed --result /tmp/push-1.json"):
+        hand = {"status": "waiting", "summary": "x", "waiting_for": "my checks", "retry_when": probe}
+        for asks in ({"wake_tier": "standard"}, {"wake_tier": "deep", "next_step": long_step}, {}):
+            assert bud.wake_tier("deep", {**hand, **asks}) == "light", (probe, asks)
+        # The daemon escalates a failed result (failed checks, a push that did not land): the task's own tier.
+        assert bud.wake_tier("standard", {**hand, "wake_tier": "standard", "escalated_wake": True}) == "standard"
+    assert bud.result_wait("ttp push --result '/tmp/a b/push-1.json'") == ("push", "/tmp/a b/push-1.json")
+    # A compound or other command is not a result wait: it keeps the tier it asks for.
+    for probe in ("ttp checks --result /tmp/run-1 && test -e /tmp/x", "ttp checks --result", "ttp ci --repo o/r",
+                  "ttp checks --result /tmp/run-1 --pushed", "mytool checks --result /tmp/run-1", "'unclosed"):
+        assert bud.result_wait(probe) is None, probe
+        assert bud.wake_tier("standard", {"status": "waiting", "retry_when": probe, "wake_tier": "standard"}) \
+            == "standard", probe
+
+
+def _push_wait_task(p, tmp_path, marker_body, tier="standard"):
+    """A code task waiting (asking for a standard wake) on a detached push whose marker holds `marker_body`."""
+    from ttp import push
+    now = time.time()
+    tid = p.db.add_task("land the fix", "s", kind="code", tier=tier, origin="user")
+    marker = tmp_path / f"push-{tid}.json"
+    marker.write_text(json.dumps({"target": "main", "log": str(tmp_path / "push.log"), **marker_body}))
+    (tmp_path / "push.log").write_text("ttp push: rebasing\nerror: the remote rejected the push\n")
+    p.db.update_task(tid, status="queued", not_before=now + 3600, result=json.dumps(
+        {"status": "waiting", "summary": "pushing", "waiting_for": "my push", "retry_after_s": 900,
+         "retry_when": push.result_probe(marker, p), "wake_tier": "standard",
+         "next_step": "report the push", "waiting_since": now - 60}))
+    return tid
+
+
+@pytest.mark.parametrize("body, escalated", [
+    ({"status": "pushed", "sha": "a" * 40}, False),
+    ({"status": "failed", "exit": 4, "reason": "a check failed"}, True),
+    ({"kind": "batch", "outcome": "landed", "phase": "finished"}, False),
+    ({"kind": "batch", "outcome": "conflict", "phase": "finished", "message": "rebase stopped"}, True)])
+def test_a_finished_push_result_wakes_at_light_and_a_push_that_did_not_land_at_the_task_tier(
+        env, monkeypatch, tmp_path, body, escalated):
+    p = make(env)
+    from ttp import budget as bud, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid = _push_wait_task(p, tmp_path, body)
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert _ready(p, tid) and task["status"] == "queued", (task["status"], res)
+    assert bud.wake_tier(task["tier"], res) == ("standard" if escalated else "light"), res
+    assert bool(res.get("escalated_wake")) == escalated, res
+    assert ("its push did not land" in res["woke"]) == escalated, res["woke"]
+    if escalated:
+        assert ("a check failed" if "reason" in body else "batch conflict (rebase stopped)") in res["woke"]
+
+
+def test_a_pending_checks_or_push_result_never_wakes_the_task(env, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.runner import proc_start
+    d = dmod.Daemon(p.base)
+    push_tid = _push_wait_task(p, tmp_path, {"status": "queued", "queued": time.time()})
+    checks_tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS, rc=None)
+    run_dir = tmp_path / f"run-{checks_tid}"
+    sleeper = subprocess.Popen(["sleep", "60"])
+    try:
+        (run_dir / "checks.pid").write_text(json.dumps({"pid": sleeper.pid, "started": proc_start(sleeper.pid)}))
+        for _ in range(2):
+            for tid in (push_tid, checks_tid):   # their timers ran out while the results are pending
+                p.db.update_task(tid, not_before=time.time() - 1)
+            d.probe_waiting()
+            for tid in (push_tid, checks_tid):
+                if tid in d._probes:
+                    d._probes[tid][0].wait(_load_scaled(60))
+            d.probe_waiting()
+        for tid in (push_tid, checks_tid):
+            task = p.db.task(tid)
+            assert not _ready(p, tid) and "woke" not in json.loads(task["result"]), (tid, task["result"])
+            assert "probe says not yet" in (task["blocked_reason"] or ""), dict(task)
+        assert not p.db.q("SELECT id FROM runs WHERE task=? AND status IS NULL", (push_tid,))
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+
 def test_a_wait_on_another_projects_reply_must_use_the_ack_wait_probe(env, tmp_path, monkeypatch):
     from ttp import budget as bud
     from ttp import project

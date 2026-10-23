@@ -7930,7 +7930,26 @@ class Daemon:
                 return
             if started:
                 why += f"; its on_pass_cmd was not run: {started}"
-        self._wake_waiting(task, why, now)
+        extra = None
+        try:
+            unpushed = self._push_unpushed(task)
+        except Exception as e:   # a wake is always safe
+            log(self.p, f"task {task['id']}: could not read its push: {type(e).__name__}: {e}")
+            unpushed = ""
+        if unpushed:
+            # A push that did not land needs real work, as failed checks do: wake at the task's own tier.
+            why += f"; its push did not land: {unpushed}"
+            extra = {"wake_tier": task["tier"] if task["tier"] in bud.TIER_ORDER else "standard",
+                     "escalated_wake": True}
+        self._wake_waiting(task, why, now, extra=extra)
+
+    def _push_unpushed(self, task: dict) -> str:
+        """Why the push a waiting task's `ttp push --result <marker>` probe waits on did not land, or ''."""
+        got = bud.result_wait(load_result(task["result"]).get("retry_when"))
+        if not got or got[0] != "push":
+            return ""
+        marker = Path(got[1]).expanduser()
+        return push.unpushed(marker if marker.is_absolute() else self.p.root / marker)
 
     def _shared_hold(self, task: dict, rc: str, run_dir: Path, now: float) -> bool:
         """Its checks failed only on pytest ids that also fail in other tasks' checks or on the push
