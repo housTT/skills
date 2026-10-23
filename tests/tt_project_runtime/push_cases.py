@@ -11006,3 +11006,19 @@ def test_backticked_and_plain_pr_branch_lines_label_a_task_the_same(env):
             labels = json.loads(p.db.one("SELECT labels FROM tasks WHERE title=?", (title,))["labels"])
             assert f"{label}:ttp/t1-example" in labels, (line, labels)
     assert worktree.spec_line_branch('`pr_branch: ""`') == ""
+
+
+def test_prune_rebase_starts_removes_a_finished_tasks_ref_and_keeps_a_continued_one(env, monkeypatch):
+    """The sweep deletes a finished rebase task's recorded start; an open task that continues it keeps
+    the ref; pruning again, or with the ref already missing, raises nothing."""
+    from ttp import worktree
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch)
+    p.db.update_task(tid, status="done")
+    cont = p.db.add_task("Continue the rebase", "s", kind="code", labels=[f"continues:{tid}"])
+    assert worktree.prune_rebase_starts(p, p.db.q("SELECT * FROM tasks WHERE id=?", (cont,))) == []
+    assert worktree.rebase_start(p.root, tid) == theirs
+    p.db.update_task(cont, status="done")
+    worktree.sweep(p)
+    assert worktree.rebase_start(p.root, tid) == ""
+    assert worktree.prune_rebase_starts(p, []) == []
+    worktree.sweep(p)

@@ -596,6 +596,22 @@ def rebase_start(repo: Path, task_id: int) -> str:
     return _git(repo, "rev-parse", "--verify", "--quiet", f"{REBASE_START_REF}{task_id}^{{commit}}", check=False)
 
 
+def prune_rebase_starts(p: Project, open_tasks: list[dict]) -> list[int]:
+    """Delete the REBASE_START_REF of every finished task whose worktree is gone and that no open
+    task still continues or names (needed_by); returns the task ids pruned. Safe to repeat."""
+    from .db import TERMINAL_TASK_STATES
+    pruned = []
+    for line in _git(p.root, "for-each-ref", "--format=%(refname)", REBASE_START_REF[:-1], check=False).split():
+        tail = line[len(REBASE_START_REF):]
+        task = p.db.task(int(tail)) if tail.isdigit() else None
+        if (not task or task["status"] not in TERMINAL_TASK_STATES or (p.worktrees / f"t{task['id']}").exists()
+                or needed_by(task, open_tasks)):
+            continue
+        _git(p.root, "update-ref", "-d", line, check=False)
+        pruned.append(task["id"])
+    return pruned
+
+
 def delivery_branch(task: dict) -> tuple[str, bool] | None:
     """The one reading of the branch `task` itself builds on and delivers onto, for the dispatcher
     (carried_head, ensure) and `ttp push --own` (push.delivery_source) alike: (branch, rebase). The
@@ -1861,6 +1877,11 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             except Exception as e:
                 res["why"] = f"error: {e}"[:300]
             out.append(res)
+        if not dry_run:
+            try:
+                prune_rebase_starts(p, open_tasks)
+            except Exception:
+                pass
         for w in stray_worktrees(p):
             if skip_run(w):
                 continue
