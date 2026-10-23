@@ -654,6 +654,7 @@ class Daemon:
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
+        self._wait_what_errs: set[str] = set()   # causes of lock-probe errors already logged (_wait_what)
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
         self._on_pass: dict[int, tuple[subprocess.Popen, float, float, Path, int, str, str, str]] = {}
         self._on_pass_waits: set[tuple[int, int]] = set()   # (task, run) whose wait was logged once
@@ -1973,6 +1974,8 @@ class Daemon:
                 note = {**(note or {}), "root": root}
                 self._root_home(root.get("branch") or "")
         db = self.p.db
+        # Where the worker pid it records means something: a reader elsewhere does not judge it (locks).
+        note = {**(note or {}), "pid_where": {"node": os.uname().nodename, "pidns": locks._pid_ns()}}
         run_id = db.x("INSERT INTO runs(task,role,provider,model,effort,account,started,boot_id,status,note,"
                       "session_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                       (task["id"] if task else None, role, provider, model, effort, prov.account(), time.time(),
@@ -7775,9 +7778,19 @@ class Daemon:
         found about the tasks and asks they name (refwaits)."""
         found, rest = locks.lock_probe_parts(str(prev.get("retry_when") or ""))
         if found:
-            cfg = self.p.config()
-            lines = [lockprobe.answer(self.p, cfg, r, sh)[1] for r, sh in found]
-            return ("; ".join(lines) + (f"; then `{' ; '.join(rest)}`" if rest else ""))[:300]
+            try:   # an unwritable or corrupt shared lock dir must not break a hand-off or a tick
+                cfg = self.p.config()
+                lines = [lockprobe.answer(self.p, cfg, r, sh)[1] for r, sh in found]
+                return ("; ".join(lines) + (f"; then `{' ; '.join(rest)}`" if rest else ""))[:300]
+            except Exception as e:
+                cause = f"{type(e).__name__}: {e}"
+                if cause not in self._wait_what_errs:   # once per cause, not every tick
+                    self._wait_what_errs.add(cause)
+                    log(self.p, f"task {tid}: lock probe for its wait note failed ({cause[:200]}); "
+                                f"its note uses its hand-off's words")
+                said = str(prev.get("waiting_for") or prev.get("summary") or "")
+                names = ", ".join(r for r, _ in found)
+                return (said + ("; " if said else "") + f"locks: {names}")[:300]
         return refwaits.with_facts(str(prev.get("waiting_for") or prev.get("summary") or "")[:300], prev)
 
     def _stale_wait_event(self, task: dict, prev: dict, since: float, max_hold: float) -> None:

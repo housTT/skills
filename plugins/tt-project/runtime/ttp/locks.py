@@ -122,8 +122,32 @@ def _pid_note(h: dict) -> str:
         return ""
     if pid <= 0:
         return ""
-    here = h.get("node") == os.uname().nodename and h.get("pidns") is not None and h.get("pidns") == _pid_ns()
-    return f", pid {pid}" + ((" alive" if _alive(pid) else " gone") if here else "")
+    return f", pid {pid}" + ((" alive" if _alive(pid) else " gone") if _judgeable(h) else "")
+
+
+def _judgeable(h: dict) -> bool:
+    """Whether this process can judge the pid a label or record names: it was seen on this host and in
+    this PID namespace (another's pid may be any process here)."""
+    return h.get("node") == os.uname().nodename and h.get("pidns") is not None and h.get("pidns") == _pid_ns()
+
+
+def _worker_note(run: dict, run_id) -> tuple[str, bool]:
+    """A run's worker pid and whether it lives, as _pid_note judges a label's: only when the run was
+    recorded on this boot, host and PID namespace (its note's "pid_where", or this host for a record from
+    before it), else "unknown", never alive: a pid from an earlier boot or another namespace may be
+    reused by any process."""
+    from .runner import same_boot
+    wp = int(run.get("pid") or 0)
+    try:
+        where = json.loads(run.get("note") or "{}").get("pid_where")
+    except (ValueError, TypeError, AttributeError):
+        where = None
+    if not same_boot(run.get("boot_id")):
+        return f", pid {wp} unknown (run {run_id}'s worker, recorded on an earlier boot)", False
+    if isinstance(where, dict) and not _judgeable(where):
+        return f", pid {wp} unknown (run {run_id}'s worker, seen on another host or PID namespace)", False
+    live = _alive(wp)
+    return f", pid {wp} {'alive' if live else 'gone'} (run {run_id}'s worker)", live
 
 
 def _holder_note(h: dict, where=None) -> str:
@@ -140,7 +164,7 @@ def _holder_note(h: dict, where=None) -> str:
     if not isinstance(where, Project) or not lbl or lbl["project"] not in (None, where.name):
         return note or ", pid unknown"
     try:   # an unreadable database or a run id that is not a number: only what the label says
-        run = where.db.one("SELECT pid, status, dir FROM runs WHERE id=?", (int(lbl["run"]),))
+        run = where.db.one("SELECT pid, status, dir, boot_id, note FROM runs WHERE id=?", (int(lbl["run"]),))
         task = where.db.one("SELECT status FROM tasks WHERE id=?", (lbl["task"],))
     except Exception:
         run = task = None
@@ -148,8 +172,7 @@ def _holder_note(h: dict, where=None) -> str:
     if not note:
         wp = int(run.get("pid") or 0) if run else 0
         if wp > 0:
-            live = _alive(wp)
-            note = f", pid {wp} {'alive' if live else 'gone'} (run {lbl['run']}'s worker)"
+            note, live = _worker_note(run, lbl["run"])
         else:
             note = ", pid unknown" + (f" (run {lbl['run']} {'active' if run['status'] == 'running' else 'ended'})"
                                       if run else f" (no record of run {lbl['run']})")

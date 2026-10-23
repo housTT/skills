@@ -33052,9 +33052,12 @@ def _relabel(f, holder):
     f.flush()
 
 
-def _run_row(p, task, status="running", pid=None, run_dir=None):
-    return p.db.x("INSERT INTO runs(task,role,status,started,pid,dir) VALUES(?,'worker',?,?,?,?)",
-                  (task, status, time.time(), pid, str(run_dir) if run_dir else None))
+def _run_row(p, task, status="running", pid=None, run_dir=None, boot=None, note=None):
+    """A worker run of `task` as the daemon records it: on this boot unless `boot` names another."""
+    from ttp import runner
+    return p.db.x("INSERT INTO runs(task,role,status,started,pid,dir,boot_id,note) VALUES(?,'worker',?,?,?,?,?,?)",
+                  (task, status, time.time(), pid, str(run_dir) if run_dir else None, boot or runner.boot_id(),
+                   json.dumps(note or {})))
 
 
 def test_lock_probe_names_pid_and_liveness_for_every_holder_kind(env):
@@ -33105,6 +33108,74 @@ def test_lock_probe_names_pid_and_liveness_for_every_holder_kind(env):
         assert f"job job-a pid 4242 ended; stale: task #{t} is done" in (out := probe()), out
     finally:
         held.close()
+
+
+def test_lock_probe_judges_a_runs_worker_pid_only_on_its_own_boot_and_pid_namespace(env):
+    """A run's worker pid recorded on an earlier boot, or seen from another host or PID namespace, may be any
+    process here: the probe names it as unknown, never alive, so a done task's hold stays marked stale."""
+    from ttp import locks
+    p = make(env)
+    t = p.db.add_task("holder", "s", kind="work", origin="user")
+    p.db.update_task(t, status="done")
+    held = _held_build_lock(p, "build-a", "x")
+    try:
+        for row, why in (({"boot": "an-earlier-boot"}, "recorded on an earlier boot"),
+                         ({"note": {"pid_where": {"node": "another-host", "pidns": locks._pid_ns()}}},
+                          "seen on another host or PID namespace"),
+                         ({"note": {"pid_where": {"node": os.uname().nodename, "pidns": "pid:[0]"}}},
+                          "seen on another host or PID namespace")):
+            run = _run_row(p, t, status="ok", pid=os.getpid(), **row)
+            _relabel(held, f"task #{t} (run {run})")
+            out = _ttp_run(p, "lock", "--probe", "build-a").stdout
+            assert f"pid {os.getpid()} unknown (run {run}'s worker, {why}); stale: task #{t} is done" in out, out
+            assert "alive" not in out, out
+        # The same pid on this boot, host and namespace (as the daemon records a run it starts) is judged.
+        run = _run_row(p, t, status="ok", pid=os.getpid(),
+                       note={"pid_where": {"node": os.uname().nodename, "pidns": locks._pid_ns()}})
+        _relabel(held, f"task #{t} (run {run})")
+        out = _ttp_run(p, "lock", "--probe", "build-a").stdout
+        assert f"pid {os.getpid()} alive (run {run}'s worker)" in out and "stale" not in out, out
+    finally:
+        held.close()
+
+
+def test_a_daemon_started_run_records_where_its_worker_pid_means_something(env, monkeypatch):
+    from ttp import locks
+    from ttp.daemon import Daemon
+    p = make(env)
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "ok"}))
+    tid = p.db.add_task("quick", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.one("SELECT id FROM runs WHERE task=?", (tid,)))
+    note = json.loads(p.db.one("SELECT note FROM runs WHERE task=?", (tid,))["note"])
+    assert note["pid_where"] == {"node": os.uname().nodename, "pidns": locks._pid_ns()}, note
+
+
+def test_a_lock_probe_error_never_breaks_a_waiting_hand_off(env, monkeypatch):
+    """_wait_what runs the lock probe in the daemon: when it raises (an unwritable or corrupt shared lock
+    dir), the hand-off still records the task as waiting, its note the hand-off's words and the locks'
+    names, and the error is logged once per cause, not on every tick."""
+    from ttp import lockprobe
+    from ttp.daemon import Daemon
+    p = make(env)
+
+    def boom(*a, **k):
+        raise OSError(30, "Read-only file system", "slots.json")
+    monkeypatch.setattr(lockprobe, "answer", boom)
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "build dir busy", "waiting_for": "the build folder",
+         "retry_after_s": 600, "retry_when": "ttp lock --probe build-a"}))
+    tid = p.db.add_task("build it", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "queued" and p.db.task(tid)["not_before"]
+                      and not p.db.q("SELECT id FROM runs WHERE status='running'"))
+    t = p.db.task(tid)
+    assert t["attempts"] == 0 and json.loads(t["result"])["status"] == "waiting", t
+    assert "the build folder; locks: build-a" in (t["blocked_reason"] or ""), t["blocked_reason"]
+    for _ in range(3):
+        assert d._wait_what(tid, json.loads(t["result"])) == "the build folder; locks: build-a"
+    d.refresh_ref_waits()
+    assert (p.logs / "daemon.log").read_text().count("lock probe for its wait note failed (OSError") == 1
 
 
 def test_lock_wait_note_names_the_probes_live_holders_and_agrees_with_the_probe(env):
