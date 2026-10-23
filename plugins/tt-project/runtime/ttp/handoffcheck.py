@@ -28,7 +28,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .project import Project
+from .project import Project, durable_write
 
 KEY = "handoff_check_sendbacks"   # in the task's result: send-backs so far
 BROKEN_EVENT = "handoff_check_broken"
@@ -108,13 +108,13 @@ def _input_file(handoff: dict, run_dir: Path | None) -> Path:
         except (OSError, ValueError):
             pass
         try:
-            (run_dir / INPUT_FILE).write_text(json.dumps(handoff, indent=1))
+            durable_write(run_dir / INPUT_FILE, json.dumps(handoff, indent=1))
             return run_dir / INPUT_FILE
         except OSError:
             pass
     fd, path = tempfile.mkstemp(prefix="ttp-handoff-", suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        json.dump(handoff, f)
+    os.close(fd)
+    durable_write(Path(path), json.dumps(handoff))
     return Path(path)
 
 
