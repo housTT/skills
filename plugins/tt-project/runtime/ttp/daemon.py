@@ -7223,18 +7223,16 @@ class Daemon:
         self.release_review_holds(now)
 
     def _dead_landed_waits(self, deferred: list[dict], now: float) -> None:
-        """deadwait.check over the deferred tasks whose start_when's last verdict on a `landed:#<id>`
-        (or `ttp landed --task <id>`) was not yet: one event per producer nothing can land."""
-        not_yet: dict[int, list[dict]] = {}
+        """deadwait.check over the queued tasks whose start_when is exactly `landed:#<id>`: one event
+        per producer nothing can land. Saved task rows only, never the in-memory probe verdicts
+        (_start_rc), which are empty after a restart: a wait in a longer probe is not judged."""
+        held: dict[int, list[dict]] = {}
         for t in deferred:
-            when = deferral(t).get("when") or ""
-            rc = self._start_rc.get(t["id"])
-            if rc and rc[0] in NOT_YET_RCS and rc[2] == when:
-                for ref in landed.task_refs(when):
-                    if ref.isdigit():
-                        not_yet.setdefault(int(ref), []).append(t)
+            m = landed.LANDED_PROBE.fullmatch(deferral(t).get("when") or "")
+            if m:
+                held.setdefault(int(m.group(1)), []).append(t)
         try:
-            deadwait.check(self.p.db, self.cfg, not_yet, now)
+            deadwait.check(self.p.db, self.cfg, held, now)
         except Exception:
             log(self.p, "dead landed waits: " + traceback.format_exc().replace("\n", " | ")[:1000])
 

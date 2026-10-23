@@ -350,6 +350,12 @@ prolonged whole-box outage.
   coordinator turn, which a re-hold no longer postpones). `dependency_cycle`: tasks that depend on
   each other, named; `task_add` and `task_update` refuse to create one. All are listed in the
   `stale_holds` event and flagged as loops in each blocker sweep.
+- Dead landing waits (model-free): a queued task whose start_when is exactly `landed:#<id>`, with
+  that producer done, not landed and nothing open that can land it (no review, fix, rebase, task on
+  its branch or push queue row) for `waiting.landed_wait_dead_s` (900), raises one
+  `landed_wait_dead` event naming the held tasks, judged from saved task rows only, so a restart
+  neither clears nor repeats it. A `landed:#<id>` inside a longer probe is not judged; the blocker
+  sweep covers it.
 - Provider failover (model-free): a queued, deferred or waiting task whose provider cannot start
   new work (logged out, a limit pause, or a red gate such as a plan window at the line) for longer
   than `coordinator.provider_failover_after_h` (4; 0 turns it off) moves to the first usable

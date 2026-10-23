@@ -31042,8 +31042,6 @@ def test_a_landed_wait_with_no_path_to_landing_wakes_the_coordinator_once_and_cl
     rows = lambda: p.db.q("SELECT * FROM tasks WHERE id IN (?,?)", (a, b))
     dead = lambda: p.db.q("SELECT * FROM events WHERE kind=?", (deadwait.DEAD_EVENT,))
     t0 = time.time()
-    for tid in (a, b):
-        d._start_rc[tid] = (1, t0, f"landed:#{code}")
     d._dead_landed_waits(rows(), t0 + 10 * deadwait.GRACE_S)
     assert not dead(), "an open review is a path to landing"
     p.db.update_task(rev["id"], status="failed")
@@ -31068,6 +31066,47 @@ def test_a_landed_wait_with_no_path_to_landing_wakes_the_coordinator_once_and_cl
     p.db.add_task("rebase it", "s", kind="code", labels=[f"rebases:{branch}"], depends_on=[a])
     d._dead_landed_waits(rows(), t0 + 7 * deadwait.GRACE_S)
     assert [e["status"] for e in dead()] == ["handled", "queued"]
+
+
+def test_a_dead_landed_wait_survives_a_daemon_restart_and_broken_probe_verdicts(env):
+    """landed_wait_dead keeps and clears its state from saved rows only: a restarted daemon (no
+    start_when verdicts yet) or a broken probe exit leaves the queued event and its state as they
+    are and raises no second one; a path appearing still clears it. A landed:#X inside a longer
+    probe is not judged."""
+    p = make(env)
+    from ttp import deadwait
+    from ttp.daemon import Daemon
+    code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    p.db.update_task(rev["id"], status="failed")
+    a = p.db.add_task("next a", "s", origin="coordinator", labels=[f"start_when:landed:#{code}"])
+    c = p.db.add_task("next c", "s", origin="coordinator",
+                      labels=[f"start_when:ttp landed --task {code} && test -e /nonexistent"])
+    rows = lambda: p.db.q("SELECT * FROM tasks WHERE id IN (?,?)", (a, c))
+    dead = lambda: p.db.q("SELECT * FROM events WHERE kind=?", (deadwait.DEAD_EVENT,))
+    t0 = time.time()
+    d = Daemon(p.base)
+    d._start_rc[a] = (1, t0, f"landed:#{code}")   # a verdict before the restart; it is not what counts
+    d._dead_landed_waits(rows(), t0)
+    d._dead_landed_waits(rows(), t0 + deadwait.GRACE_S)
+    (ev,) = dead()
+    assert f"#{a} (queued)" in ev["text"] and f"#{c} " not in ev["text"], "only an exact landed:#X is judged"
+    state = p.db.kv(deadwait.KEY)
+    assert list(state) == [str(code)]
+    # A restart: a fresh daemon's first ticks have no verdicts, then a broken one (a probe timeout).
+    d2 = Daemon(p.base)
+    later = t0 + 3 * deadwait.GRACE_S
+    d2._probed.update({a: later, c: later})   # no probe subprocess this tick
+    d2.probe_deferred(later)
+    d2._start_rc[a] = ("timeout", later, f"landed:#{code}")
+    d2._dead_landed_waits(rows(), t0 + 5 * deadwait.GRACE_S)
+    assert p.db.one("SELECT status FROM events WHERE id=?", (ev["id"],))["status"] == "queued"
+    assert p.db.kv(deadwait.KEY) == state and len(dead()) == 1
+    # A path appears: cleared.
+    p.db.add_task(f"Fix review #{rev['id']}: feature", "s", kind="code",
+                  labels=[f"continues:{code}", f"review_fix:{rev['id']}"])
+    d2._dead_landed_waits(rows(), t0 + 6 * deadwait.GRACE_S)
+    assert p.db.one("SELECT status FROM events WHERE id=?", (ev["id"],))["status"] == "handled"
+    assert p.db.kv(deadwait.KEY) == {}
 
 
 def test_a_check_only_review_failure_gets_no_fix_pair_and_keeps_its_dependents(env):

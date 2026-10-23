@@ -6,10 +6,12 @@
   branches that are not one stack, a task cap): one `review_nofix` event per review, naming the
   review, its branch and what waits on it (Daemon._fix_failed_review says why). One with no fix
   follow-ups says the same in its own task_failed event, which already wakes the coordinator.
-- A `landed:#X` start_when whose producer X is done, its work not landed, and nothing open can land
+- A start_when that is exactly `landed:#X` whose producer X is done, its work not landed, and nothing open can land
   it: no open review, fix, rebase or continue hop carrying X's change (landed.carriers), no open task
   on X's branch, and no push queue row. One `landed_wait_dead` event per X names the held tasks;
-  once a path appears or X lands it is cleared (handled), and a later dead end raises it again.
+  once a path appears, X lands or no queued task waits on it, it is cleared (handled), and a later
+  dead end raises it again. Saved database facts only: a daemon restart (empty probe verdicts) or a
+  broken probe exit neither clears nor re-raises it. A `landed:#X` inside a longer probe is not judged.
 """
 from __future__ import annotations
 
@@ -92,14 +94,14 @@ def path(db, x: int, held: set[int]) -> str:
     return f"push queue row of #{row['task']} ({row['status']})" if row else ""
 
 
-def check(db, cfg: dict, not_yet: dict[int, list[dict]], now: float) -> None:
-    """`not_yet`: producer id -> the deferred tasks whose start_when last said not yet on it. Raises
+def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
+    """`held_by`: producer id -> the queued tasks whose start_when is `landed:#<it>`. Raises
     one DEAD_EVENT per producer dead for `waiting.landed_wait_dead_s`, and clears it (handled, state
     dropped) once a path appears, the producer lands or nothing waits on it any more."""
     grace = float((cfg.get("waiting") or {}).get("landed_wait_dead_s", GRACE_S) or 0)
     state = db.kv(KEY, {}) or {}
     new: dict = {}
-    for x, tasks in sorted(not_yet.items()):
+    for x, tasks in sorted(held_by.items()):
         held = {t["id"] for t in tasks}
         if path(db, x, held):
             continue
