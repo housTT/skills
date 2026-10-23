@@ -100,16 +100,21 @@ Work from cheap to expensive:
 
 ### Fanning out
 
-Run arms in parallel when the grant allows it. An explorer owns one hypothesis: it predicts, sizes
-its own sample, dispatches, and reports the arm with its evidence. A coordinator holds the current
-best, the slot ledger and the budget, decides what is kept, and re-runs kept changes together.
-Explorers do not accept their own arms, and every dispatched run is registered with the coordinator
-when it is launched, not when it finishes.
+Run arms in parallel when the grant allows it. An explorer owns one hypothesis and iterates on it:
+predict, size the sample, dispatch, wait, then read what came back against the estimate it wrote
+first. The gap between the two is the finding — a result that matched a wrong estimate and one
+that matched a right one point in different directions. It keeps going on its own thread until the
+hypothesis is settled or its budget ends, then reports the arm with its evidence.
 
-The coordinator also reads results the way [Look at the whole run](#look-at-the-whole-run) asks,
-across arms rather than within one, and sets what to probe next. Not every run needs to be a
-candidate for best: a run whose only purpose is to show where headroom is left — or to rule a
-mechanism out — is worth a slot when the picture is thin.
+A coordinator holds the current best, the slot ledger and the budget, decides what is kept, and
+re-runs kept changes together. Explorers do not accept their own arms, and every dispatched run is
+registered with the coordinator when it is launched, not when it finishes.
+
+The coordinator reads widely where an explorer reads deeply: everything the runs leave behind, the
+way [Look at the whole run](#look-at-the-whole-run) asks, across arms rather than within one,
+looking for where headroom is still left. What to probe next comes from that. Not every run needs
+to be a candidate for best — one whose only purpose is to show where the room is, or to rule a
+mechanism out, is worth a slot when the picture is thin.
 
 Give explorers different mechanisms, not one idea at several magnitudes.
 
