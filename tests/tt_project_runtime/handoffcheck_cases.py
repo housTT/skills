@@ -166,6 +166,38 @@ def test_a_broken_hand_off_check_accepts_the_hand_off_and_is_raised_once(env):
         (True, True, False), (False, False, True)}
 
 
+def test_a_timed_out_check_whose_child_left_its_session_does_not_hold_the_hand_off(env, monkeypatch):
+    from ttp import handoffcheck
+    monkeypatch.setattr(handoffcheck, "KILL_WAIT_S", 1)
+    p = make(env)
+    pidfile = env["tmp"] / "hc-escaped.pid"
+    # the escaped child keeps the check's stdout open after its group is killed
+    run = f"setsid sh -c 'echo $$ > {shlex.quote(str(pidfile))}; exec sleep 30' & sleep 30"
+    _hc_setup(env, p, [{"name": "escapes", "run": run, "timeout_s": 0.5}])
+    tid = _hc_task(p)
+    started = time.monotonic()
+    try:
+        t = _hc_hand_off(env, p, tid, _BAD, prefetch=False)   # run inside the transaction: the worst case
+        took = time.monotonic() - started
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+    assert took < 5, f"the post-kill wait is bounded, took {took:.1f} s"
+    assert t["status"] == "done" and _hc_replies(p) == ["It is up."], "a broken check accepts the hand-off"
+    evs = p.db.q("SELECT * FROM events WHERE kind=?", (handoffcheck.BROKEN_EVENT,))
+    assert len(evs) == 1 and "timeout" in evs[0]["text"] and "escapes" in evs[0]["text"]
+
+
+def test_prefetched_check_answers_expire_from_when_the_checks_ended(env, monkeypatch):
+    from ttp import handoffcheck
+    monkeypatch.setattr(handoffcheck, "SEEN_TTL_S", 0.3)
+    p = make(env)
+    log = _hc_setup(env, p, [{"name": "slow", "run": "sleep 0.5; python3 SCRIPT {result}"}])
+    tid = _hc_task(p)
+    t = _hc_hand_off(env, p, tid, _GOOD)
+    assert t["status"] == "done" and len(_hc_runs(log)) == 1, "checks slower than the cache lifetime run once"
+
+
 def test_hand_off_check_settings_are_validated(env):
     from ttp.project import config_problems
     problems = config_problems({"worker": {"handoff_checks": [

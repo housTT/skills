@@ -39,6 +39,7 @@ OUTPUT_CHARS = 2000               # the tail of a check's output the next run an
 EVENT_OUTPUT_CHARS = 1000         # of it, in a coordinator event
 INPUT_FILE = "handoff_check.json"   # the hand-off checked, when it is not the run's result.json as is
 SEEN_TTL_S = 300
+KILL_WAIT_S = 5                   # the wait for a killed check's output; an escaped child is not waited for
 _seen: dict[tuple[str, int, str], tuple[float, dict]] = {}
 
 
@@ -141,7 +142,12 @@ def _run_one(p: Project, check: dict, task: dict, path: Path) -> tuple[int | str
             os.killpg(proc.pid, signal.SIGKILL)   # its own session: only what this check started
         except OSError:
             pass
-        out, _ = proc.communicate()
+        try:
+            out, _ = proc.communicate(timeout=KILL_WAIT_S)
+        except subprocess.TimeoutExpired as e:   # a child that left the session still holds the pipe
+            out = e.output
+            if proc.stdout:
+                proc.stdout.close()
         return "timeout", _tail((out or b"").decode(errors="replace"))
     return proc.returncode, _tail((out or b"").decode(errors="replace"))
 
@@ -173,8 +179,8 @@ def prefetch(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -
     now = time.time()
     for k in [k for k, (until, _) in _seen.items() if until <= now]:
         _seen.pop(k, None)
-    _seen[(str(p.root), int(task["id"]), _digest(handoff))] = (time.time() + SEEN_TTL_S,
-                                                              run(p, cfg, task, handoff, run_dir))
+    got = run(p, cfg, task, handoff, run_dir)   # its expiry counts from the answer, however long the checks took
+    _seen[(str(p.root), int(task["id"]), _digest(handoff))] = (time.time() + SEEN_TTL_S, got)
 
 
 def verdict(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -> dict:
