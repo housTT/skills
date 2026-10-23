@@ -1603,8 +1603,9 @@ def test_result_waits_wake_at_light_whatever_they_ask_unless_escalated(env):
             == "standard", probe
 
 
-def _push_wait_task(p, tmp_path, marker_body, tier="standard"):
-    """A code task waiting (asking for a standard wake) on a detached push whose marker holds `marker_body`."""
+def _push_wait_task(p, tmp_path, marker_body, tier="standard", pushed=False):
+    """A code task waiting (asking for a standard wake) on a detached push whose marker holds `marker_body`;
+    `pushed`: its probe is `ttp push --result <marker> --pushed`."""
     from ttp import push
     now = time.time()
     tid = p.db.add_task("land the fix", "s", kind="code", tier=tier, origin="user")
@@ -1613,23 +1614,32 @@ def _push_wait_task(p, tmp_path, marker_body, tier="standard"):
     (tmp_path / "push.log").write_text("ttp push: rebasing\nerror: the remote rejected the push\n")
     p.db.update_task(tid, status="queued", not_before=now + 3600, result=json.dumps(
         {"status": "waiting", "summary": "pushing", "waiting_for": "my push", "retry_after_s": 900,
-         "retry_when": push.result_probe(marker, p), "wake_tier": "standard",
+         "retry_when": push.result_probe(marker, p) + (" --pushed" if pushed else ""), "wake_tier": "standard",
          "next_step": "report the push", "waiting_since": now - 60}))
     return tid
 
 
+@pytest.mark.parametrize("pushed", [False, True])
 @pytest.mark.parametrize("body, escalated", [
     ({"status": "pushed", "sha": "a" * 40}, False),
     ({"status": "failed", "exit": 4, "reason": "a check failed"}, True),
     ({"kind": "batch", "outcome": "landed", "phase": "finished"}, False),
-    ({"kind": "batch", "outcome": "conflict", "phase": "finished", "message": "rebase stopped"}, True)])
+    ({"kind": "batch", "outcome": "nothing", "phase": "finished"}, False),
+    ({"kind": "batch", "outcome": "conflict", "phase": "finished", "message": "rebase stopped"}, True),
+    # its process died (killed, crashed or rebooted) before it wrote an outcome: its lock is free
+    ({"kind": "batch", "status": "running", "phase": "push", "lock": "LOCK"}, True)])
 def test_a_finished_push_result_wakes_at_light_and_a_push_that_did_not_land_at_the_task_tier(
-        env, monkeypatch, tmp_path, body, escalated):
+        env, monkeypatch, tmp_path, body, escalated, pushed):
     p = make(env)
     from ttp import budget as bud, daemon as dmod
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     d = dmod.Daemon(p.base)
-    tid = _push_wait_task(p, tmp_path, body)
+    if body.get("lock") == "LOCK":
+        (tmp_path / "run.lock").write_text("")
+        body = {**body, "lock": str(tmp_path / "run.lock")}
+    # With --pushed a push that did not land (or had nothing to push) makes the probe exit 3: a final
+    # result, never a broken probe.
+    tid = _push_wait_task(p, tmp_path, body, pushed=pushed)
     _settle_probe(d, tid)
     task = p.db.task(tid)
     res = json.loads(task["result"])
@@ -1637,8 +1647,22 @@ def test_a_finished_push_result_wakes_at_light_and_a_push_that_did_not_land_at_t
     assert bud.wake_tier(task["tier"], res) == ("standard" if escalated else "light"), res
     assert bool(res.get("escalated_wake")) == escalated, res
     assert ("its push did not land" in res["woke"]) == escalated, res["woke"]
+    assert "probe broken" not in res["woke"], res["woke"]
     if escalated:
-        assert ("a check failed" if "reason" in body else "batch conflict (rebase stopped)") in res["woke"]
+        assert ("a check failed" if "reason" in body else "batch conflict (rebase stopped)" if "message" in body
+                else "batch ended without an outcome") in res["woke"], res["woke"]
+
+
+def test_a_running_batch_without_an_outcome_is_not_read_as_a_push_that_did_not_land(tmp_path):
+    from ttp import locks, push
+    lock, marker = tmp_path / "run.lock", tmp_path / "batch-1.json"
+    marker.write_text(json.dumps({"kind": "batch", "status": "running", "phase": "push", "lock": str(lock)}))
+    held = locks.try_take([lock], "batch 1")
+    try:
+        assert push.unpushed(marker) == ""
+    finally:
+        held.close()
+    assert push.unpushed(marker).startswith("batch ended without an outcome")
 
 
 def test_a_pending_checks_or_push_result_never_wakes_the_task(env, tmp_path):

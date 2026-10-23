@@ -327,6 +327,11 @@ UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the 
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
+def _push_not_landed(probe, rc) -> bool:
+    """Whether a probe's exit is `ttp push --result <marker> --pushed` saying its push finished without landing."""
+    return rc == push.NOT_PUSHED and (bud.result_wait(probe) or ("",))[0] == "push"
+
+
 def log(p: Project, msg: str) -> None:
     p.logs.mkdir(parents=True, exist_ok=True)
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n"
@@ -6928,10 +6933,11 @@ class Daemon:
             self._probe_rc[tid] = ("timeout" if rc is None else rc, now, probe)
             if task and task["status"] == "queued":
                 self._flag_never_passes(task, probe, rc, outs[id(proc)])
-            if rc == 0 or detach.failed_check(probe, rc):
+            if rc == 0 or detach.failed_check(probe, rc) or _push_not_landed(probe, rc):
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
-                    (self._probe_passed if rc == 0 else self._job_failed)(task, now)
+                    (self._probe_passed if rc == 0 else self._job_failed if detach.failed_check(probe, rc)
+                     else self._push_finished_unpushed)(task, now)
             elif gone and task and task["status"] == "queued" and (task["not_before"] or 0) > now:
                 self._wake_waiting(task, f"probe broken: {rc}", now)   # no timer can make it pass
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
@@ -7710,6 +7716,8 @@ class Daemon:
             self._probe_passed(task, now)
         elif fresh and detach.failed_check(str(prev.get("retry_when") or ""), rc):
             self._job_failed(task, now)
+        elif fresh and _push_not_landed(prev.get("retry_when"), rc):
+            self._push_finished_unpushed(task, now)
         elif fresh and rc not in NOT_YET_RCS:
             self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}", now)
         elif fresh:
@@ -7930,18 +7938,29 @@ class Daemon:
                 return
             if started:
                 why += f"; its on_pass_cmd was not run: {started}"
-        extra = None
+        more, extra = self._push_landing(task)
+        self._wake_waiting(task, why + more, now, extra=extra)
+
+    def _push_finished_unpushed(self, task: dict, now: float) -> None:
+        """Its `ttp push --result <marker> --pushed` probe exited 3: the push finished without landing,
+        a final result and not a broken probe. It wakes at the task's own tier unless there was nothing
+        to push."""
+        why, extra = self._push_landing(task)
+        self._wake_waiting(task, f"its push finished without pushing{why}", now, extra=extra)
+
+    def _push_landing(self, task: dict) -> tuple[str, dict | None]:
+        """For a wake of a task waiting on its push's result: the words to add and the hand-off fields
+        to set. A push that did not land needs real work, as failed checks do: it wakes at the task's
+        own tier; anything else ("", None) wakes as any passed probe does."""
         try:
             unpushed = self._push_unpushed(task)
         except Exception as e:   # a wake is always safe
             log(self.p, f"task {task['id']}: could not read its push: {type(e).__name__}: {e}")
             unpushed = ""
-        if unpushed:
-            # A push that did not land needs real work, as failed checks do: wake at the task's own tier.
-            why += f"; its push did not land: {unpushed}"
-            extra = {"wake_tier": task["tier"] if task["tier"] in bud.TIER_ORDER else "standard",
-                     "escalated_wake": True}
-        self._wake_waiting(task, why, now, extra=extra)
+        if not unpushed:
+            return "", None
+        return f"; its push did not land: {unpushed}", {
+            "wake_tier": task["tier"] if task["tier"] in bud.TIER_ORDER else "standard", "escalated_wake": True}
 
     def _push_unpushed(self, task: dict) -> str:
         """Why the push a waiting task's `ttp push --result <marker>` probe waits on did not land, or ''."""
