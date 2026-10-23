@@ -249,7 +249,7 @@ EFFORT_EVENT_TRIGGERS = {
     "dead_dependency": "stuck", sweep.SWEEP_KIND: "stuck",
     "time_only_hold": "stuck", "blocked_dependency": "stuck", "dependency_cycle": "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "deferral_job_failed": "stuck",
-    "no_progress": "stuck", "stall": "stuck", "not_started": "stuck", "change_probe": "stuck",
+    "no_progress": "stuck", "stall": "stuck", "change_probe": "stuck",
     "missing_task_ref": "stuck", obligations.PROMISE_KIND: "stuck", mitigate.OVERDUE: "stuck",
     "review_stall": "stuck", "review_failed_unhandled": "stuck", "review_nofix": "stuck", "landed_wait_dead": "stuck", askrethink.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",

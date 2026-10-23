@@ -34,7 +34,7 @@ PHRASES = ("why didn't", "why did nobody", "why did no one", "why hasn't", "why 
            "should have noticed", "should have caught", "lack of progress", "no progress")
 # Event kinds of a stall detector (no progress on a task or the project). Any such event not yet
 # handled makes the next user message a likely correction.
-STALL_KINDS = ("no_progress", "stall", "not_started")
+STALL_KINDS = ("no_progress", "stall")
 FIX_KINDS = ("harness",)
 
 

@@ -578,76 +578,21 @@ def test_progress_daemon_tick_runs_the_check(env):
     assert f"no_progress:task:#{tid}" in progress.load(p.db)["raised"]
 
 
-# Ready tasks dispatch does not start (Daemon.check_stall's per-task part) and machine changes whose
-# until-probe passed while their task sleeps -------------------------------------------------------
-
-def _start_events(p):
-    return _prog_events(p, "not_started")
-
-
-def _start_setup(env, monkeypatch):
-    """_stall_setup with the whole-project stall wake off: the per-task part runs on its own."""
-    p, d, now, check = _stall_setup(env, monkeypatch)
-    d.cfg["coordinator"]["stall_wake_h"] = 0
-    return p, d, now, check
-
+# Ready tasks dispatch holds (Daemon.check_stall's stall message names dispatch's recorded hold) and
+# machine changes whose until-probe passed while their task sleeps -----------------------------------
 
 def _ready_task(p, title="Ready", labels=()):
     return p.db.add_task(title, "s", kind="work", tier="light", origin="coordinator", labels=list(labels))
 
 
-def test_overdue_fires_past_threshold_once_escalates_and_clears_when_the_task_starts(env, monkeypatch):
-    from ttp import progress
-    p, d, now, check = _start_setup(env, monkeypatch)
-    tid = _ready_task(p)
-    for m in range(15):
-        check(now + m * 60)
-    assert _start_events(p) == [], "under overdue_m (15 min)"
-    check(now + 15 * 60)
-    ev = _start_events(p)
-    assert len(ev) == 1 and ev[0]["status"] == "queued", ev
-    assert f"overdue:#{tid}" in ev[0]["text"] and "no holder: dispatch did not start it" in ev[0]["text"], ev[0]["text"]
-    for m in range(16, 30):
-        check(now + m * 60)
-    assert len(_start_events(p)) == 1, "one wake per key"
-    check(now + 30 * 60)
-    assert len(_start_events(p)) == 2, "again once its wait doubled (escalation)"
-    p.db.update_task(tid, status="running")
-    check(now + 31 * 60)
-    st = progress.load(p.db)
-    assert f"overdue:#{tid}" not in st["raised"], "a started task clears at once"
-    assert [h["key"] for h in st["history"]] == [f"overdue:#{tid}"]
-    assert len(_start_events(p)) == 2
-
-
-def test_overdue_counts_only_while_a_worker_slot_is_free(env, monkeypatch):
-    p, d, now, check = _start_setup(env, monkeypatch)
-    d.cfg.setdefault("budget", {})["max_parallel_workers"] = 1
-    _ready_task(p)
-    p.db.x("INSERT INTO runs(task,role,started,status,provider) VALUES(NULL,'worker',?,'running',?)",
-           (now, d.cfg.get("core_provider") or "claude"))
-    run = p.db.one("SELECT MAX(id) id FROM runs")["id"]
-    for m in range(40):
-        check(now + m * 60)
-    assert _start_events(p) == [], "a full worker gate is not dispatch passing the task over"
-    p.db.x("UPDATE runs SET status='ok', ended=? WHERE id=?", (now + 40 * 60, run))
-    for m in range(40, 55):
-        check(now + m * 60)
-    assert _start_events(p) == [], "the clock starts when the slot frees"
-    check(now + 55 * 60)
-    assert len(_start_events(p)) == 1
-
-
-def test_overdue_names_each_busy_resource_and_its_live_holder(env, monkeypatch):
-    p, d, now, check = _start_setup(env, monkeypatch)
-    holder = _ready_task(p, "Holder", ["exclusive:rig"])
-    p.db.update_task(holder, status="running")
-    tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])
-    for m in range(16):
-        check(now + m * 60)
-    ev = _start_events(p)
-    assert len(ev) == 1 and f"overdue:#{tid}" in ev[0]["text"], ev
-    assert f"rig held by running task(s) #{holder}" in ev[0]["text"], ev[0]["text"]
+def _stall_text(p, check, now):
+    """Raise check_stall's stall with one free ready task beside the test's own: ready at `now`, stuck 3 h
+    later with no worker run since; the observation's text."""
+    _ready_task(p, "Free to start")
+    check(now)
+    ev = check(now + 3 * 3600)
+    assert len(ev) == 1, ev
+    return ev[0]["text"]
 
 
 def _held_slot(d, res, pid=None):
@@ -669,16 +614,14 @@ def _exited_holder_pid():
     return proc.pid
 
 
-def test_overdue_names_a_live_lock_holder_and_its_pid_from_the_recorded_hold(env, monkeypatch):
-    p, d, now, check = _start_setup(env, monkeypatch)
+def test_stall_names_a_live_lock_holder_and_its_pid_from_the_recorded_hold(env, monkeypatch):
+    p, d, now, check = _stall_setup(env, monkeypatch)
     tid = _ready_task(p, "Needs the bench", ["exclusive:bench"])
     held = _held_slot(d, "bench")
     try:
-        for m in range(16):
-            check(now + m * 60)
-        ev = _start_events(p)
-        assert len(ev) == 1 and f"overdue:#{tid}" in ev[0]["text"], ev
-        assert f"bench lock held by task #99 (run 7) (pid {os.getpid()} alive)" in ev[0]["text"], ev[0]["text"]
+        text = _stall_text(p, check, now)
+        assert "Ready but held by a busy slot or lock" in text, text
+        assert f"#{tid} Needs the bench: bench lock held by task #99 (run 7) (pid {os.getpid()} alive)" in text, text
         ctx = {"now": now, "paused": {}, "busy": {}, "committed": None, "logged_out": {}}
         assert d._start_hold(p.db.task(tid), "claude", ctx) == "resource"
         rec = ctx["holds"][tid]
@@ -688,27 +631,33 @@ def test_overdue_names_a_live_lock_holder_and_its_pid_from_the_recorded_hold(env
         held.close()
 
 
-def test_overdue_never_names_a_dead_lock_holder_as_live(env, monkeypatch):
-    p, d, now, check = _start_setup(env, monkeypatch)
+def test_stall_never_names_a_dead_lock_holder_as_live(env, monkeypatch):
+    p, d, now, check = _stall_setup(env, monkeypatch)
     tid = _ready_task(p, "Needs the bench", ["exclusive:bench"])
     dead = _exited_holder_pid()
     held = _held_slot(d, "bench", pid=dead)
     try:
-        for m in range(16):
-            check(now + m * 60)
-        ev = _start_events(p)
-        assert len(ev) == 1 and f"overdue:#{tid}" in ev[0]["text"], ev
-        text = ev[0]["text"]
-        assert "held by" not in text and f"bench lock taken, no live holder: task #99 (run 7) (pid {dead} gone)" \
+        text = _stall_text(p, check, now)
+        assert "lock held by" not in text and "alive" not in text, text
+        assert f"#{tid} Needs the bench: bench lock taken, no live holder: task #99 (run 7) (pid {dead} gone)" \
             in text, text
     finally:
         held.close()
 
 
+def test_stall_names_the_running_tasks_filling_a_busy_slot(env, monkeypatch):
+    p, d, now, check = _stall_setup(env, monkeypatch)
+    holder = _ready_task(p, "Holder", ["exclusive:rig"])
+    p.db.update_task(holder, status="running")
+    tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])
+    text = _stall_text(p, check, now)
+    assert f"#{tid} Needs the rig: rig held by running task(s) #{holder}" in text, text
+
+
 def test_a_task_paused_through_a_device_lock_alias_is_never_a_lock_wait(env, monkeypatch):
     """Dispatch holds a task whose device name is paused under another device.locks name; it records a
-    pause, so the stall check never times it nor names a holder (review #3580)."""
-    p, d, now, check = _start_setup(env, monkeypatch)
+    pause, so the stall message never lists it nor names a holder (review #3580)."""
+    p, d, now, check = _stall_setup(env, monkeypatch)
     d.cfg["device"] = {**(d.cfg.get("device") or {}), "locks": ["rig-device", "rig"]}
     tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])
     p.db.set_kv("paused_resources", {"rig-device": {"reason": "maintenance", "since": now}})
@@ -717,15 +666,14 @@ def test_a_task_paused_through_a_device_lock_alias_is_never_a_lock_wait(env, mon
         ctx = {"now": now, "paused": p.db.paused_resources(), "busy": {}, "committed": None, "logged_out": {}}
         assert d._start_hold(p.db.task(tid), "claude", ctx) == "resource"
         assert ctx["holds"][tid] == {"kind": "pause", "resource": "rig"}
-        for m in range(0, 120, 5):
-            check(now + m * 60)
-        assert _start_events(p) == []
+        text = _stall_text(p, check, now)
+        assert f"#{tid}" not in text and "lock" not in text and "Ready but held" not in text, text
     finally:
         held.close()
 
 
 def test_a_task_paused_directly_records_a_pause_and_is_never_a_lock_wait(env, monkeypatch):
-    p, d, now, check = _start_setup(env, monkeypatch)
+    p, d, now, check = _stall_setup(env, monkeypatch)
     tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])
     p.db.set_kv("paused_resources", {"rig": {"reason": "maintenance", "since": now}})
     held = _held_slot(d, "rig")
@@ -733,84 +681,35 @@ def test_a_task_paused_directly_records_a_pause_and_is_never_a_lock_wait(env, mo
         ctx = {"now": now, "paused": p.db.paused_resources(), "busy": {}, "committed": None, "logged_out": {}}
         assert d._start_hold(p.db.task(tid), "claude", ctx) == "paused"
         assert ctx["holds"][tid] == {"kind": "pause", "resource": "rig"}
-        for m in range(0, 120, 5):
-            check(now + m * 60)
-        assert _start_events(p) == []
+        text = _stall_text(p, check, now)
+        assert f"#{tid}" not in text and "lock" not in text and "Ready but held" not in text, text
     finally:
         held.close()
 
 
-def test_raise_start_waits_reads_only_the_recorded_hold(env):
-    """progress.py names what dispatch recorded and never times a recorded pause; it works out no lock,
-    pause or alias of its own."""
+def test_progress_check_says_nothing_of_a_never_run_task_a_lock_holds(env, monkeypatch):
+    """A queued task that never ran is Daemon.check_stall's: progress.py raises no key for it, even while
+    a lock holds it for hours, and works out no hold of its own (no lock, pause or alias resolution)."""
     from ttp import progress
-    p = make(env)
-    now = time.time()
-    tid = _ready_task(p)
-    base = {"kind": "overdue", "key": f"#{tid}", "task": tid, "what": "x", "since": now - 3600, "n": 3600}
-    assert progress.raise_start_waits(p.db, {}, [{**base, "hold": {"kind": "pause", "resource": "rig"}}], now) == []
-    got = progress.raise_start_waits(p.db, {}, [{**base, "hold": {"kind": "lock", "resource": "rig", "holders": [
-        {"holder": "task #4 (run 2)", "pid": 123, "alive": True}]}}], now)
-    assert len(got) == 1 and "rig lock held by task #4 (run 2) (pid 123 alive)" in got[0]["text"], got
+    p, d, now, check = _stall_setup(env, monkeypatch)
+    tid = _ready_task(p, "Needs the bench", ["exclusive:bench"])
+    held = _held_slot(d, "bench")
+    try:
+        for h in range(0, 6):
+            progress.check(p.db, d.cfg, p.state, now + h * 3600, where=p, current_probe=lambda t: None, changes=[])
+        assert _prog_events(p) == [], _prog_events(p)
+        assert not [k for k in progress.load(p.db)["raised"] if f"#{tid}" in k]
+    finally:
+        held.close()
     import inspect
-    src = inspect.getsource(progress.raise_start_waits) + inspect.getsource(progress.hold_reason)
-    for name in ("canonical(", "device_locks(", "paused_resources(", "any_free(", "holders_now(",
-                 "holder_records(", "slot_paths(", "held_labels(", "pid_alive("):
+    src = inspect.getsource(progress)
+    for name in ("hold_reason", "_resource_hold(", "_start_hold(", "canonical(", "device_locks(", "holders_now(",
+                 "holder_records(", "slot_paths(", "held_labels(", "pid_alive(", "overdue:#", "multilock"):
         assert name not in src, name
 
 
-def test_multilock_names_the_recorded_hold_and_fires_after_an_hour(env, monkeypatch):
-    p, d, now, check = _start_setup(env, monkeypatch)
-    a = _ready_task(p, "Holds both", ["exclusive:rig", "resource:bench"])
-    b = _ready_task(p, "Uses the bench", ["resource:bench"])
-    for t in (a, b):
-        p.db.update_task(t, status="running")
-    tid = _ready_task(p, "Needs both", ["exclusive:rig", "resource:bench"])
-    for m in range(0, 60, 5):
-        check(now + m * 60)
-    assert _start_events(p) == [], "a wait on several resources is not overdue at 15 min"
-    check(now + 60 * 60)
-    ev = _start_events(p)
-    assert len(ev) == 1 and f"multilock:#{tid}" in ev[0]["text"], ev
-    assert f"bench held by running task(s) #{a}, #{b}" in ev[0]["text"], ev[0]["text"]
-    check(now + 61 * 60)
-    assert len(_start_events(p)) == 1
-
-
-def test_overdue_never_fires_for_a_start_when_a_paused_resource_or_a_future_start(env, monkeypatch):
-    p, d, now, check = _start_setup(env, monkeypatch)
-    _ready_task(p, "Deferred", ["start_when:test -f /nonexistent/flag"])
-    _ready_task(p, "Paused rig", ["exclusive:rig"])
-    p.db.set_kv("paused_resources", {"rig": {"reason": "maintenance", "since": now}})
-    later = _ready_task(p, "Later")
-    p.db.update_task(later, not_before=now + 86400)
-    for m in range(0, 120, 5):
-        check(now + m * 60)
-    assert _start_events(p) == []
-
-
-def test_start_waits_wake_once_across_a_flap(env, monkeypatch):
-    """A ready task that is held for one check (a pause) restarts its clock but continues its raised
-    key: no second wake as new; the clear needs the hysteresis."""
-    from ttp import progress
-    p, d, now, check = _start_setup(env, monkeypatch)
-    tid = _ready_task(p, "Flaps", ["exclusive:rig"])
-    for m in range(16):
-        check(now + m * 60)
-    assert len(_start_events(p)) == 1
-    p.db.set_kv("paused_resources", {"rig": {"reason": "maintenance", "since": now}})
-    check(now + 16 * 60)
-    p.db.set_kv("paused_resources", {})
-    for m in range(17, 29):
-        check(now + m * 60)
-    assert f"overdue:#{tid}" in progress.load(p.db)["raised"], "a one-check flap does not clear the key"
-    for m in range(29, 40):
-        check(now + m * 60)
-    assert len(_start_events(p)) == 1, "back past the threshold: the same raise, no new wake"
-
-
 def test_dispatch_logs_a_resource_wait_once(env, monkeypatch):
-    p, d, now, check = _start_setup(env, monkeypatch)
+    p, d, now, check = _stall_setup(env, monkeypatch)
     holder = _ready_task(p, "Holder", ["exclusive:rig"])
     p.db.update_task(holder, status="running")
     tid = _ready_task(p, "Needs the rig", ["exclusive:rig"])

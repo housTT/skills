@@ -34,22 +34,12 @@ runs are running, one keyed `no_progress` event names what is stuck, since when 
 - project: no result anywhere for `project_h` (2) hours since the earliest running worker run started.
 
 A queued task, never started or queued again after a run, is never judged here: whether dispatch
-would start it now is Daemon.check_stall's (its _start_hold model), not a second clock here. Its
-per-task part times one ready task dispatch passes over while other runs keep starting and hands the
-keys to `raise_start_waits`, which judges them like the rest (one `not_started` event per key):
-
-- overdue: `overdue:#<task>`, ready with a worker slot free for `overdue_m` (15) minutes, naming the
-  hold dispatch recorded (a busy slot's running tasks, or a taken lock's holder with its pid and
-  whether it lives), else "no holder: dispatch did not start it";
-- multilock: `multilock:#<task>`, held by a resource among several it needs for `multilock_h` (1)
-  hours, naming the hold dispatch recorded.
-
-The reason is only read from the hold dispatch recorded (Daemon._resource_hold: kind pause, busy or
-lock, the resource, the holders): this module works out no lock, pause or alias of its own, and a
-task dispatch recorded as paused (directly or through a device.locks alias) is never timed. Out of
-scope here: anything that would need this module to check resource state itself.
-
-Either clears at once when the task starts or leaves the queue.
+would start it now is Daemon.check_stall's (its _start_hold model), not a second clock here, and
+no key here names one. Why dispatch holds a ready task (a pause, a busy slot, a lock and its holder)
+is dispatch's record (Daemon._resource_hold), which check_stall's own stall message names; this
+module works out no lock, pause or alias. Known gap: check_stall wakes only when no worker run at
+all has started for coordinator.stall_wake_h, so one ready task that dispatch passes over while
+other runs keep starting is reported by neither.
 
 Machine changes: `change-probe:<id>`, one `change_probe` event once an open machine change of this
 project with an until-probe has had it pass for `change_probe_m` (15) minutes while the task it
@@ -232,24 +222,19 @@ def stalled(state: Path, cfg: dict | None, now: float | None = None) -> list[dic
 KEY = "progress_check"          # coordinator.progress_check: thresholds
 STATE_KEY = "progress_state"    # kv: results seen, counters, raised keys, cleared history
 SOURCE = "daemon:progress"      # the events' source, for observation mutes
-# Each key kind's event kind. check's own: no_progress, stall and change-probe. overdue and multilock
-# are Daemon.check_stall's never-started tasks (raise_start_waits): they only pass through these keys,
-# wakes and hysteresis; their readiness is its _start_hold model, never a clock here.
-EVENTS = {"no_progress": "no_progress", "stall": "stall", "change-probe": "change_probe",
-          "overdue": "not_started", "multilock": "not_started"}
-EVENT_KINDS = ("no_progress", "stall", "change_probe", "not_started")
+# Each key kind's event kind: no_progress, stall and change-probe (event change_probe).
+EVENTS = {"no_progress": "no_progress", "stall": "stall", "change-probe": "change_probe"}
+EVENT_KINDS = ("no_progress", "stall", "change_probe")
 CHECK_KINDS = ("no_progress", "stall", "change-probe")
-START_KINDS = ("overdue", "multilock")
 HEADS = {"no_progress": "No progress: running work produced no result past its threshold.",
          "stall": "Stall: the same not-yet or failure keeps repeating.",
-         "change_probe": "Machine change due its undo: its until-probe passed, the task that owns it still waits.",
-         "not_started": "Not started: dispatch passes over a ready task while a worker slot is free."}
+         "change_probe": "Machine change due its undo: its until-probe passed, the task that owns it still waits."}
 # clear_n/clear_min: hysteresis. A raised key clears only after clear_n healthy checks in a row that
 # span clear_min minutes: at the daemon's 60 s check that is 3 checks and half an hour, long enough
 # for slots that fill and free, short enough that a fixed key leaves the digest within the hour.
 CHECK_DEFAULTS = {"task_h": 2, "resource_h": 2, "project_h": 2, "probe_n": 10, "probe_h": 1, "repeat_n": 5,
                   "fail_n": 3, "escalate_x": 2, "rewake_h": 12, "quiet_h": 6, "clear_n": 3, "clear_min": 30,
-                  "overdue_m": 15, "multilock_h": 1, "change_probe_m": 15}
+                  "change_probe_m": 15}
 HEADER = "## Progress (stuck work: re-plan, re-tier, re-point the probe, route around, cancel or fix the cause)"
 BAD_RUNS = ("failed", "timeout", "stalled")
 # Waits expected to be long, whose producer has its own clock: the task's own detached job or checks,
@@ -592,7 +577,7 @@ def _line(c: dict, now: float, where: Any = None) -> str:
 
 
 def _key(c: dict) -> str:
-    """The key an event shows: bare for its own kind's (task:#3), with the kind for another (overdue:#3)."""
+    """The key an event shows: bare for its own kind's (task:#3), with the kind for another (change-probe:4)."""
     return c["key"] if EVENTS.get(c["kind"]) == c["kind"] else f"{c['kind']}:{c['key']}"
 
 
@@ -668,52 +653,6 @@ def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | N
     with db.tx():
         _save(db, st)
         return _emit(db, due, now, where, wake)
-
-
-def raise_start_waits(db: DB, cfg: dict | None, conds: list[dict], now: float | None = None,
-                      where: Any = None) -> list[dict]:
-    """Raise Daemon.check_stall's ready tasks that dispatch does not start (overdue and multilock
-    conditions it built from its _start_hold model) through the same keys, wakes, mutes and hysteresis
-    as check. A key whose task is no longer queued (it started, or ended) clears at once. Returns
-    the events raised."""
-    now = time.time() if now is None else now
-    s, st = check_settings(cfg), load(db)
-    conds = [dict(c, reason=hold_reason(c.get("hold"))) for c in conds
-             if (c.get("hold") or {}).get("kind") != "pause"]   # a paused task is never timed
-    gone = set()
-    for key, r in st["raised"].items():
-        if r.get("kind") in START_KINDS:
-            t = db.task(int(key.rsplit("#", 1)[1])) if key.rsplit("#", 1)[-1].isdigit() else None
-            if not t or t["status"] != "queued":
-                gone.add(key)
-    due = _decide(st, conds, s, now, START_KINDS, gone)
-    with db.tx():
-        _save(db, st)
-        return _emit(db, due, now, where, True)
-
-
-def hold_reason(hold: dict | None) -> str:
-    """The reason text of the hold dispatch recorded for a ready task it did not start (Daemon._resource_hold's
-    data; None: nothing held it). It only formats that record: which pause, slot or lock holds a task
-    is dispatch's to decide, never worked out again here. A lock names a holder only while its recorded
-    pid lives (or cannot be judged here); one whose every holder is gone has no live holder."""
-    if not hold:
-        return "no holder: dispatch did not start it"
-    res, kind = hold.get("resource") or "?", hold.get("kind")
-    if kind == "pause":
-        return f"{res} paused"
-    if kind == "busy":
-        return f"{res} held by running task(s) " + (", ".join(f"#{t}" for t in hold.get("tasks") or []) or "?")
-    hs = [h for h in hold.get("holders") or [] if isinstance(h, dict)]
-
-    def _who(h: dict, state: str) -> str:
-        return f"{h.get('holder') or 'an unnamed holder'} (pid {h.get('pid') or '?'} {state})"
-    live = [h for h in hs if h.get("alive") is not False]
-    if live:
-        return f"{res} lock held by " + "; ".join(_who(h, "alive" if h.get("alive") else "unknown") for h in live)
-    if hs:
-        return f"{res} lock taken, no live holder: " + "; ".join(_who(h, "gone") for h in hs)
-    return f"{res} lock taken, holder unknown"
 
 
 def change_probes(db: DB, s: dict, st: dict, changes: list[dict], now: float) -> tuple[list[dict], set[str]]:
