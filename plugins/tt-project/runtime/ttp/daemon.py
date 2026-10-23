@@ -59,6 +59,7 @@ from . import outagetask
 from . import grants
 from . import ends
 from . import handofflint
+from . import handoffcheck
 from . import harnesstree
 from . import heal
 from . import holdloops
@@ -2906,7 +2907,7 @@ class Daemon:
         except Exception:
             root_now = None
         if r["role"] != "coordinator" and r["task"]:
-            self._prefetch_remote(r["task"], _read_result(run_dir / RESULT_FILE))
+            self._prefetch_remote(r["task"], _read_result(run_dir / RESULT_FILE), run_dir)
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         with db.tx():
@@ -3301,7 +3302,7 @@ class Daemon:
             run = db.one("SELECT * FROM runs WHERE id=?", (pv.get("run"),)) if pv.get("run") else None
             from .providers.base import RunUsage
             usage = RunUsage(cost_usd=float(pv.get("cost") or 0.0), estimated=bool(pv.get("estimated")))
-            self._prefetch_lint(tid, handoff)
+            self._prefetch_lint(tid, handoff, run_dir)
             with db.tx():
                 t = db.task(tid)
                 if not t or t["status"] != "pushing" or pushclaim.KEY not in load_result(t["result"]):
@@ -3343,11 +3344,11 @@ class Daemon:
         if not missing:
             scr.close_watcher_issues(db, "daemon:push-audit", why="every claimed push of the last days is on its remote")
 
-    def _prefetch_remote(self, task_id: int, result: dict | None) -> None:
+    def _prefetch_remote(self, task_id: int, result: dict | None, run_dir: Path | None = None) -> None:
         """What finishing a code or review task's hand-off asks the push remote (pushq.prefetch), asked
         now, before the transaction that records it: inside it the answer is read, never fetched, so
         the write lock never waits on the network. Best effort: an unanswered question reads as before."""
-        task = self._prefetch_lint(task_id, result)
+        task = self._prefetch_lint(task_id, result, run_dir)
         if not isinstance(result, dict) or result.get("status") not in ("done", "needs_review"):
             return   # only a finished hand-off approves a push or gets its review
         if not task or task["kind"] not in ("code", "review"):
@@ -3357,15 +3358,20 @@ class Daemon:
         except Exception as e:
             log(self.p, f"task {task_id}: asking the push remote before finishing failed: {type(e).__name__}: {e}")
 
-    def _prefetch_lint(self, task_id: int, result) -> dict | None:
-        """What the hand-off lint (handofflint.lint, in _finish_worker) reads from the remote, asked
-        before the transaction. Returns the task."""
+    def _prefetch_lint(self, task_id: int, result, run_dir: Path | None = None) -> dict | None:
+        """What the hand-off lint (handofflint.lint, in _finish_worker) reads from the remote, and the
+        project's hand-off checks (handoffcheck), asked before the transaction. Returns the task."""
         task = self.p.db.task(task_id)
         try:
             if task:
                 handofflint.prefetch(self.p, self.cfg, task, result)
         except Exception as e:
             log(self.p, f"task {task_id}: asking the remote for the hand-off lint failed: {type(e).__name__}: {e}")
+        try:
+            if task and not _push_rechecked(task):
+                handoffcheck.prefetch(self.p, self.cfg, task, result, run_dir)
+        except Exception as e:   # verdict runs them again inside the transaction
+            log(self.p, f"task {task_id}: the hand-off checks failed to run early: {type(e).__name__}: {e}")
         return task
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
@@ -3664,6 +3670,42 @@ class Daemon:
                 attempts = int(task["attempts"] or 0)
             elif new == "queued":
                 extra[conflictfix.KEY] = cmark   # its next run is the same conflict fix
+        # The project's own hand-off checks (worker.handoff_checks, handoffcheck.py), run before this
+        # transaction: one that fails sends the run back with its output, before any reply posts or
+        # review or push is queued; past the cap the task goes to review, its result kept. A broken one
+        # never holds a hand-off back: the coordinator hears once per check.
+        sent_back = int(load_result(task["result"]).get(handoffcheck.KEY) or 0)
+        hcheck_text = ""
+        checked = handoffcheck.verdict(self.p, self.cfg, task, handoff, run_dir) \
+            if status == "ok" and not waiting and not _daemon_precheck(r, handoff) and not refusal and not push_quiet \
+            and not _push_rechecked(task) else {}
+        for b in checked.get("broken") or []:
+            fp = handoffcheck.broken_fingerprint(b)
+            log(self.p, f"task {task['id']}: hand-off check '{b['name']}' is broken ({b['why']}); accepted")
+            if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                     (time.time(), "daemon", handoffcheck.BROKEN_EVENT, fp, "normal",
+                      handoffcheck.broken_text(task, b), "queued", task["id"]))
+        if (bad := checked.get("failed")):
+            cap = handoffcheck.max_sendbacks(self.cfg)
+            log(self.p, f"task {task['id']}: hand-off check '{bad['name']}' failed ({sent_back} of {cap} send-backs "
+                        f"so far)")
+            approval = None
+            attempts = int(task["attempts"] or 0)   # the cap bounds these runs, not max_attempts
+            if sent_back < cap:
+                sent_back += 1
+                new, not_before, push_quiet = "queued", time.time(), True
+                extra["woke"] = handoffcheck.reason(bad, sent_back, cap)
+                reason = f"hand-off check '{bad['name']}' failed; sent back ({sent_back} of {cap})"
+            else:
+                new, sent_back = "review", 0   # a requeue by the coordinator gets its send-backs again
+                reason = f"hand-off check '{bad['name']}' still fails after {cap} send-backs; the coordinator decides"
+                hcheck_text = (f"\nHand-off check '{bad['name']}' still fails after {cap} send-backs: nothing was "
+                               f"posted, reviewed or pushed, and its result and branch are kept. Decide: fix and "
+                               f"requeue it, accept it as is, or cancel it. The check's output:\n"
+                               f"{handoffcheck.event_tail(bad['output'])}")
+        if sent_back and not (checked and not checked.get("failed")):
+            extra[handoffcheck.KEY] = sent_back   # until a hand-off passes them
         if new == "done" and not approval and not push_verified and status == "ok" \
                 and self._defer_for_push(r, task, run_dir, usage, ended, result, summary):
             return
@@ -3690,7 +3732,7 @@ class Daemon:
             {"summary": summary, "status": shown, **extra,
              **({k: v for k, v in result.items()
                  if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake",
-                              "stale_wakes", "wait_key")}
+                              "stale_wakes", "wait_key", handoffcheck.KEY)}
                 if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]
@@ -3788,7 +3830,7 @@ class Daemon:
         where = _result_ref(self.p, run_dir if handoff is None else run_dir / RESULT_FILE)
         head = (f"#{task['id']} {task['title']} → {outcome} (run {ended or status}, {'~' if usage.estimated else ''}"
                 f"${usage.cost_usd:.2f}): ")
-        text = ""   # the daemon's own lines after the summary, which the digest must show whole
+        text = hcheck_text   # the daemon's own lines after the summary, which the digest must show whole
         if undelivered:
             text += (f"\nNot posted to the chat: {undelivered}. The user got nothing: post the deliverable "
                      f"(a `reply`) or rerun the task asking for it in result.json `{replymsg.FIELD}`.")
@@ -3821,7 +3863,7 @@ class Daemon:
         # A finished code task's next step is its review, queued here in the same step whatever else the
         # hand-off holds: its follow-ups go into the review's spec and stay the coordinator's to queue.
         # A hand-off with nothing else to decide (no follow-ups or notes, normal severity) starts no turn.
-        plain = not fups and not notes and sev == "normal"
+        plain = not fups and not notes and sev == "normal" and not hcheck_text
         # A done hop whose only proposal is the next `continue:` hop, with progress and under the
         # chain caps, gets it from the daemon (chaincap). A code task that left its change unfinished
         # (a split: a `continue:` hop for its branch, or a head its hand-off marks WIP) gets no review:
@@ -8107,7 +8149,7 @@ class Daemon:
             _, r, run_dir, on_pass, head = got
             from .providers.base import RunUsage
             self._probe_rc.pop(task["id"], None)
-            self._prefetch_remote(task["id"], on_pass)
+            self._prefetch_remote(task["id"], on_pass, run_dir)
             with self.p.db.tx():
                 self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=on_pass)
             log(self.p, f"task {task['id']} retry_when probe passed; its checks passed on {head[:12]}: "
@@ -8481,7 +8523,7 @@ class Daemon:
             if not why and r:
                 from .providers.base import RunUsage
                 self._probe_rc.pop(tid, None)
-                self._prefetch_remote(tid, result)
+                self._prefetch_remote(tid, result, Path(r["dir"]))
                 with db.tx():
                     self._finish_worker(r, RunUsage(), "ok", Path(r["dir"]), "model-free", handoff=result)
                 log(self.p, f"task {tid} on_pass_cmd recorded {result['status']} model-free")
@@ -10715,6 +10757,16 @@ def _checked_head(run_dir: Path, task: dict) -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return head
+
+
+def _daemon_precheck(r: dict, handoff) -> bool:
+    """The daemon's own failed-precheck hand-off of a review no reviewer ran: no worker wrote it."""
+    return r.get("id") is None and isinstance(handoff, dict) and handoff.get(REVIEW_FAILURE_KEY) == "precheck"
+
+
+def _push_rechecked(task: dict) -> bool:
+    """The task's hand-off is back from verify_pushes: its hand-off checks already passed it once."""
+    return task.get("status") == "pushing" and pushclaim.KEY in load_result(task.get("result"))
 
 
 def _read_result(path: Path) -> dict | None:

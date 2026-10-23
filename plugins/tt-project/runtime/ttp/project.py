@@ -354,6 +354,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # each {label, all_of: [regex...], unless, pass_blocking: [...], override_field, reason}. An ask is
     # refused when every all_of regex matches its text, recommendation and least_disruptive.
     "ask_gate": {"refuse": []},
+    # The project's own model-free checks on each worker's hand-off (handoffcheck.py), run before it is
+    # accepted, its reply posts or its review or push is queued: each {name, run, timeout_s (60), kinds}.
+    # `run` runs from the project root with the hand-off in TTP_RESULT_JSON and `{result}`; exit 0
+    # passes, 1 sends the run back with the output (handoff_check_max_sendbacks times, then the task
+    # goes to review), anything else is a broken check: accepted, the coordinator told once.
+    "worker": {"handoff_checks": [], "handoff_check_max_sendbacks": 2},
     # Worker and reviewer runs, everything they start (detached checks, tests, reference models) and
     # the pushes and push batches the daemon starts run this many nice levels below the daemon
     # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the
@@ -704,6 +710,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     from .devq import config_problems as runner_problems
     from .hostmap import problems as host_problems
     out += ask_gate_rules(raw)[1]
+    from .handoffcheck import rules as handoff_check_rules
+    out += handoff_check_rules(raw)[1]
     out += host_problems(raw)
     runners = (raw.get("device") or {}).get("runners")
     if runners is not None and not isinstance(runners, dict):
