@@ -19,7 +19,10 @@ changes within AREA_WINDOW_S, the daemon queues no automatic fix for it and rais
 REVIEW_AREA_EVENT, which makes the coordinator's turn a tricky one (TRIGGER) that re-plans.
 A review whose hand-off says `review_failure: check_only` (daemon.review_failure) found no code
 problem, only a missing or inapplicable check, so it does not count toward the cap; nor does one
-the push queue failed because only its batch checks failed (pushq._settle writes check_only too).
+the push queue failed because only its batch checks failed (pushq._settle writes check_only too),
+nor one the daemon failed with no reviewer run because its pre-review checks failed
+(`review_failure: precheck`, Daemon._precheck_failed): no reviewer judged the design. That one still
+counts toward the per-change round cap (daemon.AUTO_FIX_ROUNDS), since it is a round of the stack.
 """
 from __future__ import annotations
 
@@ -187,19 +190,25 @@ def check_only(task: dict) -> bool:
     return load_result(task.get("result")).get("review_failure") == "check_only"
 
 
+def unjudged(task: dict) -> bool:
+    """Whether review `task` failed with no reviewer judging the code: check-only, or its pre-review
+    checks failed (precheck). Neither counts toward area_fail_cap."""
+    return load_result(task.get("result")).get("review_failure") in ("check_only", "precheck")
+
+
 def failed_reviews(db: DB, since: float) -> list[int]:
-    """Reviews that failed or asked for changes since `since`, each once, but none that failed check-only."""
+    """Reviews that failed or asked for changes since `since`, each once, but none no reviewer judged (unjudged)."""
     return [r["task"] for r in db.q(
         "SELECT DISTINCT e.task, t.result FROM events e JOIN tasks t ON t.id=e.task WHERE t.kind='review' AND e.ts>? "
         f"AND e.kind IN ({','.join('?' * len(FAILED_KINDS))}) ORDER BY e.task", (since, *FAILED_KINDS))
-        if not check_only(r)]
+        if not unjudged(r)]
 
 
 def area(p, cfg: dict, review: dict, now: float | None = None) -> dict | None:
     """When `review` (failing now) makes area_fail_cap failed reviews of its area within
     AREA_WINDOW_S: {root, title, reviews, tasks, files}; None below it or with the cap off."""
     n = cap(cfg)
-    if not n or check_only(review):
+    if not n or unjudged(review):
         return None
     db, now = p.db, time.time() if now is None else now
     fails = set(failed_reviews(db, now - AREA_WINDOW_S)) | {review["id"]}

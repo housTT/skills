@@ -10086,3 +10086,76 @@ def test_ttp_land_root_lands_on_master_in_a_temp_clone_and_the_projects_own_mast
     said = []
     assert land.land(p, clone, head, t, said.append, recorded=False) == 2, said
     assert _git_out(repo, "rev-parse", "master") == tip and not p.db.q("SELECT * FROM task_landings")
+
+
+_PRECHECK_FAIL_OUT = ("tests/test_a.py::test_one FAILED\n"
+                      "FAILED tests/test_a.py::test_one - assert 1 == 2\n1 failed, 3 passed in 0.50s\n")
+
+
+def _precheck_review(s, monkeypatch, rc="1", fail=None):
+    """`s.review` carries the label of checks the daemon started on `s.head` that ended with `rc`
+    (None: still unended) and wrote `fail` over a pytest failure's check_failure.json, as `ttp checks`
+    does; the review runs on a daemon whose start_run only records it."""
+    from ttp import cli
+    from ttp.daemon import PRECHECK_LABEL, PRECHECKS_DIR
+    out = s.p.state / PRECHECKS_DIR / f"t{s.code}-{s.head[:12]}"
+    out.mkdir(parents=True)
+    if rc is not None:
+        (out / cli.CHECKS_RC).write_text(f"{rc}\n")
+    (out / cli.CHECKS_OUT).write_text("".join(f"line {n}\n" for n in range(30)) + _PRECHECK_FAIL_OUT)
+    (out / "check_failure.json").write_text(json.dumps({
+        "kind": "check_failed", "sig": "x", "check": "python3 -m pytest -q", "targets": [], "head": s.head,
+        "rc": 1, "output": _PRECHECK_FAIL_OUT, "unrelated": False, "purpose": "candidate", **(fail or {})}))
+    s.p.db.update_task(s.review, provider="claude", budget_usd=8.0, labels=[PRECHECK_LABEL + out.name])
+    return _reuse_daemon(s.p, monkeypatch)
+
+
+def test_a_review_whose_precheck_failed_goes_to_a_fix_with_the_failing_tests_and_no_reviewer_run(env, monkeypatch):
+    """Reviews read the daemon's failed pre-review checks and only then queued a fix: the daemon fails
+    the review model-free with the failing ids and the end of checks.out, and queues the fix and
+    re-review a failed review with fixes gets. It counts as a round of the change, not for the area cap."""
+    from ttp import reviewcap, sharedchecks
+    s = _pq(env, monkeypatch)
+    d, started = _precheck_review(s, monkeypatch)
+    d.dispatch()
+    assert started == [], "a reviewer ran on a head whose checks failed"
+    rev = s.p.db.task(s.review)
+    res = json.loads(rev["result"])
+    assert rev["status"] == "failed" and res["review_failure"] == "precheck"
+    assert res[sharedchecks.FAILING_KEY] == ["tests/test_a.py::test_one"] and res[sharedchecks.COMPLETE_KEY]
+    assert "line 29\n" in res["summary"] and "line 13\n" in res["summary"] and "line 12\n" not in res["summary"]
+    [fix] = s.p.db.q("SELECT * FROM tasks WHERE kind='code' AND labels LIKE ?", (f'%"review_fix:{s.review}"%',))
+    assert fix["title"].startswith(f"Fix review #{s.review}: ") and fix["status"] == "queued"
+    assert "tests/test_a.py::test_one" in fix["spec"] and "no reviewer ran" in fix["spec"]
+    [again] = s.p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=? AND status='queued'", (s.review,))
+    assert fix["id"] in json.loads(again["depends_on"])
+    assert s.p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0
+    assert reviewcap.unjudged(rev) and s.review not in reviewcap.failed_reviews(s.p.db, 0)
+    assert reviewcap.area(s.p, {"review": {"area_fail_cap": 1}}, rev) is None
+    # Its failure is recorded, so another change failing the same test can be seen as shared.
+    assert s.p.db.one("SELECT ids FROM checks_failures WHERE task=?", (s.review,))["ids"] == \
+        json.dumps(["tests/test_a.py::test_one"])
+
+
+@pytest.mark.parametrize("case", ["passed", "unended", "env fault", "env problem", "target missing", "timeout",
+                                  "killed", "moved", "shared"])
+def test_a_review_whose_precheck_did_not_fail_on_its_tests_still_gets_its_reviewer(env, monkeypatch, case):
+    """A pass, checks still running or past the hold, an environment fault (exit 75 or an env_problem,
+    as a missing runner), a missing target, a timeout or kill, a head that moved, or a failure shared
+    with other changes (its incident path holds the reviewer's own checks): the reviewer runs as before."""
+    from ttp import sharedchecks
+    s = _pq(env, monkeypatch)
+    rc = {"passed": "0", "unended": None, "env fault": "75", "killed": "killed"}.get(case, "1")
+    fail = {"env problem": {"env_problem": "No module named pytest"},
+            "target missing": {"kind": "target_missing"}, "timeout": {"rc": 124},
+            "moved": {"head": "f" * 40}}.get(case, {})
+    if case == "shared":   # the same test failed the same way in two other changes
+        ids = ["tests/test_a.py::test_one"]
+        sigs = sharedchecks.failure_sigs(_PRECHECK_FAIL_OUT, ids)
+        for n in (1, 2):
+            other = s.p.db.add_task(f"other {n}", "s", kind="code", origin="user", status="done")
+            sharedchecks.record(s.p.db, other, f"{n}" * 40, ids, time.time(), sigs)
+    d, started = _precheck_review(s, monkeypatch, rc, fail)
+    d.dispatch()
+    assert started == [s.review], case
+    assert not s.p.db.q("SELECT id FROM tasks WHERE labels LIKE ?", (f'%"review_fix:{s.review}"%',))

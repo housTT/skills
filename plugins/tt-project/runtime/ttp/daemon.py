@@ -210,8 +210,13 @@ OWN_STEP = re.compile(r"It (?:delivers onto its pr_branch|rebases \S+ and delive
 # What a failed review's hand-off says failed (review_failure; kind-review.md): only a check or gate
 # that is missing or does not apply, with no code finding (check_only), code findings (substantive),
 # or both (mixed). A check-only failure gets no fix and re-review: nothing in the change is to fix.
-# Any other value is unknown and handled like substantive.
-REVIEW_FAILURE_KEY, REVIEW_FAILURE_KINDS = "review_failure", ("check_only", "substantive", "mixed")
+# Any other value is unknown and handled like substantive. The daemon writes a fourth, precheck, for a
+# review it failed with no reviewer run because the checks it started on the head failed
+# (Daemon._precheck_failed): it gets a fix and re-review like substantive.
+REVIEW_FAILURE_KEY, REVIEW_FAILURE_KINDS = "review_failure", ("check_only", "substantive", "mixed", "precheck")
+# A precheck failure's verdict: the last lines of checks.out it quotes, and the failing command's exit
+# codes that mean a timeout or a kill (the environment, not the head), which leave the reviewer to run.
+PRECHECK_TAIL_LINES, PRECHECK_KILLED_RCS = 20, (124, 137, 143)
 # A PR whose open findings outlive the task that delivered it gets this many fix tasks from the daemon.
 PR_FIX_ROUNDS = 2
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
@@ -5481,6 +5486,9 @@ class Daemon:
                 task = dict(task, budget_usd=round((task["spent_usd"] or 0)
                                                    + bud.task_default_usd(self.cfg, task["tier"]), 2))
                 db.update_task(task["id"], budget_usd=task["budget_usd"])
+            # Before _start_hold: a review whose pre-review checks failed needs no reviewer, nor its gates.
+            if task["kind"] == "review" and self._precheck_failed(task):
+                continue
             provider = task["provider"] or core
             why = self._start_hold(task, provider, ctx, reserve=True)
             if why == "held":
@@ -8974,6 +8982,75 @@ class Daemon:
         info = _read_checks_pid(out)
         return (not (out / CHECKS_RC).exists() and _checks_alive(info)
                 and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
+
+    def _precheck_failed(self, task: dict) -> bool:
+        """A review whose checks the daemon started on its head (_precheck) failed on that head, still
+        the branch's tip: failed model-free, with the failing test ids and the end of checks.out as its
+        verdict (review_failure precheck) and one follow-up to fix them, so _finish_worker queues the
+        fix and re-review as for any failed review with fixes (_fix_failed_review). It counts toward
+        that per-change round cap (AUTO_FIX_ROUNDS), not toward review_area_cap: no reviewer judged the
+        design (reviewcap.unjudged). False, and the reviewer runs as before, while they run or for
+        anything but a test failure: a pass, an environment fault (exit 75, an env_problem, as
+        `ttp checks` reports a missing runner), a missing target or selector (check:<sig>), a timeout
+        or kill, a head that moved, or a failure shared with other changes (sharedchecks), whose
+        incident path holds the reviewer's own checks."""
+        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
+        m = re.fullmatch(r"t(\d+)-[0-9a-f]{12}", name)
+        if not m:
+            return False
+        from .cli import CHECKS_OUT, CHECKS_RC
+        out = self.p.state / PRECHECKS_DIR / name
+        try:
+            rc = (out / CHECKS_RC).read_text().strip()
+            fail = json.loads((out / "check_failure.json").read_text())
+        except (OSError, ValueError):
+            return False
+        if rc != "1" or not isinstance(fail, dict) or fail.get("kind") != "check_failed" or fail.get("env_problem") \
+                or not isinstance(fail.get("rc"), int) or fail["rc"] <= 0 or fail["rc"] in PRECHECK_KILLED_RCS:
+            return False
+        head, code = str(fail.get("head") or ""), self.p.db.task(int(m[1]))
+        try:
+            tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{code['branch']}^{{commit}}",
+                                check=False) if code and code["branch"] else ""
+        except Exception:
+            tip = ""
+        if not head or tip != head:
+            return False
+        db, now, output = self.p.db, time.time(), str(fail.get("output") or "")
+        ids, complete = sharedchecks.failing_ids(output)
+        try:
+            if ids:
+                sigs = sharedchecks.failure_sigs(output, ids)
+                sharedchecks.record(db, task["id"], head, ids, now, sigs)
+                if complete and sharedchecks.shared(db, task["id"], head, ids, now, self.cfg,
+                                                    pushq.bad_tip_ids(db), sigs):
+                    return False
+        except Exception as e:   # unread: the reviewer runs, as before
+            log(self.p, f"review {task['id']}: its failed precheck was not classified: {e}")
+            return False
+        try:
+            tail = "\n".join((out / CHECKS_OUT).read_text(errors="replace").splitlines()[-PRECHECK_TAIL_LINES:])
+        except OSError:
+            tail = "\n".join(output.splitlines()[-PRECHECK_TAIL_LINES:])
+        check = fail.get("check")
+        cmd = str(check.get("run") or "") if isinstance(check, dict) else str(check or "")
+        failing = ", ".join(ids[:20]) + (f" and {len(ids) - 20} more" if len(ids) > 20 else "") if ids \
+            else "no pytest ids in its output"
+        said = (f"The project's checks (`ttp checks`) the daemon ran on head {head[:12]} before this review failed"
+                + (f" ({cmd}, exit {fail['rc']})" if cmd else f" (exit {fail['rc']})")
+                + f"; no reviewer ran. Failing tests: {failing}. The end of {out / CHECKS_OUT}:\n{tail}")
+        fix = {"title": f"Make the project's checks pass on {head[:12]}",
+               "spec": (f"{said}\nFix the change so these checks pass (or a test, if the test is what is wrong), "
+                        f"run the failing tests, then the full checks, and commit.")}
+        result = {"status": "failed", "summary": said, REVIEW_FAILURE_KEY: "precheck",
+                  sharedchecks.FAILING_KEY: ids, sharedchecks.COMPLETE_KEY: complete, "followups": [fix]}
+        from .providers.base import RunUsage
+        with db.tx():
+            self._finish_worker({"task": task["id"], "id": None, "note": "{}"}, RunUsage(), "ok", out, "model-free",
+                                handoff=result)
+        log(self.p, f"review {task['id']}: its precheck failed on {head[:12]} ({len(ids)} failing test(s)); "
+                    f"failed with no reviewer run")
+        return True
 
     def _continue_ready(self, task: dict, fups: list[dict]) -> str:
         """chaincap.hop_ready for a done task whose only proposal is one `continue:` follow-up; ''
