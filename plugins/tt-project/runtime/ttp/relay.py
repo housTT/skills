@@ -23,6 +23,7 @@ VERBATIM = "user's words (verbatim)"
 CONTEXT = "relayer context (data, not the user's word)"
 WINDOW_S = 3600   # without a turn's own messages, how far back the guard reads inbound messages
 SHINGLE = 5       # words in a phrase the guard matches
+QUOTE_BACK = 600  # chars of the user's words a rejection hands back, so the next turn can quote them
 CONTENT = 3       # of them, at least this many not common words: "the push queue is on" is no quote
 _COMMON = set("""a an and are as at be been but by can do does done for from has have if in into is it its
 it's me my no not now of on once or our so than that the their them then there these this those to too up
@@ -77,9 +78,26 @@ def context_only(text: str, messages: list[dict], terms: set[str] | frozenset = 
     of SHINGLE words (CONTENT of them not common words), or a model/effort name (`terms`, or one that
     looks like a model name), found in some message's context and in none of the user's words: the
     messages' verbatim text and `said` (text the user already backs: the charter, user-rule memory)."""
+    return guard(text, messages, terms, said)[0]
+
+
+def words_back(m: dict | None, limit: int = QUOTE_BACK) -> str:
+    """For a rejection: message `m`'s own words, labelled as the user's, so the next turn can quote them
+    exactly ('' when it has none). Cut at `limit` chars, with a marker."""
+    words = split((m or {}).get("text") or "")[0]
+    if not words:
+        return ""
+    if len(words) > limit:
+        words = f"{words[:limit].rstrip()} [... cut at {limit} of {len(words)} chars]"
+    return f"Message #{m['id']}, {VERBATIM}: \"{words}\""
+
+
+def guard(text: str, messages: list[dict], terms: set[str] | frozenset = frozenset(),
+          said: list[str] = ()) -> tuple[str, dict | None]:
+    """context_only's reason, with the message whose context holds the phrase (None when there is none)."""
     ctx = [m for m in messages if (m.get("context") or "").strip()]
     if not ctx or not (text or "").strip():
-        return ""
+        return "", None
     said = [_words(m.get("text") or "") for m in messages] + [_words(x) for x in said]
     said_words = {w for ws in said for w in ws}
     said_phrases = set().union(*(_shingles(ws) for ws in said))
@@ -89,13 +107,13 @@ def context_only(text: str, messages: list[dict], terms: set[str] | frozenset = 
         cw = _words(m["context"])
         for w in dict.fromkeys(words):
             if (w in terms or _PIN_TERM.match(w)) and w in cw and w not in said_words:
-                return f"{w!r} is only in message #{m['id']}'s relayer context, not in the user's words"
+                return f"{w!r} is only in message #{m['id']}'s relayer context, not in the user's words", m
         hit = {h for h in (_shingles(words) & _shingles(cw)) - said_phrases
                if sum(w not in _COMMON for w in h) >= CONTENT}
         if hit:
             phrase = " ".join(min(hit, key=lambda s: words.index(s[0])))
-            return f"{phrase!r} is only in message #{m['id']}'s relayer context, not in the user's words"
-    return ""
+            return f"{phrase!r} is only in message #{m['id']}'s relayer context, not in the user's words", m
+    return "", None
 
 
 def pin_terms(cfg: dict, providers: bool = False) -> set[str]:
