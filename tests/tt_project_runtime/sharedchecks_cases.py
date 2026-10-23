@@ -567,6 +567,16 @@ def _tip_daemon(p, monkeypatch, tip="c" * 40, holds_tip=False):
     return d, started, tips
 
 
+def _tip_ran(p, d, tip, ids, rc, now):
+    """A rerun of `ids` on `tip` that already ended with exit code `rc`."""
+    from ttp import sharedchecks
+    key = sharedchecks.tip_key(tip, ids)
+    sharedchecks.tip_started(p.db, key, tip, ids, now)
+    d._tip_dir(key).mkdir(parents=True, exist_ok=True)
+    (d._tip_dir(key) / "rc").write_text(rc + "\n")
+    return key
+
+
 def _fixes(p):
     return p.db.q("SELECT * FROM tasks WHERE title LIKE 'Fix shared check failure%' ORDER BY id")
 
@@ -578,6 +588,7 @@ def test_a_second_shared_failure_while_its_fix_is_in_review_or_pushing_links_to_
     _seed_other_failures(p, _IDS)
     t1 = _shared_fail_task(p, tmp_path, _pytest_out(_IDS))[0]
     now = time.time()
+    _tip_ran(p, d, "c" * 40, _IDS, "1", now)   # they fail on the tip too: the first failure opens the incident
     d._probe_passed(p.db.task(t1), now)
     (fix,) = _fixes(p)
     # The fix ended done and its review is open: the next failure of the same ids is that fix's.
@@ -668,13 +679,38 @@ def test_a_shared_failure_not_passing_on_the_tip_adds_exactly_one_fix_task(env, 
         assert "woke" not in res and not _ready(p, tid)
 
 
-def test_a_shared_failure_on_a_head_holding_the_tip_opens_its_incident_without_a_tip_rerun(env, monkeypatch, tmp_path):
+@pytest.mark.parametrize("rc", ["0", "1"])
+def test_a_shared_failure_on_a_head_holding_the_tip_still_reruns_on_the_tip(env, monkeypatch, tmp_path, rc):
+    # A head built on the tip can fail by its own change: a size-budget or guard test each change trips
+    # with its own code fails the same way (numbers aside) on every such head. Passing on the tip, it is
+    # each task's own: no fix task, and the task wakes to fix its change, not to rebase. Failing there,
+    # the tip is broken: one incident with one fix task.
+    from ttp import sharedchecks
     p = make(env)
-    d, _, tips = _tip_daemon(p, monkeypatch, holds_tip=True)
+    tip = "c" * 40
+    d, started, tips = _tip_daemon(p, monkeypatch, tip=tip, holds_tip=True)
     _seed_other_failures(p, _IDS)
     tid = _shared_fail_task(p, tmp_path, _pytest_out(_IDS))[0]
-    d._probe_passed(p.db.task(tid), time.time())
-    assert not tips and len(_fixes(p)) == 1
+    now = time.time()
+    d._probe_passed(p.db.task(tid), now)
+    key = sharedchecks.tip_key(tip, _IDS)
+    assert tips == [(tip, sorted(_IDS), key)] and not _fixes(p)
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["shared_hold"]["tip_check"] == key and res["shared_hold"]["holds_tip"] is True
+    d._tip_dir(key).mkdir(parents=True, exist_ok=True)
+    (d._tip_dir(key) / "rc").write_text(rc + "\n")
+    d._probe_passed(p.db.task(tid), now + 120)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert len(tips) == 1 and not started
+    if rc == "0":
+        assert not _fixes(p) and not p.db.q("SELECT id FROM checks_incidents")
+        assert "pass on the push-branch tip" in res["woke"] and "your own change" in res["woke"], res
+        assert "rebase" not in res["woke"] and res["wake_tier"] == "standard"
+        assert task["not_before"] <= now + 120
+    else:
+        (fix,) = _fixes(p)
+        assert res["shared_hold"]["incident"] and "woke" not in res and not _ready(p, tid)
 
 
 def test_a_missing_check_target_is_never_held_nor_rerun_on_the_tip(env, monkeypatch, tmp_path):

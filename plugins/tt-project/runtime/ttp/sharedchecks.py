@@ -23,8 +23,10 @@ One owner per failure (in_flight): an incident whose fix task ended done stays o
 on its way to the push branch (a review of it open, a push queue row of it not settled), so a second
 failure of the same ids links to it instead of adding a fix task. A failure no open incident owns is
 first rerun model-free on the push-branch tip, only its failing ids (tip_verdict, Daemon._tip_check):
-when they pass there, no fix task is added and the held task is woken to rebase onto the tip; when they
-fail there too (or the tip cannot be checked), one incident opens as before."""
+when they pass there, no fix task is added and the held task is woken to rebase onto the tip, or, when
+its head already holds the tip, to fix its own change (a budget test each change trips with its own code
+fails the same way on every head); when they fail there too (or the tip cannot be checked), one incident
+opens as before."""
 from __future__ import annotations
 
 import hashlib

@@ -8176,7 +8176,8 @@ class Daemon:
         RERUNS_MAX reruns it wakes. False: wake it as before (another runner, an id not shared...).
         No new incident while one owns the ids with a fix live or on its way to the push branch
         (sharedchecks.owner); with none, the failing ids are first rerun on the push-branch tip
-        (_tip_gate): passing there, no fix task is added and the task wakes to rebase."""
+        (_tip_gate): passing there, no fix task is added and the task wakes to rebase, or to fix its own
+        change when its head already holds that tip."""
         from .cli import _read_checks_pid
         db, tid = self.p.db, task["id"]
         if rc == "killed":
@@ -8205,7 +8206,7 @@ class Daemon:
                     db.update_task(tid, not_before=now + 2 * PROBE_EVERY_S)
                 return True
             if v == "pass":
-                return self._tip_passed(task, ids, str(hold.get("tip") or ""), now)
+                return self._tip_passed(task, ids, str(hold.get("tip") or ""), now, bool(hold.get("holds_tip")))
             tipped, hold = True, {k: v for k, v in hold.items() if k != "tip_check"}
         elif hold and hold.get("started") == started:   # the failure it was held on: release or sleep on
             moved = bool(tip and hold.get("tip") and tip != hold["tip"]
@@ -8250,15 +8251,19 @@ class Daemon:
 
     def _tip_gate(self, task: dict, prev: dict, hold: dict, now: float) -> bool | None:
         """A shared failure no incident owns: rerun only its failing ids on the push-branch tip before a
-        fix task is added (sharedchecks.tip_verdict). True: held while that rerun runs, or woken to rebase
-        since they pass there. None: open the incident as before (no tip, the task's head already holds
-        it, the rerun could not start, failed there or proved nothing)."""
+        fix task is added (sharedchecks.tip_verdict). True: held while that rerun runs, or woken since
+        they pass there (to rebase, or to fix its own change when its head already holds the tip: a
+        budget or guard test each change trips with its own code fails the same way on every head).
+        None: open the incident as before (no tip, the rerun could not start, failed there or proved
+        nothing)."""
         tid, tip, head, ids = task["id"], hold["tip"], hold["head"], hold["ids"]
+        if not tip:
+            return None
         try:
-            if not tip or worktree.is_ancestor(self.p, tip, head):
-                return None   # its own failure on a head holding the tip is the tip's
+            holds = worktree.is_ancestor(self.p, tip, head)
         except (OSError, subprocess.SubprocessError):
             return None
+        hold = {**hold, "holds_tip": bool(holds)}
         key = sharedchecks.tip_key(tip, ids)
         v = self._tip_result(key, now)
         if v is None and not (self.p.db.kv(sharedchecks.TIP_KEY) or {}).get(key):
@@ -8272,7 +8277,7 @@ class Daemon:
                     worktree._git(self.p.root, "worktree", "prune", check=False)
             v = "pending"
         if v == "pass":
-            return self._tip_passed(task, ids, tip, now)
+            return self._tip_passed(task, ids, tip, now, bool(holds))
         if v != "pending":
             return None
         until = now + sharedchecks.settings(self.cfg)["tip_timeout_s"]
@@ -8282,13 +8287,17 @@ class Daemon:
                     f"owns them; held while they rerun on the push-branch tip {tip[:12]}")
         return True
 
-    def _tip_passed(self, task: dict, ids: list[str], tip: str, now: float) -> bool:
-        """Its failing ids pass on the push-branch tip: no fix task; wake it to rebase and rerun its checks."""
+    def _tip_passed(self, task: dict, ids: list[str], tip: str, now: float, holds_tip: bool = False) -> bool:
+        """Its failing ids pass on the push-branch tip: no fix task; wake it to rebase and rerun its checks,
+        or, when its head already holds that tip, to fix what its own change broke."""
         log(self.p, f"task {task['id']}: its {len(ids)} failing test(s) pass on the push-branch tip {tip[:12]}; "
-                    f"no fix task, woken to rebase onto it and rerun its checks")
+                    + ("its head holds that tip, so its own change fails them; no fix task, woken to fix it"
+                       if holds_tip else "no fix task, woken to rebase onto it and rerun its checks"))
+        todo = ("which your head already holds, so your own change fails them: fix it and run your checks again"
+                if holds_tip else "rebase onto the tip and run your checks again")
         self._wake_waiting(task, f"its checks failed on {len(ids)} test(s) ({', '.join(ids[:3])}"
-                                 f"{', ...' if len(ids) > 3 else ''}) that pass on the push-branch tip {tip[:12]}: "
-                                 "rebase onto the tip and run your checks again; no fix task was added", now,
+                                 f"{', ...' if len(ids) > 3 else ''}) that pass on the push-branch tip {tip[:12]}"
+                                 f"{', ' if holds_tip else ': '}{todo}; no fix task was added", now,
                            extra={"wake_tier": task["tier"] if task["tier"] in bud.TIER_ORDER else "standard",
                                   "shared_hold": {}})
         return True
