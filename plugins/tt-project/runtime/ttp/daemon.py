@@ -91,6 +91,7 @@ from . import refwaits
 from . import release
 from . import responsibilities
 from . import reviewcap
+from . import reviewhold
 from . import reviewreuse
 from . import reviewstats
 from . import runner
@@ -6931,6 +6932,31 @@ class Daemon:
             self._start_probe(t["id"], d["when"], now, "start_when")
             if t["id"] not in self._probes:
                 self._start_verdict(t, self._probe_rc.pop(t["id"])[0], now)
+        self.release_review_holds(now)
+
+    def release_review_holds(self, now: float) -> None:
+        """Model-free: a review held for a carried change's open fix chain (reviewhold) is released
+        once its start_when passed (the fix landed), once no such chain is open (one that ended failed
+        or cancelled gets a spec line saying so) or at review.carried_hold_max_h hours. Its line on
+        inherited commits is refreshed from the head's commits now (pushq.carried)."""
+        db = self.p.db
+        max_h = float((self.cfg.get("review") or {}).get("carried_hold_max_h", reviewhold.MAX_H) or 0)
+        for t in db.q("SELECT * FROM tasks WHERE status='queued' AND kind='review' "
+                      "AND labels LIKE '%\"" + reviewhold.LABEL + "%'"):
+            got = reviewhold.verdict(db, t, now, max_h)
+            if got is None:
+                continue
+            why, line = got
+            head, _ = reviewhold.hold_of(t) or ("", [])
+            code = next((c for i in dependency_ids(t) if i is not None and (c := db.task(i))), None)
+            try:
+                carried = pushq.carried(self.p, code, head, self.cfg) if code and head else {}
+            except Exception as e:
+                log(self.p, f"task {t['id']}: carried commits not read on release: {e}")
+                carried = {}
+            db.update_task(t["id"], labels=reviewhold.released_labels(t), not_before=None,
+                           spec=reviewhold.respec(t["spec"] or "", inherited_line(carried) if carried else "", line))
+            log(self.p, f"task {t['id']} review hold released ({why})")
 
     def _own_255(self, tid: int, probe: str, out: str, now: float) -> int | str:
         """A probe's 255 means "host unreachable" only when it is ssh's own: each host it names is
@@ -8765,6 +8791,7 @@ class Daemon:
         # A push branch no push can ever reach (main/master without allow_protected_push_branch, or a
         # code repo without the remote) makes every review review only: a push step there would only
         # exit 2 and block the review, and a raw `git push` would skip the checks and the queue.
+        held: dict[int, int] = {}
         never = "" if delivered or elsewhere or off or not (d.get("push_branch") and d.get("push_allowed", True)) \
             else push.push_branch_problem(d["push_branch"], self.p.root, push.allow_protected(d))
         # A local push branch of a code repo with no git remote lands with `ttp land` (land.py) instead.
@@ -8810,6 +8837,9 @@ class Daemon:
             # Named now, so a review that passes need not be woken again by the queue's refusal.
             if carried := pushq.carried(self.p, task, full, cfg):
                 lines.append(inherited_line(carried))
+                # A carried change whose fix is still open: its reviewer could only repeat the open
+                # finding, so the review waits for that fix chain (reviewhold).
+                held = reviewhold.blocking(db, carried, skip={task["id"]})
         else:
             lines.append("Review only: leave the branch" + (" and the PR" if pr else "") + " as they are.")
         checks = self._precheck(task, full) if pushes else None
@@ -8823,11 +8853,13 @@ class Daemon:
         # A review that publishes with `ttp push --own` carries the branch it publishes onto, as its subject does.
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
             + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never else []) + ([push.LAND_LABEL] if lands else []) \
-            + ([f"pr_branch:{elsewhere}"] if own_step else [])
+            + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held)
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=labels, **pin_of(task))
-        log(self.p, f"task {task['id']}: queued review #{rid} ({tier})")
+        log(self.p, f"task {task['id']}: queued review #{rid} ({tier})" + (
+            f", held until the fix of {', '.join(f'#{t} (#{f})' for t, f in sorted(held.items()))} lands or "
+            f"its chain ends" if held else ""))
         return rid, True
 
     def _verified_review_line(self, task: dict, full: str) -> str:

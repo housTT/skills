@@ -165,7 +165,11 @@ prolonged whole-box outage.
   rule behind it (`review_tier`).
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
   daemon queues the review of each finished code task in the same step that records its hand-off
-  (`review.auto`, on by default). A hand-off with no follow-ups, notes or findings starts no
+  (`review.auto`, on by default). A review whose head carries commits of another task whose latest
+  review failed, while that task's fix or re-review is still open, is queued but held: its status
+  names the open fix, and it starts once that fix lands, once the fix chain ends failed or
+  cancelled (its spec then says so), or after `review.carried_hold_max_h` hours (default 24, 0 no
+  cap). A hand-off with no follow-ups, notes or findings starts no
   coordinator turn; any other still goes to the coordinator for those, and the review's spec lists
   its follow-ups. As a backstop, a done code task (or one waiting on something else for
   `review.sweep_after_s`) whose head is on no push-branch ref, with no review, open continuation,
