@@ -629,3 +629,30 @@ def test_the_skip_history_survives_a_daemon_restart_is_capped_and_shown(env, cap
     assert f"({sched.SKIP_KEEP} skip(s) in 24 h)" in capsys.readouterr().out
     row = next(r for r in sched.with_costs(p.db) if r["name"] == "filler")
     assert row["skips_24h"] == sched.SKIP_KEEP and len(row["skips"]) == 5
+
+
+def test_schedule_skip_records_leave_the_quiet_gate_settling_all_held_idle_wakes(env):
+    """A skip-history row is a record: it never changes the quiet gate's 'nothing new arrived'
+    fingerprint, so an all-held idle wake after a precheck or debounce skip is still settled quiet,
+    even when coordinator.quiet_held_kinds names other kinds."""
+    from ttp import quietgate, schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    t = p.db.add_task("tuning", "s", origin="user")
+    p.db.update_task(t, labels=["start_after:" + str(time.time() + 86400)])
+    _prechecked(p, "echo window empty")
+    d = Daemon(p.base)
+    assert sched.SKIP_KIND in quietgate.RECORD_KINDS
+    for cfg in ({}, {"coordinator": {"quiet_held_kinds": ["other"]}}):
+        fp = quietgate.fingerprint(p.db, cfg, "wake")
+        sched.record_skip(p.db, "filler", "skipped: last run done on unchanged evidence")
+        assert quietgate.fingerprint(p.db, cfg, "wake") == fp
+    cfg, now = {}, time.time()
+    fp = quietgate.fingerprint(p.db, cfg, "wake")
+    quietgate.left(p.db, fp, 1, now - 60)
+    _run_precheck_schedule(d)
+    assert [x["reason"] for x in sched.skips(p.db, "summary")] == ["skipped: precheck: window empty"]
+    fp2 = quietgate.fingerprint(p.db, cfg, "wake")
+    assert fp2 == fp and quietgate.all_held(p.db, cfg, now)
+    assert quietgate.quiet(p.db, cfg, [], [], lambda: [], "idle", fp2, now)

@@ -6,7 +6,8 @@ lift: a user pause (userpause.probe_of: its only hold is a probe of a user marke
 A running task, or an open task held by anything else, keeps every turn. Nothing new arrived when the
 state the last coordinator turn left behind is unchanged: the wake fingerprint (open tasks, asks,
 schedules, red gates, pauses, charter, config and memory), each open task's exact status and labels,
-the newest user message, the newest event of a kind that is not routine, the project pause and the
+the newest user message, the newest event of a kind that is not routine (record-only schedule skips
+never count), the project pause and the
 open machine ledger changes and outages.
 
 Then a batch of only routine daemon events (`coordinator.quiet_held_kinds`, default idle_capacity), or
@@ -33,6 +34,7 @@ LEFT_KEY = "quiet_left"      # kv: {fp, ts, run} the state the last finished coo
 SKIPS_KEY = "quiet_skips"    # kv: [{ts, events, due, usd}] turns skipped, for the daily review
 KEEP_SKIPS_S = 8 * 86400
 ROUTINE_KINDS = ("idle_capacity",)
+RECORD_KINDS = ("schedule_skip",)   # record-only rows (schedule.SKIP_KIND) that never change the fingerprint
 URGENT = ("high", "critical")
 
 
@@ -84,7 +86,7 @@ def all_held(db, cfg: dict, now: float) -> bool:
 def fingerprint(db, cfg: dict, wake_fp: str, pause=None, ledger=None) -> str:
     """The state a turn leaves behind, without what routine events and probe retries change.
     `pause`: the project pause (projpause.current); `ledger`: the open machine ledger changes and outages."""
-    kinds = sorted(routine_kinds(cfg))
+    kinds = sorted(routine_kinds(cfg) | set(RECORD_KINDS))
     tasks = [(t["id"], t["status"], t["labels"]) for t in db.q(
         f"SELECT id, status, labels FROM tasks WHERE status NOT IN ({','.join('?' * len(CLOSED))}) ORDER BY id", CLOSED)]
     msg = db.one("SELECT MAX(id) n FROM messages WHERE direction='in'")
