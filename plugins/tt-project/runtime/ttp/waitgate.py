@@ -9,6 +9,7 @@ passed, or another wake path made it due). In this order:
 1. Must-wake events always start the turn: an escalated wake, any wake reason other than a plain
    timer or "probe passed" (failed checks, a broken probe, a reboot, a resumed resource, ...), a spec
    that changed since the last turn, a probe whose exit or output changed since the gate's last skip,
+   a probe that answered anything but "not yet" (its pass or failed job keeps its model-free path),
    and the cap (`max_skips` skips in a row, or `max_skip_h` hours since the last real turn).
 2. Model-free rules re-defer what is mechanically still pending: a local detached job (`ttp detach
    --check`) still running with no exit code, a lock (`ttp lock --probe`) still held by a live
@@ -248,6 +249,10 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
             d = Decision(False, "rule", "its probe passed with the answer its last turn already saw and waited on")
         else:
             d = Decision(True, "event", "its probe passed")
+    elif probe and probe[0] != "timeout" and probe[0] not in _not_yet():
+        # The probe answered (a pass, a failed job, a broken probe): never skipped, so a skip's
+        # evidence is always a "not yet" and its pass or failure still takes its model-free path.
+        d = Decision(True, "event", f"its probe answered exit {probe[0]}")
     else:
         try:
             why = pending(p, cfg, prev.get("retry_when"))
@@ -266,6 +271,11 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
     d.log_id = log(db, task["id"], d, wake_cost(db, cfg, now) if not d.wake else 0.0, now)
     d.extra = {"skips": skips}
     return d
+
+
+def _not_yet() -> tuple:
+    from .daemon import NOT_YET_RCS
+    return NOT_YET_RCS
 
 
 def bud_retry_s(prev: dict) -> float:
@@ -287,7 +297,8 @@ def skipped(prev: dict, d: Decision, now: float) -> dict:
 
 def holds(prev: dict, rc: Any, out: str | None) -> str | None:
     """For a task asleep after a gate skip, what a new probe answer means: 'same' (keep asleep: the
-    gate already judged it), 'changed' (wake at once), or None (no skip to compare with)."""
+    gate already judged it), 'changed' (the probe loop's usual paths, else a wake), or None (no skip
+    to compare with)."""
     gate = prev.get("wake_gate") if isinstance(prev, dict) else None
     if not isinstance(gate, dict) or not gate.get("seen") or not gate.get("log"):
         return None

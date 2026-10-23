@@ -3721,6 +3721,11 @@ class Daemon:
         else:
             db.update_task(task["id"], **upd)
         effort.settle(db, task["id"], "done" if rejects else new, attempts)
+        try:   # the wake-gate decisions behind this run: a wake that only handed the wait back is a miss
+            waitgate.settle_run(db, json.loads(r.get("note") or "{}"), load_result(task["result"]), result,
+                                isinstance(result, dict) and result.get("status") == "waiting")
+        except Exception as e:
+            log(self.p, f"task {task['id']}: wake gate settling failed: {type(e).__name__}: {e}")
         if new == "done" and worktree.own_worktree(task):
             self._local_only_due = 0.0   # is its work on a remote? checked this tick
             self._queue_backup(task)
@@ -4795,6 +4800,12 @@ class Daemon:
         if prompt_file and (self.p.harness / "prompts" / prompt_file).exists():
             spec = (self.p.harness / "prompts" / prompt_file).read_text() + "\n\n" + spec
         jev_lines = jevuse.lines(db, self.cfg) if payload.get("jev_report", s["name"] == "daily-review") else []
+        if payload.get("jev_report", s["name"] == "daily-review"):
+            try:
+                if gate_line := waitgate.line(db, self.cfg):
+                    jev_lines.append(gate_line)
+            except Exception as e:   # a metric must not keep the review from starting
+                log(self.p, f"wake gate line failed: {type(e).__name__}: {e}")
         if jev_lines:
             spec += (f"\n\nJev uses over the last {jevuse.window_s(self.cfg) / 86400:g} d (calls, cost, estimated "
                      f"savings, net, error rate; a use with no net saving is switched off by itself):\n"
@@ -7046,8 +7057,9 @@ class Daemon:
             self._probe_rc[tid] = ("timeout" if rc is None else rc, now, probe)
             if task and task["status"] == "queued":
                 self._flag_never_passes(task, probe, rc, outs[id(proc)])
-            if task and self._gate_holds(task, self._probe_rc[tid][0], outs[id(proc)], now):
-                continue
+            gated = self._gate_answer(task, probe, self._probe_rc[tid][0], outs[id(proc)], now) if task else None
+            if gated == "same":
+                continue   # asleep after a wake-gate skip on this very answer: the gate judged it
             if rc == 0 or detach.failed_check(probe, rc) or _push_not_landed(probe, rc):
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
@@ -7055,6 +7067,9 @@ class Daemon:
                      else self._push_finished_unpushed)(task, now)
             elif gone and task and task["status"] == "queued" and (task["not_before"] or 0) > now:
                 self._wake_waiting(task, f"probe broken: {rc}", now)   # no timer can make it pass
+            elif gated == "changed" and rc is not None and rc not in NOT_YET_RCS:
+                # A new answer after a skip that no branch above handles: wake now, not at the backoff.
+                self._wake_waiting(task, f"its probe's answer changed (exit {rc})", now)
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
             prev = load_result(t["result"])
             probe = prev.get("retry_when")
@@ -7074,7 +7089,7 @@ class Daemon:
             got = self._probe_rc.get(t["id"])
             if t["id"] not in self._probes and got and got[2] == probe and (t["not_before"] or 0) > now \
                     and (got[0] == 0 or detach.failed_check(probe, got[0])) \
-                    and not self._gate_holds(t, got[0], (self._probe_out.get(t["id"]) or ("",))[0], now):
+                    and self._gate_answer(t, probe, got[0], (self._probe_out.get(t["id"]) or ("",))[0], now) != "same":
                 (self._probe_passed if got[0] == 0 else self._job_failed)(db.task(t["id"]) or t, now)
         self.probe_deferred(now)
 
@@ -7709,20 +7724,18 @@ class Daemon:
         finally:
             f.close()
 
-    def _gate_holds(self, task: dict, rc, out: str, now: float) -> bool:
-        """A task asleep after a wake-gate skip: True keeps it asleep on a probe answer the gate already
-        judged (the same exit and output). An answer that changed wakes it at once, unless it only says
-        "not yet" (the usual sleep then stands)."""
+    def _gate_answer(self, task: dict, probe: str, rc, out: str, now: float) -> str | None:
+        """A task asleep after a wake-gate skip: 'same' when the probe gave the answer the gate already
+        judged (it stays asleep), 'changed' when it gave another, None when no skip applies. Only the
+        caller acts on 'changed': a pass, a failed job or an unlanded push goes through its own
+        model-free path (_probe_passed, _job_failed, _push_finished_unpushed). A failed job or an
+        unlanded push is never held, whatever the gate saw."""
         if task["status"] != "queued" or (task["not_before"] or 0) <= now:
-            return False
-        prev = load_result(task["result"])
-        held = waitgate.holds(prev, rc, out)
-        if held == "same":
-            return True
-        if held == "changed" and rc not in NOT_YET_RCS:
-            self._wake_waiting(task, "probe passed" if rc == 0 else f"its probe's answer changed (exit {rc})", now)
-            return True
-        return False
+            return None
+        held = waitgate.holds(load_result(task["result"]), rc, out)
+        if held == "same" and (detach.failed_check(probe, rc) or _push_not_landed(probe, rc)):
+            return None
+        return held
 
     def _note_probe_out(self, tid: int, probe: str, text: str, now: float) -> None:
         got = self._probe_out.get(tid)
