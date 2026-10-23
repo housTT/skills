@@ -28,7 +28,8 @@ tasks name and for the project. Past its threshold while work is queued or runni
 `no_progress` event names what is stuck, since when and the last reason seen:
 
 - task: a queued task dispatch could start (dependencies met, no timer or start_when, no paused
-  resource) that has had no result for `task_h` (2) hours while a worker slot is free;
+  resource) that has had no result for `task_h` (2) hours since it became ready while a worker slot
+  is free;
 - resource: a resource named by queued or running tasks with no result on any task naming it for
   `resource_h` (2) hours;
 - project: no result anywhere for `project_h` (2) hours while tasks are queued or running.
@@ -208,7 +209,7 @@ def stalled(state: Path, cfg: dict | None, now: float | None = None) -> list[dic
 # ---- progress and stall check (the daemon's check_progress) ----
 
 KEY = "progress_check"          # coordinator.progress_check: thresholds
-STATE_KEY = "progress_state"    # kv: results seen, counters, raised keys, cleared history
+STATE_KEY = "progress_state"    # kv: results seen, counters, ready clocks, raised keys, cleared history
 SOURCE = "daemon:progress"      # the events' source, for observation mutes
 EVENT_KINDS = ("no_progress", "stall")
 # clear_n/clear_min: hysteresis. A raised key clears only after clear_n healthy checks in a row that
@@ -267,7 +268,7 @@ def load(db: DB) -> dict:
     st = db.kv(STATE_KEY) or {}
     if not isinstance(st, dict):
         st = {}
-    for k in ("results", "probes", "scheds", "raised"):
+    for k in ("results", "probes", "scheds", "ready", "raised"):
         st.setdefault(k, {})
     st.setdefault("history", [])
     return st
@@ -387,17 +388,38 @@ def _task_reason(db: DB, t: dict) -> str:
         if r else "queued, never started"
 
 
+def _ready_clock(st: dict, ready: list[dict], s: dict, now: float) -> dict[int, float]:
+    """Task id -> when a check first saw it ready (dependencies met, deferral or not_before passed,
+    pause lifted, hold cleared), not when it was created: a task that waited days behind a dependency
+    is not stuck the moment it is released. A task gone from the ready set (dispatched, deferred
+    again) keeps its clock until clear_n checks spanning clear_min minutes have not seen it, the
+    same hysteresis as a raised key, so a run that fails and requeues it does not restart it."""
+    clock = st["ready"]
+    ids = {str(t["id"]) for t in ready}
+    for tid in ids:
+        clock[tid] = {"since": float((clock.get(tid) or {}).get("since") or now)}
+    for tid in [k for k in clock if k not in ids]:
+        r = clock[tid]
+        r["gone_n"] = int(r.get("gone_n") or 0) + 1
+        r["gone_since"] = r.get("gone_since") or now
+        if r["gone_n"] >= s["clear_n"] and now - float(r["gone_since"]) >= s["clear_min"] * 60:
+            clock.pop(tid)
+    return {int(t["id"]): clock[str(t["id"])]["since"] for t in ready}
+
+
 def no_progress(db: DB, cfg: dict, s: dict, st: dict, now: float, open_streaks: dict | None = None) -> list[dict]:
-    """Queued or running work with no counted result past its threshold. `open_streaks`: drivers'
-    report streaks (`streaks`), whose last refusal or failure names why a resource is stuck."""
+    """Queued or running work with no counted result past its threshold. A ready task's clock starts
+    when it became ready (`_ready_clock`). `open_streaks`: drivers' report streaks (`streaks`), whose
+    last refusal or failure names why a resource is stuck."""
     ready, running, free, paused = _active(db, cfg, now)
+    ready_since = _ready_clock(st, ready, s, now)
     if not ready and not running:
         return []
     last = _last_results(db, st, now)
     out = []
     if s["task_h"] and free > 0:
         for t in ready:
-            since = max(float(t["created"] or now), last.get(t["id"], 0.0))
+            since = max(ready_since[t["id"]], last.get(t["id"], 0.0))
             if now - since >= s["task_h"] * 3600:
                 out.append({"kind": "no_progress", "key": f"task:#{t['id']}", "task": t["id"],
                             "what": f"task #{t['id']} {_clip(t['title'], 60)}", "since": since, "n": now - since,
@@ -407,7 +429,7 @@ def no_progress(db: DB, cfg: dict, s: dict, st: dict, now: float, open_streaks: 
         named: dict[str, list[tuple[float, dict | None]]] = {}
         for t in ready:
             for r in _resources(t):
-                named.setdefault(r, []).append((float(t["created"] or now), t))
+                named.setdefault(r, []).append((ready_since[t["id"]], t))
         for run in running:
             for r in _resources({"labels": run.get("labels")}):
                 named.setdefault(r, []).append((float(run["started"] or now), None))
@@ -428,7 +450,7 @@ def no_progress(db: DB, cfg: dict, s: dict, st: dict, now: float, open_streaks: 
                         "n": now - since, "reason": _clip(why)})
     if s["project_h"]:
         done = max([0.0, *last.values(), *(float(v) for v in st["results"].values())])
-        starts = [float(t["created"] or now) for t in ready] + [float(r["started"] or now) for r in running]
+        starts = [ready_since[t["id"]] for t in ready] + [float(r["started"] or now) for r in running]
         since = max(done, min(starts))
         if now - since >= s["project_h"] * 3600:
             out.append({"kind": "no_progress", "key": "project", "what": "the project", "since": since,

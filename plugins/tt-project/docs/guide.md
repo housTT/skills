@@ -323,8 +323,10 @@ prolonged whole-box outage.
   results (a task done, a worker hand-off, a driver's `result` report). A `no_progress` event names a
   queued task dispatch could start (with a worker slot free), a resource queued or running tasks
   name, or the whole project, once it has gone `task_h`, `resource_h` or `project_h` (2 each) hours
-  with work queued or running and no result. A `stall` event names a repeat: a retry_when or
-  start_when probe still saying not yet after `probe_n` (10) verdicts and `probe_h` (1) hour (waits
+  with work queued or running and no result. A queued task's clock starts when it became ready
+  (dependencies met, start time passed, pause lifted), not when it was created. A `stall` event
+  names a repeat: a retry_when or start_when probe still saying not yet after `probe_n` (10)
+  verdicts and `probe_h` (1) hour (waits
   on the task's own job, a push, CI, another task or a time are left out), a task's or schedule's
   worker runs failing `fail_n` (3) times in a row the same way, or a schedule failing `repeat_n` (5)
   times in a row the same way (a skip on its own daily cap is the schedule-budget observation's, not
