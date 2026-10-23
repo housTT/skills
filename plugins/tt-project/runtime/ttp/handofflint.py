@@ -69,7 +69,8 @@ def _repo_of(p: Project, task: dict, branch: str) -> Path:
 
 def _ask_remote(p: Project, repo: Path, branch: str) -> bool | None:
     """Whether `branch` exists on the remote `ttp push --own` publishes to (for another repository
-    than the project root: the remote its branch tracks, else origin); None when unreadable or the
+    than the project root: the remote its branch tracks, else origin; delivery.own_push_remote when
+    set); None when unreadable or the
     repo has no remote. Asks the network: never inside a transaction (prefetch only)."""
     from . import push
     d = p.config().get("delivery") or {}
@@ -81,6 +82,7 @@ def _ask_remote(p: Project, repo: Path, branch: str) -> bool | None:
             remote = tracked if tracked and tracked != "." else "origin"
         else:
             remote = push.target(p, repo)[0] if str(d.get("push_branch") or "").strip() else "origin"
+        remote = push.own_push_remote(d, repo) or remote
     except Exception:
         return None
     ls = push._git_net(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}", timeout_s=REMOTE_TIMEOUT_S)

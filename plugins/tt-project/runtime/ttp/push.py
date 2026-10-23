@@ -1340,10 +1340,18 @@ def _git(repo: Path, *args: str, quiet: bool = True) -> subprocess.CompletedProc
 def _fetch(repo: Path, remote: str, branch: str) -> str:
     """The remote branch's current tip, or "" when it cannot be read. The explicit refspec also
     works where the remote's configured refspec does not cover the branch."""
-    if _git(repo, "fetch", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}",
-            quiet=False).returncode != 0:
+    ref = tracking_ref(remote, branch)
+    if _git(repo, "fetch", remote, f"+refs/heads/{branch}:{ref}", quiet=False).returncode != 0:
         return ""
-    return _git(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}").stdout.strip()
+    return _git(repo, "rev-parse", "--verify", "--quiet", ref).stdout.strip()
+
+
+def tracking_ref(remote: str, branch: str) -> str:
+    """Where a fetch of `branch` from `remote` is kept: refs/remotes/<remote>/<branch> for a remote's
+    name, a ref of its own for a URL (delivery.own_push_remote), which no ref name may hold."""
+    if not url_like(remote):
+        return f"refs/remotes/{remote}/{branch}"
+    return f"refs/ttp/url/{hashlib.sha256(remote.encode()).hexdigest()[:12]}/{branch}"
 
 
 def _existing_tip(repo: Path, remote: str, branch: str) -> str:
@@ -1402,14 +1410,13 @@ def _fetch_bounded(repo: Path, remote: str, branch: str) -> str:
     """_fetch with no prompt, no stdin and at most REACH_FETCH_S: "" when it times out."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
-        if subprocess.run(["git", "-C", str(repo), "fetch", remote,
-                           f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"],
+        if subprocess.run(["git", "-C", str(repo), "fetch", remote, f"+refs/heads/{branch}:{tracking_ref(remote, branch)}"],
                           stdin=subprocess.DEVNULL, stdout=2, text=True, env=env,
                           timeout=REACH_FETCH_S).returncode != 0:
             return ""
     except subprocess.TimeoutExpired:
         return ""
-    return _git(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}").stdout.strip()
+    return _git(repo, "rev-parse", "--verify", "--quiet", tracking_ref(remote, branch)).stdout.strip()
 
 
 def reach(p: Project, repo: Path, pushed: str, sha: str | None) -> dict | None:
@@ -1531,7 +1538,9 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     Another task's ttp/t<id>-... branch the task only inherited is refused (foreign_pr_branch).
     With `--own-branch` (OWN_BRANCH_ENV) the task's own checked-out ttp/t<id>-... branch is published
     under its own name, never onto a pr_branch it carries.
-    In a repo with no git remote the remote is LOCAL: publish moves the local branch (local_refusal)."""
+    In a repo with no git remote the remote is LOCAL: publish moves the local branch (local_refusal).
+    delivery.own_push_remote, when set, is the remote instead; unset, a remote that is someone's local
+    working copy or another project's is refused (local_remote_problem)."""
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not branch:
         raise ValueError("--own publishes the checked-out branch, not a detached HEAD")
@@ -1569,8 +1578,12 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
         raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}")
     d = p.config().get("delivery") or {}
     remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
-    if remote_less(repo):
+    if configured := own_push_remote(d, repo):
+        remote = configured
+    elif remote_less(repo):
         remote = LOCAL
+    elif why := local_remote_problem(p, repo, remote):
+        raise ValueError(why)
     if task and not notes and (why := foreign_pr_branch(p, task, branch, f"{remote}/{branch}")):
         raise ValueError(why)
     base = str(d.get("base_ref") or "").strip()
@@ -1583,6 +1596,99 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
             raise ValueError(f"this task's pr_branch {branch} exists neither here nor on {remote}: --own "
                              f"publishes onto an existing branch only, never creates one")
     return remote, branch
+
+
+OWN_REMOTE_KEY = "delivery.own_push_remote"
+
+
+def url_like(remote: str) -> bool:
+    """Whether `remote` is a URL or path git pushes to directly rather than a remote's name:
+    scheme://..., scp-like host:path, or a filesystem path."""
+    return bool(re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", remote) or re.match(r"[^/]+:", remote)
+                or remote.startswith(("/", "./", "../", "~")))
+
+
+def _repo_keys(repo: Path) -> tuple[list[Path], str]:
+    """The paths `repo` is known by (its top level, and the main checkout a worktree belongs to) and
+    the main checkout's folder name: what a delivery.own_push_remote map is keyed by."""
+    top = _git(repo, "rev-parse", "--show-toplevel").stdout.strip()
+    common = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    paths = [Path(x).resolve() for x in (top, str(Path(common).parent) if common else "") if x]
+    main = Path(common).parent if common and Path(common).name == ".git" else Path(top or repo)
+    return paths, main.name
+
+
+def own_push_remote(d: dict, repo: Path) -> str:
+    """delivery.own_push_remote for `repo` (delivery settings `d`): where every own-branch publish
+    goes instead of the push branch's remote (else origin). A remote's name or a URL; or a map from a
+    repo (its path, or the main checkout's folder name; "*" for any other) to one. "" when unset or
+    no entry covers `repo`. Raises ValueError on a value of another kind, or a name `repo` has no
+    remote by, so nothing is pushed to a remote nobody chose."""
+    v = d.get("own_push_remote")
+    if isinstance(v, dict) and v:
+        paths, name = _repo_keys(repo)
+        hit = next((x for k, x in v.items() if k != "*" and (k == name or ("/" in k or k.startswith("~"))
+                                                              and Path(k).expanduser().resolve() in paths)), None)
+        v = v.get("*") if hit is None else hit
+    if v is None or v == "" or v == {}:
+        return ""
+    if not isinstance(v, str) or not v.strip():
+        raise ValueError(f"{OWN_REMOTE_KEY}: {v!r} is neither a git remote's name, a URL nor a map of them; "
+                         f"not pushing")
+    v = v.strip()
+    if not url_like(v) and v not in _git(repo, "remote").stdout.split():
+        raise ValueError(f"{OWN_REMOTE_KEY} names remote {v}, which this repo has no remote by "
+                         f"(`git remote add {v} <url>`, or set the URL itself); not pushing")
+    return v
+
+
+def _local_path(url: str, repo: Path) -> Path | None:
+    """The filesystem path a remote's URL names (a path or file:// URL), else None (a network remote)."""
+    if url.startswith("file://"):
+        return Path(unquote(url[len("file://"):]))
+    if not url or url_like(url) and not url.startswith(("/", "./", "../", "~")):
+        return None
+    path = Path(url).expanduser()
+    return path if path.is_absolute() else repo / path
+
+
+def _owning_project(path: Path) -> tuple[str, Path] | None:
+    """(name, folder) of the registered project on this machine (`ttp list`) whose folder holds
+    `path` most closely, or None."""
+    from .project import hostname, load_registry
+    best = None
+    for name, e in (load_registry().get("projects") or {}).items():
+        if not (isinstance(e, dict) and e.get("dir")) or e.get("host") not in (None, hostname()):
+            continue
+        try:
+            d = Path(e["dir"]).resolve()
+        except OSError:
+            continue
+        if path.is_relative_to(d) and (best is None or len(d.parts) > len(best[1].parts)):
+            best = (name, d)
+    return best
+
+
+def local_remote_problem(p: Project, repo: Path, remote: str) -> str:
+    """Why `ttp push --own` must not publish to `remote` while delivery.own_push_remote is unset, or
+    "": its push URL is a local path (or file:// URL) that is a non-bare working tree or lies inside
+    another registered project's folder, i.e. someone else's copy rather than a shared remote.
+    Network remotes and other local paths (e.g. a bare repo of this project's own) pass."""
+    url = _git(repo, "remote", "get-url", "--push", remote).stdout.strip()
+    path = _local_path(url, repo)
+    if path is None or not path.exists():
+        return ""
+    path = path.resolve()
+    owner = _owning_project(path)
+    if owner and owner[1] != p.root.resolve():
+        what = f"inside project {owner[0]}'s folder"
+    elif _git(path, "rev-parse", "--is-bare-repository").stdout.strip() == "false":
+        what = "a working copy, not a shared remote"
+    else:
+        return ""
+    return (f"{remote} is a local path ({path}), {what}: --own does not publish there unless "
+            f"{OWN_REMOTE_KEY} names it. Set {OWN_REMOTE_KEY} to the remote or URL task branches are "
+            f"published to; nothing pushed")
 
 
 LOCAL = "local"   # own_target's remote in a code repo with no git remote: publishing moves the local branch
@@ -2261,7 +2367,8 @@ def pr_branch_source(p: Project, task: dict | None) -> tuple[dict | None, str]:
 
 def never_published(repo: Path, d: dict, branch: str, timeout: float = 30) -> bool:
     """Whether `branch` exists neither as a local branch of `repo` nor on the remote of
-    `delivery.push_branch` (`d`; else origin), so `ttp push --own` cannot publish onto it (own_target
+    `delivery.push_branch` (`d`; else origin; delivery.own_push_remote when set), so `ttp push --own`
+    cannot publish onto it (own_target
     never creates a carried branch). False whenever git cannot tell (not a repo, remote unreachable)."""
     def git(*args: str) -> subprocess.CompletedProcess | None:
         try:
@@ -2281,6 +2388,10 @@ def never_published(repo: Path, d: dict, branch: str, timeout: float = 30) -> bo
         return True   # no remote: the local branch is the only place it could be
     ref = str(d.get("push_branch") or "").strip()
     remote = _split_target(ref, remotes.stdout.split())[0] if ref else "origin"
+    try:
+        remote = own_push_remote(d, repo) or remote
+    except ValueError:
+        return False
     ls = git("ls-remote", "--heads", remote, f"refs/heads/{branch}")
     return ls is not None and ls.returncode == 0 and not any(
         ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())

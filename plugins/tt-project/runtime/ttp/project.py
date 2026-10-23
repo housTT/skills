@@ -390,6 +390,8 @@ EXTRA_KEYS = {
     # fast_forward_also: more branches each push moves to the pushed commit, fast-forward only (off: unset).
     # mirror_remotes: {remote, branch} tables each push also sends the pushed commit to, fast-forward only.
     # allow_protected_push_branch: lets the push branch be main, master or the remote's default (off: unset).
+    # own_push_remote: where `ttp push --own` publishes task branches (a remote's name, a URL, or a map
+    # keyed by repo path or folder name); unset: the push branch's remote, else origin (push.own_push_remote).
     # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
     # push_solo_paths: pathspecs a batch takes at most one change touching (pushq.SOLO_PATHS); push_cap_tests:
@@ -398,7 +400,7 @@ EXTRA_KEYS = {
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
                  "push_solo_paths", "push_cap_tests",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
-                 "allow_protected_push_branch", "own_push", "deploy_restart_wait_s", "plugin_version_guard",
+                 "allow_protected_push_branch", "own_push", "own_push_remote", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_host"},   # where checks run (remotecheck)
     "jev": {"via", "url", "model"},

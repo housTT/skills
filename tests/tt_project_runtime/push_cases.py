@@ -10263,3 +10263,89 @@ def test_a_review_whose_precheck_did_not_fail_on_its_tests_still_gets_its_review
     d.dispatch()
     assert started == [s.review], case
     assert not s.p.db.q("SELECT id FROM tasks WHERE labels LIKE ?", (f'%"review_fix:{s.review}"%',))
+
+
+def test_own_push_remote_names_where_own_branches_go_by_remote_name_or_url(env, monkeypatch, capsys):
+    """delivery.own_push_remote: `ttp push --own` publishes the task branch to the remote it names, or
+    to the URL it names (here per repo, keyed by the main checkout's folder name), never to origin.
+    With own_push existing_only the branch-exists check asks that target, not origin."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tmp = env["tmp"]
+    pub, by_url = tmp / "pub.git", tmp / "by-url.git"
+    _bare_init(env, pub)
+    _bare_init(env, by_url)
+    _git_out(repo, "remote", "add", "pub", str(pub))
+    heads = lambda r: _git_out(r, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t40-feature")
+    _commit(repo, "a.txt", "a\n")
+    p.set_config("delivery.own_push_remote", "pub")
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert heads(pub) == ["ttp/t40-feature"] and heads(origin) == ["proj"]
+    url = f"file://{by_url}"
+    p.set_config("delivery.own_push_remote", {repo.name: url, "*": "pub"})
+    for n in range(2):   # the second publish reads the URL's tip back (fetched into a ref of its own)
+        _commit(repo, f"b{n}.txt", "b\n")
+        assert _ttp("push", "--own") == 0, capsys.readouterr().err
+        assert _git_out(by_url, "rev-parse", "ttp/t40-feature") == _git_out(repo, "rev-parse", "HEAD")
+    assert "ttp/t40-feature" not in heads(origin)
+    assert _ttp("push", "--own") == 0 and "nothing to push" in capsys.readouterr().err
+    # existing_only: the branch on origin does not count; on the configured URL it does
+    p.set_config("delivery.own_push", "existing_only")
+    _git_out(repo, "checkout", "-q", "-b", "feature/x")
+    _commit(repo, "c.txt", "c\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD~1:refs/heads/feature/x")
+    assert _ttp("push", "--own") == 2
+    assert "has no branch feature/x" in capsys.readouterr().err
+    assert "feature/x" not in heads(by_url)
+    _git_out(repo, "push", "-q", url, "HEAD~1:refs/heads/feature/x")
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(by_url, "rev-parse", "feature/x") == _git_out(repo, "rev-parse", "HEAD")
+    # a name the repo has no remote by, or a value of another kind, pushes nothing
+    for bad in ("nosuch", ["pub"]):
+        p.set_config("delivery.own_push_remote", bad)
+        assert _ttp("push", "--own") == 2
+        assert "delivery.own_push_remote" in capsys.readouterr().err
+
+
+def test_own_push_refuses_a_local_working_copy_or_another_projects_folder_as_origin(env, monkeypatch, capsys):
+    """A reported case: a code repo's origin was a local working copy belonging to another project, and
+    `ttp push --own` pushed a task branch into it. With delivery.own_push_remote unset, an origin that
+    is a non-bare local path (also as file://), or any path inside another registered project's
+    folder, is refused naming the setting, and no ref is created there. Set to that same path, it
+    goes. A local bare repo of no other project, and network URLs, are as before."""
+    from ttp import project, push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tmp = env["tmp"]
+    heads = lambda r: _git_out(r, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t40-feature")
+    _commit(repo, "a.txt", "a\n")
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err   # a local bare origin: unchanged
+    assert "ttp/t40-feature" in heads(origin)
+    _commit(repo, "b.txt", "b\n")
+    for url in (str(other), f"file://{other}"):   # `other` is a non-bare clone of origin
+        _git_out(repo, "remote", "set-url", "origin", url)
+        assert _ttp("push", "--own") == 2
+        err = capsys.readouterr().err
+        assert "a working copy" in err and "Set delivery.own_push_remote" in err and "nothing pushed" in err, err
+        assert heads(other) == ["proj"]
+    theirs = tmp / "elsewhere" / "code"
+    theirs.mkdir(parents=True)
+    their_bare = theirs / "mirror.git"
+    _bare_init(env, their_bare)
+    monkeypatch.setattr(project, "load_registry",
+                        lambda: {"projects": {"neighbour": {"dir": str(theirs)}, p.name: {"dir": str(p.root)}}})
+    _git_out(repo, "remote", "set-url", "origin", str(their_bare))
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "inside project neighbour's folder" in err and "delivery.own_push_remote" in err, err
+    assert heads(their_bare) == []
+    p.set_config("delivery.own_push_remote", str(their_bare))   # chosen explicitly: allowed
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert heads(their_bare) == ["ttp/t40-feature"]
+    p.set_config("delivery.own_push_remote", None)
+    for url in ("https://example.invalid/acme/widgets.git", "ssh://git@example.invalid/acme/widgets.git",
+                "git@example.invalid:acme/widgets.git"):
+        _git_out(repo, "remote", "set-url", "origin", url)
+        assert push.local_remote_problem(p, repo, "origin") == ""
+        assert push.tracking_ref("origin", "b") == "refs/remotes/origin/b"
+    assert push.tracking_ref("https://example.invalid/x.git", "b").startswith("refs/ttp/url/")

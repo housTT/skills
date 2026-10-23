@@ -6,6 +6,13 @@ Unset, a code task may still create its own `ttp/t<id>-...` branch (draft PRs on
 A code task refused creating another task's branch it carries is told its route: commit on its own branch and run `ttp push --own-branch --detach`.
 Never `git push` around a refusal.
 
+## Where own branches go
+
+`delivery.own_push_remote` names where `ttp push --own` (and every push that publishes as with `--own`) sends a branch: a git remote's name, a URL, or a map from a repo (its path, or its main checkout's folder name; `"*"` for any other) to one.
+Unset, it is the remote of `delivery.push_branch`, else `origin`.
+Unset, `ttp push --own` refuses, pushing nothing, when that remote is a local path or `file://` URL that is a non-bare working copy or lies inside another project's folder (`ttp list`): set `delivery.own_push_remote` to the remote or URL task branches belong on. A local path set there explicitly is used as given; network remotes behave as before.
+With `existing_only`, the branch-exists check asks the configured target.
+
 ## Hand-off lint
 
 Model-free, run by the daemon on every code hand-off (no worker call).

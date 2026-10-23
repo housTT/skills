@@ -929,6 +929,13 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `failover.allow_delivery_remote` is set (only where its rules allow such refs). `ttp lease check`
   says whether the store may be used and answers; `ttp status` shows one `lease:` line. Not to be
   confused with provider failover (`coordinator.provider_failover_*`).
+- `delivery.own_push_remote` (unset by default) names where own-branch publishes go: a git remote's
+  name, a URL, or a map from a repo (its path, or its main checkout's folder name; `"*"` for any
+  other) to one. Unset, it is the remote of `delivery.push_branch`, else `origin`, and
+  `ttp push --own` refuses, pushing nothing, when that remote is a local path or `file://` URL that
+  is a non-bare working copy or lies inside another project's folder (`ttp list`), naming this
+  setting. A local path set here explicitly is used as given; network remotes are unchanged. The
+  `existing_only` branch check below asks the configured target.
 - `delivery.own_push` (`existing_only` when unset) says which remote branches besides the push branch
   `ttp push --own` may push to, and every push that publishes as with `--own` (a notes branch, a
   `pr_branch:` or `rebases:` task). `on`, set explicitly: the task's own or carried branch, created
