@@ -80,14 +80,18 @@ def _segment(text: str, resource: str) -> tuple[int, int] | None:
     return None
 
 
+WAIT_PREFIX = "waiting for "   # every note the daemon builds from a waiting hand-off (Daemon._wait_what)
+
+
 def live_note(p, cfg: dict, result: dict, note: str, cache: dict | None = None) -> str:
     """A waiting task's note as a reader shows it (`ttp status`, the web app): on a wait whose probe is
     `ttp lock --probe` commands, each lock's line is the probe's answer now (its live holders with pid and
     liveness, or free), never the holders the stored note or hand-off named, which may have changed since
-    the daemon wrote it. Lines the note lacks (a note from the hand-off's words) make it "waiting for
-    <the locks now>". Any other wait, a note the daemon manages (held: ...) or a probe that fails: `note`
-    as stored. `cache` shares answers across the tasks of one listing."""
-    if result.get("status") != "waiting" or str(note or "").startswith("held: "):
+    the daemon wrote it. A note from the hand-off's words ("waiting for <its waiting_for>...", lines it
+    lacks) becomes "waiting for <the locks now>". Only a lock-wait note is rewritten: any note the daemon
+    wrote since for another reason (held: ..., a start failure, its on_pass_cmd running, a paused resource),
+    any other wait or a probe that fails: `note` as stored. `cache` shares answers across one listing."""
+    if result.get("status") != "waiting" or not str(note or "").startswith(WAIT_PREFIX):
         return note
     found, rest = locks.lock_probe_parts(str(result.get("retry_when") or ""))
     if not found:
@@ -107,5 +111,8 @@ def live_note(p, cfg: dict, result: dict, note: str, cache: dict | None = None) 
         out = out[:seg[0]] + cache[(r, sh)] + out[seg[1]:]
     if whole:
         return out
-    return ("waiting for " + "; ".join(cache[k] for k in found)
+    said = str(result.get("waiting_for") or result.get("summary") or "")[:300].strip()   # as Daemon._wait_what
+    if not said or not str(note)[len(WAIT_PREFIX):].startswith(said):
+        return note
+    return (WAIT_PREFIX + "; ".join(cache[k] for k in found)
             + (f"; then `{' ; '.join(rest)}`" if rest else ""))[:500]

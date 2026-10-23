@@ -33254,6 +33254,42 @@ def test_status_and_web_show_a_lock_waits_live_holders_not_its_stored_note(env):
     assert rows[hand] == "waiting for build-a: free; build-b: free", rows[hand]
 
 
+def test_status_and_web_keep_a_lock_waits_later_non_lock_notes_as_stored(env):
+    """Only a lock-wait note is rebuilt from the live holders: a note the daemon wrote later for another
+    reason on a task still queued with its lock-probe hand-off (its on_pass_cmd running, a start failure, a
+    paused resource, a workspace retry, ...) shows as stored in `ttp status` and the web row, never as a
+    made-up "waiting for <lock>: free" that hides the real reason."""
+    from ttp import cli
+    from ttp.daemon import PAUSED_NOTE, WORKSPACE_RETRY_NOTE
+    from ttp.web import state_payload
+    p = make(env)
+    notes = ["its probe passed; running its on_pass_cmd model-free (up to 10 min)",
+             "could not start a run: OSError: disk full",
+             f"{PAUSED_NOTE} build-a (maintenance); it starts once resumed",
+             WORKSPACE_RETRY_NOTE,
+             "interrupted by `ttp stop --kill`; resumes",
+             "its resource stayed busy before the run could start; retries",
+             "waiting for a standard run: board busy"]
+    later = time.time() + 3600
+    tids = {}
+    for note in notes:
+        tid = _due_waiting_task(p, "ttp lock --probe build-a >/dev/null", waiting_for="build-a held by #1")
+        p.db.update_task(tid, not_before=later, blocked_reason=note)
+        tids[tid] = note
+    lock = _due_waiting_task(p, "ttp lock --probe build-a >/dev/null", waiting_for="build-a held by #1")
+    p.db.update_task(lock, not_before=later, blocked_reason="waiting for build-a held by #1; next try 20:00")
+    rows = {t["id"]: t["blocked_reason"] for t in state_payload(p, p.db)["tasks"]}
+    out = {ln.split(":", 1)[0].split()[0]: ln for ln in cli.status_text(p).splitlines() if "waiting, next" in ln}
+    for tid, note in tids.items():
+        assert rows[tid] == note, (note, rows[tid])
+        if f"#{tid}" in out:   # status lists the first few waits
+            assert out[f"#{tid}"].endswith(f" — {note}"), (note, out[f"#{tid}"])
+    assert {f"#{t}" for t in list(tids)[:3]} <= set(out), out   # on_pass_cmd, start failure, paused resource
+    assert rows[lock] == "waiting for build-a: free", rows[lock]
+    p.db.update_task(lock, not_before=time.time() + 60)   # first in the listing
+    assert "waiting for build-a: free" in cli.status_text(p), cli.status_text(p)
+
+
 def test_lock_probe_busy_while_reserved_under_any_device_name(env):
     p = _device_project(env)
     from ttp import locks as lk
