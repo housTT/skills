@@ -12628,6 +12628,118 @@ def test_blocker_sweep_never_skips_what_a_turn_must_judge(env, monkeypatch, case
     assert eid and recs == [], f"{case}: a model sweep, no receipt"
 
 
+def _coordinator_pause_sweep(p, monkeypatch, end, by="coordinator"):
+    """_held_sweep plus a pause of board-c `by` with `end`, judged by a model sweep a minute after T0.
+    Returns the check at the next interval (T0 + 6 h + 2 min) through `again`, after `change` if given."""
+    from ttp import coordinator as coord, sweep, sweepskip
+    d, db, t0, at, run, ids = _held_sweep(p, monkeypatch)
+    end = end(t0) if callable(end) else end
+    coord.pause_resource(p, "board-c", True, reason="fabric repair", by=by, end=end)
+    t1, t2 = t0 + 60, t0 + 6 * 3600 + 120
+
+    def again(change=None, ts=t2):
+        at(ts)
+        db.set_kv(sweep.PAUSE_PROBES_KEY, {"board-c": {"probe": "test -e out/c", "rc": 1, "at": ts - 60}})
+        if change:
+            change(d, db, ts)
+        return sweepskip.check(db, d.cfg, sweep.items(db, ts, d.cfg), ts, d._probe_rc.get, p.name)
+    sweepskip.swept(db, again(ts=t1), t1)
+    return d, db, t0, again
+
+
+@pytest.mark.parametrize("end, rule", [
+    ({"end_when": "test -e out/c"}, "probe: end_when `test -e out/c`"),
+    ({"end_when": {"heal": "board-c-up", "healthy_n": 3, "clean_s": 1800}}, "heal: heal check `board-c-up` lifts it"),
+    (lambda t0: {"until": t0 + 8 * 3600}, "end before the next sweep: until"),
+])
+def test_blocker_sweep_skip_counts_a_coordinator_pause_that_ends_model_free(env, monkeypatch, end, rule):
+    """A pause the coordinator set, unchanged since the model sweep, skips the sweep when something
+    model-free re-evaluates or ends it first: a working end_when probe, an enabled heal check's health
+    end, or (with neither) an `until` before the next interval sweep. The receipt names its rule."""
+    from ttp import schedule as sched, sweepskip
+    p = make(env)
+    sched.upsert(p.db, "board-c-up", "command", "5m", payload={"heal": {"check": "true", "resource": "board-c"}})
+    d, db, t0, again = _coordinator_pause_sweep(p, monkeypatch, end)
+    got = again()
+    assert got["skip"], got["why"]
+    assert got["ends"]["resource:board-c"].startswith(rule)
+    rec = sweepskip.skip(db, got, "every 6h", time.time())
+    assert ["resource:board-c", got["ends"]["resource:board-c"]] in rec["items"]
+
+
+def _broken_probe(d, db, ts):
+    from ttp import sweep
+    db.set_kv(sweep.PAUSE_PROBES_KEY, {"board-c": {"probe": "test -e out/c", "rc": 2, "at": ts - 60}})
+
+
+def _stale_probe(d, db, ts):
+    from ttp import sweep
+    db.set_kv(sweep.PAUSE_PROBES_KEY, {"board-c": {"probe": "test -e out/c", "rc": 1, "at": ts - 2 * 3600}})
+
+
+def _heal_disabled(d, db, ts):
+    db.x("UPDATE schedules SET enabled=0 WHERE name='board-c-up'")
+
+
+def _reason_changed(d, db, ts):
+    from ttp import coordinator as coord
+    coord.pause_resource(d.p, "board-c", True, reason="fabric repair, second try", by="coordinator")
+
+
+def _end_changed(d, db, ts):
+    from ttp import coordinator as coord
+    coord.pause_resource(d.p, "board-c", True, reason="fabric repair", by="coordinator",
+                         end={"end_when": "test -e out/c", "until": ts + 3600})
+
+
+@pytest.mark.parametrize("case, end, change, control_h", [
+    ("dated end after the next sweep", lambda t0: {"until": t0 + 13 * 3600}, None, 7.1),
+    ("broken probe", {"end_when": "test -e out/c"}, _broken_probe, None),
+    ("stale probe", {"end_when": "test -e out/c"}, _stale_probe, None),
+    ("heal check disabled", {"end_when": {"heal": "board-c-up", "healthy_n": 3, "clean_s": 1800}}, _heal_disabled,
+     None),
+    ("past its end, never lifted", lambda t0: {"until": t0 + 3 * 3600}, None, 1.0),
+])
+def test_blocker_sweep_skip_still_sweeps_a_coordinator_pause_with_no_model_free_end(env, monkeypatch, case, end,
+                                                                                    change, control_h):
+    """A dated-only pause ending after the next sweep, a broken or stale end_when probe, a heal end whose
+    check is off, or a pause past its end that was never lifted has no model-free end: the model sweep
+    runs. The control (the same pause before the change, or at `control_h` hours past T0) skips."""
+    from ttp import schedule as sched
+    p = make(env)
+    sched.upsert(p.db, "board-c-up", "command", "5m", payload={"heal": {"check": "true", "resource": "board-c"}})
+    d, db, t0, again = _coordinator_pause_sweep(p, monkeypatch, end)
+    control = again() if control_h is None else again(ts=t0 + control_h * 3600)
+    assert control["skip"], (case, "the control skips", control["why"])
+    got = again(change)
+    assert not got["skip"] and "no model-free end: resource:board-c" in got["why"], (case, got["why"])
+
+
+@pytest.mark.parametrize("change", [_reason_changed, _end_changed])
+def test_blocker_sweep_skip_sweeps_a_coordinator_pause_changed_since_the_model_sweep(env, monkeypatch, change):
+    """A coordinator pause whose reason or end changed since the model sweep is judged by a turn, even
+    when its new end is model-free."""
+    p = make(env)
+    d, db, t0, again = _coordinator_pause_sweep(p, monkeypatch, {"end_when": "test -e out/c"})
+    assert again()["skip"], "the control skips"
+    got = again(change)
+    assert not got["skip"] and "items changed" in got["why"], got["why"]
+
+
+def test_blocker_sweep_skip_keeps_an_unchanged_user_pause_beside_a_coordinator_pause(env, monkeypatch):
+    """A user pause is lifted on their word only: unchanged, it still skips whatever its end, beside a
+    coordinator pause its probe ends; the receipt names each with its rule."""
+    from ttp import coordinator as coord, sweepskip
+    p = make(env)
+    d, db, t0, again = _coordinator_pause_sweep(p, monkeypatch, {"end_when": "test -e out/c"})
+    coord.pause_resource(p, "board-v", True, reason="vendor visit", by="user", end={"until": t0 + 5 * 86400})
+    sweepskip.swept(db, again(ts=t0 + 120), t0 + 120)
+    got = again()
+    assert got["skip"], got["why"]
+    assert got["ends"]["resource:board-v"] == "user pause"
+    assert got["ends"]["resource:board-c"] == "probe: end_when `test -e out/c`"
+
+
 def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_a_reason(env, monkeypatch):
     from ttp import coordinator as coord, reviewreuse
     p = make(env)

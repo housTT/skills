@@ -302,7 +302,10 @@ prolonged whole-box outage.
   kind change, until the ask is answered or withdrawn, a user message arrives, the item changes, the
   ask passes `coordinator.ask_rethink_h`, or a day passes since that outcome. An outcome stored
   in an older format is no cover. A waiting task on a user-pause probe is never reported
-  as a stale wait. The daily review lists everything stuck over 6 h with its sweep outcome.
+  as a stale wait. A sweep whose items are all unchanged since the last model sweep (within 24 h),
+  each with a model-free end, is skipped model-free with a receipt naming each item's end. A pause
+  the coordinator set counts when its `end_when` probe answers (not broken), a heal check's health
+  end lifts it, or, with neither, its `until` falls before the next sweep is due. The daily review lists everything stuck over 6 h with its sweep outcome.
 - Course check: a digest section, shown only when something trips, with model-free signs the project
   is off track or wasteful, each with its evidence and a suggested correction: an open task that
   failed `fails_24h` (3) times in 24 h; queued tasks that never ran held `queued_h` (6) hours on a

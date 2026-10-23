@@ -5,6 +5,11 @@
 Before the daemon queues a blocker sweep (Daemon.blocker_sweep), it names what ends each stuck item
 without a turn (end()):
 - a user pause: a user-pause probe, a pause the user set on a resource, or a cover recorded on one;
+- a pause the coordinator set on a resource this project checks (pauseends.owned), something
+  model-free re-evaluates or ends before the next sweep (_pause_end): an `end_when` probe whose last
+  answer is fresh and not broken (0, or a not yet: 1, 75, 255), an enabled heal check's health end
+  (which lifts it after healthy results), or, with neither, an `until` before the next interval
+  sweep is due (coordinator.blocker_sweep_h), when the pause_end_due event brings the re-evaluation;
 - a time: a start_after or a hold's `waits_on until` still ahead, a promise, mitigation or outage not
   due yet;
 - a working model-free probe: a deferral's start_when within coordinator.defer_max_days, a hold's
@@ -20,10 +25,10 @@ MAX_AGE_H ago, and nothing else needs a turn: no signal() request pending, no re
 outcome asked for came due (its `next` or the daily re-check, which the receipt's clock would
 otherwise pass), no inbound message unhandled, no other queued event but routine ones
 (quietgate.routine_kinds), no task pushing past coordinator.review_backlog_h, no loop and no ask
-held past ask_rethink_h. A new or changed item, a broken or stale probe, a deferral past
-defer_max_days, a pause the coordinator set, a dependency or probe task that failed, was cancelled or
-does not exist, a review past its expected time, or an item with no model-free end starts the sweep
-turn as before.
+held past ask_rethink_h. A new or changed item (a pause: its reason, `until` or `end_when`), a
+broken or stale probe, a deferral past defer_max_days, a pause the coordinator set with none of those
+ends or past its end, a dependency or probe task that failed, was cancelled or does not exist, a
+review past its expected time, or an item with no model-free end starts the sweep turn as before.
 
 A skip writes a receipt (RECEIPTS_KEY: each item and what ends it, with the estimated saving, the
 quiet gate's mean coordinator turn) and sets sweep.STATE_KEY `receipt`, which the sweep's clock counts
@@ -84,14 +89,42 @@ def _probe_end(probe: Any, got: Any, now: float, what: str) -> str | None:
     return f"{what} `{sweep._clip(probe, 120)}`"
 
 
-def end(db: DB, cfg: dict, i: dict, now: float, probe_of: Probe | None = None, asks: dict | None = None) -> str | None:
+def _pause_end(db: DB, cfg: dict, name: str, row: dict, now: float, project: str | None) -> str | None:
+    """What re-evaluates or ends a pause the coordinator set before the next sweep without a turn,
+    with the rule it counts under (probe, heal, end before the next sweep), or None (module doc)."""
+    from . import heal
+    if row.get("by") != "coordinator" or row.get("fleet") or (row.get("shared") and row.get("project") != project):
+        return None   # only the project that set a pause checks its end (pauseends.owned)
+    until, probe = row.get("until"), row.get("end_when")
+    if until is not None and _f(until, 0) <= now:
+        return None   # past its end and never lifted
+    if isinstance(probe, str) and probe.strip():
+        got = ((db.kv(sweep.PAUSE_PROBES_KEY) or {}).get(name) or {})
+        if got.get("probe") != probe or got.get("rc") not in (0, *ends.NOT_YET_RCS) \
+                or now - _f(got.get("at"), 0) > sweep.PROBE_FRESH_S:
+            return None   # broken, stale or never answered
+        return f"probe: end_when `{sweep._clip(probe, 120)}`"
+    if isinstance(probe, dict):
+        check = probe.get("heal")
+        return f"heal: heal check `{check}` lifts it" if any(r["name"] == check for r, _ in heal.checks(db)) else None
+    every = sweep._cfg(cfg, "blocker_sweep_h", sweep.EVERY_H) * 3600
+    if until is not None and every > 0 and _f(until, 0) <= now + every:
+        return f"end before the next sweep: until {timefmt.long(_f(until, 0), cfg)}"
+    return None
+
+
+def end(db: DB, cfg: dict, i: dict, now: float, probe_of: Probe | None = None, asks: dict | None = None,
+        paused: dict | None = None, project: str | None = None) -> str | None:
     """What ends sweep item `i` without a turn (see the module doc), or None when a turn must judge it."""
     c = cfg.get("coordinator") or {}
     where = cfg
     if i.get("ends") == "due":
         return "its due time"
     if i["kind"] == "paused":
-        return "user pause" if i.get("ends") == "user" else None   # a pause the coordinator set is its own
+        if i.get("ends") == "user":
+            return "user pause"
+        row = (db.paused_resources() if paused is None else paused).get(i["resource"])
+        return _pause_end(db, cfg, i["resource"], row, now, project) if isinstance(row, dict) else None
     t = db.task(i["task"]) if i.get("task") else None
     if t is None:
         return None
@@ -141,19 +174,27 @@ def end(db: DB, cfg: dict, i: dict, now: float, probe_of: Probe | None = None, a
     return f"open ask #{a['id']}" if a.get("id") in (asks or {}) else None
 
 
-def _fp(db: DB, i: dict, e: str | None) -> str:
-    """The item as a turn would judge it: its kind, status, spec, reason, end and its dependencies' states."""
+def _fp(db: DB, i: dict, e: str | None, paused: dict | None = None) -> str:
+    """The item as a turn would judge it: its kind, status, spec, reason, end and its dependencies' states.
+    A coordinator pause counts its row's own ends (`until`, `end_when`) instead of the end found now: a dated end
+    comes within the next sweep, and a probe first answers, as time passes, not as the pause changes."""
     t = db.task(i["task"]) if i.get("task") else None
     deps = [[d, (db.task(d) or {}).get("status")] for d in dependency_ids(t) if isinstance(d, int)] if t else []
+    row = (paused or {}).get(i["resource"]) if i["kind"] == "paused" else None
+    if isinstance(row, dict) and i.get("ends") != "user":   # a user pause keeps its end as before
+        e = [row.get(k) for k in ("by", "since", "until", "end_when")]
     return hashlib.sha256(json.dumps([i["key"], i["kind"], i["status"], i["spec_sha"], i["reason"], e, deps],
                                      default=str).encode()).hexdigest()[:16]
 
 
-def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | None = None) -> dict:
-    """{skip: bool, why: why a turn is needed ('' on a skip), ends: {key: end or None}, fps: {key: fp}}."""
+def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | None = None,
+          project: str | None = None) -> dict:
+    """{skip: bool, why: why a turn is needed ('' on a skip), ends: {key: end or None}, fps: {key: fp}}.
+    `project`: this project's name, which a shared pause names when this project set it."""
     asks = sweep._open_asks(db)
-    got = {i["key"]: end(db, cfg, i, now, probe_of, asks) for i in live}
-    fps = {i["key"]: _fp(db, i, got[i["key"]]) for i in live}
+    paused = db.paused_resources() if any(i["kind"] == "paused" for i in live) else {}
+    got = {i["key"]: end(db, cfg, i, now, probe_of, asks, paused, project) for i in live}
+    fps = {i["key"]: _fp(db, i, got[i["key"]], paused) for i in live}
     out = {"skip": False, "why": "", "ends": got, "fps": fps}
     model = db.kv(MODEL_KEY) or {}
     state = db.kv(sweep.STATE_KEY, {}) or {}

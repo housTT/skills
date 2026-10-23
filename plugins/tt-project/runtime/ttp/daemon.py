@@ -5499,7 +5499,8 @@ class Daemon:
                 return self._start_hold(t, prov, ctx)
             self.sweep_unreviewed(force=True)   # its data pass: no finished change sits unreviewed into it
             # Every item ends model-free and nothing changed since the last model sweep: a receipt, no turn.
-            got = sweepskip.check(db, self.cfg, sweep.items(db, now, self.cfg), now, probe_of=self._probe_rc.get)
+            got = sweepskip.check(db, self.cfg, sweep.items(db, now, self.cfg), now, probe_of=self._probe_rc.get,
+                                  project=self.p.name)
             if got["skip"]:
                 rec = sweepskip.skip(db, got, why, now)
                 log(self.p, f"blocker sweep skipped model-free ({why}): {len(rec['items'])} item(s) unchanged, "
