@@ -30626,6 +30626,80 @@ def test_superseded_accepts_a_task_in_review_only_when_its_work_is_merged(env, c
     assert f"task #{queued} is queued, not done" in capsys.readouterr().err
 
 
+def _replies(p, chat):
+    return p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' AND chat=?", (chat,))
+
+
+def test_closing_a_harness_task_from_review_answers_its_chat_once(env, capsys):
+    """A chat-asked harness task closed from review, by the sweep (merged commit) or by `ttp task
+    superseded`, posts exactly one reply to that chat, its hand-off `message` kept; a later sweep posts
+    none."""
+    from ttp import cli
+    from ttp.daemon import Daemon
+    p = make(env)
+    _commit_in_harness_tree(p.harness, "prompts/merged.md", "x\n", "merged edit")
+    sha = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    tid = _harness_in_review(p, "merged fix", f"committed {sha[:10]}", time.time() - 1900)
+    p.db.update_task(tid, reply_chat="c1", result=json.dumps({"status": "needs_review", "message": "prompts tuned",
+                                                              "summary": f"committed {sha[:10]}"}))
+    d = Daemon(p.base)
+    _sweep(d)
+    assert p.db.task(tid)["status"] == "done"
+    (r,) = _replies(p, "c1")
+    assert r["text"].startswith("prompts tuned (") and "merged into the harness" in r["text"]
+    _sweep(d)
+    assert len(_replies(p, "c1")) == 1
+    other = _harness_in_review(p, "landed edit", "ok", time.time())
+    p.db.update_task(other, reply_chat="c2")
+    try:
+        cli.main(["task", p.name, "superseded", str(other), sha[:12]])
+    except SystemExit as e:
+        assert e.code in (0, None)
+    capsys.readouterr()
+    assert p.db.task(other)["status"] == "done"
+    (r,) = _replies(p, "c2")
+    assert "recorded with `ttp task superseded`" in r["text"]
+    _sweep(d)
+    assert len(_replies(p, "c2")) == 1 and len(_replies(p, "c1")) == 1
+
+
+def test_a_harness_task_whose_review_passed_is_closed_with_no_merged_commit_seen(env):
+    """A harness task in review whose hand-off names no commit (its branch merged and deleted by the
+    harness sweep) gets one review; once that review passes, the next sweep closes the task as done and
+    its dependent starts. One whose branch still has unmerged commits stays in review instead, and the
+    coordinator gets one queued event about it, not one per pass."""
+    from ttp import daemon as dm
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = _harness_in_review(p, "branchless fix", "tuned the prompts", time.time() - 1900)
+    dep = p.db.add_task("after it", "s", kind="code", origin="coordinator", depends_on=[tid])
+    d = Daemon(p.base)
+    _sweep(d)
+    (rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review'")
+    assert "names no commit" in rev["spec"] and p.db.task(tid)["status"] == "review"
+    assert dep not in [t["id"] for t in p.db.ready_tasks()]
+    p.db.update_task(rev["id"], status="done", result=json.dumps({"status": "done", "summary": "approved"}))
+    _sweep(d)
+    t = p.db.task(tid)
+    assert t["status"] == "done" and json.loads(t["result"])["reviewed_by"] == rev["id"]
+    assert f"review #{rev['id']} passed" in json.loads(t["result"])["summary"]
+    assert dep in [t["id"] for t in p.db.ready_tasks()]
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1
+
+    held, _ = _unmerged_harness_commit(p, "conflicted edit")
+    p.db.update_task(held, status="review", result=json.dumps({"status": "needs_review", "summary": "ok"}))
+    _ran(p, held, time.time() - 1900)
+    _sweep(d)
+    (rev2,) = _daemon_reviews(p, held)
+    p.db.update_task(rev2["id"], status="done", result=json.dumps({"status": "done", "summary": "approved"}))
+    for _ in range(2):
+        _sweep(d)
+        assert p.db.task(held)["status"] == "review"
+        (ev,) = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (dm.HARNESS_UNMERGED, held))
+        assert ev["status"] == "queued" and f"passed review #{rev2['id']}" in ev["text"]
+    assert len(_daemon_reviews(p, held)) == 1
+
+
 def test_replay_2800_a_done_code_task_left_with_no_review_gets_exactly_one(env, monkeypatch):
     """Replay of #2800: a code task committed, its checks passed (recorded model-free from its on_pass),
     its done hand-off proposed one follow-up, and no review was queued. The invariant queues exactly one

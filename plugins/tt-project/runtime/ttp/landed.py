@@ -383,7 +383,9 @@ def _record_harness(p, task: dict, sha: str) -> str:
 
 
 def _close_review(p, task: dict, sha: str) -> str:
-    """Close `task`, left in 'review', as done now that `sha` carries its work: the words to add."""
+    """Close `task`, left in 'review', as done now that `sha` carries its work, with the chat reply
+    (pushq._reply) when this closed it: the words to add."""
+    from . import pushq
     from .db import dump_result, load_result
     now, line = time.time(), f"its work is in {sha[:10]}, recorded with `ttp task superseded`"
     with p.db.tx():
@@ -397,6 +399,7 @@ def _close_review(p, task: dict, sha: str) -> str:
         p.db.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                           (now, f"task:{task['id']}", "task_superseded", "normal",
                            f"#{task['id']} {task['title']}: {line}; closed as done.", "handled", task["id"]))
+        pushq._reply(p.db, task, "done", pushq._done_text(prev, result["summary"], line))
     return "; it was in review and is now done"
 
 

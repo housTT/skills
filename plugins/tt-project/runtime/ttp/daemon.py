@@ -351,6 +351,7 @@ STALE_OPEN = ("queued", "waiting", "blocked")   # a hop not under way, that a la
 STALE_REVIEWS_PER_PASS = 20   # queued reviews whose subject is looked up on the push branch per pass
 KV_KEPT_MESSAGES = "kept_messages"   # kv: user message ids kept unhandled once after a fixable task_add rejection
 REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code and harness tasks left in review with no review
+HARNESS_UNMERGED = "harness_review_unmerged"   # event: a harness task passed review but its branch is not merged
 # sweep_unreviewed: a done (or long externally waiting) code task with an unlanded head and no review
 UNREVIEWED_EVENT = "review_unqueued"
 UNREVIEWED_PER_PASS = 2        # review.unreviewed_per_pass: most reviews one pass queues (0 off)
@@ -9063,33 +9064,65 @@ class Daemon:
     def _sweep_harness_review(self, t: dict, reviews: list[dict], start: float, sha: str | None, now: float) -> None:
         """sweep_reviews for harness task `t`, in review since `start`. A review of it that is open, or
         that ended since it entered review, had its say (a failed one is the coordinator's to act on)
-        unless it passed and the commit is merged. Else a commit merged into the harness (`sha`) is
-        delivered, as the harness has no remote: the task is closed as done, with no review queued.
-        Else it gets one review of its own (_auto_review_harness)."""
+        unless it passed. A commit merged into the harness (`sha`) is delivered, as the harness has no
+        remote: the task is closed as done, with no review queued. So is one whose review passed and
+        whose worktree branch has nothing unmerged (harnesstree.sweep may have merged and deleted it);
+        a branch still holding unmerged commits then raises one HARNESS_UNMERGED event for the
+        coordinator. Else it gets one review of its own (_auto_review_harness)."""
         mine = [r for r in reviews if t["id"] in dependency_ids(r) or review_subject(r) == t["id"]]
         if any(r["status"] not in ("done", "failed") for r in mine):
             return
         ended = [r for r in mine if float(r["updated"] or 0) >= start]
-        if ended and not (sha and ended[-1]["status"] == "done" and task_outcome(ended[-1]) != CHANGES_NEEDED):
+        passed = bool(ended) and ended[-1]["status"] == "done" and task_outcome(ended[-1]) != CHANGES_NEEDED
+        if ended and not passed:
             return
-        if not sha:
+        if sha:
+            why = f"its commit {sha[:10]} is merged into the harness" + (
+                f" and review #{ended[-1]['id']} passed" if ended else "")
+            self._close_harness_review(t, start, now, why, {"harness_merged": sha}, bool(ended))
+        elif not passed:
             self._swept(t, self._auto_review_harness(t), start, now)
-            return
+        elif left := harnesstree.unmerged(self.p, t["id"]):
+            self._harness_unmerged(t, ended[-1]["id"], left, start, now)
+        else:
+            why = (f"review #{ended[-1]['id']} passed and its branch {harnesstree.branch(t['id'])} has nothing "
+                   f"left to merge into the harness")
+            self._close_harness_review(t, start, now, why, {"reviewed_by": ended[-1]["id"]}, True)
+
+    def _close_harness_review(self, t: dict, start: float, now: float, why: str, extra: dict,
+                              reviewed: bool) -> None:
+        """Close harness task `t`, in review since `start`, as done because `why` (`extra` added to its
+        result); one review_swept event, and the chat reply (pushq._reply) when this closed it."""
         db = self.p.db
-        why = (f"its commit {sha[:10]} is merged into the harness" + (f" and review #{ended[-1]['id']} passed"
-                                                                       if ended else ""))
-        prev = load_result(t.get("result"))
-        result = {**prev, "status": "done", "harness_merged": sha,
-                  "summary": f"{str(prev.get('summary') or '').rstrip()} ({why})".strip()[:1500]}
         with db.tx():
+            prev = load_result((db.task(t["id"]) or t).get("result"))
+            result = {**prev, **extra, "status": "done",
+                      "summary": f"{str(prev.get('summary') or '').rstrip()} ({why})".strip()[:1500]}
             if not db.conn.execute("UPDATE tasks SET status='done', blocked_reason=NULL, result=?, updated=? "
                                    "WHERE id=? AND status='review'", (dump_result(result), now, t["id"])).rowcount:
                 return
             db.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                             (now, "daemon", "review_swept", "normal",
                              f"#{t['id']} {t['title']} sat in review {(now - start) / 3600:.1f}h; {why}, so it was "
-                             f"closed as done" + ("" if ended else " with no review queued") + ".", "handled", t["id"]))
+                             f"closed as done" + ("" if reviewed else " with no review queued") + ".", "handled", t["id"]))
+            pushq._reply(db, t, "done", pushq._done_text(prev, result["summary"], why))
         log(self.p, f"task {t['id']}: in review {(now - start) / 3600:.1f}h; {why}: closed as done")
+
+    def _harness_unmerged(self, t: dict, rid: int, left: int, start: float, now: float) -> None:
+        """Harness task `t` passed review #`rid` but its worktree branch still holds `left` commits the
+        harness lacks (-1: git could not tell), e.g. after a merge conflict: one queued event per stay in
+        review, for the coordinator to merge or requeue it."""
+        db = self.p.db
+        if db.one("SELECT id FROM events WHERE kind=? AND task=? AND ts>=?", (HARNESS_UNMERGED, t["id"], start)):
+            return
+        b = harnesstree.branch(t["id"])
+        n = "an unknown number of" if left < 0 else str(left)
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (now, "daemon", HARNESS_UNMERGED, "normal",
+              f"#{t['id']} {t['title']} passed review #{rid}, but its branch {b} has {n} commits not merged "
+              f"into the harness (`git -C {self.p.harness} log HEAD..{b}`), so it stays in review: merge them "
+              f"(or close it with `ttp task superseded`), or requeue it.", "queued", t["id"]))
+        log(self.p, f"task {t['id']}: review #{rid} passed but branch {b} has {n} unmerged commits; told the coordinator")
 
     def _auto_review_harness(self, task: dict) -> tuple[int, bool] | None:
         """The review of harness task `task`, left in 'review' with its commits not merged into the harness

@@ -207,7 +207,10 @@ prolonged whole-box outage.
   A harness task left in review the same way delivers by its commit in the harness, which has no
   remote. Once the commit its hand-off names is merged into the harness, its dependents may start
   while it stays in review, and the sweep closes it as done with no review queued (or once its
-  review passed). Until then it gets one review-only review of its own. A queued task held by a
+  review passed). Until then it gets one review-only review of its own. Once that review passes,
+  it is closed as done too when its worktree branch has nothing left to merge; if the branch still
+  has unmerged commits, the coordinator is told once. Closing it answers the chat that asked for
+  it, as `ttp task superseded` does when it closes one. A queued task held by a
   dependency left in review names it in its start note ("waits on #<id> (in review <h>h)").
   `review.auto_notes` is added
   to each such review's spec (for example, what to do after a push). When the task's PR already
