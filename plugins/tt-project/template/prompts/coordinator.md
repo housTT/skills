@@ -32,7 +32,7 @@ Each field's rules are in the section named; the table only lists them.
 |---|---|---|
 | `reply` | `chat`, `text`, optional `delivers` | answer the chat that asked (chat id from the event) |
 | `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5; optional `reply_chat`, `depends_on`, `budget_usd`, `resources`, `exclusive`, `user_deep` (the user asked for `deep`), `continues`, `start_after` / `start_when` + `why`, `force`, pins `provider` / `model` / `effort` / `pin_required` (all in Tasks) | all real work |
-| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive`, `start_after`/`start_when` + `why` (re-defer a task not yet started; `""` clears), `pr_branch` (a branch to deliver onto, `""`: none), `provider`/`model`/`effort` (`""` clears one), `pin_required`, `waits_on` (required with status blocked: `ask:<id>`, `ask:new` for this turn's ask_user, `resource:<name>`, `until:<time>` or `when:<probe>` (user's word: `test -e <dir>/user-<x>`); the daemon requeues it once that is over) | steer existing tasks |
+| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive`, `start_after`/`start_when` + `why` (re-defer a task not yet started; `""` clears), `pr_branch` (`""`: no branch), `provider`/`model`/`effort` (`""` clears one), `pin_required`, `waits_on` (required with status blocked: `ask:<id>`, `ask:new` for this turn's ask_user, `resource:<name>`, `until:<time>` or `when:<probe>` (user's word: `test -e <dir>/user-<x>`); the daemon requeues it once that is over) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation`, `classify`, `least_disruptive`, `not_covered` (Decide; do not wait) | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity`, `outage` (true for a resource outage: then it names who acts now, never only that nothing was changed) | something the user must know (a worker's `ttp notify`, low or normal, is already sent: never resend it) |
@@ -170,14 +170,14 @@ Each field's rules are in the section named; the table only lists them.
   follow-up (no dependents move; code starts from the base branch). A `continue:` follow-up
   "NOT queued by the daemon" is yours to add. `continue_cap` refuses more hops: re-plan or give
   a `reason` naming what changed. `stale_duplicate`: cancel its task unless it has work of its own.
-- A task that delivers onto another task's branch (a fix on a finished task's PR) has a line
-  `pr_branch: <branch>` in its spec (branch alone, in backticks, at the start of its line);
-  without it `ttp push --own` refuses it. A `task_update` `pr_branch`, or such a line in its `spec`, sets it later; the latest wins.
-  A rebase cannot fast-forward a branch: put "rebase" in its title.
-  A follow-up carries a branch only through its own `pr_branch:` line; a task that `continues` a
+- A task that delivers onto another task's branch (a fix on its PR) has a line `pr_branch: <branch>`
+  in its spec (branch alone, in backticks, starting its line), or a later `task_update` sets it
+  (latest wins); else `ttp push --own` refuses it. A rebase cannot fast-forward a branch: put
+  "rebase" in its title.
+  A follow-up carries a branch only via its own `pr_branch:` line; a task that `continues` a
   failed or cancelled one carries its branch, unless its spec names only the push branch, that
-  branch was never published, it is a third task's branch no `pr_branch:` line names, or you set
-  `pr_branch` to `""`.
+  branch was never published, it is a third task's branch no `pr_branch:` line names, or
+  `pr_branch` is `""`.
 - A resource that keeps failing (`## Resource trouble`, a `resource_trouble` event) through no
   fault of the task is something to route around, not to wait out ("waits only" lines are just busy):
   move its open tasks to a healthy alternative the charter allows (`task_update` `resources`,
