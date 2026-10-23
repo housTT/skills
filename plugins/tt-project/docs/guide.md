@@ -753,6 +753,17 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   harness: `git diff --check` from the push target (else HEAD's parent) to HEAD, leaving out `*.log`, and
   `python3 -m pytest -q runtime/tests` and `bin/tests`, each only where that folder exists (`if_exists`:
   a missing one is reported skipped, never passed). A configured harness entry replaces the whole plan.
+- A project whose harness repo is not its code repo gives each repo its own list with
+  `delivery.push_checks_by_repo`: a map from `"harness"` (the project's own harness repo), a repo path
+  (absolute, `~`, or relative to the project root) or a main checkout's folder name to a list in the
+  `push_checks` form, e.g. `{"harness": ["python3 -m pytest -q runtime/tests"], "my-repo": ["make test"]}`.
+  `ttp checks`, `ttp push`, `ttp land` and the push queue run the list of the repo they check;
+  `delivery.push_checks` still covers every repo the map does not name. The harness repo never
+  inherits the code repo's `push_checks`: with no `"harness"` entry, `ttp checks` there says
+  `no repo checks configured for the harness repo` and runs the built-in harness default above
+  (`--purpose harness`: only `push_checks`' purpose harness entries, else that default). Its pass is
+  the harness repo's own, never a pass of the code checks; `checks.json` records the list's source in
+  `checks_from`. `ttp config` refuses a malformed map.
 - `ttp checks` refuses a worktree with uncommitted changes, except unstaged edits to tracked files the
   repository's ignore rules match: a log a running watcher appends to (add it to `.gitignore`) no longer
   forces a fresh worktree. The run lists them; a staged edit to such a file still blocks.

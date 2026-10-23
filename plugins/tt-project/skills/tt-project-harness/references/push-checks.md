@@ -10,6 +10,12 @@ A failure lists up to five files that exist only in the authoring worktree and t
 `{"run": "...", "cwd": "authoring"}` runs one check in the authoring worktree (it needs build outputs made there); its pass is labelled as not from a clean tree in the output and in `checks.json` (`authoring_tree`). The default is `"clean"`.
 `ttp push`, `ttp land` and the push queue already run their checks in scratch worktrees of the exact commit they push, and remote checks copy it with `git archive` (below).
 
+## Which list runs
+
+Each repo runs its own list. `delivery.push_checks_by_repo` maps `"harness"` (the project's own harness repo), a repo path (absolute, `~`, or relative to the project root) or a main checkout's folder name to a list in the `push_checks` form; `delivery.push_checks` covers every repo the map does not name.
+The harness repo never inherits the code repo's `push_checks`. With no `"harness"` entry, `ttp checks` there says `no repo checks configured for the harness repo` and runs the built-in harness default (a whitespace check, and pytest of `runtime/tests` and `bin/tests` where they exist); `--purpose harness` runs only `push_checks`' purpose harness entries, else that default.
+That pass is the harness repo's own, never a pass of the code checks; `checks.json` names the list's source in `checks_from`.
+
 ## Fast path
 
 Opt-in, off by default: with no `delivery.checks_fast_globs`, every diff runs the full checks.
