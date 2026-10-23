@@ -9316,8 +9316,11 @@ def test_relay_rejection_hands_back_the_users_own_words(env):
                            user_turn=True, messages=[bare])
     assert problems and "the charter takes only the user's own verbatim words. Drop or reword only those words" \
         in problems[0], problems
-    # The refusal says how to fix it: the user's own words, in any wording, are enough (never a re-ask).
+    # The refusal says how to fix it: the user's own words, in any wording, are enough (never a re-ask);
+    # with words of the user's, the quote stays last so its cut marker ends the refusal.
     assert problems[0].endswith("resend in this turn: the user's own words, in any wording, are enough"), problems
+    assert "in any wording, are enough. Message #" in coord.apply(p, [{"type": "charter_update", "section": "Policies",
+        "text": "Every nightly build must run on the spare widget farm."}], user_turn=True, messages=[mid])[0]
     assert relay.words_back(None) == "" and relay.words_back({"id": 1, "text": "  "}) == ""
 
 
