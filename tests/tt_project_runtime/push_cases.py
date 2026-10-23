@@ -5275,7 +5275,7 @@ def _held_review(env, monkeypatch, fix_status="queued", s=None, name="rejected")
     return s, d, x, fix, rid
 
 
-def _ready(db, tid):
+def _review_ready(db, tid):
     return tid in {t["id"] for t in db.ready_tasks()}
 
 
@@ -5285,14 +5285,14 @@ def test_a_daemon_queued_review_is_held_while_a_carried_change_s_fix_is_open(env
     s, d, x, fix, rid = _held_review(env, monkeypatch)
     t = s.p.db.task(rid)
     assert deferral(t)["when"] == f"landed:#{x}" and reviewhold.hold_of(t)[1] == [x], t["labels"]
-    assert not _ready(s.p.db, rid)
+    assert not _review_ready(s.p.db, rid)
     assert f"#{x}'s fix #{fix} lands" in coord.starts_text(t, plain=True), coord.starts_text(t, plain=True)
     d.release_review_holds(time.time())
-    assert not _ready(s.p.db, rid) and reviewhold.hold_of(s.p.db.task(rid))
+    assert not _review_ready(s.p.db, rid) and reviewhold.hold_of(s.p.db.task(rid))
     # The hold lives in the task's labels: a restarted daemon keeps it.
     from ttp.daemon import Daemon
     Daemon(s.p.base).release_review_holds(time.time())
-    assert not _ready(s.p.db, rid) and reviewhold.hold_of(s.p.db.task(rid))
+    assert not _review_ready(s.p.db, rid) and reviewhold.hold_of(s.p.db.task(rid))
 
 
 def test_a_held_review_is_released_once_the_carried_fix_lands(env, monkeypatch):
@@ -5306,7 +5306,7 @@ def test_a_held_review_is_released_once_the_carried_fix_lands(env, monkeypatch):
     d._start_verdict(s.p.db.task(rid), 0, time.time())
     d.release_review_holds(time.time())
     t = s.p.db.task(rid)
-    assert _ready(s.p.db, rid) and not reviewhold.hold_of(t), t["labels"]
+    assert _review_ready(s.p.db, rid) and not reviewhold.hold_of(t), t["labels"]
     assert "unreviewed commits" not in t["spec"] and "ended" not in t["spec"], t["spec"]
     assert t["spec"].rstrip().splitlines()[-1].startswith("Return the verdict")
 
@@ -5319,7 +5319,7 @@ def test_a_held_review_wakes_at_once_when_the_carried_fix_chain_ends_failed_or_c
         s.p.db.update_task(fix, status=end)
         d.release_review_holds(time.time())
         t = s.p.db.task(rid)
-        assert _ready(s.p.db, rid) and not reviewhold.hold_of(t), t["labels"]
+        assert _review_ready(s.p.db, rid) and not reviewhold.hold_of(t), t["labels"]
         assert f"The fix chain of carried task #{x} ended {end} (#{fix}) without landing" in t["spec"], t["spec"]
         # The inherited commits are still named, so the approval is not refused for them later.
         assert f"carries unreviewed commits from tasks whose latest review failed (#{x}: " in t["spec"]
@@ -5336,29 +5336,29 @@ def test_no_review_hold_when_the_carried_change_s_review_passed_none_ran_or_no_f
         c, _, _, _ = _pq_stacked(s, f"on-{name}", on=xbranch)
         rid, added = d._auto_review(s.p.db.task(c), "made the change")
         t = s.p.db.task(rid)
-        assert added and not reviewhold.hold_of(t) and _ready(s.p.db, rid), (name, t["labels"])
+        assert added and not reviewhold.hold_of(t) and _review_ready(s.p.db, rid), (name, t["labels"])
     # A fix that already ended: nothing open to wait for.
     _, _, _, _, rid = _held_review(env, monkeypatch, fix_status="cancelled", s=s, name="fixed")
-    assert not reviewhold.hold_of(s.p.db.task(rid)) and _ready(s.p.db, rid)
+    assert not reviewhold.hold_of(s.p.db.task(rid)) and _review_ready(s.p.db, rid)
 
 
 def test_the_review_hold_cap_releases_it_with_a_line_saying_so(env, monkeypatch):
     from ttp import reviewhold
     s, d, x, fix, rid = _held_review(env, monkeypatch)
     d.release_review_holds(time.time() + 23 * 3600)
-    assert not _ready(s.p.db, rid)
+    assert not _review_ready(s.p.db, rid)
     d.release_review_holds(time.time() + 25 * 3600)
     t = s.p.db.task(rid)
-    assert _ready(s.p.db, rid) and not reviewhold.hold_of(t), t["labels"]
+    assert _review_ready(s.p.db, rid) and not reviewhold.hold_of(t), t["labels"]
     assert f"for the fix of #{x} (#{fix} still open)" in t["spec"], t["spec"]
     # The cap is configurable; 0 turns it off.
     s, d, x, fix, rid = _held_review(env, monkeypatch, s=s, name="again")
     d.cfg["review"]["carried_hold_max_h"] = 0
     d.release_review_holds(time.time() + 1000 * 3600)
-    assert not _ready(s.p.db, rid)
+    assert not _review_ready(s.p.db, rid)
     d.cfg["review"]["carried_hold_max_h"] = 1
     d.release_review_holds(time.time() + 2 * 3600)
-    assert _ready(s.p.db, rid)
+    assert _review_ready(s.p.db, rid)
 
 
 def _pq_add_reviewed_tasks(db, start, stop):
