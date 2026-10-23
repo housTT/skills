@@ -42,7 +42,7 @@ WHOLE_RUN = "whole run"
 # a run supervisor's "task #7 (run 3), whole run" and a keeper's "task #7 (run 3), detached jobs". On a
 # shared resource the holder names the project first (shared.holder): "demo task #7 (run 3)".
 _LABEL_RE = re.compile(r"(?P<holder>(?:(?P<project>[A-Za-z0-9][A-Za-z0-9._-]*) )?task #(?P<task>\d+))"
-                       rf" \(run [^()]*\)(?:, (?P<kind>{WHOLE_RUN}|{LABEL}))?")
+                       rf" \(run (?P<run>[^()]*)\)(?:, (?P<kind>{WHOLE_RUN}|{LABEL}))?")
 
 
 def who(task) -> str:
@@ -57,10 +57,12 @@ def label(holder: str, run, kind: str = "") -> str:
 
 
 def parse(lbl) -> dict | None:
-    """A label() as {"holder", "project" (None when not shared), "task" (int), "kind"}; None for any
-    other text (a reservation, another lock's label, a hold taken outside a task)."""
+    """A label() as {"holder", "project" (None when not shared), "task" (int), "run" (its text, "?" when
+    unknown), "kind"}; None for any other text (a reservation, another lock's label, a hold taken
+    outside a task)."""
     m = _LABEL_RE.fullmatch(str(lbl or ""))
-    return m and {"holder": m["holder"], "project": m["project"], "task": int(m["task"]), "kind": m["kind"] or ""}
+    return m and {"holder": m["holder"], "project": m["project"], "task": int(m["task"]), "run": m["run"],
+                  "kind": m["kind"] or ""}
 
 
 def task_of(lbl, project: str | None = None) -> int | None:

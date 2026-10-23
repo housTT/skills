@@ -126,6 +126,48 @@ def _pid_note(h: dict) -> str:
     return f", pid {pid}" + ((" alive" if _alive(pid) else " gone") if here else "")
 
 
+def _holder_note(h: dict, where=None) -> str:
+    """What follows a holder's label and since when in a busy or wait line: its pid and whether it lives
+    (_pid_note), never nothing. Where `where` is the holder's project, a task's hold is looked up in its
+    run record: one with no pid in its label (from before pids) names its run's worker pid instead, else
+    "pid unknown" and whether the run is still active or ended; the keeper of a task's detached jobs also
+    names each job's own pid and whether it still runs. A hold whose task is done and that has no live
+    pid (its own, its run's worker or a job's) is marked stale: it is not a live holder, though the lock
+    stays taken until whatever process has its file open lets go."""
+    from . import detach, hold
+    from .project import Project
+    note, lbl = _pid_note(h), hold.parse(h.get("holder"))
+    if not isinstance(where, Project) or not lbl or lbl["project"] not in (None, where.name):
+        return note or ", pid unknown"
+    try:   # an unreadable database or a run id that is not a number: only what the label says
+        run = where.db.one("SELECT pid, status, dir FROM runs WHERE id=?", (int(lbl["run"]),))
+        task = where.db.one("SELECT status FROM tasks WHERE id=?", (lbl["task"],))
+    except Exception:
+        run = task = None
+    live = note.endswith(" alive")
+    if not note:
+        wp = int(run.get("pid") or 0) if run else 0
+        if wp > 0:
+            live = _alive(wp)
+            note = f", pid {wp} {'alive' if live else 'gone'} (run {lbl['run']}'s worker)"
+        else:
+            note = ", pid unknown" + (f" (run {lbl['run']} {'active' if run['status'] == 'running' else 'ended'})"
+                                      if run else f" (no record of run {lbl['run']})")
+    if lbl["kind"] == hold.LABEL and run and run["dir"]:
+        jobs = []
+        for rc in (hold.read(Path(run["dir"])) or {}).get("jobs") or []:
+            rc = Path(rc)
+            pid, runs = detach._entry(rc).get("pid"), not job_ended(rc)
+            live = live or runs
+            jobs.append(f"job {rc.stem} pid {pid if isinstance(pid, int) and pid > 1 else 'unknown'} "
+                        f"{'running' if runs else 'ended'}")
+        if jobs:
+            note += "; " + ", ".join(jobs[:3]) + (f" +{len(jobs) - 3} more" if len(jobs) > 3 else "")
+    if task and task["status"] == "done" and not live:
+        note += f"; stale: task #{lbl['task']} is done"
+    return note
+
+
 SHARED_MARK = " (shared)"   # ends a shared holder's label
 
 
@@ -233,7 +275,7 @@ def holders(paths: list[Path], where=None, pids: bool = False) -> list[str]:
             continue
         if isinstance(h, dict) and h:
             out.append(f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}"
-                       + (_pid_note(h) if pids else ""))
+                       + (_holder_note(h, where) if pids else ""))
     return out
 
 
@@ -244,34 +286,45 @@ def held_labels(paths: list[Path]) -> list[str]:
 
 
 def holders_now(paths: list[Path], where=None) -> list[str]:
-    """`holders` with pids, of only the slots whose lock is taken right now, then the shared holders:
-    what a wait or busy message names."""
+    """`holders` with pids (_holder_note), of only the slots whose lock is taken right now, then the shared
+    holders: what a wait or busy message names."""
     out = holders([x for x in paths if _slot_labels([x])], where, pids=True)
-    return out + [f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}{_pid_note(h)}"
+    return out + [f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}{_holder_note(h, where)}"
                   for h in (shared_holders(paths) if paths else [])]
 
 
-def probe_resources(cmd: str) -> list[str]:
-    """The resources a wait probe checks when it is only `ttp lock --probe <resource>` commands (joined
-    by &&, || or ;), else []."""
-    out = []
+_REDIRECT = re.compile(r"^\d*(?:>>?|<|>&|&>)")
+
+
+def lock_probe_parts(cmd: str) -> tuple[list[tuple[str, bool]], list[str]]:
+    """A wait probe's `ttp lock --probe [--shared] <resource>` commands (joined by &&, || or ;, output
+    redirections allowed) as (resource, shared), and its other commands as their text."""
+    found, rest = [], []
     for part in re.split(r"&&|\|\||;", str(cmd or "")):
         try:
             w = shlex.split(part)
         except ValueError:
-            return []
-        names = [x for x in w[2:] if not x.startswith("-")]
-        if w[:2] != ["ttp", "lock"] or "--probe" not in w or "--timeout" in w or len(names) != 1:
-            return []
-        out.append(names[0])
-    return out
+            return [], [str(cmd)]
+        words, skip = [], False
+        for x in w:
+            if skip:
+                skip = False
+            elif _REDIRECT.match(x):
+                skip = bool(_REDIRECT.fullmatch(x))   # `> file`: the file is the next word
+            else:
+                words.append(x)
+        names = [x for x in words[2:] if not x.startswith("-")]
+        if words[:2] == ["ttp", "lock"] and "--probe" in words and "--timeout" not in words and len(names) == 1:
+            found.append((names[0], "--shared" in words))
+        elif part.strip():
+            rest.append(part.strip())
+    return found, rest
 
 
-def probe_lines(text: str, resources: list[str]) -> list[str]:
-    """The answer lines of `ttp lock --probe` for `resources` in a probe's output ("dev: busy (held by
-    ...)"): who holds each lock as the probe ran, with pid and whether it lives (holders_now)."""
-    return [ln.strip() for ln in str(text or "").splitlines()
-            if any(ln.strip().startswith(f"{r}: ") for r in resources)]
+def probe_resources(cmd: str) -> list[str]:
+    """The resources a wait probe checks when it is only `ttp lock --probe <resource>` commands, else []."""
+    found, rest = lock_probe_parts(cmd)
+    return [] if rest else [r for r, _ in found]
 
 
 def _slot_labels(paths: list[Path]) -> list[str]:

@@ -33044,6 +33044,100 @@ def test_lock_probe_wait_note_names_live_holders_not_the_ones_its_hand_off_saw(e
     assert "build-a: busy (held by task #900 (run 9) since" in note and f"pid {os.getpid()} alive" in note, note
 
 
+def _relabel(f, holder):
+    """The held slot file `f` relabelled as `holder` with no pid, as a label from before pids reads."""
+    f.seek(0)
+    f.truncate()
+    f.write(json.dumps({"holder": holder, "since": time.time(), "command": "build"}))
+    f.flush()
+
+
+def _run_row(p, task, status="running", pid=None, run_dir=None):
+    return p.db.x("INSERT INTO runs(task,role,status,started,pid,dir) VALUES(?,'worker',?,?,?,?)",
+                  (task, status, time.time(), pid, str(run_dir) if run_dir else None))
+
+
+def test_lock_probe_names_pid_and_liveness_for_every_holder_kind(env):
+    """`ttp lock --probe` never names a bare `task #N (run M)`: a label with no pid names its run's worker
+    pid, else "pid unknown" and whether the run is active; a keeper of detached jobs names each job's own
+    pid and whether it runs; a done task's hold with no live pid is stale."""
+    from ttp import hold, locks
+    p = make(env)
+
+    def probe():
+        r = _ttp_run(p, "lock", "--probe", "build-a")
+        assert r.returncode == 75, r.stdout + r.stderr
+        return r.stdout.strip()
+
+    t = p.db.add_task("holder", "s", kind="work", origin="user")
+    held = _held_build_lock(p, "build-a", "x")
+    try:
+        run = _run_row(p, t, pid=os.getpid())
+        _relabel(held, f"task #{t} (run {run})")
+        assert f"held by task #{t} (run {run}) since" in (out := probe()), out
+        assert f"pid {os.getpid()} alive (run {run}'s worker)" in out and "stale" not in out, out
+        run = _run_row(p, t)
+        _relabel(held, f"task #{t} (run {run})")
+        assert f"pid unknown (run {run} active)" in (out := probe()) and "stale" not in out, out
+        p.db.x("UPDATE runs SET status='ok' WHERE id=?", (run,))
+        p.db.update_task(t, status="done")
+        assert f"pid unknown (run {run} ended); stale: task #{t} is done" in (out := probe()), out
+
+        # The keeper of a done task's detached jobs: it holds for its jobs, each named with its own pid.
+        rd = p.state / "runs" / "keeper-run"
+        rd.mkdir(parents=True)
+        rc = rd / "job-a.rc"
+        (rd / "detached.json").write_text(json.dumps([{"name": "job-a", "rc": str(rc), "pid": 4242}]))
+        (rd / hold.RECORD).write_text(json.dumps({"state": "holding", "jobs": [str(rc)]}))
+        run = _run_row(p, t, status="ok", run_dir=rd)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        job = locks.try_take([locks.job_lock(rc)], "detached job job-a", "sleep")
+        try:
+            _relabel(held, hold.label(f"task #{t}", run, hold.LABEL))
+            locks.label_pid(held, dead.pid)
+            out = probe()
+            assert f"(run {run}), detached jobs since" in out and f"pid {dead.pid} gone; job job-a pid 4242 running" in out, out
+            assert "stale" not in out, out
+        finally:
+            job.close()
+        rc.write_text("0")
+        assert f"job job-a pid 4242 ended; stale: task #{t} is done" in (out := probe()), out
+    finally:
+        held.close()
+
+
+def test_lock_wait_note_names_the_probes_live_holders_and_agrees_with_the_probe(env):
+    """A waiting task's note on lock probes (output redirected or mixed with other commands too) is the
+    probe's own answer: the same live holders, never the done task its hand-off named as holder."""
+    from ttp import daemon as dmod, locks
+    p = make(env)
+    assert locks.lock_probe_parts("ttp lock --probe build-a >/dev/null 2>&1 && ttp lock --probe --shared build-b") \
+        == ([("build-a", False), ("build-b", True)], [])
+    assert locks.lock_probe_parts("ttp lock --probe build-a > /dev/null; test -e /tmp/x") == ([("build-a", False)],
+                                                                                               ["test -e /tmp/x"])
+    old = p.db.add_task("old holder", "s", kind="work", origin="user")
+    p.db.update_task(old, status="done")
+    now_t = p.db.add_task("holder now", "s", kind="work", origin="user")
+    probe = "ttp lock --probe build-a >/dev/null 2>&1 && ttp lock --probe build-b >/dev/null"
+    tid = _due_waiting_task(p, probe, waiting_for=f"build-a held by #{old}, build-b held by task #{old}")
+    held = [_held_build_lock(p, "build-a", "x"), _held_build_lock(p, "build-b", "y")]
+    try:
+        _relabel(held[0], f"task #{now_t} (run {_run_row(p, now_t, pid=os.getpid())})")
+        d = dmod.Daemon(p.base)
+        d.refresh_ref_waits()
+        note = p.db.task(tid)["blocked_reason"]
+        said = [_ttp_run(p, "lock", "--probe", r).stdout.strip() for r in ("build-a", "build-b")]
+        what = d._wait_what(tid, json.loads(p.db.task(tid)["result"]))
+    finally:
+        for h in held:
+            h.close()
+    assert f"#{old}" not in note and f"#{old}" not in what, (note, what)
+    assert what == "; ".join(said) and what in note, (what, said, note)
+    assert f"task #{now_t} (run" in said[0] and f"pid {os.getpid()} alive" in said[0], said
+    assert f"pid {os.getpid()} alive" in said[1], said
+
+
 def test_lock_probe_busy_while_reserved_under_any_device_name(env):
     p = _device_project(env)
     from ttp import locks as lk

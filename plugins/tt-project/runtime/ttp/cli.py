@@ -3472,7 +3472,7 @@ def _probe_machine_lock(resource: str, shared_mode: bool) -> None:
     under ~/.tt-project/locks, where every project takes it: that lock answers, as the plain probe does
     (0 free, 75 busy, paused or reserved). Any other lock lives in some project's state, so there is
     nothing here to read: it says n/a and exits LOCK_NA."""
-    from . import fleethold, locks as lk, shared
+    from . import fleethold, lockprobe, locks as lk, shared
     if resource not in shared.names({}):
         print(f"{resource}: n/a (no tt-project project here, and `ttp machines` does not share it)")
         sys.exit(LOCK_NA)
@@ -3484,9 +3484,7 @@ def _probe_machine_lock(resource: str, shared_mode: bool) -> None:
     where = shared.root() / resource
     paths = lk.slot_paths(where, resource, shared.machine_slots(resource))
     free = lk.probe(where, resource, paths, shared=shared_mode and not resource.endswith("-device"))
-    n, who_r = len(lk.queued(where, resource)), lk.reserved_by(lk.reserve_path(where, resource))
-    print(f"{resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders_now(paths)) or 'nobody'}"
-                                                 f"; {n} waiting{f'; reserved for {who_r}' if who_r else ''})"))
+    print(lockprobe.line(resource, free, where, resource, paths))
     sys.exit(0 if free else 75)
 
 
@@ -3524,7 +3522,7 @@ def cmd_lock(a) -> None:
     neither paused nor reserved. Outside any project, `--probe` answers for a resource `ttp machines`
     shares (its lock is machine-wide) and says n/a, exit 3, for any other.
     """
-    from . import hold, locks as lk
+    from . import hold, lockprobe, locks as lk
     cmd = list(a.command or [])
     while cmd and cmd[0] == "--disruptive":   # given after the resource, where the command's words start
         a.disruptive, cmd = True, cmd[1:]
@@ -3542,16 +3540,8 @@ def cmd_lock(a) -> None:
     p = Project(base)
 
     def _pause() -> dict | None:
-        try:
-            paused = p.db.paused_resources()
-            # A pause of any of the device's names holds them all; a fleet hold, every name on its machine.
-            from . import fleethold
-            hold = fleethold.covering(a.resource)
-            return paused.get(a.resource) or next((v for k, v in paused.items() if lk.canonical(cfg, k) == res), None) \
-                or (fleethold.entry(hold) if hold else None)
-        except Exception as e:   # an unreadable database must not stop device commands
-            print(f"ttp lock: could not check for a pause of {a.resource}: {e}", file=sys.stderr, flush=True)
-            return None
+        # A pause of any of the device's names holds them all; a fleet hold, every name on its machine.
+        return lockprobe.pause(p, cfg, a.resource)
 
     def _refuse_paused() -> None:
         # Checked before each try, so a pause set while this waits holds too.
@@ -3583,15 +3573,10 @@ def cmd_lock(a) -> None:
         paths = lk.slot_paths(where, res, shared.slots(p, res, cfg))
     except OSError as e:
         _unwritable(e)
-    if a.probe:
-        if (held := _pause()) is not None:   # a paused `ttp lock` exits 75, so its probe must too
-            print(f"{a.resource}: paused" + (f" ({held['reason']})" if held.get("reason") else ""))
-            sys.exit(75)
-        free = lk.probe(where, res, paths, shared=a.shared)
-        n, who_r = len(lk.queued(where, res)), lk.reserved_by(lk.reserve_path(where, res))
-        print(f"{a.resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders_now(paths, p)) or 'nobody'}"
-                                                      f"; {n} waiting{f'; reserved for {who_r}' if who_r else ''})"))
-        sys.exit(0 if free else 75)
+    if a.probe:   # a paused `ttp lock` exits 75, so its probe must too
+        rc, said = lockprobe.answer(p, cfg, a.resource, a.shared)
+        print(said)
+        sys.exit(rc)
     who = shared.holder(p, res, hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID")), cfg)
     held_locks = [x for x in os.environ.get("TTP_LOCKS_HELD", "").split(",") if x]
     shared_locks = [x for x in os.environ.get("TTP_LOCKS_SHARED", "").split(",") if x]
