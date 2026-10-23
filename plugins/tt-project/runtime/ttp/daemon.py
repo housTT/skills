@@ -113,6 +113,7 @@ from . import unblock
 from . import upstream
 from . import userpause
 from . import verified
+from . import waitgate
 from . import waitheal
 from . import watchdup
 from . import schedrun
@@ -694,6 +695,7 @@ class Daemon:
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
+        self._woke_on: dict[int, tuple[int | str, float, str]] = {}   # task -> the verdict its last wake came on (wake gate)
         self._wait_what_errs: set[str] = set()   # causes of lock-probe errors already logged (_wait_what)
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
         self._on_pass: dict[int, tuple[subprocess.Popen, float, float, Path, int, str, str, str]] = {}
@@ -5666,6 +5668,9 @@ class Daemon:
                 reached.add(task["id"])
             if why:
                 continue
+            skipped, gated = self._wake_gate(task)
+            if skipped:
+                continue
             review_pick = None
             if task["kind"] == "review" and self._reuse_review(task):
                 continue
@@ -5694,6 +5699,8 @@ class Daemon:
                     note["start_checks"] = found
                 if wake:
                     note["wake"] = {"tier": tier, "escalated": bool(load_result(task["result"]).get("escalated_wake"))}
+                if gated:
+                    note[waitgate.USE] = gated
                 if picked:
                     note["pick"] = picked
                 if review_pick:
@@ -5829,6 +5836,43 @@ class Daemon:
             else "network" if note.get("lost_to_network") else "lost"
         return {"run": r["id"], "session": session, "cwd": cwd, "dir": str(run_dir), "ended": r["ended"],
                 "cause": cause, "spec_sha": note.get("spec_sha")}
+
+    def _wake_gate(self, task: dict) -> tuple[bool, dict | None]:
+        """The wait-wake gate (waitgate.py) on a waiting task due now. (True, None): it re-deferred the
+        wake with no model turn. Else (False, what the run's note keeps for settling, or None when the
+        gate does not apply). Any error wakes the model as before."""
+        prev = load_result(task["result"])
+        if prev.get("status") != "waiting":
+            return False, None
+        db, now, tid = self.p.db, time.time(), task["id"]
+        try:
+            from .prompts import spec_digest
+            last = db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' AND status!='running' "
+                          "ORDER BY id DESC LIMIT 1", (tid,))
+            probe = None
+            got = self._probe_rc.get(tid) or self._woke_on.get(tid)
+            since = float(prev.get("waiting_since") or 0)
+            if got and got[2] == prev.get("retry_when") and got[1] >= since:
+                out = self._probe_out.get(tid)
+                probe = (got[0], out[0] if out and out[2] == got[2] else "")
+            d = waitgate.decide(self.p, self.cfg, task, prev, now, probe=probe, last_run=last,
+                                jev=self.jev, spec_sha=spec_digest(task))
+        except Exception as e:   # a wake is always safe
+            log(self.p, f"task {tid}: wake gate failed, waking: {type(e).__name__}: {e}")
+            return False, None
+        if d is None:
+            return False, None
+        if d.wake:
+            log(self.p, f"task {tid} wake gate: wake ({d.by}: {d.reason})")
+            return False, d.note(prev, d.extra.get("skips") or [])
+        nb = now + d.delay_s
+        db.update_task(tid, not_before=nb, result=dump_result(waitgate.skipped(prev, d, now)), blocked_reason=(
+            f"waiting for {self._wait_what(tid, prev)}; the wake gate skipped a turn ({d.reason}); next try "
+            f"{timefmt.short(nb, self.p)}")[:500])
+        self._woke_on.pop(tid, None)
+        log(self.p, f"task {tid} wake gate: skip ({d.by}: {d.reason}); asleep until {timefmt.short(nb, self.p)}")
+        self._unreserve(task)
+        return True, None
 
     def _unreserve(self, task: dict) -> None:
         for res in _exclusive(task):
@@ -7002,6 +7046,8 @@ class Daemon:
             self._probe_rc[tid] = ("timeout" if rc is None else rc, now, probe)
             if task and task["status"] == "queued":
                 self._flag_never_passes(task, probe, rc, outs[id(proc)])
+            if task and self._gate_holds(task, self._probe_rc[tid][0], outs[id(proc)], now):
+                continue
             if rc == 0 or detach.failed_check(probe, rc) or _push_not_landed(probe, rc):
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
@@ -7027,7 +7073,8 @@ class Daemon:
             self._start_probe(t["id"], probe, now)
             got = self._probe_rc.get(t["id"])
             if t["id"] not in self._probes and got and got[2] == probe and (t["not_before"] or 0) > now \
-                    and (got[0] == 0 or detach.failed_check(probe, got[0])):   # a shared verdict
+                    and (got[0] == 0 or detach.failed_check(probe, got[0])) \
+                    and not self._gate_holds(t, got[0], (self._probe_out.get(t["id"]) or ("",))[0], now):
                 (self._probe_passed if got[0] == 0 else self._job_failed)(db.task(t["id"]) or t, now)
         self.probe_deferred(now)
 
@@ -7662,6 +7709,21 @@ class Daemon:
         finally:
             f.close()
 
+    def _gate_holds(self, task: dict, rc, out: str, now: float) -> bool:
+        """A task asleep after a wake-gate skip: True keeps it asleep on a probe answer the gate already
+        judged (the same exit and output). An answer that changed wakes it at once, unless it only says
+        "not yet" (the usual sleep then stands)."""
+        if task["status"] != "queued" or (task["not_before"] or 0) <= now:
+            return False
+        prev = load_result(task["result"])
+        held = waitgate.holds(prev, rc, out)
+        if held == "same":
+            return True
+        if held == "changed" and rc not in NOT_YET_RCS:
+            self._wake_waiting(task, "probe passed" if rc == 0 else f"its probe's answer changed (exit {rc})", now)
+            return True
+        return False
+
     def _note_probe_out(self, tid: int, probe: str, text: str, now: float) -> None:
         got = self._probe_out.get(tid)
         if not got or got[0] != text or got[2] != probe:
@@ -7972,7 +8034,9 @@ class Daemon:
     def _wake_waiting(self, task: dict, why: str, now: float, extra: dict | None = None) -> None:
         """Make a waiting task due now and tell its next run why it woke."""
         tid = task["id"]
-        self._probe_rc.pop(tid, None)
+        got = self._probe_rc.pop(tid, None)
+        if got:
+            self._woke_on[tid] = got
         prev = load_result(task["result"])
         self.p.db.update_task(tid, not_before=min(task["not_before"] or now, now),
                               result=dump_result({**prev, **(extra or {}), "woke": why}))

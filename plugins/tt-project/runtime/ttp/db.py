@@ -138,6 +138,14 @@ CREATE TABLE IF NOT EXISTS jev_calls (
   outcome TEXT, outcome_ts REAL, note TEXT, changed INTEGER);
 CREATE INDEX IF NOT EXISTS jev_calls_use ON jev_calls(ts, use);
 
+-- One row per wait-wake gate decision (waitgate.py): skip or wake, by which step, why, its Jev call,
+-- the model turn a skip is estimated to have saved, and the outcome the next real turn settled.
+CREATE TABLE IF NOT EXISTS wake_gate (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, task INTEGER NOT NULL, decision TEXT NOT NULL,
+  by TEXT NOT NULL, reason TEXT, jev_call INTEGER, avoided_usd REAL NOT NULL DEFAULT 0,
+  outcome TEXT, outcome_ts REAL, note TEXT);
+CREATE INDEX IF NOT EXISTS wake_gate_ts ON wake_gate(ts, task);
+
 -- One row per episode of a high alert with a condition key; cleared is set, never deleted.
 CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, raised REAL NOT NULL, last REAL,
