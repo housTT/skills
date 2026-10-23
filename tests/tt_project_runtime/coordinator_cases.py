@@ -12458,6 +12458,174 @@ def test_blocker_sweep_replay_of_a_day_of_signals_over_probe_watched_holds(env):
 
 
 
+def _held_sweep(p, monkeypatch):
+    """A daemon whose stuck items each end without a turn: a user-set resource pause, a task blocked until
+    a time ahead, a wait on a retry_when probe and a deferral on a start_when probe whose last answers are
+    a fresh not yet, and a task blocked on an open ask. The first sweep at T0 runs the model."""
+    from ttp import anchors, coordinator as coord, daemon as dm, startgate, sweep, sweepskip
+    db, t0 = p.db, time.time()
+    clock = [t0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    coord.pause_resource(p, "board-u", True, reason="hold for the user", by="user")
+    dep = db.add_task("the fixture it builds on")
+    db.update_task(dep, status="running")
+    until = db.add_task("blocked until the window", depends_on=[dep])
+    db.update_task(until, status="blocked", blocked_reason="the lab window opens later",
+                   labels=[anchors.label("until", str(t0 + 3 * 86400))])
+    waiting = db.add_task("waits on a build")
+    db.update_task(waiting, status="waiting", result=json.dumps(
+        {"status": "waiting", "summary": "build", "retry_when": "test -e out/w", "waiting_since": t0}))
+    aid = db.post("out", "Which vendor key?", kind="ask", ref="blocking:review")
+    asked = db.add_task("needs the vendor key")
+    db.update_task(asked, status="blocked", blocked_reason=f"waiting on the answer to ask {aid}",
+                   labels=[anchors.label("ask", str(aid))])
+    deferred = db.add_task("bench after the repair", labels=["start_when:test -e out/d", f"deferred_since:{t0 - 600}"])
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")   # the coordinator read its inbox
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    d.cfg.setdefault("waiting", {})["max_hold_s"] = 2 * 86400
+
+    def at(ts):
+        """Move to `ts`; both probes answered not yet a minute ago."""
+        clock[0] = ts
+        d._probe_rc[waiting] = (1, ts - 60, "test -e out/w")
+        startgate.record(db, deferred, "test -e out/d", 1, "not yet", ts - 60)
+
+    def run(ts=None):
+        """One blocker_sweep check at `ts`: the queued sweep event's id (None if none), the receipts."""
+        if ts is not None:
+            at(ts)
+        d._sweep_checked = 0.0
+        d.blocker_sweep()
+        ev = db.one("SELECT id FROM events WHERE kind=? AND status='queued'", (sweep.SWEEP_KIND,))
+        if ev:
+            db.x("UPDATE events SET status='handled' WHERE id=?", (ev["id"],))
+        return (ev or {}).get("id"), db.kv(sweepskip.RECEIPTS_KEY) or []
+
+    eid, recs = run(t0)
+    assert eid and not recs, "no model sweep on record: the first one runs the model"
+    ids = {"until": until, "waiting": waiting, "asked": asked, "deferred": deferred, "dep": dep, "aid": aid}
+    return d, db, t0, at, run, ids
+
+
+def test_blocker_sweep_skips_model_free_when_every_item_is_held_and_unchanged(env, monkeypatch):
+    """An unchanged sweep whose every item ends without a turn is skipped: a receipt lists each item and
+    its end, resets the 6-h clock, shows as one low status line and feed row, and the daily review counts
+    it; past 24 h a model sweep runs again."""
+    from ttp import audit, cli, sweep, sweepskip, web
+    p = make(env)
+    d, db, t0, at, run, ids = _held_sweep(p, monkeypatch)
+    db.x("INSERT INTO runs(role, status, cost_usd) VALUES('coordinator','done',0.5)")
+    model = db.kv(sweepskip.MODEL_KEY)
+    assert model["ts"] == t0 and len(model["fps"]) == 5
+    t1 = t0 + 6 * 3600 + 60
+    eid, recs = run(t1)
+    assert eid is None, "every item held and unchanged: no sweep turn"
+    [rec] = recs
+    assert rec["ts"] == t1 and rec["model"] == t0 and rec["usd"] == 0.5
+    ends = dict(rec["items"])
+    assert ends.pop("resource:board-u") == "user pause"
+    assert ends.pop(f"task:{ids['until']}").startswith("until ")
+    assert ends.pop(f"task:{ids['waiting']}") == "retry_when `test -e out/w`"
+    assert ends.pop(f"task:{ids['asked']}") == f"open ask #{ids['aid']}"
+    assert ends.pop(f"task:{ids['deferred']}") == "start_when test -e out/d"
+    assert not ends
+    # The receipt resets the 6-h clock.
+    assert sweep.due(db, d.cfg, t1) is None and sweep.due(db, d.cfg, t1 + 5 * 3600) is None
+    assert sweep.due(db, d.cfg, t1 + 6 * 3600) == "every 6h"
+    # One low status line and feed row, never an alert.
+    line = "blocker sweep skipped model-free"
+    assert line in cli.status_text(p) and "5 item(s) unchanged" in sweepskip.status_lines(db, t1, p)[0]
+    rows = [m for m in web.state_payload(p, db)["feed"] if line in (m.get("text") or "")]
+    assert [(m["severity"], m["state"]) for m in rows] == [("low", "status")]
+    assert not db.one("SELECT id FROM events WHERE severity IN ('high','critical')")
+    # The daily review counts model and skipped sweeps and the saving.
+    assert sweepskip.counts(db, t0 - 60, t1 + 60) == {"model": 1, "skipped": 1, "usd": 0.5}
+    assert any("blocker sweeps: 1 by the model, 1 skipped model-free" in ln and "~$0.50 saved" in ln
+               for ln in audit.lines(db, t1 + 60)), audit.lines(db, t1 + 60)
+    # A second interval skips again; once the model sweep is 24 h old, the model runs.
+    assert run(t1 + 6 * 3600 + 60)[0] is None and len(db.kv(sweepskip.RECEIPTS_KEY)) == 2
+    eid, recs = run(t0 + 24 * 3600 + 60)
+    assert eid and len(recs) == 2 and db.kv(sweepskip.MODEL_KEY)["ts"] == t0 + 24 * 3600 + 60
+    assert sweepskip.latest(db) is None and sweepskip.status_lines(db, t0 + 24 * 3600 + 60, p) == []
+
+
+def _never_skip(case, p, d, db, t1, ids):
+    from ttp import anchors, coordinator as coord, sweep
+    if case == "new item":
+        n = db.add_task("another window")
+        db.update_task(n, status="blocked", blocked_reason="later", labels=[anchors.label("until", str(t1 + 86400))])
+    elif case == "changed item":
+        db.update_task(ids["until"], blocked_reason="the lab window moved")
+    elif case == "broken probe":
+        d._probe_rc[ids["waiting"]] = (2, t1 - 60, "test -e out/w")
+    elif case == "stale probe":
+        d._probe_rc[ids["waiting"]] = (1, t1 - 2 * 3600, "test -e out/w")
+    elif case == "overdue wait":
+        d.cfg["waiting"]["max_hold_s"] = 3600
+    elif case == "deferral past defer_max_days":
+        d.cfg.setdefault("coordinator", {})["defer_max_days"] = 0.001
+    elif case == "coordinator pause":
+        coord.pause_resource(p, "board-c", True, reason="fabric repair", by="coordinator")
+    elif case in ("failed", "cancelled"):
+        db.update_task(ids["dep"], status=case)
+    elif case == "missing dependency":
+        db.update_task(ids["until"], depends_on=[ids["dep"] + 1000])
+    elif case == "review past backlog":
+        r = db.add_task("a change to review")
+        db.update_task(r, status="review")
+        db.add_task("review it", kind="review", depends_on=[r])
+        db.x("UPDATE tasks SET updated=? WHERE id=?", (t1 - 7 * 3600, r))
+    elif case == "pushing past backlog":
+        r = db.add_task("a change being pushed")
+        db.x("UPDATE tasks SET status='pushing', updated=? WHERE id=?", (t1 - 7 * 3600, r))
+    elif case == "no model-free end":
+        n = db.add_task("needs a decision")
+        db.update_task(n, status="blocked", blocked_reason="needs a decision")
+    elif case == "pending signal":
+        sweep.signal(db, "provider pause over: codex")
+    elif case == "unhandled message":
+        db.post("in", "any news?")
+    elif case == "queued event":
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (t1 - 60, "daemon", "task_failed", "normal", "#9 failed", "queued"))
+    elif case == "next check due":
+        # A turn judged the until-blocked task still blocked and asked for a re-check before now.
+        sweep.record(db, {"id": ids["until"], "outcome": "still_blocked", "until": "the window opens",
+                          "until_probe": "test -e out/window"}, t1 - 60, t1 - 6 * 3600)
+    elif case == "daily re-check due":
+        # A turn judged the ask-held task a day ago, after the user last spoke: its daily re-check came due.
+        db.x("UPDATE messages SET ts=? WHERE direction='in'", (t1 - 2 * 86400,))
+        sweep.record(db, {"id": ids["asked"], "outcome": "human_indispensable", "why": "only the user answers"},
+                     None, t1 - 24 * 3600 - 60)
+
+
+@pytest.mark.parametrize("case, why", [
+    ("new item", "items changed"), ("changed item", "items changed"),
+    ("broken probe", "no model-free end"), ("stale probe", "no model-free end"),
+    ("overdue wait", "no model-free end"), ("deferral past defer_max_days", "no model-free end"),
+    ("coordinator pause", "no model-free end: resource:board-c"),
+    ("failed", "no model-free end"), ("cancelled", "no model-free end"), ("missing dependency", "no model-free end"),
+    ("review past backlog", "no model-free end"), ("pushing past backlog", "a task is pushing past"),
+    ("no model-free end", "no model-free end"), ("pending signal", "a signal is pending"),
+    ("unhandled message", "a message waits"), ("queued event", "another event needs a turn"),
+    ("next check due", "next check due: task:"), ("daily re-check due", "daily re-check due: task:"),
+])
+def test_blocker_sweep_never_skips_what_a_turn_must_judge(env, monkeypatch, case, why):
+    """Each case that needs a turn queues the model sweep instead of a receipt, from a state that skips."""
+    from ttp import sweep, sweepskip
+    p = make(env)
+    d, db, t0, at, run, ids = _held_sweep(p, monkeypatch)
+    t1 = t0 + 6 * 3600 + 60
+    at(t1)
+    assert sweepskip.check(db, d.cfg, sweep.items(db, t1, d.cfg), t1, d._probe_rc.get)["skip"], "the control skips"
+    _never_skip(case, p, d, db, t1, ids)
+    got = sweepskip.check(db, d.cfg, sweep.items(db, t1, d.cfg), t1, d._probe_rc.get)
+    assert not got["skip"] and why in got["why"], got["why"]
+    eid, recs = run()
+    assert eid and recs == [], f"{case}: a model sweep, no receipt"
+
+
 def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_a_reason(env, monkeypatch):
     from ttp import coordinator as coord, reviewreuse
     p = make(env)

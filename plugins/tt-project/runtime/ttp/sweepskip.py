@@ -16,12 +16,14 @@ without a turn (end()):
 
 The turn is skipped only when every item has such an end, the items and each one's status, spec,
 reason and end are what they were at the last sweep a turn ran (MODEL_KEY), that sweep was less than
-MAX_AGE_H ago, and nothing else needs a turn: no signal() request pending, no inbound message
-unhandled, no other queued event but routine ones (quietgate.routine_kinds), no task pushing past
-coordinator.review_backlog_h, no loop and no ask held past ask_rethink_h. A new or changed item, a
-broken or stale probe, a deferral past defer_max_days, a pause the coordinator set, a dependency or
-probe task that failed, was cancelled or does not exist, a review past its expected time, or an item
-with no model-free end starts the sweep turn as before.
+MAX_AGE_H ago, and nothing else needs a turn: no signal() request pending, no re-check a sweep
+outcome asked for came due (its `next` or the daily re-check, which the receipt's clock would
+otherwise pass), no inbound message unhandled, no other queued event but routine ones
+(quietgate.routine_kinds), no task pushing past coordinator.review_backlog_h, no loop and no ask
+held past ask_rethink_h. A new or changed item, a broken or stale probe, a deferral past
+defer_max_days, a pause the coordinator set, a dependency or probe task that failed, was cancelled or
+does not exist, a review past its expected time, or an item with no model-free end starts the sweep
+turn as before.
 
 A skip writes a receipt (RECEIPTS_KEY: each item and what ends it, with the estimated saving, the
 quiet gate's mean coordinator turn) and sets sweep.STATE_KEY `receipt`, which the sweep's clock counts
@@ -45,6 +47,7 @@ KEEP_S = 8 * 86400
 DEFER_MAX_DAYS = 14.0
 MAX_HOLD_S = 6 * 3600.0
 DEAD = ("failed", "cancelled")
+RECHECKS = ("next check due", "daily re-check due")   # sweep._signals lines for a re-check a turn asked for
 
 Probe = Callable[[int], Any]   # task id -> (rc, ts, probe) of its last probe answer, or None
 
@@ -162,7 +165,10 @@ def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | Non
         (lambda: not isinstance(model, dict) or not model.get("fps"), "no model sweep on record"),
         (lambda: now - _f(model.get("ts"), 0) >= MAX_AGE_H * 3600, "the last model sweep is 24 h old"),
         (lambda: model.get("fps") != fps, "items changed since the last model sweep"),
-        (lambda: db.kv(sweep.SIGNAL_KEY, []), "a signal is pending"),
+        (lambda: bool(db.kv(sweep.SIGNAL_KEY, [])), "a signal is pending"),
+        # A re-check a turn asked for (an outcome's `next`, a daily re-check) came due since the clock:
+        # a receipt would move the clock past it and lose it.
+        (lambda: [s for s in sweep._signals(db, state, live, now) if s.startswith(RECHECKS)], "{}"),
         (lambda: db.one("SELECT id FROM messages WHERE direction='in' AND handled=0 LIMIT 1"), "a message waits"),
         (lambda: db.one(f"SELECT id FROM events WHERE status='queued' AND kind NOT IN "
                         f"({','.join('?' * (len(routine) + 1))}) LIMIT 1", (sweep.SWEEP_KIND, *routine)),
