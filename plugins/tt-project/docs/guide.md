@@ -426,11 +426,15 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   0 = normal priority), so they never slow the machine's own work. The daemon and the coordinator
   keep normal priority. Each run's `exit.json` records the level its agent ran at.
 - Parallel code tasks that build the same files: when a code task is added whose spec names repo
-  paths another open code task's spec names, or a finished branch that has not landed adds or
-  changes, the task is still added, but its task_add result and its line in the coordinator's open
-  tasks say `overlaps #<id> (<paths>, new files flagged)` with the fix (`start_when landed:#<id>`
-  or `depends_on`). Its worker's prompt lists those branches and says to reuse their module. Model-free:
-  each branch's diff is read once per head. Config `overlap`: `enabled` (on), `ignore` (globs such as
+  paths another open code task's spec or branch names, or that a done task's branch still to land
+  adds or changes, the task is still added, but its task_add result and its line in the coordinator's
+  open tasks say `overlaps #<id> (<paths>, new files flagged)` for the three most recent such tasks
+  (then `+N more tasks`) with the fix: `depends_on` an open task, `start_when landed:#<id>` a done
+  one. A done task counts only while it finished within `branch_days`, has a branch head, is not
+  landed (itself or through a review, fix or continuation that carried it), merged or on the push
+  branch by patch, and was not shelved, rejected, superseded or cancelled, so a landed wait it names
+  can pass. Its worker's prompt lists the eight most recent such branches and says to reuse their
+  module. Model-free: each branch's diff is read once per head. Config `overlap`: `enabled` (on), `ignore` (globs such as
   changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
   150000, touched by most changes, never count) and `branch_days` (14). Folders and the files the
   check commands (`delivery.push_checks`) name never count either: specs cite those as the required suite.

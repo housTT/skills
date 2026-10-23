@@ -33,8 +33,7 @@ def test_task_add_warns_when_another_open_code_task_names_the_same_new_file(env)
     assert coord.apply(p, [{"type": "task_add", "title": "driver reports", "kind": "code",
                             "spec": "Record driver results in `runtime/ttp/progress.py` (append, KINDS)."}]) == []
     new = p.db.one("SELECT id FROM tasks WHERE title='driver reports'")["id"]
-    want = (f"overlaps #{first} (runtime/ttp/progress.py): build on it, not beside it: "
-            f"start_when landed:#{first} or depends_on [{first}]")
+    want = f"overlaps #{first} (runtime/ttp/progress.py): build on it, not beside it: depends_on [{first}]"
     assert f"task_add: #{new} added; {want}" in p.db.kv(coord.NOTES_KEY)
     assert _labels(p, new) == [f"overlap:{first}:{want}"]
     line = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{new} |"))
@@ -171,3 +170,71 @@ def test_task_add_gives_no_warning_for_folders_or_the_required_check_files(env):
     p.db.update_task(first, spec=relay + " Add runtime/ttp/progress.py.")
     hits = overlap.find(p, web + " Use runtime/ttp/progress.py.")
     assert [(h["id"], h["paths"]) for h in hits] == [(first, [("runtime/ttp/progress.py", False)])]
+
+
+def test_overlap_lists_only_open_or_recent_unlanded_tasks_with_advice_each_can_follow(env):
+    """#3526's warning listed #1115 and 27 more tasks done two weeks earlier whose work had long landed
+    through a successor (a review, a fix) or was shelved, telling it to wait on `landed:#1115`. Only
+    an open task (depends_on) or a done one that finished within overlap.branch_days with a head
+    still off the push branch (start_when landed:#<id>) counts; the most recent are listed first."""
+    from ttp import coordinator as coord, overlap
+    p = make(env)
+    root = p.root
+    def git(*args):
+        return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
+                              text=True).stdout.strip()
+    p.set_config("delivery.push_branch", git("symbolic-ref", "--short", "HEAD"))
+    path = "runtime/ttp/progress.py"
+    now = time.time()
+
+    def done_task(title, ended, **kw):
+        tid = p.db.add_task(title, "s", kind="code", status="done", **kw)
+        _branch_adding(p, f"ttp/t{tid}-x", {path: f"# {title}\n"})
+        p.db.update_task(tid, branch=f"ttp/t{tid}-x")
+        p.db.x("INSERT INTO runs(task, role, status, started, ended) VALUES(?,'worker','done',?,?)",
+               (tid, ended - 60, ended))
+        return tid
+    old = done_task("old, no landed record", now - 20 * 86400)          # a later write moved `updated`
+    carried = done_task("landed through its fix", now - 3600)
+    fix = p.db.add_task("Fix review of it", "s", kind="code", status="done", labels=[f"review_fix:{carried}"])
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m1', ?, 'abc1234', 'b')", (fix,))
+    shelved = done_task("shelved", now - 3600)
+    p.db.update_task(shelved, result=json.dumps({"summary": "no gain", "outcome": "shelved"}))
+    picked = done_task("on the push branch by patch", now - 3600)
+    recent = done_task("recent, unlanded", now - 3600)
+    git("commit", "-q", "--allow-empty", "-m", "other work")   # so the pick is a new commit, not the same one
+    git("cherry-pick", f"ttp/t{picked}-x")
+    opened = p.db.add_task("open one", f"Add {path}.", kind="code", status="queued")
+    hits = overlap.find(p, f"Extend {path}.")
+    assert [(h["id"], h["open"]) for h in hits] == [(opened, True), (recent, False)], (hits, old, carried, shelved)
+    want = (f"overlaps #{opened} ({path}); #{recent} ({path} (new file)): build on them, not beside them: "
+            f"depends_on [{opened}] and start_when landed:#{recent}")
+    assert overlap.warning(hits) == want
+    assert overlap.label(hits) == f"overlap:{opened},{recent}:{want}"
+    assert json.loads((p.state / overlap.LANDED_CACHE).read_text()) == [git("rev-parse", f"ttp/t{picked}-x")]
+    # Only the done one: a landed wait it can pass; once it lands, nothing.
+    p.db.update_task(opened, status="cancelled")
+    assert overlap.warning(overlap.find(p, f"Extend {path}.")) == (
+        f"overlaps #{recent} ({path} (new file)): build on it, not beside it: start_when landed:#{recent}")
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m2', ?, 'def5678', 'b')", (recent,))
+    assert overlap.find(p, f"Extend {path}.") == []
+    assert coord.apply(p, [{"type": "task_add", "title": "stall", "kind": "code", "spec": f"Extend {path}."}]) == []
+    assert not [n for n in p.db.kv(coord.NOTES_KEY) if "overlaps" in n]
+
+
+def test_overlap_warning_names_the_most_recent_few_then_a_count(env):
+    """Many matches: the warning names the MAX_TASKS most recent, then '+N more tasks', and its fix
+    and label name only those; the digest drops it once the task depends on them."""
+    from ttp import coordinator as coord, overlap
+    p = make(env)
+    ids = [p.db.add_task(f"t{i}", "Change runtime/ttp/relay.py.", kind="code", status="queued") for i in range(5)]
+    assert coord.apply(p, [{"type": "task_add", "title": "mine", "kind": "code",
+                            "spec": "Tidy runtime/ttp/relay.py."}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='mine'")["id"]
+    top = ids[::-1][:overlap.MAX_TASKS]
+    want = ("overlaps " + "; ".join(f"#{i} (runtime/ttp/relay.py)" for i in top) + "; +2 more tasks: build on "
+            f"them, not beside them: depends_on [{', '.join(map(str, top))}]")
+    assert f"task_add: #{new} added; {want}" in p.db.kv(coord.NOTES_KEY)
+    assert _labels(p, new) == [f"overlap:{','.join(map(str, top))}:{want}"]
+    p.db.update_task(new, depends_on=json.dumps(top))
+    assert overlap.digest_note(p.db.task(new)) == ""

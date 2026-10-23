@@ -5,15 +5,20 @@
 Two code tasks run side by side and each adds its own copy of one new module: the APIs clash and
 a review fails. So when a `code` or `harness` task is added, the repo paths its spec names
 (spec_paths: path-like tokens with a known source extension, or whose folder is in the repo) are
-compared with (a) the paths other open code tasks' specs name and (b) the files that finished,
-not yet landed code branches add or change (`git diff --name-status <base>...<head>`, cached per
-head). An overlap gives one short line (warning) in task_add's result and the new task's line in
-the digest's open tasks, naming the other task, the shared paths (new files flagged) and the fix:
-`start_when landed:#<id>` or `depends_on`. A code worker's prompt lists the unlanded branches
-that touch what its spec names (prompt_block). Common files never count: the `overlap.ignore`
-globs (changelogs, changesets, manifests, `__init__.py`) and hubs, tracked files larger than
-`overlap.hub_bytes`, which most changes touch in passing, and the files the check commands
-(`delivery.push_checks`) name, which specs cite as the required suite. Folders are no paths. No
+compared with (a) the paths other open code tasks' specs name and (b) the files the branches of
+other code tasks still to land add or change (`git diff --name-status <base>...<head>`, cached per
+head). A branch counts while its task is open, or once done only while it finished within
+`overlap.branch_days`, has a head, is not landed (tried.landed_tasks: a push queue landing of it or
+of a successor carrying it on, a supersession), not merged into the base nor on the push branch by
+patch (landed.py), and its hand-off did not shelve or reject the change. An overlap gives one short
+line (warning) in task_add's result and the new task's line in the digest's open tasks, naming the
+most recent few tasks (then '+N more'), the shared paths (new files flagged) and the fix:
+`depends_on` an open task, `start_when landed:#<id>` a done one. A code worker's prompt lists the
+unlanded branches that touch what its spec names (prompt_block). Common files never count: the
+`overlap.ignore` globs (changelogs, changesets, manifests, `__init__.py`) and hubs, tracked files
+larger than `overlap.hub_bytes`, which most changes touch in passing, and the files the check
+commands (`delivery.push_checks`) name, which specs cite as the required suite. Folders are no
+paths. No
 network, no model.
 """
 from __future__ import annotations
@@ -33,8 +38,10 @@ OPEN = ("queued", "running", "review", "pushing", "waiting", "blocked")
 LABEL = "overlap:"           # a task's label: overlap:<ids>:<warning>, shown in the digest while queued
 CACHE = "overlap_diffs.json"  # state/: {head: [[status, path], ...]}, one git diff per head ever
 CACHE_MAX = 400
+LANDED_CACHE = "overlap_landed.json"   # state/: [head], branch heads found on the push branch by patch
 MAX_PATHS = 4                 # shared paths named in one warning
-MAX_TASKS = 3                 # other tasks named in one warning
+MAX_TASKS = 3                 # other tasks named in one warning, the most recent first
+MAX_BRANCHES = 8              # branches a worker's prompt lists, the most recent first
 LS_TTL_S = 60
 # A slash path without a known extension (bin/tool, skills/tt-x/SKILL): kept when its folder is in the repo.
 _PLAIN = re.compile(r"(?<![\w./:@-])((?:[\w.-]+/)+[\w-][\w.-]*)(?![\w/-])")
@@ -150,27 +157,37 @@ def diff(p, base: str, head: str, cache: dict) -> list[tuple[str, str]]:
 
 
 def _landed_ids(db) -> set[int]:
-    """Tasks the records show landed or superseded, and the subjects of reviews that landed."""
-    from .db import review_subject
-    ids = {r["task"] for r in db.q("SELECT task FROM task_landings UNION SELECT task FROM task_superseded")}
-    for r in db.q("SELECT id, labels, title FROM tasks WHERE kind='review' AND id IN "
-                  "(SELECT task FROM task_landings)"):
-        if (s := review_subject(dict(r))) is not None:
-            ids.add(s)
-    return ids
+    """Tasks the records show landed or superseded, themselves or through a successor that carried
+    their work on (a review, a fix, a continuation, a rebase): tried.landed_tasks."""
+    from .tried import landed_tasks
+    return landed_tasks(db)
+
+
+def _shelved(result) -> bool:
+    """The hand-off says its change was shelved or rejected: nothing of it is to land."""
+    from .db import load_result
+    return str(load_result(result).get("outcome") or "").strip().lower() in ("shelved", "rejected")
 
 
 def branches(p, skip=()) -> list[dict]:
-    """Code tasks' unlanded branches with commits of their own: [{id, branch, head, files: [(A|M|D, path)]}].
-    Done or open tasks of the last `overlap.branch_days`, not landed by the records nor merged into
-    the base; a diff per head is read once and cached in state/."""
+    """Code tasks' branches still to land, with commits of their own:
+    [{id, branch, head, open, files: [(A|M|D, path)]}]. An open task's branch, or a done task's that
+    finished (its last run ended) within `overlap.branch_days`, was not shelved or rejected, is not
+    landed by the records and not merged into the base; a diff per head is read once and cached in state/."""
     from . import worktree
     days = float(settings(p).get("branch_days") or 14)
-    rows = p.db.q("SELECT id, branch FROM tasks WHERE kind IN (%s) AND branch IS NOT NULL AND branch != '' "
-                  "AND status NOT IN ('failed','cancelled') AND updated>? ORDER BY id"
-                  % ",".join("?" * len(KINDS)), (*KINDS, time.time() - days * 86400))
+    since = time.time() - days * 86400
+    rows = p.db.q("SELECT id, branch, status, result, updated FROM tasks WHERE kind IN (%s) AND branch IS NOT NULL "
+                  "AND branch != '' AND (status IN (%s) OR (status='done' AND updated>?)) ORDER BY id"
+                  % (",".join("?" * len(KINDS)), ",".join("?" * len(OPEN))), (*KINDS, *OPEN, since))
     landed = _landed_ids(p.db)
-    rows = [r for r in rows if r["id"] not in landed and r["id"] not in skip]
+    rows = [r for r in rows if r["id"] not in landed and r["id"] not in skip
+            and (r["status"] in OPEN or not _shelved(r["result"]))]
+    done = [r["id"] for r in rows if r["status"] not in OPEN]
+    if done:   # `updated` moves with any later write: a done task's finish is its last run's end
+        ended = {r["task"]: r["e"] for r in p.db.q("SELECT task, MAX(ended) e FROM runs WHERE task IN (%s) "
+                                                     "GROUP BY task" % ",".join("?" * len(done)), done)}
+        rows = [r for r in rows if r["status"] in OPEN or (ended.get(r["id"]) or r["updated"] or 0) > since]
     if not rows:
         return []
     try:
@@ -187,7 +204,8 @@ def branches(p, skip=()) -> list[dict]:
     for r in rows:
         head = heads.get(r["branch"])
         if head and (files := diff(p, base, head, cache)):
-            out.append({"id": r["id"], "branch": r["branch"], "head": head, "files": files})
+            out.append({"id": r["id"], "branch": r["branch"], "head": head, "open": r["status"] in OPEN,
+                        "files": files})
     if len(cache) != size:
         keepers = dict(list(cache.items())[-CACHE_MAX:])
         from .project import durable_write
@@ -198,9 +216,45 @@ def branches(p, skip=()) -> list[dict]:
     return out
 
 
+def _on_push_branch(p, b: dict, seen: list) -> bool:
+    """A done task's branch is on the push branch under other commits (a rebase, a squash, a replay):
+    landed.py's patch checks, local refs only. Read only for branches that touch the new task's
+    files; a head found there is kept in `seen` (state/LANDED_CACHE), as it stays there."""
+    if b["open"]:
+        return False
+    if b["head"] in seen:
+        return True
+    from . import landed
+    try:
+        hit = landed.on_push_branch(p, b["branch"]) or landed.equivalent(
+            p, b["branch"], (p.config().get("delivery") or {}).get("version_bump"))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    if hit:
+        seen.append(b["head"])
+    return bool(hit)
+
+
+def _load_seen(p) -> list:
+    try:
+        got = json.loads((p.state / LANDED_CACHE).read_text())
+        return got if isinstance(got, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_seen(p, seen: list, size: int) -> None:
+    if len(seen) != size:
+        from .project import durable_write
+        try:
+            durable_write(p.state / LANDED_CACHE, json.dumps(seen[-CACHE_MAX:]))
+        except OSError:
+            pass
+
+
 def find(p, spec: str, skip=()) -> list[dict]:
-    """The other tasks whose spec or unlanded branch names a path `spec` names:
-    [{id, paths: [(path, new)], branch?, head?}], ignored files and hubs left out."""
+    """The other tasks whose spec or unlanded branch names a path `spec` names, the most recent first:
+    [{id, open, paths: [(path, new)], branch?, head?}], ignored files and hubs left out."""
     if not settings(p).get("enabled", True):
         return []
     mine = keep(p, spec_paths(spec, p.root))
@@ -215,23 +269,37 @@ def find(p, spec: str, skip=()) -> list[dict]:
         theirs = spec_paths(r["spec"] or "", p.root)
         shared = [m for m in mine if any(same(m, t) for t in theirs)]
         if shared:
-            hits[r["id"]] = {"id": r["id"], "paths": {m: False for m in shared}}
+            hits[r["id"]] = {"id": r["id"], "open": True, "paths": {m: False for m in shared}}
+    seen = _load_seen(p)
+    size = len(seen)
     for b in branches(p, skip):
         shared = {}
         for status, f in b["files"]:
             for m in mine:
                 if same(m, f):
                     shared[m] = shared.get(m, False) or status == "A"
-        if shared:
-            h = hits.setdefault(b["id"], {"id": b["id"], "paths": {}})
+        if shared and not _on_push_branch(p, b, seen):
+            h = hits.setdefault(b["id"], {"id": b["id"], "open": b["open"], "paths": {}})
             for m, new in shared.items():
                 h["paths"][m] = h["paths"].get(m, False) or new
             h.update(branch=b["branch"], head=b["head"])
-    return [{**h, "paths": list(h["paths"].items())} for _, h in sorted(hits.items())]
+    _save_seen(p, seen, size)
+    return [{**h, "paths": list(h["paths"].items())} for _, h in sorted(hits.items(), reverse=True)]
+
+
+def advice(hits: list[dict]) -> tuple[list[int], str]:
+    """(the ids it names, the fix) for the tasks a warning lists: `depends_on` the open ones, and
+    `start_when landed:#<id>` the most recent done one with a head (its landed probe can pass)."""
+    shown = hits[:MAX_TASKS]
+    deps = [h["id"] for h in shown if h.get("open")]
+    land = next((h["id"] for h in shown if not h.get("open") and h.get("head")), None)
+    fix = ([f"depends_on [{', '.join(map(str, deps))}]"] if deps else []) + \
+        ([f"start_when landed:#{land}"] if land is not None else [])
+    return deps + ([land] if land is not None else []), " and ".join(fix)
 
 
 def warning(hits: list[dict]) -> str:
-    """One line naming the other tasks, the shared paths (new files flagged) and the fix."""
+    """One line naming the most recent few other tasks, the shared paths (new files flagged) and the fix."""
     if not hits:
         return ""
     parts = []
@@ -240,13 +308,15 @@ def warning(hits: list[dict]) -> str:
         more = len(h["paths"]) - MAX_PATHS
         parts.append(f"#{h['id']} ({', '.join(names)}{f', +{more} more' if more > 0 else ''})")
     more = len(hits) - MAX_TASKS
-    first = hits[0]["id"]
-    return (f"overlaps {'; '.join(parts)}{f'; +{more} more tasks' if more > 0 else ''}: build on it, not beside "
-            f"it: start_when landed:#{first} or depends_on [{first}]")
+    it = "it" if len(hits) == 1 else "them"
+    fix = advice(hits)[1]
+    return (f"overlaps {'; '.join(parts)}{f'; +{more} more tasks' if more > 0 else ''}: build on {it}, not "
+            f"beside {it}{f': {fix}' if fix else ''}")
 
 
 def label(hits: list[dict]) -> str:
-    return f"{LABEL}{','.join(str(h['id']) for h in hits)}:{warning(hits)}" if hits else ""
+    """overlap:<ids the fix names>:<warning>: the digest drops it once the task waits on them all."""
+    return f"{LABEL}{','.join(map(str, advice(hits)[0]))}:{warning(hits)}" if hits else ""
 
 
 def digest_note(task: dict) -> str:
@@ -276,16 +346,20 @@ def prompt_block(p, task: dict) -> str:
         mine = keep(p, spec_paths(task.get("spec") or "", p.root)) if settings(p).get("enabled", True) else []
         if not mine:
             return ""
-        lines = []
-        for b in branches(p, skip={int(task.get("id") or 0)}):
+        lines, seen = [], _load_seen(p)
+        size = len(seen)
+        for b in reversed(branches(p, skip={int(task.get("id") or 0)})):
             shared = [(f, s == "A") for s, f in b["files"] if any(same(m, f) for m in mine)]
-            if shared:
+            if shared and not _on_push_branch(p, b, seen):
                 names = ", ".join(f"{f} (new file)" if new else f for f, new in shared[:MAX_PATHS])
                 lines.append(f"- #{b['id']} {b['branch']} at {b['head'][:10]}: {names}")
+        _save_seen(p, seen, size)
     except Exception:   # a hint, never a reason to fail a dispatch
         return ""
     if not lines:
         return ""
+    more = len(lines) - MAX_BRANCHES
+    lines = lines[:MAX_BRANCHES] + ([f"- +{more} more"] if more > 0 else [])
     return ("## Unlanded branches that touch your files\n"
             "These other tasks' branches add or change files your spec names and have not landed yet. Build on "
             "or coordinate with them: reuse their module and API (read it with `git show <branch>:<path>`), "
